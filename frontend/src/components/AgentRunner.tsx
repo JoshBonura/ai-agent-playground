@@ -7,7 +7,7 @@ export default function AgentRunner() {
   const runAgent = async () => {
   if (!prompt) return;
   try {
-    const res = await fetch("http://localhost:8080/api/agents/1/generate", {
+    const res = await fetch("https://1c772e4eab90.ngrok-free.app", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
