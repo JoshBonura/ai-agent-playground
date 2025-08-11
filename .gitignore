@@ -1,0 +1,39 @@
+# Python venv
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Model files (GGUF, GGML, bin)
+*.gguf
+*.ggml
+*.bin
+*.pth
+*.pt
+*.safetensors
+
+# Large dataset and embeddings
+*.jsonl
+*.parquet
+*.csv
+*.tsv
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE / editor settings
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Build / dist
+build/
+dist/
+*.egg-info/

@@ -1,13 +1,10 @@
-import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
-import AgentRunner from "./components/AgentRunner";
+
+import AgentRunner from "./pages/AgentRunner";
 
 export default function App() {
   return (
-    <Router>
-      <Routes>
-        <Route path="/runner" element={<AgentRunner />} />
-        <Route path="*" element={<AgentRunner />} /> {/* default route */}
-      </Routes>
-    </Router>
+    <main className="bg-gray-50 min-h-screen">
+      <AgentRunner />
+    </main>
   );
 }
