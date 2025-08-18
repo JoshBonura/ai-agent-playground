@@ -9,6 +9,6 @@ class ChatMessage(BaseModel):
 class ChatBody(BaseModel):
     sessionId: Optional[str] = None
     messages: Optional[List[ChatMessage]] = None
-    max_tokens: Optional[int] = 80
+    max_tokens: Optional[int] = 512
     temperature: float = 0.7
     top_p: float = 0.95

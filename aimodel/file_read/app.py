@@ -53,7 +53,7 @@ async def generate_stream(data: ChatBody, request: Request):
     incoming = [{"role": m.role, "content": m.content} for m in data.messages]
     st = handle_incoming(session_id, incoming)
 
-    out_budget = data.max_tokens or 80
+    out_budget = data.max_tokens or 512
     system_text = build_system(style="", short=False, bullets=False)
 
     packed, input_budget = pack_messages(

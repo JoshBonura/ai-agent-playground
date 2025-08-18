@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { SendHorizonal, Square } from "lucide-react";
 
 type Props = {
   input: string;
   setInput: (v: string) => void;
   loading: boolean;
-  onSend: (text: string) => void;   // 👈 change the type
+  onSend: (text: string) => void;
   onStop: () => void;
   onHeightChange?: (h: number) => void;
 };
+
 export default function ChatComposer({
   input,
   setInput,
@@ -20,11 +22,8 @@ export default function ChatComposer({
   const taRef = useRef<HTMLTextAreaElement>(null);
   const MAX_HEIGHT_PX = 192;
   const [isClamped, setIsClamped] = useState(false);
-
-  // Local state to track the textarea text
   const [draft, setDraft] = useState(input);
 
-  // Keep draft in sync when `input` changes externally
   useEffect(() => {
     setDraft(input);
   }, [input]);
@@ -52,20 +51,22 @@ export default function ChatComposer({
     autogrow();
   }, [draft]);
 
+  const hasText = draft.trim().length > 0;
+
+  const handleSendClick = () => {
+    const v = draft.trim();
+    if (!v) return;
+    onSend(v);
+    setDraft("");
+    setInput("");
+  };
+
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSendClick();
     }
   }
-
-const handleSendClick = () => {
-  const v = draft;
-  if (!v.trim()) return;
-  onSend(v);        // 👈 pass the text up
-  setDraft("");
-  setInput("");
-};
 
   return (
     <div
@@ -78,7 +79,7 @@ const handleSendClick = () => {
           value={draft}
           onChange={(e) => {
             setDraft(e.target.value);
-            setInput(e.target.value); // keep parent in sync
+            setInput(e.target.value);
             autogrow();
           }}
           onInput={autogrow}
@@ -90,17 +91,26 @@ const handleSendClick = () => {
           rows={1}
           style={{ maxHeight: MAX_HEIGHT_PX }}
         />
+
         <div className="flex items-end gap-2">
-          <button
-            className="px-4 py-2 rounded-lg bg-black text-white disabled:opacity-50"
-            onClick={handleSendClick}
-            disabled={loading || !draft.trim()}
-          >
-            {loading ? "Sending…" : "Send"}
-          </button>
+          {hasText && (
+            <button
+              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
+              onClick={handleSendClick}
+              disabled={loading}
+              title="Send"
+            >
+              <SendHorizonal size={18} />
+            </button>
+          )}
+
           {loading && (
-            <button className="px-3 py-2 rounded-lg border" onClick={onStop}>
-              Stop
+            <button
+              className="p-2 rounded-lg border hover:bg-gray-50"
+              onClick={onStop}
+              title="Stop generating"
+            >
+              <Square size={18} />
             </button>
           )}
         </div>

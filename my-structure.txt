@@ -163,6 +163,7 @@ ai-agent-playground/
     .gitignore
     Dockerfile
     README.md
+    clean-structure.txt
     eslint.config.js
     index.html
     package-lock.json
@@ -293,6 +294,7 @@ ai-agent-playground/
       locate-path/
       lodash.merge/
       lru-cache/
+      lucide-react/
       magic-string/
       merge2/
       micromatch/
@@ -407,6 +409,7 @@ ai-agent-playground/
         hooks/
           useAutoScroll.ts
           useChatStream.ts
+          useLockBodyScroll.ts
           useMultiSelect.ts
         pages/
           AgentRunner.tsx
