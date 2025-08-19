@@ -5,6 +5,10 @@ ai-agent-playground/
   docker-compose.dev.yml
   folder_structure.py
   my-structure.txt
+  myprint.txt
+  myprint2.txt
+  myprint3.txt
+  print2.py
   printcode.py
   .git/
   .venv/
@@ -92,71 +96,35 @@ ai-agent-playground/
       websockets.exe
       wheel.exe
     pyvenv.cfg
-  agent/
-    .dockerignore
-    .gitattributes
-    .gitignore
-    Dockerfile
-    HELP.md
-    mvnw
-    mvnw.cmd
-    pom.xml
-    run-debug.log
-    settings.json
-    .mvn/
-      wrapper/
-        maven-wrapper.properties
-    .vscode/
-      settings.json
-    logs/
-      spring.log
-    src/
-      main/
-        java/
-          com/
-            example/
-              agent/
-                AgentPlaygroundApplication.java
-                config/
-                  WebConfig.java
-                controller/
-                  AiController.java
-                  ChatController.java
-                exception/
-                  ValidationExceptionHandler.java
-                model/
-                  Chat.java
-                  ChatMessage.java
-                repository/
-                  ChatMessageRepository.java
-                  ChatRepository.java
-                service/
-                  AiService.java
-                  ChatMessageService.java
-                  ChatService.java
-        resources/
-          application.properties
-          static/
-          templates/
-      test/
-        java/
-          com/
-            example/
-              agent/
-                AgentPlaygroundApplicationTests.java
   aimodel/
     .dockerignore
     Dockerfile
     file_read/
+      __init__.py
       app.py
-      init.py
-      memory.py
-      model.py
+      model_runtime.py
+      paths.py
       requirements.txt
-      schemas.py
-      style.py
-    models/
-      mistral-7b-instruct-v0.2.Q4_K_M.gguf
+      api/
+        chats.py
+        generate.py
+        health.py
+        models.py
+      core/
+        __init__.py
+        memory.py
+        schemas.py
+        style.py
+      runtime/
+        utils/
+      store/
+        __init__.py
+        base.py
+        chats.py
+        index.py
+        pending.py
+      utils/
+        streaming.py
   frontend/
     .dockerignore
     .env.development
@@ -197,6 +165,7 @@ ai-agent-playground/
       @tailwindcss/
       @types/
       @typescript-eslint/
+      @ungap/
       @vitejs/
       acorn/
       acorn-jsx/
@@ -208,6 +177,7 @@ ai-agent-playground/
       arg/
       argparse/
       autoprefixer/
+      bail/
       balanced-match/
       binary-extensions/
       brace-expansion/
@@ -216,11 +186,17 @@ ai-agent-playground/
       callsites/
       camelcase-css/
       caniuse-lite/
+      ccount/
       chalk/
+      character-entities/
+      character-entities-html4/
+      character-entities-legacy/
+      character-reference-invalid/
       chokidar/
       chownr/
       color-convert/
       color-name/
+      comma-separated-tokens/
       commander/
       concat-map/
       cookie/
@@ -228,8 +204,11 @@ ai-agent-playground/
       cssesc/
       csstype/
       debug/
+      decode-named-character-reference/
       deep-is/
+      dequal/
       detect-libc/
+      devlop/
       didyoumean/
       dlv/
       eastasianwidth/
@@ -248,7 +227,9 @@ ai-agent-playground/
       esquery/
       esrecurse/
       estraverse/
+      estree-util-is-identifier-name/
       esutils/
+      extend/
       fast-deep-equal/
       fast-glob/
       fast-json-stable-stringify/
@@ -269,15 +250,27 @@ ai-agent-playground/
       graphemer/
       has-flag/
       hasown/
+      hast-util-is-element/
+      hast-util-to-jsx-runtime/
+      hast-util-to-text/
+      hast-util-whitespace/
+      highlight.js/
+      html-url-attributes/
       ignore/
       import-fresh/
       imurmurhash/
+      inline-style-parser/
+      is-alphabetical/
+      is-alphanumerical/
       is-binary-path/
       is-core-module/
+      is-decimal/
       is-extglob/
       is-fullwidth-code-point/
       is-glob/
+      is-hexadecimal/
       is-number/
+      is-plain-obj/
       isexe/
       jackspeak/
       jiti/
@@ -292,11 +285,59 @@ ai-agent-playground/
       lilconfig/
       lines-and-columns/
       locate-path/
+      lodash.castarray/
+      lodash.isplainobject/
       lodash.merge/
+      longest-streak/
+      lowlight/
       lru-cache/
       lucide-react/
       magic-string/
+      markdown-table/
+      mdast-util-find-and-replace/
+      mdast-util-from-markdown/
+      mdast-util-gfm/
+      mdast-util-gfm-autolink-literal/
+      mdast-util-gfm-footnote/
+      mdast-util-gfm-strikethrough/
+      mdast-util-gfm-table/
+      mdast-util-gfm-task-list-item/
+      mdast-util-mdx-expression/
+      mdast-util-mdx-jsx/
+      mdast-util-mdxjs-esm/
+      mdast-util-phrasing/
+      mdast-util-to-hast/
+      mdast-util-to-markdown/
+      mdast-util-to-string/
       merge2/
+      micromark/
+      micromark-core-commonmark/
+      micromark-extension-gfm/
+      micromark-extension-gfm-autolink-literal/
+      micromark-extension-gfm-footnote/
+      micromark-extension-gfm-strikethrough/
+      micromark-extension-gfm-table/
+      micromark-extension-gfm-tagfilter/
+      micromark-extension-gfm-task-list-item/
+      micromark-factory-destination/
+      micromark-factory-label/
+      micromark-factory-space/
+      micromark-factory-title/
+      micromark-factory-whitespace/
+      micromark-util-character/
+      micromark-util-chunked/
+      micromark-util-classify-character/
+      micromark-util-combine-extensions/
+      micromark-util-decode-numeric-character-reference/
+      micromark-util-decode-string/
+      micromark-util-encode/
+      micromark-util-html-tag-name/
+      micromark-util-normalize-identifier/
+      micromark-util-resolve-all/
+      micromark-util-sanitize-uri/
+      micromark-util-subtokenize/
+      micromark-util-symbol/
+      micromark-util-types/
       micromatch/
       minimatch/
       minipass/
@@ -316,6 +357,7 @@ ai-agent-playground/
       p-locate/
       package-json-from-dist/
       parent-module/
+      parse-entities/
       path-exists/
       path-key/
       path-parse/
@@ -332,14 +374,21 @@ ai-agent-playground/
       postcss-selector-parser/
       postcss-value-parser/
       prelude-ls/
+      property-information/
       punycode/
       queue-microtask/
       react/
       react-dom/
+      react-markdown/
       react-router/
       react-router-dom/
       read-cache/
       readdirp/
+      rehype-highlight/
+      remark-gfm/
+      remark-parse/
+      remark-rehype/
+      remark-stringify/
       resolve/
       resolve-from/
       reusify/
@@ -352,11 +401,15 @@ ai-agent-playground/
       shebang-regex/
       signal-exit/
       source-map-js/
+      space-separated-tokens/
       string-width/
       string-width-cjs/
+      stringify-entities/
       strip-ansi/
       strip-ansi-cjs/
       strip-json-comments/
+      style-to-js/
+      style-to-object/
       sucrase/
       supports-color/
       supports-preserve-symlinks-flag/
@@ -367,15 +420,26 @@ ai-agent-playground/
       thenify-all/
       tinyglobby/
       to-regex-range/
+      trim-lines/
+      trough/
       ts-api-utils/
       ts-interface-checker/
       type-check/
       typescript/
       typescript-eslint/
       undici-types/
+      unified/
+      unist-util-find-after/
+      unist-util-is/
+      unist-util-position/
+      unist-util-stringify-position/
+      unist-util-visit/
+      unist-util-visit-parents/
       update-browserslist-db/
       uri-js/
       util-deprecate/
+      vfile/
+      vfile-message/
       vite/
       which/
       word-wrap/
@@ -384,6 +448,7 @@ ai-agent-playground/
       yallist/
       yaml/
       yocto-queue/
+      zwitch/
     public/
       vite.svg
     src/
@@ -393,31 +458,79 @@ ai-agent-playground/
         main.tsx
         vite-env.d.ts
         api/
-        assets/
-          react.svg
+        app/
         components/
-          AppIntro.tsx
-          Button.tsx
+          AssistantMetrics.tsx
           ChatBubble.tsx
           ChatComposer.tsx
           ChatContainer.tsx
-          ChatSidebar.tsx
-          ChatView.tsx
-          Spinner.tsx
-          SpinnerWithMessage.tsx
-          TypingIndicator.tsx
-        hooks/
-          useAutoScroll.ts
-          useChatStream.ts
-          useLockBodyScroll.ts
-          useMultiSelect.ts
-        pages/
-          AgentRunner.tsx
-        services/
+          ChatItem.tsx
+          DesktopHeader.tsx
+          MetricsHoverCard.tsx
+          MobileDrawer.tsx
+          ChatSidebar/
+            ChatSidebar.tsx
+            SidebarHeader.tsx
+            SidebarListItem.tsx
+          ChatView/
+            ChatView.tsx
+            StatusLine.ts
+          Markdown/
+            MarkdownMessage.tsx
+        data/
           aiApi.ts
           chatApi.ts
+        features/
+          chat/
+        hooks/
+          useAutoScroll.ts
+          useChatState.ts
+          useChatStream.ts
+          useChatsPager.ts
+          useLockBodyScroll.ts
+          useMetrics.ts
+          useMultiSelect.ts
+          useRetitle.ts
+          useRunMetrics.ts
+          useRunState.ts
+          useSession.ts
+          useSidebar.ts
+          useStream.ts
+          useTheme.ts
+          useToast.ts
+          data/
+          stream/
+            core/
+              buffer.ts
+              cancel.ts
+              constants.ts
+              controller.ts
+              network.ts
+              queue.ts
+              runner.ts
+              runner_metrics.ts
+              runner_persist.ts
+              runner_stream.ts
+              types.ts
+              updater.ts
+        pages/
+          AgentRunner.tsx
+          AgentShell.tsx
+          useInitialLoad.ts
+        services/
           http.ts
+        shared/
+          api/
+          lib/
+            runjson.ts
+            text.ts
+          ui/
+            Button.tsx
+            CodeCopyButton.tsx
+            Spinner.tsx
+            Toast.tsx
+            TypingIndicator.tsx
         types/
           chat.ts
         utils/
-          text.ts
+          metricsCache.ts

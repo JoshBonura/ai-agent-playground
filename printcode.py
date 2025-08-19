@@ -15,11 +15,8 @@ if os.name == "nt":
 # Add/remove as you like.
 # ──────────────────────────────────────────────────────────────────────────────
 SEARCH_FOLDERS = [
-    "agent/src/main/java",
-    "agent/src/main/resources",
     "aimodel/file_read",
     "frontend/src/file_read",
-    "frontend",  
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -43,7 +40,9 @@ IGNORE_DIRS = {
 }
 
 IGNORE_BASENAMES = {
-    "package-lock.json",   # skip npm lockfile
+    "package-lock.json",
+    "package.json",
+    "postcss.config.js"   # skip npm lockfile
     # add more if you want:
     # "yarn.lock", "pnpm-lock.yaml", "bun.lockb"
 }

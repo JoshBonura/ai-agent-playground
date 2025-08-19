@@ -1,27 +1,44 @@
 import { useState, useRef } from "react";
-import ChatView from "./ChatView";
+import ChatView from "./ChatView/ChatView";
 import ChatComposer from "./ChatComposer";
 import type { ChatMsg } from "../types/chat";
+import type { GenMetrics, RunJson } from "../hooks/useChatStream";
 
-export default function ChatContainer({
-  messages, input, setInput, loading, send, stop
-}: {
+interface Props {
   messages: ChatMsg[];
   input: string;
   setInput: (s: string) => void;
   loading: boolean;
+  queued?: boolean;
   send: (text?: string) => Promise<void>;
   stop: () => Promise<void> | void;
+  runMetrics?: GenMetrics | null;
+  runJson?: RunJson | null;
   onRefreshChats?: () => void;
-}) {
-  const [composerH, setComposerH] = useState(0);
 
-  // The only scrollable thing is this container
+  // NEW: bubble deletion handler from parent (knows session id + API)
+  onDeleteMessages?: (ids: string[]) => void;
+}
+
+export default function ChatContainer({
+  messages,
+  input,
+  setInput,
+  loading,
+  queued = false,
+  send,
+  stop,
+  runMetrics,
+  runJson,
+  onRefreshChats,
+  onDeleteMessages, // NEW
+}: Props) {
+  const [composerH, setComposerH] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const handleSend = async (text?: string) => {
-    if (loading) return;
     await send(text);
+    onRefreshChats?.();
   };
 
   return (
@@ -30,7 +47,11 @@ export default function ChatContainer({
         <ChatView
           messages={messages}
           loading={loading}
+          queued={queued}
           bottomPad={composerH}
+          runMetrics={runMetrics}
+          runJson={runJson}
+          onDeleteMessages={onDeleteMessages} // NEW
         />
       </div>
 
@@ -38,9 +59,11 @@ export default function ChatContainer({
         input={input}
         setInput={setInput}
         loading={loading}
+        queued={queued}
         onSend={handleSend}
         onStop={stop}
         onHeightChange={setComposerH}
+        onRefreshChats={onRefreshChats}
       />
     </div>
   );

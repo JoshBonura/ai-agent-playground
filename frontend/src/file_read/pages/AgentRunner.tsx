@@ -1,88 +1,107 @@
 // frontend/src/file_read/pages/AgentRunner.tsx
-import ChatContainer from "../components/ChatContainer";
-import ChatSidebar from "../components/ChatSidebar";
 import { useEffect, useState } from "react";
+import ChatContainer from "../components/ChatContainer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
 import { useChatStream } from "../hooks/useChatStream";
-import { appendMessage, updateChatLast } from "../services/chatApi";
-import { firstLineSmart } from "../utils/text";
-import { PanelLeftOpen } from "lucide-react";
+import { useSidebar } from "../hooks/useSidebar";
+import { useToast } from "../hooks/useToast";
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import Toast from "../shared/ui/Toast";
+
+// Use a single API layer (services)
+import { createChat, listChatsPage, deleteMessagesBatch, enqueuePendingDelete } from "../hooks/data/chatApi";
+import { cancelSession } from "../hooks/data/aiApi";
+
+const PAGE_SIZE = 30;
+const LS_KEY = "lastSessionId";
 
 export default function AgentRunner() {
   const chat = useChatStream();
   const [refreshKey, setRefreshKey] = useState(0);
+  const { toast, show } = useToast();
+  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
 
-  // Sidebar open/close (visible by default on desktop)
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
-
+  // initial load: open last or most recent session
   useEffect(() => {
-    const onResize = () => {
-      if (window.innerWidth >= 768) setSidebarOpen(true); // pin on desktop
-    };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    (async () => {
+      try {
+        const ceil = new Date().toISOString();
+        const page = await listChatsPage(0, PAGE_SIZE, ceil);
+        const saved = localStorage.getItem(LS_KEY) || "";
+        const targetId =
+          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
+          page.content[0]?.sessionId ||
+          "";
+        if (targetId) {
+          await chat.loadHistory(targetId);
+          localStorage.setItem(LS_KEY, targetId);
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- New Chat ----
   async function newChat(): Promise<void> {
-    const prevSessionId = chat.sessionIdRef.current;
-    const wasStreaming = chat.loading;
-    const pending = (chat as any).snapshotPendingAssistant?.() ?? "";
-
-    if (wasStreaming) {
-      try { await chat.stop(); } catch {}
-      if (pending && pending.trim() && prevSessionId) {
-        try {
-          await appendMessage(prevSessionId, "assistant", pending);
-          await updateChatLast(prevSessionId, pending, firstLineSmart(pending));
-        } catch (e) {
-          console.warn("persist pending assistant failed:", e);
-        }
-      }
-    }
-
-    chat.reset();
     const id = crypto.randomUUID();
     chat.setSessionId(id);
+    try { await createChat(id, "New Chat"); } catch {}
+    localStorage.setItem(LS_KEY, id);
     setRefreshKey((k) => k + 1);
+    chat.setInput("");
+    chat.clearMetrics?.();
   }
 
-  // ---- Open existing session ----
   async function openSession(id: string): Promise<void> {
-    if (!id) {
-      chat.reset();
+    if (!id) return;
+    await chat.loadHistory(id);
+    localStorage.setItem(LS_KEY, id);
+    chat.setInput("");
+    chat.clearMetrics?.();
+  }
+
+  // Single, consolidated delete handler (queues while streaming)
+  async function handleDeleteMessages(ids: string[]) {
+    const sid = chat.sessionIdRef.current;
+    if (!sid || !ids?.length) return;
+
+    const numericIds = ids.map(Number).filter(Number.isFinite);
+
+    // If the session is currently streaming, queue + cancel.
+    if (chat.loading) {
+      try {
+        // non-numeric ID likely = in-flight assistant bubble
+        const tailAssistant = ids.some((x) => !/^\d+$/.test(x));
+        await enqueuePendingDelete(sid, {
+          messageIds: numericIds.length ? numericIds : undefined,
+          tailAssistant,
+        });
+        await cancelSession(sid); // stop stream; backend applies pending on next append
+        show("Delete queued; will apply as soon as the run settles.");
+      } catch {
+        show("Failed to queue delete");
+      }
       return;
     }
-    try { await chat.stop(); } catch {}
-    await chat.loadHistory(id);
+
+    // Not streaming: perform immediately
+    if (!numericIds.length) {
+      show("Nothing to delete yet");
+      return;
+    }
+    try {
+      await deleteMessagesBatch(sid, numericIds);
+      await chat.loadHistory(sid);
+      setRefreshKey((k) => k + 1);
+      show("Message deleted");
+    } catch {
+      show("Failed to delete message");
+    }
   }
-
-  // Mobile drawer helpers
-  const openMobileDrawer = () => {
-    document.getElementById("mobile-drawer")?.classList.remove("hidden");
-    document.getElementById("mobile-backdrop")?.classList.remove("hidden");
-    document.body.style.overflow = "hidden";
-  };
-  const closeMobileDrawer = () => {
-    document.getElementById("mobile-drawer")?.classList.add("hidden");
-    document.getElementById("mobile-backdrop")?.classList.add("hidden");
-    document.body.style.overflow = "";
-  };
-
-  // Optional: Ctrl+B to toggle on desktop
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
-        e.preventDefault();
-        setSidebarOpen((v) => !v);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
 
   return (
     <div className="h-screen w-full flex bg-gray-50">
-      {/* Desktop left rail */}
+      {/* Desktop sidebar */}
       {sidebarOpen && (
         <div className="hidden md:flex h-full">
           <ChatSidebar
@@ -95,97 +114,37 @@ export default function AgentRunner() {
         </div>
       )}
 
-      {/* Mobile top bar */}
-      <div className="md:hidden fixed top-0 left-0 right-0 z-40 bg-white border-b">
-        <div className="h-14 flex items-center justify-between px-3">
-          <button
-            className="inline-flex items-center justify-center h-9 w-9 rounded-lg border hover:bg-gray-50"
-            onClick={openMobileDrawer}
-            aria-label="Open sidebar"
-            title="Open sidebar"
-          >
-            <PanelLeftOpen className="w-4 h-4" />
-          </button>
-          <div className="font-semibold">Local AI Model</div>
-          <div className="w-9" />
-        </div>
-      </div>
-
-      {/* Mobile drawer */}
-      <div
-        id="mobile-backdrop"
-        className="md:hidden fixed inset-0 z-40 bg-black/40 hidden"
-        onClick={closeMobileDrawer}
+      {/* Mobile controls */}
+      <MobileDrawer
+        onOpenSession={openSession}
+        onNewChat={newChat}
+        refreshKey={refreshKey}
+        activeId={chat.sessionIdRef.current}
+        openMobileDrawer={openMobileDrawer}
+        closeMobileDrawer={closeMobileDrawer}
       />
-      <aside
-        id="mobile-drawer"
-        role="dialog"
-        aria-modal="true"
-        className="md:hidden fixed inset-y-0 left-0 z-50 w-80 max-w-[85vw] bg-white border-r shadow-xl hidden animate-[slideIn_.2s_ease-out]"
-      >
-        <div className="h-14 flex items-center justify-between px-3 border-b">
-          <div className="font-medium">Chats</div>
-          <button
-            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
-            onClick={closeMobileDrawer}
-            aria-label="Close sidebar"
-          >
-            <span className="rotate-45 text-xl leading-none">+</span>
-          </button>
-        </div>
-        <ChatSidebar
-          onOpen={async (id) => {
-            await openSession(id);
-            closeMobileDrawer();
-          }}
-          onNew={async () => {
-            await newChat();
-            closeMobileDrawer();
-          }}
-          refreshKey={refreshKey}
-          activeId={chat.sessionIdRef.current}
-        />
-      </aside>
-      <style>{`@keyframes slideIn{from{transform:translateX(-12px);opacity:.0}to{transform:translateX(0);opacity:1}}`}</style>
+      <div className="md:hidden h-14 shrink-0" />
 
-      {/* Right/main column */}
+      {/* Right column */}
       <div className="flex-1 min-w-0 flex flex-col">
-        {/* Spacer under fixed mobile bar */}
-        <div className="md:hidden h-14 shrink-0" />
-
-        {/* Desktop header with Show button when hidden */}
-        <div className="hidden md:flex h-14 shrink-0 items-center justify-between px-4 border-b bg-white">
-          <div className="flex items-center gap-2">
-            {!sidebarOpen && (
-              <button
-                className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
-                onClick={() => setSidebarOpen(true)}
-                aria-label="Show sidebar"
-                title="Show sidebar"
-              >
-                <PanelLeftOpen className="w-4 h-4" />
-              </button>
-            )}
-            <div className="font-semibold">Local AI Model</div>
-          </div>
-          <div />
-        </div>
-
-        {/* Content fills remaining height */}
+        <DesktopHeader sidebarOpen={sidebarOpen} onShowSidebar={() => setSidebarOpen(true)} />
         <div className="flex-1 min-h-0">
-
-          {/* Chat area — centered, width-capped like ChatGPT */}
           <div className="h-full px-3 md:px-6">
-            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl">
+            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
               <ChatContainer
                 messages={chat.messages}
                 input={chat.input}
                 setInput={chat.setInput}
                 loading={chat.loading}
+                queued={chat.queued}
                 send={chat.send}
                 stop={chat.stop}
+                runMetrics={chat.runMetrics}
+                runJson={chat.runJson}
                 onRefreshChats={() => setRefreshKey((k) => k + 1)}
+                onDeleteMessages={handleDeleteMessages}
               />
+              <Toast message={toast} />
             </div>
           </div>
         </div>

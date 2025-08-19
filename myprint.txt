@@ -1,0 +1,522 @@
+LM Studio
+├── LICENSE.electron.txt
+├── LICENSES.chromium.html
+├── LM Studio.exe
+├── Uninstall LM Studio.exe
+├── chrome_100_percent.pak
+├── chrome_200_percent.pak
+├── d3dcompiler_47.dll
+├── ffmpeg.dll
+├── icudtl.dat
+├── libEGL.dll
+├── libGLESv2.dll
+├── resources.pak
+├── snapshot_blob.bin
+├── structure.txt
+├── v8_context_snapshot.bin
+├── vk_swiftshader.dll
+├── vk_swiftshader_icd.json
+├── vulkan-1.dll
+├── locales
+│   ├── af.pak
+│   ├── am.pak
+│   ├── ar.pak
+│   ├── bg.pak
+│   ├── bn.pak
+│   ├── ca.pak
+│   ├── cs.pak
+│   ├── da.pak
+│   ├── de.pak
+│   ├── el.pak
+│   ├── en-GB.pak
+│   ├── en-US.pak
+│   ├── es-419.pak
+│   ├── es.pak
+│   ├── et.pak
+│   ├── fa.pak
+│   ├── fi.pak
+│   ├── fil.pak
+│   ├── fr.pak
+│   ├── gu.pak
+│   ├── he.pak
+│   ├── hi.pak
+│   ├── hr.pak
+│   ├── hu.pak
+│   ├── id.pak
+│   ├── it.pak
+│   ├── ja.pak
+│   ├── kn.pak
+│   ├── ko.pak
+│   ├── lt.pak
+│   ├── lv.pak
+│   ├── ml.pak
+│   ├── mr.pak
+│   ├── ms.pak
+│   ├── nb.pak
+│   ├── nl.pak
+│   ├── pl.pak
+│   ├── pt-BR.pak
+│   ├── pt-PT.pak
+│   ├── ro.pak
+│   ├── ru.pak
+│   ├── sk.pak
+│   ├── sl.pak
+│   ├── sr.pak
+│   ├── sv.pak
+│   ├── sw.pak
+│   ├── ta.pak
+│   ├── te.pak
+│   ├── th.pak
+│   ├── tr.pak
+│   ├── uk.pak
+│   ├── ur.pak
+│   ├── vi.pak
+│   ├── zh-CN.pak
+│   └── zh-TW.pak
+└── resources
+    ├── app-update.yml
+    ├── elevate.exe
+    ├── icon.ico
+    ├── trayIconActiveDarkTemplate.png
+    ├── trayIconActiveDarkTemplate@2x.png
+    ├── trayIconActiveDarkTemplate@3x.png
+    ├── trayIconActiveTemplate.png
+    ├── trayIconActiveTemplate@2x.png
+    ├── trayIconActiveTemplate@3x.png
+    ├── trayIconDarkTemplate.png
+    ├── trayIconDarkTemplate@2x.png
+    ├── trayIconDarkTemplate@3x.png
+    ├── trayIconPausedDarkTemplate.png
+    ├── trayIconPausedDarkTemplate@2x.png
+    ├── trayIconPausedDarkTemplate@3x.png
+    ├── trayIconPausedTemplate.png
+    ├── trayIconPausedTemplate@2x.png
+    ├── trayIconPausedTemplate@3x.png
+    ├── trayIconTemplate.png
+    ├── trayIconTemplate@2x.png
+    ├── trayIconTemplate@3x.png
+    └── app
+        ├── package.json
+        └── .webpack
+            ├── lms.exe
+            ├── bin
+            │   ├── deno.exe
+            │   ├── esPluginScaffolding.tar.gz
+            │   ├── esbuild.exe
+            │   ├── node.exe
+            │   ├── sqlite-vector.dll
+            │   ├── bundled-models
+            │   │   └── nomic-ai
+            │   │       └── nomic-embed-text-v1.5-GGUF
+            │   │           └── nomic-embed-text-v1.5.Q4_K_M.gguf
+            │   ├── extensions
+            │   │   ├── backends
+            │   │   └── frameworks
+            │   └── liblmstudio
+            │       ├── cpu
+            │       │   ├── liblmstudio_bindings.node
+            │       │   └── lmstudiocore.dll
+            │       └── vulkan
+            │           ├── liblmstudio_bindings_vulkan.node
+            │           ├── lmstudiocore.dll
+            │           └── vulkan-1.dll
+            ├── bundled-plugins
+            │   ├── bundled-plugin-js-code-sandbox.tar.gz
+            │   ├── bundled-plugin-rag-v1.tar.gz
+            │   └── bundled-plugins.json
+            ├── lib
+            │   ├── embeddingworker.js
+            │   ├── embeddingworker.js.LICENSE.txt
+            │   ├── imagegenworker.js
+            │   ├── liblmstudioworker.js
+            │   ├── libvips-42.dll
+            │   ├── libvips-cpp.dll
+            │   ├── llmworker.js
+            │   ├── llmworker.js.LICENSE.txt
+            │   ├── mcpbridgeworker.js
+            │   ├── mcpbridgeworker.js.LICENSE.txt
+            │   ├── retrievalworker.js
+            │   ├── sharp-win32-x64.node
+            │   ├── systemresourcesworker.js
+            │   ├── transcriptionworker.js
+            │   └── native_modules
+            │       ├── build
+            │       │   └── Release
+            │       │       └── better_sqlite3.node
+            │       └── prebuilds
+            │           └── win32-x64
+            │               └── node.napi.node
+            ├── main
+            │   ├── 13.js
+            │   ├── 341.js
+            │   ├── 566.js
+            │   ├── 566.js.LICENSE.txt
+            │   ├── hosted_app_preload.js
+            │   ├── index.js
+            │   ├── index.js.LICENSE.txt
+            │   ├── main_window_preload.js
+            │   ├── watcher.node
+            │   └── native_modules
+            │       ├── node-gyp-bin
+            │       │   ├── node-gyp
+            │       │   └── node-gyp.cmd
+            │       ├── node-gyp-bin1
+            │       │   ├── node-gyp
+            │       │   └── node-gyp.cmd
+            │       └── prebuilds
+            │           └── win32-x64
+            │               └── node.napi.node
+            └── renderer
+                ├── 0108e89c9003e8c14ea3.woff
+                ├── 02271ec5cb9f5b4588ac.woff
+                ├── 073b3402d036714b4370.woff
+                ├── 0afbcdc2d1724cbb3322f4f57b62fb67.png
+                ├── 0ba282215b7ce33f1bbad9754fe2e147.png
+                ├── 0c3b8929d377c0e9b2f3.woff
+                ├── 1065.js
+                ├── 1065.js.LICENSE.txt
+                ├── 1065.js.map
+                ├── 1134.js
+                ├── 1134.js.LICENSE.txt
+                ├── 1134.js.map
+                ├── 1147.js
+                ├── 1147.js.LICENSE.txt
+                ├── 1147.js.map
+                ├── 1156.js
+                ├── 1156.js.LICENSE.txt
+                ├── 1156.js.map
+                ├── 1259.js
+                ├── 1259.js.LICENSE.txt
+                ├── 1259.js.map
+                ├── 1448.js
+                ├── 1448.js.LICENSE.txt
+                ├── 1448.js.map
+                ├── 147.js
+                ├── 147.js.LICENSE.txt
+                ├── 147.js.map
+                ├── 1471.js
+                ├── 1471.js.LICENSE.txt
+                ├── 1471.js.map
+                ├── 14f38f8cfd0b5389a211054b20083b8c.png
+                ├── 172d3529b26f8cedef6b.woff2
+                ├── 180.js
+                ├── 180.js.LICENSE.txt
+                ├── 180.js.map
+                ├── 1886.js
+                ├── 1886.js.LICENSE.txt
+                ├── 1886.js.map
+                ├── 1960.js
+                ├── 1960.js.LICENSE.txt
+                ├── 1960.js.map
+                ├── 1961.js
+                ├── 1961.js.LICENSE.txt
+                ├── 1961.js.map
+                ├── 2060.js
+                ├── 2060.js.LICENSE.txt
+                ├── 2060.js.map
+                ├── 2075.js
+                ├── 2075.js.LICENSE.txt
+                ├── 2075.js.map
+                ├── 20f389c4120be058d80a.woff2
+                ├── 2140.js
+                ├── 2140.js.LICENSE.txt
+                ├── 2140.js.map
+                ├── 2240.js
+                ├── 2240.js.LICENSE.txt
+                ├── 2240.js.map
+                ├── 249.js
+                ├── 249.js.LICENSE.txt
+                ├── 249.js.map
+                ├── 2571.js
+                ├── 2571.js.LICENSE.txt
+                ├── 2571.js.map
+                ├── 2798.js
+                ├── 2798.js.LICENSE.txt
+                ├── 2798.js.map
+                ├── 2814.js
+                ├── 2814.js.LICENSE.txt
+                ├── 2814.js.map
+                ├── 2892.js
+                ├── 2892.js.LICENSE.txt
+                ├── 2892.js.map
+                ├── 2911.js
+                ├── 2911.js.LICENSE.txt
+                ├── 2911.js.map
+                ├── 2954.js
+                ├── 2954.js.LICENSE.txt
+                ├── 2954.js.map
+                ├── 2960900c4f271311eb36.woff2
+                ├── 2f7bc363fc5424ebda59.ttf
+                ├── 3036.js
+                ├── 3036.js.LICENSE.txt
+                ├── 3036.js.map
+                ├── 354501bac435c3264834.woff
+                ├── 3585.js
+                ├── 3585.js.LICENSE.txt
+                ├── 3585.js.map
+                ├── 3632.js
+                ├── 3632.js.LICENSE.txt
+                ├── 3632.js.map
+                ├── 3682.js
+                ├── 3682.js.LICENSE.txt
+                ├── 3682.js.map
+                ├── 3703a7536654c06275dc988da535be4c.svg
+                ├── 3760.js
+                ├── 3760.js.LICENSE.txt
+                ├── 3760.js.map
+                ├── 3919.js
+                ├── 3919.js.LICENSE.txt
+                ├── 3919.js.map
+                ├── 39890742bc957b368704.woff2
+                ├── 3a99e70aee4076660d38.woff
+                ├── 3c707f524db3b2fac823cb1e415e81df.png
+                ├── 3f07ed67f06c720120ce.woff
+                ├── 3fc349d6beaed0138151295960278aeb.png
+                ├── 4028.js
+                ├── 4028.js.LICENSE.txt
+                ├── 4028.js.map
+                ├── 4129.js
+                ├── 4129.js.LICENSE.txt
+                ├── 4129.js.map
+                ├── 4188.js
+                ├── 4188.js.LICENSE.txt
+                ├── 4188.js.map
+                ├── 428978dc7837d46de091.woff
+                ├── 4368.js
+                ├── 4368.js.LICENSE.txt
+                ├── 4368.js.map
+                ├── 4386.js
+                ├── 4386.js.LICENSE.txt
+                ├── 4386.js.map
+                ├── 4407.js
+                ├── 4407.js.LICENSE.txt
+                ├── 4407.js.map
+                ├── 4456.js
+                ├── 4456.js.LICENSE.txt
+                ├── 4456.js.map
+                ├── 4902.js
+                ├── 4902.js.LICENSE.txt
+                ├── 4902.js.map
+                ├── 4912.js
+                ├── 4912.js.LICENSE.txt
+                ├── 4912.js.map
+                ├── 4946.js
+                ├── 4946.js.LICENSE.txt
+                ├── 4946.js.map
+                ├── 4ad7c7e8bb8d10a34bb7.ttf
+                ├── 4c6b94fd1d07f8beff7c.woff
+                ├── 4c761b3711973ab04edf.ttf
+                ├── 4f35fbcc9ee8614c2bcc.woff
+                ├── 5062.js
+                ├── 5062.js.LICENSE.txt
+                ├── 5062.js.map
+                ├── 50e1210aa7cf3495ef4eb3667732c4d2.png
+                ├── 525.js
+                ├── 525.js.LICENSE.txt
+                ├── 525.js.map
+                ├── 5288.js
+                ├── 5288.js.LICENSE.txt
+                ├── 5288.js.map
+                ├── 5377.js
+                ├── 5377.js.LICENSE.txt
+                ├── 5377.js.map
+                ├── 5593.js
+                ├── 5593.js.LICENSE.txt
+                ├── 5593.js.map
+                ├── 5703.js
+                ├── 5703.js.LICENSE.txt
+                ├── 5703.js.map
+                ├── 57f5c1837853986ea1db.ttf
+                ├── 5849.js
+                ├── 5849.js.LICENSE.txt
+                ├── 5849.js.map
+                ├── 5880.js
+                ├── 5880.js.LICENSE.txt
+                ├── 5880.js.map
+                ├── 5962.js
+                ├── 5962.js.LICENSE.txt
+                ├── 5962.js.map
+                ├── 5b49f4993ae22d7975b4.ttf
+                ├── 6082.js
+                ├── 6082.js.LICENSE.txt
+                ├── 6082.js.map
+                ├── 6241.js
+                ├── 6241.js.LICENSE.txt
+                ├── 6241.js.map
+                ├── 6423.js
+                ├── 6423.js.LICENSE.txt
+                ├── 6423.js.map
+                ├── 6424.js
+                ├── 6424.js.LICENSE.txt
+                ├── 6424.js.map
+                ├── 6449.js
+                ├── 6449.js.LICENSE.txt
+                ├── 6449.js.map
+                ├── 6489.js
+                ├── 6489.js.LICENSE.txt
+                ├── 6489.js.map
+                ├── 6587.js
+                ├── 6587.js.LICENSE.txt
+                ├── 6587.js.map
+                ├── 665.js
+                ├── 665.js.LICENSE.txt
+                ├── 665.js.map
+                ├── 6717.js
+                ├── 6717.js.LICENSE.txt
+                ├── 6717.js.map
+                ├── 6789a2ef19bdd0f5c8f29218f8e636fc.png
+                ├── 69a364dd4ae60315e1c5d6638fd29012.png
+                ├── 6d3d25f4820d0da8f01f.woff2
+                ├── 6de7d4b539221a49e9e2.ttf
+                ├── 6eec866c69313624be60.woff2
+                ├── 6fdf0ac577be0ba82a4c.woff
+                ├── 7043.js
+                ├── 7043.js.LICENSE.txt
+                ├── 7043.js.map
+                ├── 7131.js
+                ├── 7131.js.LICENSE.txt
+                ├── 7131.js.map
+                ├── 7165d305b28068ca599458dfbea748d0.png
+                ├── 7287.js
+                ├── 7287.js.LICENSE.txt
+                ├── 7287.js.map
+                ├── 73ea273a72f4aca30ca5.woff2
+                ├── 7489a2fbfb9bfe704420.ttf
+                ├── 7562.js
+                ├── 7562.js.LICENSE.txt
+                ├── 7562.js.map
+                ├── 7637.js
+                ├── 7637.js.LICENSE.txt
+                ├── 7637.js.map
+                ├── 7778.js
+                ├── 7778.js.LICENSE.txt
+                ├── 7778.js.map
+                ├── 7835.js
+                ├── 7835.js.LICENSE.txt
+                ├── 7835.js.map
+                ├── 7947224e8a9914fa332b.woff
+                ├── 7d393d382f3e7fb1c637.woff2
+                ├── 7e873d3833eb108a0758.ttf
+                ├── 8070.js
+                ├── 8070.js.LICENSE.txt
+                ├── 8070.js.map
+                ├── 8084.js
+                ├── 8084.js.LICENSE.txt
+                ├── 8084.js.map
+                ├── 8169508bf58f8bd92ad8.ttf
+                ├── 8180.js
+                ├── 8180.js.LICENSE.txt
+                ├── 8180.js.map
+                ├── 828abcb200061cffbaae.ttf
+                ├── 8401.js
+                ├── 8401.js.map
+                ├── 8424.js
+                ├── 8424.js.LICENSE.txt
+                ├── 8424.js.map
+                ├── 848.js
+                ├── 848.js.LICENSE.txt
+                ├── 848.js.map
+                ├── 853be92419a6c3766b9a.ttf
+                ├── 854.js
+                ├── 854.js.LICENSE.txt
+                ├── 854.js.map
+                ├── 8670.js
+                ├── 8670.js.LICENSE.txt
+                ├── 8670.js.map
+                ├── 8715.js
+                ├── 8715.js.LICENSE.txt
+                ├── 8715.js.map
+                ├── 8719.js
+                ├── 8719.js.LICENSE.txt
+                ├── 8719.js.map
+                ├── 8734.js
+                ├── 8734.js.LICENSE.txt
+                ├── 8734.js.map
+                ├── 8906.js
+                ├── 8906.js.LICENSE.txt
+                ├── 8906.js.map
+                ├── 8946.js
+                ├── 8946.js.LICENSE.txt
+                ├── 8946.js.map
+                ├── 8a5f936332e8028c7278.ttf
+                ├── 8ae17bbee4fec22955ebdabca400a629.png
+                ├── 8b99220c21e98f34cd7edee102ffb9e4.png
+                ├── 8c02662811277bacd09ea2389c572119.png
+                ├── 8d593cfaa96238d5e2f8.woff
+                ├── 8d6b6822586eea3d3b20.ttf
+                ├── 911.js
+                ├── 911.js.LICENSE.txt
+                ├── 911.js.map
+                ├── 9313a5b39c736e1360d25d4cd72de008.png
+                ├── 931d67ea207ab37ee693.woff2
+                ├── 9343.js
+                ├── 9343.js.LICENSE.txt
+                ├── 9343.js.map
+                ├── 9398.js
+                ├── 9398.js.LICENSE.txt
+                ├── 9398.js.map
+                ├── 9400.js
+                ├── 9400.js.LICENSE.txt
+                ├── 9400.js.map
+                ├── 9537.js
+                ├── 9537.js.LICENSE.txt
+                ├── 9537.js.map
+                ├── 95591a929f0d32aa282a.woff2
+                ├── 96759856b4e70f3a8338.woff
+                ├── 9684.js
+                ├── 9684.js.LICENSE.txt
+                ├── 9684.js.map
+                ├── 9907.js
+                ├── 9907.js.LICENSE.txt
+                ├── 9907.js.map
+                ├── 996.js
+                ├── 996.js.LICENSE.txt
+                ├── 996.js.map
+                ├── 9eba1d77abcf2aa6e94e.ttf
+                ├── a18c9920c249d9bb6d3a1efb120bd8cc.png
+                ├── a1abf90dfd72792a577a.woff2
+                ├── aeffd8025cba3647f1a6.woff
+                ├── b257a18c016f37ee4543.ttf
+                ├── b84613efe3a90a1f7bba5581be208fa0.png
+                ├── b9cd458ac6d5889ff9c3.woff
+                ├── bf2d440b3a42ea78a998.ttf
+                ├── bf3b8d080abc41d5920ef7da0121d515.png
+                ├── c295e7f71970f03c0549.woff2
+                ├── c5b6b0788bcb36cddb0e38b4b6731d38.png
+                ├── c5c02d763c89380dcb4e.ttf
+                ├── c81d1b2a4b75d3eded60.woff2
+                ├── cc19dfcb92855f47749684f28bcb85f7.png
+                ├── cd5e231e0cc53b2cb2c0.woff2
+                ├── d36b7b19908116b8d38a3c844a480cb4.png
+                ├── d562e886c52f12660a41.woff
+                ├── d6484fce1ef428d5bd94.woff2
+                ├── d757c535a2e5902f1325.woff
+                ├── d8afa19c513df8d4657c0740d3772a20.svg
+                ├── dac1159e8fadbc4985cd30fb578d12da.png
+                ├── db074fa22cf224af93d7.woff
+                ├── dcbcbd93bac0470b462d.woff2
+                ├── e1951519f6f0596f7356.woff2
+                ├── e418bf257af1052628d8.woff2
+                ├── e94178960f07dd54db8f65a74a326178.png
+                ├── ed305b5434865e06ffde.ttf
+                ├── f6283f7ccaed1249d9eb.ttf
+                ├── f650f111a3b890d116f1.woff2
+                ├── f9afbdfc5099479cd02e55efabfb4625.png
+                ├── fa675e5e4bec9eb250b6.ttf
+                ├── fc9ba5249878cd8f8d88.ttf
+                ├── fd947498bc16392e76c2.woff
+                ├── fdc106ede72e24425f29b0513a6cec9d.png
+                ├── fe2176f79edaa716e621.woff2
+                ├── index.html
+                ├── main_window.js
+                ├── main_window.js.LICENSE.txt
+                ├── main_window.js.map
+                └── monaco-editor
+                    ├── editor.worker.js
+                    ├── editor.worker.js.map
+                    ├── json.worker.js
+                    ├── json.worker.js.LICENSE.txt
+                    ├── json.worker.js.map
+                    ├── ts.worker.js
+                    ├── ts.worker.js.LICENSE.txt
+                    └── ts.worker.js.map

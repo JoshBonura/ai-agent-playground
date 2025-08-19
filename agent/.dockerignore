@@ -1,8 +1,0 @@
-target/
-**/*.iml
-.idea/
-.vscode/
-.mvn/wrapper/maven-wrapper.jar   
-logs/
-uploads/
-.env

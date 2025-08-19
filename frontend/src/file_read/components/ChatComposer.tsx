@@ -5,18 +5,22 @@ type Props = {
   input: string;
   setInput: (v: string) => void;
   loading: boolean;
-  onSend: (text: string) => void;
-  onStop: () => void;
+  queued?: boolean;              // NEW: show stop while queued too
+  onSend: (text: string) => void | Promise<void>;
+  onStop: () => void | Promise<void>;
   onHeightChange?: (h: number) => void;
+  onRefreshChats?: () => void;
 };
 
 export default function ChatComposer({
   input,
   setInput,
   loading,
+  queued = false,                // NEW
   onSend,
   onStop,
   onHeightChange,
+  onRefreshChats,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -24,9 +28,7 @@ export default function ChatComposer({
   const [isClamped, setIsClamped] = useState(false);
   const [draft, setDraft] = useState(input);
 
-  useEffect(() => {
-    setDraft(input);
-  }, [input]);
+  useEffect(() => setDraft(input), [input]);
 
   const autogrow = () => {
     const ta = taRef.current;
@@ -45,34 +47,42 @@ export default function ChatComposer({
     const onResize = () => autogrow();
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     autogrow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
   const hasText = draft.trim().length > 0;
 
   const handleSendClick = () => {
     const v = draft.trim();
-    if (!v) return;
-    onSend(v);
+    if (!v || loading || queued) return; // prevent sending while queued or streaming
     setDraft("");
     setInput("");
+    void Promise.resolve(onSend(v)).finally(() => {
+      onRefreshChats?.();
+    });
+  };
+
+  const handleStopClick = () => {
+    if (!loading && !queued) return;
+    void Promise.resolve(onStop()).finally(() => {
+      onRefreshChats?.(); // refresh once the stop lands
+    });
   };
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSendClick();
+      if (!loading && !queued) handleSendClick();
     }
   }
 
   return (
-    <div
-      ref={wrapRef}
-      className="relative z-50 bg-white/95 backdrop-blur border-t p-3"
-    >
+    <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
       <div className="flex gap-2">
         <textarea
           ref={taRef}
@@ -93,26 +103,25 @@ export default function ChatComposer({
         />
 
         <div className="flex items-end gap-2">
-          {hasText && (
-            <button
-              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
-              onClick={handleSendClick}
-              disabled={loading}
-              title="Send"
-            >
-              <SendHorizonal size={18} />
-            </button>
-          )}
-
-          {loading && (
+          {(loading || queued) ? (
             <button
               className="p-2 rounded-lg border hover:bg-gray-50"
-              onClick={onStop}
-              title="Stop generating"
+              onClick={handleStopClick}
+              title={queued ? "Cancel queued message" : "Stop generating"}
+              aria-label={queued ? "Cancel queued message" : "Stop generating"}
             >
               <Square size={18} />
             </button>
-          )}
+          ) : hasText ? (
+            <button
+              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
+              onClick={handleSendClick}
+              title="Send"
+              aria-label="Send"
+            >
+              <SendHorizonal size={18} />
+            </button>
+          ) : null}
         </div>
       </div>
     </div>
