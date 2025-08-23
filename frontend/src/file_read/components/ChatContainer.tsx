@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import ChatView from "./ChatView/ChatView";
 import ChatComposer from "./ChatComposer";
 import type { ChatMsg } from "../types/chat";
@@ -15,9 +15,8 @@ interface Props {
   runMetrics?: GenMetrics | null;
   runJson?: RunJson | null;
   onRefreshChats?: () => void;
-
-  // NEW: bubble deletion handler from parent (knows session id + API)
   onDeleteMessages?: (ids: string[]) => void;
+  autoFollow?: boolean;
 }
 
 export default function ChatContainer({
@@ -31,19 +30,63 @@ export default function ChatContainer({
   runMetrics,
   runJson,
   onRefreshChats,
-  onDeleteMessages, // NEW
+  onDeleteMessages,
+  autoFollow = true,
 }: Props) {
   const [composerH, setComposerH] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Track if the user is scrolled up
+  const [pinned, setPinned] = useState(false);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const threshold = 120;
+
+    const isNearBottom = () => {
+      return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+    };
+
+    const onScroll = () => {
+      // pinned = true if not near bottom
+      setPinned(!isNearBottom());
+    };
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+
+    // initialize
+    setPinned(!isNearBottom());
+
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const forceScrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  };
+
   const handleSend = async (text?: string) => {
+    // Only auto-scroll if user hasn’t scrolled up
+    if (!pinned) {
+      forceScrollToBottom("auto");
+    }
     await send(text);
     onRefreshChats?.();
+    if (!pinned) {
+      requestAnimationFrame(() => forceScrollToBottom("smooth"));
+    }
   };
 
   return (
     <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
-      <div ref={containerRef} className="flex-1 overflow-y-auto min-w-0">
+      <div
+        ref={containerRef}
+        data-chat-scroll
+        className="flex-1 overflow-y-auto min-w-0"
+      >
         <ChatView
           messages={messages}
           loading={loading}
@@ -51,7 +94,8 @@ export default function ChatContainer({
           bottomPad={composerH}
           runMetrics={runMetrics}
           runJson={runJson}
-          onDeleteMessages={onDeleteMessages} // NEW
+          onDeleteMessages={onDeleteMessages}
+          autoFollow={autoFollow}
         />
       </div>
 

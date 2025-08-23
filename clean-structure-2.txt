@@ -1,0 +1,2613 @@
+5;
+const MIN_THRESHOLD_PX = 24;
+
+// Custom event name dispatched by ChatComposer on Send
+const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
+
+export default function ChatView({
+  messages,
+  loading,
+  queued = false,
+  bottomPad,
+  runMetrics,
+  runJson,
+  onDeleteMessages,
+  autoFollow = true,
+}: {
+  messages: ChatMsg[];
+  loading: boolean;
+  queued?: boolean;
+  bottomPad: number;
+  runMetrics?: GenMetrics | null;
+  runJson?: RunJson | null;
+  onDeleteMessages?: (ids: string[]) => void;
+  autoFollow?: boolean;
+}) {
+  // Inner wrapper (not the scroller) + bottom sentinel for scrollIntoView
+  const listRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Track previous stream state & assistant text length for streaming nudge
+  const prevLoadingRef = useRef<boolean>(loading);
+  const prevAsstLenRef = useRef<number>(0);
+  const didInitialAutoscrollRef = useRef(false);
+
+  // The *real* scroll container (ChatContainer sets data-chat-scroll)
+  function getScrollEl(): HTMLElement | null {
+    const el = listRef.current;
+    if (!el) return null;
+    return el.closest<HTMLElement>("[data-chat-scroll]") ?? el;
+  }
+
+  // Are we close enough to the bottom of the scroll container?
+  function isNearBottom(ratio = SCROLL_THRESHOLD_VH): boolean {
+    const el = getScrollEl();
+    if (!el) return true; // default to follow if unsure
+    const threshold = Math.max(MIN_THRESHOLD_PX, el.clientHeight * ratio);
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return dist <= threshold;
+  }
+
+  // Programmatic scroll helper
+  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    bottomRef.current?.scrollIntoView({ behavior, block: "end" });
+  };
+
+  // 🔹 NEW: On first open (first time messages appear), auto-scroll to bottom
+  useEffect(() => {
+    if (didInitialAutoscrollRef.current) return;
+    if (messages.length === 0) return;
+    didInitialAutoscrollRef.current = true;
+
+    // Do it twice (now and next frame) to account for layout/measure changes
+    scrollToBottom("auto");
+    requestAnimationFrame(() => scrollToBottom("auto"));
+  }, [messages.length]);
+
+  // 🔹 Respond to a global "force scroll" event from ChatComposer (Send)
+  useEffect(() => {
+    const handler = (evt: Event) => {
+      const behavior =
+        (evt as CustomEvent<{ behavior?: ScrollBehavior }>).detail?.behavior ??
+        "smooth";
+      bottomRef.current?.scrollIntoView({ behavior, block: "end" });
+    };
+    window.addEventListener(FORCE_SCROLL_EVT, handler as EventListener);
+    return () => window.removeEventListener(FORCE_SCROLL_EVT, handler as EventListener);
+  }, []);
+
+  // --- Assistant streaming deltas: gentle nudge only if already near bottom ---
+  const lastAssistantIndex = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return i;
+    }
+    return -1;
+  }, [messages]);
+
+  const asstText =
+    lastAssistantIndex >= 0 ? (messages[lastAssistantIndex]?.text ?? "") : "";
+
+useEffect(() => {
+  if (lastAssistantIndex < 0) return;
+
+  const len = asstText.length;
+  const prev = prevAsstLenRef.current || 0;
+  prevAsstLenRef.current = len;
+
+  if (!autoFollow) return;
+
+  // Nudge whenever content grows, but only if already near bottom
+  if (len > prev && isNearBottom()) {
+    scrollToBottom("auto");
+  }
+}, [lastAssistantIndex, asstText, autoFollow]);
+
+  // --- Streaming finished: settle to bottom only if near bottom ---
+  useEffect(() => {
+    const prev = prevLoadingRef.current;
+    const cur = loading;
+    prevLoadingRef.current = cur;
+
+    if (prev && !cur && autoFollow && isNearBottom()) {
+      scrollToBottom("smooth");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, autoFollow]);
+
+  // --- Optional: when composer height changes, keep bottom visible only if near bottom ---
+  useEffect(() => {
+    if (autoFollow && isNearBottom()) {
+      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }
+  }, [bottomPad, autoFollow]);
+
+  const lastMsg = messages[messages.length - 1];
+
+  return (
+    <div
+      ref={listRef}
+      className="p-4 space-y-3 bg-gray-50 min-w-0"
+      style={{ paddingBottom: bottomPad }}
+    >
+      {messages.map((m, idx) => (
+        <ChatItem
+          key={m.id}
+          m={m}
+          idx={idx}
+          loading={loading}
+          lastAssistantIndex={lastAssistantIndex}
+          runJsonLive={runJson ?? null}
+          runMetricsLive={runMetrics ?? null}
+          onDelete={onDeleteMessages ? (id) => onDeleteMessages([id]) : undefined}
+        />
+      ))}
+
+      {(loading || queued) &&
+        !(lastMsg?.role === "assistant" && (lastMsg.text?.trim().length ?? 0) > 0) && (
+          <TypingIndicator />
+        )}
+
+      {/* Sentinel used for programmatic scrolls */}
+      <div ref={bottomRef} className="h-0" />
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatView/StatusLine.ts =====
+
+// frontend/src/file_read/components/chat/StatusLine.ts
+import type { RunJson, GenMetrics } from "../../shared/lib/runjson";
+
+const oneDec = (n?: number | null) =>
+  typeof n === "number" && Number.isFinite(n) ? n.toFixed(1) : undefined;
+
+export function buildStatus(json?: RunJson | null, flat?: GenMetrics | null) {
+  const st = json?.stats;
+  if (st) {
+    const parts: string[] = [];
+    if (st.predictedTokensCount != null) parts.push(`${st.predictedTokensCount} tok`);
+    if (st.tokensPerSecond != null) parts.push(`${oneDec(st.tokensPerSecond) ?? st.tokensPerSecond} tok/s`);
+    if (st.timeToFirstTokenSec != null) parts.push(`TTFT ${Math.round(st.timeToFirstTokenSec * 1000)} ms`);
+    if (st.stopReason) parts.push(`stop: ${st.stopReason}`);
+    return parts.join(" • ");
+  }
+  if (flat) {
+    const parts: string[] = [];
+    if (flat.output_tokens != null) parts.push(`${flat.output_tokens} tok`);
+    if (flat.tok_per_sec != null) parts.push(`${oneDec(flat.tok_per_sec) ?? flat.tok_per_sec} tok/s`);
+    if (flat.ttft_ms != null) parts.push(`TTFT ${Math.round(flat.ttft_ms)} ms`);
+    if (flat.stop_reason) parts.push(`stop: ${flat.stop_reason}`);
+    return parts.join(" • ");
+  }
+  return "";
+}
+
+# ===== frontend/src/file_read/components/DesktopHeader.tsx =====
+
+import { PanelLeftOpen } from "lucide-react";
+
+export default function DesktopHeader({
+  sidebarOpen,
+  onShowSidebar,
+  title = "Local AI Model",
+}: {
+  sidebarOpen: boolean;
+  onShowSidebar: () => void;
+  title?: string;
+}) {
+  return (
+    <div className="hidden md:flex h-14 shrink-0 items-center justify-between px-4 border-b bg-white">
+      <div className="flex items-center gap-2">
+        {!sidebarOpen && (
+          <button
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
+            onClick={onShowSidebar}
+            aria-label="Show sidebar"
+            title="Show sidebar"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+          </button>
+        )}
+        <div className="font-semibold">{title}</div>
+      </div>
+      <div />
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Markdown/MarkdownMessage.tsx =====
+
+// frontend/src/file_read/components/MarkdownMessage.tsx
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github.css";
+import CodeCopyButton from "../../shared/ui/CodeCopyButton";
+
+type Props = { text: string };
+
+export default function MarkdownMessage({ text }: Props) {
+  return (
+    <>
+      {/* keep pre spacing at zero; don't overwrite token colors */}
+      <style>{`
+        pre { margin: 0 !important; padding: 0 !important; background: transparent !important; }
+        pre code { display: block; margin: 0 !important; padding: 0 !important; }
+        .hljs { background: transparent !important; }
+      `}</style>
+
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        components={{
+          code({
+            inline,
+            className,
+            children,
+            ...props
+          }: {
+            inline?: boolean;
+            className?: string;
+            children?: React.ReactNode;
+          }) {
+            const raw = String(children ?? "");
+            const lang = (className || "").replace("language-", "");
+
+            if (inline) {
+              return (
+                <code
+                  className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-900 font-mono text-[14px]"
+                  {...props}
+                >
+                  {children}
+                </code>
+              );
+            }
+
+            return (
+              <div className="relative w-full">
+                <pre className="m-0 p-0 w-full overflow-x-auto rounded-md border border-gray-300">
+                  {/* Let hljs theme color tokens; no text color override here */}
+                  <code className={`${className ?? ""} hljs font-mono text-sm`} {...props}>
+                    {children}
+                  </code>
+                </pre>
+
+                <div className="absolute top-2 right-2 flex items-center gap-1">
+                  {lang && (
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-200 text-gray-700">
+                      {lang}
+                    </span>
+                  )}
+                  <CodeCopyButton text={raw} />
+                </div>
+              </div>
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </>
+  );
+}
+
+# ===== frontend/src/file_read/components/MetricsHoverCard.tsx =====
+
+import { useMemo, useRef, useState } from "react";
+import { Info, Copy, Check, X } from "lucide-react";
+
+type Props = {
+  data: unknown;                 // anything JSON-serializable
+  title?: string;                // optional header
+  align?: "left" | "right";      // popover alignment
+  maxWidthPx?: number;           // width of the panel
+  compact?: boolean;             // shrink button & paddings
+};
+
+export default function MetricsHoverCard({
+  data,
+  title = "Run details",
+  align = "right",
+  maxWidthPx = 460,
+  compact = true,
+}: Props) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  const json = useMemo(() => {
+    try {
+      return JSON.stringify(data, null, 2);
+    } catch {
+      return String(data ?? "");
+    }
+  }, [data]);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  }
+
+  // accessibility: close on ESC
+  function onKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape") {
+      setOpen(false);
+      btnRef.current?.focus();
+    }
+  }
+
+  return (
+    <div className="relative inline-block">
+      <button
+        ref={btnRef}
+        type="button"
+        className={`inline-flex items-center justify-center rounded border bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition ${
+          compact ? "h-7 w-7" : "h-8 w-8"
+        }`}
+        title="Show run JSON"
+        aria-haspopup="dialog"
+        aria-expanded={open ? "true" : "false"}
+        onClick={() => setOpen((v) => !v)}
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+      >
+        <Info className={compact ? "w-4 h-4" : "w-5 h-5"} />
+      </button>
+
+      {/* Panel */}
+      <div
+        role="dialog"
+        aria-label={title}
+        onKeyDown={onKeyDown}
+        className={`absolute z-50 mt-2 ${align === "right" ? "right-0" : "left-0"}`}
+        style={{ width: Math.min(maxWidthPx, window.innerWidth - 40) }}
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+      >
+        <div
+          className={`rounded-xl border bg-white shadow-xl overflow-hidden transition
+          ${open ? "opacity-100 translate-y-0" : "pointer-events-none opacity-0 -translate-y-1"}`}
+        >
+          <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
+            <div className="text-xs font-semibold text-gray-700">{title}</div>
+            <div className="flex items-center gap-1">
+              <button
+                className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+                onClick={copy}
+                title="Copy JSON"
+              >
+                {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+              </button>
+              <button
+                className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+                onClick={() => setOpen(false)}
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="p-3">
+            <pre
+              className="m-0 p-0 text-xs leading-relaxed overflow-auto"
+              style={{ maxHeight: 360 }}
+            >
+              <code>{json}</code>
+            </pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/MobileDrawer.tsx =====
+
+import { PanelLeftOpen } from "lucide-react";
+import ChatSidebar from "./ChatSidebar/ChatSidebar";
+
+export default function MobileDrawer({
+  onOpenSession,
+  onNewChat,
+  refreshKey,
+  activeId,
+  openMobileDrawer,
+  closeMobileDrawer,
+}: {
+  onOpenSession: (id: string) => Promise<void>;
+  onNewChat: () => Promise<void>;
+  refreshKey: number;
+  activeId?: string;
+  openMobileDrawer: () => void;
+  closeMobileDrawer: () => void;
+}) {
+  return (
+    <>
+      {/* Mobile top bar */}
+      <div className="md:hidden fixed top-0 left-0 right-0 z-40 bg-white border-b">
+        <div className="h-14 flex items-center justify-between px-3">
+          <button
+            className="inline-flex items-center justify-center h-9 w-9 rounded-lg border hover:bg-gray-50"
+            onClick={openMobileDrawer}
+            aria-label="Open sidebar"
+            title="Open sidebar"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+          </button>
+          <div className="font-semibold">Local AI Model</div>
+          <div className="w-9" />
+        </div>
+      </div>
+
+      {/* Backdrop */}
+      <div
+        id="mobile-backdrop"
+        className="md:hidden fixed inset-0 z-40 bg-black/40 hidden"
+        onClick={closeMobileDrawer}
+      />
+
+      {/* Drawer */}
+      <aside
+        id="mobile-drawer"
+        role="dialog"
+        aria-modal="true"
+        className="md:hidden fixed inset-y-0 left-0 z-50 w-80 max-w-[85vw] bg-white border-r shadow-xl hidden animate-[slideIn_.2s_ease-out]"
+      >
+        <div className="h-14 flex items-center justify-between px-3 border-b">
+          <div className="font-medium">Chats</div>
+          <button
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
+            onClick={closeMobileDrawer}
+            aria-label="Close sidebar"
+          >
+            <span className="rotate-45 text-xl leading-none">+</span>
+          </button>
+        </div>
+
+        <ChatSidebar
+          onOpen={async (id) => { await onOpenSession(id); closeMobileDrawer(); }}
+          onNew={async () => { await onNewChat(); closeMobileDrawer(); }}
+          refreshKey={refreshKey}
+          activeId={activeId}
+        />
+      </aside>
+
+      <style>{`@keyframes slideIn{from{transform:translateX(-12px);opacity:.0}to{transform:translateX(0);opacity:1}}`}</style>
+    </>
+  );
+}
+
+# ===== frontend/src/file_read/hooks/data/aiApi.ts =====
+
+import { API_BASE } from "../../services/http";
+
+export function streamGenerate(
+  payload: unknown,
+  abortSignal: AbortSignal,
+): ReadableStream<Uint8Array> | null {
+  // Note: fetch streaming body works in modern browsers + Vite dev server
+  let stream: ReadableStream<Uint8Array> | null = null;
+
+  // We purposefully do NOT await; the caller will read res.body
+  fetch(`${API_BASE}/api/ai/generate/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: abortSignal,
+  }).then(res => {
+    if (res.ok) stream = res.body ?? null;
+  }).catch(() => { /* surface in hook if needed */ });
+
+  // The caller will poll for stream being set in the next tick
+  // (or just call fetch directly if they prefer).
+  return stream;
+}
+
+export async function cancelSession(sessionId: string): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, { method: "POST" });
+  } catch { /* best-effort */ }
+}
+
+# ===== frontend/src/file_read/hooks/data/chatApi.ts =====
+
+import type { ChatRow, ChatMessageRow, Role } from "../../types/chat";
+import { request } from "../../services/http";
+
+// Spring Page<T> type
+export type PageResp<T> = {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  size: number;
+  number: number;      // current page index (0-based)
+  first: boolean;
+  last: boolean;
+  empty: boolean;
+};
+
+export function createChat(sessionId: string, title: string) {
+  return request<ChatRow>("/api/chats", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, title }),
+  });
+}
+
+export function updateChatLast(sessionId: string, lastMessage: string, title?: string) {
+  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lastMessage, title: title || "" }),
+  });
+}
+
+// Legacy (unused after pagination in sidebar)
+export function listChats() {
+  return request<ChatRow[]>("/api/chats");
+}
+
+// NEW: paginated list
+export function listChatsPage(page = 0, size = 30, ceiling?: string) {
+  const qs = new URLSearchParams({ page: String(page), size: String(size) });
+  if (ceiling) qs.set("ceiling", ceiling);
+  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
+}
+
+export function listMessages(sessionId: string) {
+  return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
+}
+
+export function appendMessage(sessionId: string, role: Role, content: string) {
+  return request<ChatMessageRow>(`/api/chats/${encodeURIComponent(sessionId)}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role, content }),
+  });
+}
+
+export async function deleteChatsBatch(sessionIds: string[]) {
+  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionIds }),
+  });
+  return data.deleted;
+}
+
+export function deleteMessage(sessionId: string, messageId: string | number) {
+  return request<{ deleted: number }>(
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
+    { method: "DELETE" }
+  );
+}
+
+/** Delete a batch of messages. Backend returns { deleted: number[] } */
+export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
+  const ids = messageIds
+    .map((id) => (typeof id === "string" ? Number(id) : id))
+    .filter((n) => Number.isFinite(n)) as number[];
+
+  return request<{ deleted: number[] }>(  // <-- number[]
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messageIds: ids }),
+    }
+  );
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/buffer.ts =====
+
+// frontend/src/file_read/hooks/stream/core/buffer.ts
+import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
+import { extractRunJsonFromBuffer } from "../../../shared/lib/runjson";
+import { STOP_SENTINEL_AT_END } from "./constants";
+
+export type BufferStep = {
+  cleanText: string;
+  delta: string;
+  metrics?: { json?: RunJson; flat?: GenMetrics };
+};
+
+export function processChunk(prevClean: string, rawBufIn: string): BufferStep {
+  let rawBuf = rawBufIn;
+  if (STOP_SENTINEL_AT_END.test(rawBuf)) {
+    rawBuf = rawBuf.replace(STOP_SENTINEL_AT_END, "");
+  }
+  const { clean, json, flat } = extractRunJsonFromBuffer(rawBuf);
+  const delta = clean.slice(prevClean.length);
+  return { cleanText: clean, delta, metrics: json || flat ? { json, flat } : undefined };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/cancel.ts =====
+
+import { postCancel } from "./network";
+
+type Deps = {
+  getVisibleSid: () => string;
+  setLoadingFor: (sid: string, v: boolean) => void;
+  setQueuedFor: (sid: string, v: boolean) => void;
+  getController: () => AbortController | null;
+  getReader: () => ReadableStreamDefaultReader<Uint8Array> | null;
+  setCancelForSid: (sid: string | null) => void;
+  isActiveSid: (sid: string) => boolean;
+  dropJobsForSid: (sid: string) => void;
+};
+
+export function createCanceller(d: Deps) {
+  async function cancelBySessionId(id: string) {
+    d.setCancelForSid(id);
+
+    if (d.isActiveSid(id)) {
+      try { d.getController()?.abort(); } catch {}
+      try { d.getReader()?.cancel(); } catch {}
+      d.setLoadingFor(id, false);
+    } else {
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+      d.setCancelForSid(null);
+    }
+
+    // fire-and-forget server stop
+    postCancel(id).catch(() => {});
+  }
+
+  async function stopVisible() {
+    const id = d.getVisibleSid();
+    await cancelBySessionId(id);
+  }
+
+  return { cancelBySessionId, stopVisible };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/constants.ts =====
+
+// frontend/src/file_read/hooks/stream/core/constants.ts
+export const STOP_SENTINEL_AT_END = /(?:\r?\n)?\u23F9 stopped(?:\r?\n)?$/u;
+export const STOP_FLUSH_TIMEOUT_MS = 3500;
+
+# ===== frontend/src/file_read/hooks/stream/core/controller.ts =====
+
+import { appendMessage } from "../../data/chatApi";
+import type { StreamController, StreamCoreOpts } from "./types";
+import { createScheduler, type QueueItem } from "./queue";
+import { createCanceller } from "./cancel";
+import { runStreamOnce } from "./runner";
+
+export function createStreamController(opts: StreamCoreOpts): StreamController {
+  let cancelForSid: string | null = null;
+  let controllerRef: AbortController | null = null;
+  let readerRef: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  const scheduler = createScheduler(async (job: QueueItem) => {
+    try { opts.setQueuedFor(job.sid, false); } catch {}
+    await runStreamOnce(job, {
+      opts,
+      getCancelForSid: () => cancelForSid,
+      clearCancelIf: (sid) => { if (cancelForSid === sid) cancelForSid = null; },
+      setController: (c) => { controllerRef = c; },
+      setReader: (r) => { readerRef = r; },
+    });
+  });
+
+  const canceller = createCanceller({
+    getVisibleSid: opts.getSessionId,
+    setLoadingFor: opts.setLoadingFor,
+    setQueuedFor: opts.setQueuedFor,
+    getController: () => controllerRef,
+    getReader: () => readerRef,
+    setCancelForSid: (sid) => { cancelForSid = sid; },
+    isActiveSid: scheduler.isActiveSid,
+    dropJobsForSid: scheduler.dropJobsForSid,
+  });
+
+  async function send(override?: string) {
+    const prompt = (override ?? "").trim();
+    if (!prompt) return;
+
+    await opts.ensureChatCreated();
+    const sid = opts.getSessionId();
+
+    // Stable UI ids
+    const userCid = crypto.randomUUID();
+    const asstCid = crypto.randomUUID();
+
+    // 1) Optimistically add user + assistant placeholder with serverId=null
+    opts.setMessagesFor(sid, (prev) => [
+      ...prev,
+      { id: userCid, serverId: null, role: "user",      text: prompt },
+      { id: asstCid, serverId: null, role: "assistant", text: ""     },
+    ]);
+    opts.setInput("");
+
+    // 2) Persist user message; patch serverId when we get it
+    appendMessage(sid, "user", prompt)
+      .then((row) => {
+        if (row?.id != null) {
+          opts.setServerIdFor(sid, userCid, Number(row.id));
+          // Sidebar: make sure the chat shows up as soon as it really exists
+          try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+        }
+      })
+      .catch(() => { /* ignore; UI stays optimistic */ });
+
+    try { opts.setQueuedFor(sid, true); } catch {}
+    scheduler.enqueue({ sid, prompt, asstId: asstCid });
+  }
+
+  async function stop() { await canceller.stopVisible(); }
+  async function cancelBySessionId(id: string) { await canceller.cancelBySessionId(id); }
+  function dispose() {
+    try { controllerRef?.abort(); } catch {}
+    try { readerRef?.cancel(); } catch {}
+    controllerRef = null; readerRef = null;
+  }
+
+  return { send, stop, cancelBySessionId, dispose };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/network.ts =====
+
+// frontend/src/file_read/hooks/stream/core/network.ts
+import { API_BASE } from "../../../services/http";
+
+export async function postStream(body: unknown, signal: AbortSignal) {
+  const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  return res.body.getReader();
+}
+
+export async function postCancel(sessionId: string) {
+  try {
+    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/queue.ts =====
+
+export type QueueItem = { sid: string; prompt: string; asstId: string };
+export type RunJob = (job: QueueItem) => Promise<void>;
+
+export function createScheduler(runJob: RunJob) {
+  const q: QueueItem[] = [];
+  let active: { sid: string } | null = null;
+
+  async function startNext() {
+    if (active || q.length === 0) return;
+    const job = q.shift()!;
+    active = { sid: job.sid };
+    try { await runJob(job); }
+    finally {
+      active = null;
+      if (q.length) void startNext();
+    }
+  }
+
+  return {
+    enqueue(job: QueueItem) { q.push(job); void startNext(); },
+    isActiveSid: (sid: string) => active?.sid === sid,
+    dropJobsForSid(sid: string) {
+      for (let i = q.length - 1; i >= 0; i--) if (q[i].sid === sid) q.splice(i, 1);
+    },
+    getActiveSid: () => active?.sid ?? null,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
+
+import { postStream } from "./network";
+import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
+import type { ChatMsg } from "../../../types/chat";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { readStreamLoop } from "./runner_stream";
+import {
+  pinLiveMetricsToSession,
+  pinLiveMetricsToBubble,
+  pinFallbackToSessionAndBubble,
+} from "./runner_metrics";
+import { persistAssistantTurn } from "./runner_persist";
+import type { QueueItem } from "./queue";
+
+export type RunnerDeps = {
+  opts: {
+    ensureChatCreated: () => Promise<void>;
+    getSessionId: () => string;
+    getMessagesFor: (sid: string) => ChatMsg[];
+    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+    setInput: (v: string) => void;
+    setLoadingFor: (sid: string, v: boolean) => void;
+    setQueuedFor: (sid: string, v: boolean) => void;
+    resetMetricsFor: (sid: string) => void;
+    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+    onRetitle: (sid: string, finalText: string) => Promise<void>;
+    /** NEW: patch serverId by clientId */
+    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+  };
+  getCancelForSid: () => string | null;
+  clearCancelIf: (sid: string) => void;
+  setController: (c: AbortController | null) => void;
+  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
+};
+
+export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
+  const { sid, prompt, asstId } = job;
+  const { opts } = d;
+  const wasCanceled = () => d.getCancelForSid() === sid;
+
+  opts.resetMetricsFor(sid);
+  opts.setLoadingFor(sid, true);
+  ensureAssistantPlaceholder(opts, sid, asstId);
+
+  const MAX_HISTORY = 10;
+  const history = opts
+    .getMessagesFor(sid)
+    .slice(-MAX_HISTORY)
+    .map((m) => ({ role: m.role, content: m.text }))
+    .filter((m) => m.content.trim().length > 0);
+
+  const controller = new AbortController();
+  d.setController(controller);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  try {
+    reader = await postStream(
+      { sessionId: sid, messages: [...history, { role: "user", content: prompt }] },
+      controller.signal
+    );
+    d.setReader(reader);
+
+    const result = await readStreamLoop(reader, {
+      wasCanceled,
+      onDelta: (delta) => {
+        // append assistant delta inline
+        opts.setMessagesFor(sid, (prev) => {
+          const idx = prev.findIndex((m) => m.id === asstId);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], text: (next[idx].text || "") + delta };
+          return next;
+        });
+      },
+      onMetrics: (json, flat) => {
+        pinLiveMetricsToSession(opts, sid, json, flat);
+        pinLiveMetricsToBubble(opts, sid, asstId, json, flat);
+      },
+      onCancelTimeout: (cleanSoFar) => {
+        opts.setMetricsFallbackFor(sid, "user_cancel_timeout", cleanSoFar);
+      },
+    });
+
+    const { finalText, gotMetrics, lastRunJson } = result;
+    let persistJson: RunJson | null = gotMetrics ? lastRunJson : null;
+
+    if (!gotMetrics) {
+      const reason = wasCanceled() ? "user_cancel" : "end_of_stream_no_metrics";
+      const fallback = pinFallbackToSessionAndBubble(opts, sid, asstId, reason, finalText);
+      if (!wasCanceled()) persistJson = fallback;
+    }
+
+    if (!wasCanceled() && finalText.trim()) {
+      const newServerId = await persistAssistantTurn(sid, finalText, persistJson);
+      if (newServerId != null) {
+        // patch serverId on the assistant placeholder (identified by clientId = asstId)
+        opts.setServerIdFor(sid, asstId, newServerId);
+      }
+      try { await opts.onRetitle(sid, finalText); } catch {}
+      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+    }
+  } catch (e: any) {
+    const localAbort =
+      e?.name === "AbortError" && (wasCanceled() || controller.signal.aborted);
+    const reason = localAbort ? "client_abort_after_stop" : e?.name || "client_error";
+
+    const last = snapshotPendingAssistant(opts.getMessagesFor(sid));
+    opts.setMetricsFallbackFor(sid, reason, last);
+
+    opts.setMessagesFor(sid, (prev) => {
+      const end = prev[prev.length - 1];
+      if (end?.role === "assistant" && !end.text.trim()) {
+        return prev.map((m, i) => (i === prev.length - 1 ? { ...m, text: "[stream error]" } : m));
+      }
+      return prev;
+    });
+  } finally {
+    if (d.getCancelForSid() === sid) d.clearCancelIf(sid);
+    opts.setLoadingFor(sid, false);
+    d.setController(null);
+    d.setReader(null);
+  }
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner_metrics.ts =====
+
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import type { ChatMsg } from "../../../types/chat";
+
+type Opts = {
+  setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+  setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+};
+
+export function pinLiveMetricsToSession(
+  opts: Opts,
+  sid: string,
+  json?: RunJson,
+  flat?: GenMetrics
+) {
+  opts.setMetricsFor(sid, json, flat);
+}
+
+export function pinLiveMetricsToBubble(
+  opts: Opts,
+  sid: string,
+  asstId: string,
+  json?: RunJson,
+  flat?: GenMetrics
+) {
+  opts.setMessagesFor(sid, (prev) =>
+    prev.map((m) =>
+      m.id === asstId
+        ? { ...m, meta: { ...(m.meta ?? {}), runJson: json ?? m.meta?.runJson, flat: flat ?? m.meta?.flat } }
+        : m
+    )
+  );
+}
+
+/** Also returns the synthesized RunJson so caller can persist if needed. */
+export function pinFallbackToSessionAndBubble(
+  opts: Opts,
+  sid: string,
+  asstId: string,
+  reason: string,
+  finalText: string
+): RunJson {
+  const json: RunJson = {
+    stats: {
+      stopReason: reason,
+      tokensPerSecond: null,
+      timeToFirstTokenSec: null,
+      totalTimeSec: null,
+      promptTokensCount: null,
+      predictedTokensCount: finalText ? finalText.length : 0,
+      totalTokensCount: null,
+    },
+  };
+  const flat: GenMetrics = {
+    stop_reason: reason,
+    tok_per_sec: null,
+    ttft_ms: null,
+    output_tokens: null,
+    input_tokens_est: null,
+    total_tokens_est: null,
+  };
+
+  opts.setMetricsFallbackFor(sid, reason, finalText);
+  opts.setMessagesFor(sid, (prev) =>
+    prev.map((m) =>
+      m.id === asstId ? { ...m, meta: { ...(m.meta ?? {}), runJson: json, flat } } : m
+    )
+  );
+  return json;
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner_persist.ts =====
+
+import { appendMessage, updateChatLast } from "../../data/chatApi";
+import type { RunJson } from "../../../shared/lib/runjson";
+import { MET_START, MET_END } from "../../../shared/lib/runjson";
+
+/**
+ * Persist assistant turn; returns the new server message id (or null).
+ */
+export async function persistAssistantTurn(
+  sid: string,
+  finalText: string,
+  json: RunJson | null
+): Promise<number | null> {
+  let toPersist = finalText;
+  if (json) {
+    toPersist = `${finalText}\n${MET_START}\n${JSON.stringify(json)}\n${MET_END}\n`;
+  }
+  try {
+    const row = await appendMessage(sid, "assistant", toPersist);
+    await updateChatLast(sid, finalText, "").catch(() => {});
+    return row?.id != null ? Number(row.id) : null;
+  } catch {
+    return null;
+  }
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner_stream.ts =====
+
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { processChunk } from "./buffer";
+
+type LoopDeps = {
+  wasCanceled: () => boolean;
+  onDelta: (delta: string, cleanSoFar: string) => void;
+  onMetrics: (json?: RunJson, flat?: GenMetrics) => void;
+  onCancelTimeout: (cleanSoFar: string) => void;
+};
+
+export async function readStreamLoop(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  d: LoopDeps
+): Promise<{ finalText: string; gotMetrics: boolean; lastRunJson: RunJson | null }> {
+  const decoder = new TextDecoder();
+  let rawBuf = "";
+  let cleanSoFar = "";
+  let gotMetrics = false;
+  let lastRunJson: RunJson | null = null;
+  let stopTimeout: number | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    if (value) {
+      rawBuf += decoder.decode(value, { stream: true });
+      const step = processChunk(cleanSoFar, rawBuf);
+
+      if (step.metrics) {
+        gotMetrics = true;
+        if (step.metrics.json) lastRunJson = step.metrics.json;
+        d.onMetrics(step.metrics.json, step.metrics.flat);
+      }
+      if (step.delta) {
+        cleanSoFar = step.cleanText;
+        d.onDelta(step.delta, cleanSoFar);
+      }
+    }
+
+    if (d.wasCanceled()) break;
+
+    if (d.wasCanceled() && stopTimeout == null) {
+      stopTimeout = window.setTimeout(() => {
+        if (!gotMetrics) d.onCancelTimeout(cleanSoFar);
+      }, STOP_FLUSH_TIMEOUT_MS) as unknown as number;
+    }
+  }
+
+  if (stopTimeout != null) clearTimeout(stopTimeout);
+  return { finalText: cleanSoFar, gotMetrics, lastRunJson };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/types.ts =====
+
+import type { ChatMsg } from "../../../types/chat";
+import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
+
+export type MsgAccessor = {
+  getMessagesFor: (sessionId: string) => ChatMsg[];
+  setMessagesFor: (sessionId: string, updater: (prev: ChatMsg[]) => ChatMsg[]) => void;
+};
+
+export type UiHooks = {
+  setInput: (v: string) => void;
+  setLoadingFor: (sessionId: string, v: boolean) => void;
+  setQueuedFor: (sessionId: string, v: boolean) => void;
+  setMetricsFor: (sessionId: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMetricsFallbackFor: (sessionId: string, reason: string, partialOut: string) => void;
+
+  /** NEW: patch the server id for a bubble identified by clientId */
+  setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+};
+
+export type SessionPlumbing = {
+  getSessionId: () => string;
+  ensureChatCreated: () => Promise<void>;
+  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
+  resetMetricsFor: (sessionId: string) => void;
+};
+
+export type StreamCoreOpts = MsgAccessor & UiHooks & SessionPlumbing;
+
+export type StreamController = {
+  send: (override?: string) => Promise<void>;
+  stop: () => Promise<void>;
+  cancelBySessionId: (sid: string) => Promise<void>;
+  dispose: () => void;
+};
+
+# ===== frontend/src/file_read/hooks/stream/core/updater.ts =====
+
+import type { ChatMsg } from "../../../types/chat";
+import type { MsgAccessor } from "./types";
+
+export function appendAssistantDelta(
+  access: MsgAccessor,
+  sessionId: string,
+  asstId: string,
+  delta: string
+) {
+  if (!delta) return;
+  access.setMessagesFor(sessionId, (prev) => {
+    const idx = prev.findIndex((m) => m.id === asstId);
+    if (idx === -1) return prev;
+    const next = [...prev];
+    const cur = next[idx];
+    next[idx] = { ...cur, text: (cur.text || "") + delta };
+    return next;
+  });
+}
+
+export function ensureAssistantPlaceholder(
+  access: MsgAccessor,
+  sessionId: string,
+  asstId: string
+) {
+  access.setMessagesFor(sessionId, (prev) => {
+    const idx = prev.findIndex((m) => m.id === asstId);
+    if (idx !== -1) return prev;
+    return [...prev, { id: asstId, serverId: null, role: "assistant", text: "" } as ChatMsg];
+  });
+}
+
+export function snapshotPendingAssistant(msgs: ChatMsg[]): string {
+  if (!msgs.length) return "";
+  const last = msgs[msgs.length - 1];
+  return last.role === "assistant" ? last.text : "";
+}
+
+# ===== frontend/src/file_read/hooks/useAutoScroll.ts =====
+
+// frontend/src/file_read/hooks/useAutoScroll.ts
+import { useEffect } from "react";
+
+type AnyRef<T extends HTMLElement> = { current: T | null };
+
+/**
+ * Auto-scrolls to bottom when the user is already near the bottom.
+ * Supports BOTH:
+ *   1) useAutoScroll(ref, [dep1, dep2],)          // old style
+ *   2) useAutoScroll(ref, thresholdPx, dep1, dep2) // new style with threshold
+ */
+export function useAutoScroll<T extends HTMLElement>(
+  ref: AnyRef<T>,
+  depsOrThreshold: any[] | number = [],
+  ...restDeps: any[]
+) {
+  const thresholdPx =
+    typeof depsOrThreshold === "number" ? depsOrThreshold : 24;
+  const deps = Array.isArray(depsOrThreshold) ? depsOrThreshold : restDeps;
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceFromBottom <= thresholdPx;
+
+    if (atBottom) {
+      // wait a tick so layout paints, then scroll
+      requestAnimationFrame(() => {
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+      });
+    }
+    // include threshold so changing it retriggers
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thresholdPx, ...deps]);
+}
+
+# ===== frontend/src/file_read/hooks/useChatsPager.ts =====
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { listChatsPage } from "../hooks/data/chatApi";
+import type { ChatRow } from "../types/chat";
+
+export function useChatsPager(pageSize = 10, refreshKey?: number) {
+  const [chats, setChats] = useState<ChatRow[]>([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const [ceiling, setCeiling] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
+
+  const seenIds = useMemo(() => new Set(chats.map(c => c.sessionId)), [chats]);
+
+  async function loadFirst() {
+    setInitialLoading(true);
+    try {
+      const ceil = new Date().toISOString();
+      setCeiling(ceil);
+      const res = await listChatsPage(0, pageSize, ceil);
+      setChats(res.content);
+      setPage(1);
+      setHasMore(!res.last);
+      setTotal(res.totalElements ?? 0);
+      setTotalPages(res.totalPages ?? 0);
+    } catch {
+      setChats([]); setPage(0); setHasMore(false); setTotal(0); setTotalPages(0);
+    } finally {
+      setInitialLoading(false);
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMoreRef.current || loadingMore || !hasMore || !ceiling) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const res = await listChatsPage(page, pageSize, ceiling);
+      const next = res.content.filter(c => !seenIds.has(c.sessionId));
+      setChats(prev => [...prev, ...next]);
+      setPage(p => p + 1);
+      setHasMore(!res.last);
+      setTotal(res.totalElements ?? total);
+      setTotalPages(res.totalPages ?? totalPages);
+    } catch {
+      setHasMore(false);
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }
+
+  async function refreshFirst() {
+    setChats([]); setPage(0); setHasMore(true);
+    setTotal(0); setTotalPages(0); setCeiling(null);
+    await loadFirst();
+  }
+
+  // external refreshes
+  useEffect(() => { void refreshFirst(); /* eslint-disable-next-line */ }, [refreshKey]);
+  useEffect(() => {
+    const onRefresh = () => void refreshFirst();
+    window.addEventListener("chats:refresh", onRefresh);
+    return () => window.removeEventListener("chats:refresh", onRefresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // infinite scroll
+  useEffect(() => {
+    const rootEl = scrollRef.current, sentinel = sentinelRef.current;
+    if (!rootEl || !sentinel) return;
+    const hasOverflow = rootEl.scrollHeight - rootEl.clientHeight > 8;
+    if (!hasOverflow) return;
+
+    const io = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (entry?.isIntersecting) void loadMore();
+    }, { root: rootEl, rootMargin: "96px 0px", threshold: 0.01 });
+
+    io.observe(sentinel);
+    return () => io.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chats.length, page, hasMore, ceiling]);
+
+  return {
+    // state
+    chats, page, hasMore, total, totalPages,
+    initialLoading, loadingMore,
+    // refs
+    scrollRef, sentinelRef,
+    // actions
+    loadMore, refreshFirst, setChats,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useChatState.ts =====
+
+import { useState } from "react";
+import type { ChatMsg } from "../types/chat";
+
+type BySession<T> = Record<string, T>;
+
+export function useChatState() {
+  const [bySession, setBySession] = useState<BySession<ChatMsg[]>>({});
+  const [input, setInput] = useState("");
+
+  const getMsgs = (sid: string) => bySession[sid] ?? [];
+  const setMsgs = (
+    sid: string,
+    upd: ((prev: ChatMsg[]) => ChatMsg[]) | ChatMsg[]
+  ) => {
+    setBySession((prev) => {
+      const cur = prev[sid] ?? [];
+      const next = Array.isArray(upd) ? upd : upd(cur);
+      return next === cur ? prev : { ...prev, [sid]: next };
+    });
+  };
+
+  const resetMsgs = (sid: string) =>
+    setBySession((prev) => (prev[sid] ? { ...prev, [sid]: [] } : prev));
+
+  return { bySession, input, setInput, getMsgs, setMsgs, resetMsgs };
+}
+
+# ===== frontend/src/file_read/hooks/useChatStream.ts =====
+
+import { useMemo } from "react";
+import type { ChatMsg } from "../types/chat";
+import { useSession } from "./useSession";
+import { useStream } from "./useStream";
+import { useChatState } from "./useChatState";
+import { useRunState } from "./useRunState";
+import { useMetrics } from "./useMetrics";
+import { useRetitle } from "./useRetitle";
+
+export type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export function useChatStream() {
+  // state slices
+  const chat = useChatState();
+  const run = useRunState();
+  const met = useMetrics();
+  const { retitleNow } = useRetitle(true);
+
+  // session plumbing
+  const { sessionIdRef, ensureChatCreated, loadHistory, setSessionId, resetSession } = useSession({
+    setMessagesForSession: (sid: string, msgs: ChatMsg[]) => chat.setMsgs(sid, msgs),
+    getMessagesForSession: (sid: string) => chat.getMsgs(sid),
+    isStreaming: (sid: string) => !!run.loadingBy[sid],
+  });
+
+  // stream controller
+  const { send, stop, cancelBySessionId } = useStream({
+    messages: chat.getMsgs(sessionIdRef.current), // keeps deps stable
+    setMessagesForSession: (sid, updater) => chat.setMsgs(sid, updater),
+    getMessagesForSession: chat.getMsgs,
+    setInput: chat.setInput,
+    sessionId: () => sessionIdRef.current,
+    ensureChatCreated,
+    onRetitle: retitleNow,  
+    setLoadingForSession: run.setLoadingFor,
+    setQueuedForSession: run.setQueuedFor,
+    setMetricsForSession: met.setMetricsFor,
+    setMetricsFallbackForSession: met.setMetricsFallbackFor,
+    resetMetricsForSession: met.resetMetricsFor,
+  });
+
+  async function cancelSessions(ids: string[]) {
+    await Promise.all(ids.map(cancelBySessionId));
+  }
+
+  // derived (active session)
+  const activeId = sessionIdRef.current;
+  const messages = useMemo(() => chat.getMsgs(activeId), [chat.bySession, activeId]);
+  const loading = !!run.loadingBy[activeId];
+  const queued = !!run.queuedBy[activeId];
+  const runJson = met.metricsBy[activeId]?.runJson ?? null;
+  const runMetrics = met.metricsBy[activeId]?.flat ?? null;
+
+  function reset() {
+    chat.setInput("");
+    met.resetMetricsFor(activeId);
+    resetSession();
+  }
+
+  function snapshotPendingAssistant(): string {
+    const msgs = chat.getMsgs(activeId);
+    const last = msgs[msgs.length - 1];
+    return last?.role === "assistant" ? (last.text ?? "") : "";
+  }
+
+  return {
+    // chat state
+    messages,
+    input: chat.input,
+    setInput: chat.setInput,
+    loading,
+    queued,
+
+    // actions
+    send,
+    stop,
+    cancelSessions,
+    onRetitle: retitleNow,
+
+    // session ctl
+    setSessionId,
+    sessionIdRef,
+    loadHistory,
+    reset,
+    snapshotPendingAssistant,
+
+    // metrics (active only)
+    runMetrics,
+    runJson,
+    clearMetrics: () => met.resetMetricsFor(activeId),
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useLockBodyScroll.ts =====
+
+import { useEffect } from "react";
+
+export function useLockBodyScroll(lock: boolean) {
+  useEffect(() => {
+    const { overflow } = document.body.style;
+    if (lock) document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = overflow; };
+  }, [lock]);
+}
+
+# ===== frontend/src/file_read/hooks/useMetrics.ts =====
+
+import { useState } from "react";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+type BySession<T> = Record<string, T>;
+type Pair = { runJson: RunJson | null; flat: GenMetrics | null };
+
+export function useMetrics() {
+  const [metricsBy, setMetricsBy] = useState<BySession<Pair>>({});
+
+  function resetMetricsFor(sid: string) {
+    setMetricsBy((prev) => ({ ...prev, [sid]: { runJson: null, flat: null } }));
+  }
+
+  function setMetricsFor(sid: string, json?: RunJson, flat?: GenMetrics) {
+    setMetricsBy((prev) => {
+      const cur = prev[sid] ?? { runJson: null, flat: null };
+      return { ...prev, [sid]: { runJson: json ?? cur.runJson, flat: flat ?? cur.flat } };
+    });
+  }
+
+  function setMetricsFallbackFor(sid: string, reason: string, partialOut: string) {
+    const json: RunJson = {
+      stats: {
+        stopReason: reason,
+        tokensPerSecond: null,
+        timeToFirstTokenSec: null,
+        totalTimeSec: null,
+        promptTokensCount: null,
+        predictedTokensCount: partialOut ? partialOut.length : 0,
+        totalTokensCount: null,
+      },
+    };
+    const flat: GenMetrics = {
+      stop_reason: reason,
+      tok_per_sec: null,
+      ttft_ms: null,
+      output_tokens: null,
+      input_tokens_est: null,
+      total_tokens_est: null,
+    };
+    setMetricsFor(sid, json, flat);
+  }
+
+  return { metricsBy, resetMetricsFor, setMetricsFor, setMetricsFallbackFor };
+}
+
+# ===== frontend/src/file_read/hooks/useMultiSelect.ts =====
+
+// frontend/src/file_read/hooks/useMultiSelect.ts
+import { useEffect, useMemo, useState } from "react";
+
+export function useMultiSelect(allIds: string[]) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // keep selection pruned when the list of ids changes
+  useEffect(() => {
+    setSelected(prev => {
+      const next = new Set([...prev].filter(id => allIds.includes(id)));
+      // only update if it actually changed
+      return next.size === prev.size ? prev : next;
+    });
+  }, [allIds]);
+
+  const allSelected = useMemo(
+    () => selected.size > 0 && selected.size === allIds.length,
+    [selected, allIds.length]
+  );
+
+  const toggleOne = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelected(prev =>
+      prev.size === allIds.length ? new Set() : new Set(allIds)
+    );
+  };
+
+  return { selected, setSelected, allSelected, toggleOne, toggleAll };
+}
+
+# ===== frontend/src/file_read/hooks/useRetitle.ts =====
+
+// frontend/src/file_read/hooks/useRetitle.ts
+import { API_BASE } from "../services/http";
+import { listMessages, updateChatLast } from "../hooks/data/chatApi";
+import { stripRunJson } from "../shared/lib/runjson";
+
+const TITLE_MAX_WORDS = 6;
+
+function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
+  let t = (raw.split(/\r?\n/)[0] ?? "");
+  t = t.replace(/[^\p{L}\p{N} ]+/gu, " ");
+  t = t.replace(/\s+/g, " ").trim();
+  t = t.split(" ").slice(0, maxWords).join(" ").trim();
+  return t;
+}
+
+export function useRetitle(enabled = true) {
+  async function retitleNow(sessionId: string, latestAssistant: string) {
+    console.log("1")
+    if (!enabled) return;
+
+    try {
+      // Build a minimal transcript to title on
+      const rows = await listMessages(sessionId);
+      const textDump = rows
+        .map((r) => `${r.role === "user" ? "User" : "Assistant"}: ${r.content}`)
+        .join("\n");
+
+      // Ask the local model for a very short title
+      const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: `${sessionId}::titlebot`,
+          messages: [
+            {
+              role: "system",
+              content: "You output ultra-concise, neutral chat titles and nothing else.",
+            },
+            {
+              role: "user",
+              content:
+                "Write ONE short title summarizing the conversation below.\n" +
+                "Rules: at most 6 words — sentence or title case — no punctuation — no emojis — no quotes — return ONLY the title\n\n" +
+                textDump +
+                "\n\nTitle:",
+            },
+          ],
+          max_tokens: 24,
+          temperature: 0.2,
+          top_p: 0.9,
+        }),
+      });
+
+      if (!res.ok || !res.body) return;
+
+      // Gather the streamed text + strip runjson
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let raw = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) raw += decoder.decode(value, { stream: true });
+      }
+
+      const { text } = stripRunJson(raw);
+      const title = sanitizeTitle(text);
+      if (!title) return;
+
+      // Save title + lastMessage (lastMessage stays the full assistant text)
+      await updateChatLast(sessionId, latestAssistant, title).catch(() => {});
+      // Nudge sidebar so it shows new title immediately
+      try {
+        window.dispatchEvent(new CustomEvent("chats:refresh"));
+      } catch {}
+    } catch (e) {
+      console.warn("retitleNow failed:", e);
+    }
+  }
+
+  return { retitleNow };
+}
+
+# ===== frontend/src/file_read/hooks/useRunMetrics.ts =====
+
+import { useState } from "react";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export function useRunMetrics() {
+  const [runMetrics, setRunMetrics] = useState<GenMetrics | null>(null);
+  const [runJson, setRunJson] = useState<RunJson | null>(null);
+
+  function resetMetrics() {
+    setRunMetrics(null);
+    setRunJson(null);
+  }
+
+  function setFromParsed(json?: RunJson, flat?: GenMetrics) {
+    if (json) setRunJson(json);
+    if (flat) setRunMetrics(flat);
+  }
+
+  function synthesizeStop(reason: string, partialOut: string) {
+    const json: RunJson = {
+      stats: {
+        stopReason: reason,
+        tokensPerSecond: null,
+        timeToFirstTokenSec: null,
+        totalTimeSec: null,
+        promptTokensCount: null,
+        predictedTokensCount: partialOut ? partialOut.length : 0,
+        totalTokensCount: null,
+      },
+    };
+    const flat: GenMetrics = {
+      stop_reason: reason,
+      tok_per_sec: null,
+      ttft_ms: null,
+      output_tokens: null,
+      input_tokens_est: null,
+      total_tokens_est: null,
+    };
+    return { json, flat };
+  }
+
+  function setFallback(reason: string, partialOut: string) {
+    const { json, flat } = synthesizeStop(reason, partialOut);
+    setRunJson(prev => prev ?? json);
+    setRunMetrics(prev => prev ?? flat);
+  }
+
+  return {
+    runMetrics,
+    runJson,
+    resetMetrics,
+    setFromParsed,
+    setFallback,
+  };
+}
+
+export type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+# ===== frontend/src/file_read/hooks/useRunState.ts =====
+
+import { useState } from "react";
+
+type BySession<T> = Record<string, T>;
+
+export function useRunState() {
+  const [loadingBy, setLoadingBy] = useState<BySession<boolean>>({});
+  const [queuedBy, setQueuedBy] = useState<BySession<boolean>>({});
+
+  const setBool =
+    (setter: React.Dispatch<React.SetStateAction<BySession<boolean>>>) =>
+    (sid: string, v: boolean) =>
+      setter((prev) => (prev[sid] === v ? prev : { ...prev, [sid]: v }));
+
+  return {
+    loadingBy,
+    queuedBy,
+    setLoadingFor: setBool(setLoadingBy),
+    setQueuedFor: setBool(setQueuedBy),
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useSession.ts =====
+
+// frontend/src/file_read/hooks/useSession.ts
+import { useRef } from "react";
+import type { ChatMsg, ChatMessageRow } from "../types/chat";
+import { createChat, listMessages } from "../hooks/data/chatApi";
+import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
+
+function rowToMsg(r: ChatMessageRow): ChatMsg {
+  if (r.role === "assistant") {
+    const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
+    const base: ChatMsg = {
+      id: `cid-${r.id}`,        // stable UI id derived from server id
+      serverId: r.id,
+      role: r.role,
+      text: clean,
+    };
+    if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
+    return base;
+  }
+  return { id: `cid-${r.id}`, serverId: r.id, role: r.role, text: r.content };
+}
+
+export function useSession(opts: {
+  setMessagesForSession: (sid: string, msgs: ChatMsg[]) => void;
+  getMessagesForSession: (sid: string) => ChatMsg[];
+  isStreaming: (sid: string) => boolean;
+}) {
+  const { setMessagesForSession, getMessagesForSession, isStreaming } = opts;
+  const sessionIdRef = useRef<string>(crypto.randomUUID());
+  const hasCreatedRef = useRef(false);
+
+  async function ensureChatCreated() {
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = crypto.randomUUID();
+      hasCreatedRef.current = false;
+    }
+    if (hasCreatedRef.current) return;
+    try {
+      await createChat(sessionIdRef.current, "New Chat");
+      hasCreatedRef.current = true;
+    } catch (e) {
+      console.warn("createChat failed:", e);
+    }
+  }
+
+  async function loadHistory(sessionId: string): Promise<void> {
+    sessionIdRef.current = sessionId;
+    hasCreatedRef.current = true;
+
+    try {
+      const rows = await listMessages(sessionId);
+      const serverMsgs = rows.map(rowToMsg);
+
+      const prevClient = getMessagesForSession(sessionId) ?? [];
+
+      if (isStreaming(sessionId)) {
+        // When streaming, merge by serverId (preserve any in-flight tail by clientId)
+        const byServer = new Map<number, ChatMsg>(
+          prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
+        );
+        const merged = serverMsgs.map(s => {
+          const prev = byServer.get(s.serverId!);
+          if (!prev) return s;
+          // prefer freshly parsed meta if present, else keep previous meta
+          const meta = s.meta ?? prev.meta ?? undefined;
+          return { ...prev, ...s, meta };
+        });
+
+        const tail: ChatMsg[] = [];
+        const last = prevClient[prevClient.length - 1];
+        if (last?.role === "assistant" && (last.text?.length ?? 0) > 0 && last.serverId == null) {
+          tail.push(last); // keep streaming tail bubble (unsaved)
+        }
+
+        setMessagesForSession(sessionId, [...merged, ...tail]);
+      } else {
+        setMessagesForSession(sessionId, serverMsgs);
+      }
+    } catch (e) {
+      console.warn("listMessages failed:", e);
+      if (!isStreaming(sessionId)) setMessagesForSession(sessionId, []);
+    }
+  }
+
+  function setSessionId(newId: string) {
+    sessionIdRef.current = newId;
+    hasCreatedRef.current = false;
+    setMessagesForSession(newId, []);
+  }
+
+  function resetSession() {
+    const id = sessionIdRef.current;
+    if (id) setMessagesForSession(id, []);
+  }
+
+  return {
+    sessionIdRef,
+    ensureChatCreated,
+    loadHistory,
+    setSessionId,
+    resetSession,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useSidebar.ts =====
+
+// frontend/src/file_read/hooks/useSidebar.ts
+import { useEffect, useState } from "react";
+
+export function useSidebar() {
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
+
+  // pin on desktop
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth >= 768) setSidebarOpen(true);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Ctrl+B toggle
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
+        e.preventDefault();
+        setSidebarOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // mobile drawer helpers (DOM-level; safe here)
+  const openMobileDrawer = () => {
+    document.getElementById("mobile-drawer")?.classList.remove("hidden");
+    document.getElementById("mobile-backdrop")?.classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+  };
+  const closeMobileDrawer = () => {
+    document.getElementById("mobile-drawer")?.classList.add("hidden");
+    document.getElementById("mobile-backdrop")?.classList.add("hidden");
+    document.body.style.overflow = "";
+  };
+
+  return {
+    sidebarOpen,
+    setSidebarOpen,
+    openMobileDrawer,
+    closeMobileDrawer,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useStream.ts =====
+
+// frontend/src/file_read/hooks/useStream.ts
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ChatMsg } from "../types/chat";
+import type { RunJson, GenMetrics } from "../shared/lib/runjson";
+import { createStreamController } from "./stream/core/controller";
+
+type UseStreamDeps = {
+  // not read directly; keeps memo deps stable
+  messages: ChatMsg[];
+
+  // message state per session
+  setMessagesForSession: (
+    sid: string,
+    updater: (prev: ChatMsg[]) => ChatMsg[]
+  ) => void;
+  getMessagesForSession: (sid: string) => ChatMsg[];
+
+  // ui
+  setInput: (v: string) => void;
+
+  // session plumbing
+  sessionId: () => string;
+  ensureChatCreated: () => Promise<void>;
+  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
+
+  // per-session flags/metrics
+  setLoadingForSession: (sid: string, v: boolean) => void;
+  setQueuedForSession?: (sid: string, v: boolean) => void;
+  setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMetricsFallbackForSession: (sid: string, reason: string, partialOut: string) => void;
+  resetMetricsForSession: (sid: string) => void;
+};
+
+export function useStream({
+  setMessagesForSession,
+  getMessagesForSession,
+  setInput,
+  sessionId,
+  ensureChatCreated,
+  onRetitle,
+  setLoadingForSession,
+  setQueuedForSession,
+  setMetricsForSession,
+  setMetricsFallbackForSession,
+  resetMetricsForSession,
+}: UseStreamDeps) {
+  const [loading, setLoading] = useState(false);
+  const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
+
+  // Build the controller once; it manages its own queue + aborts.
+  const controller = useMemo(() => {
+    return createStreamController({
+      // message access
+      getMessagesFor: (sid) => getMessagesForSession(sid),
+      setMessagesFor: (sid, updater) => setMessagesForSession(sid, updater),
+
+      // ui hooks
+      setInput: () => setInput(""),
+      setLoadingFor: (sid, v) => {
+        if (sid === sessionId()) setLoading(v);
+        setLoadingForSession(sid, v);
+      },
+      setQueuedFor: setQueuedForSession ?? (() => {}),
+
+      // metrics
+      setMetricsFor: (sid, json, flat) => setMetricsForSession(sid, json, flat),
+      setMetricsFallbackFor: (sid, reason, out) =>
+        setMetricsFallbackForSession(sid, reason, out),
+
+      // NEW: patch server id onto a bubble identified by clientId
+      setServerIdFor: (sid, clientId, serverId) => {
+        setMessagesForSession(sid, (prev) =>
+          prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
+        );
+      },
+
+      // session plumbing
+      getSessionId: sessionId,
+      ensureChatCreated,
+      onRetitle,
+      resetMetricsFor: (sid) => resetMetricsForSession(sid),
+    });
+    // Intentionally stable: controller owns its own lifecycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    controllerRef.current = controller;
+    return () => controllerRef.current?.dispose();
+  }, [controller]);
+
+  async function send(override?: string) {
+    const text = (override ?? "").trim();
+    if (!text) return;
+    await controller.send(text);
+  }
+
+  async function stop() {
+    await controller.stop();
+  }
+
+  async function cancelBySessionId(sid: string) {
+    await controller.cancelBySessionId(sid);
+  }
+
+  return { loading, send, stop, cancelBySessionId };
+}
+
+# ===== frontend/src/file_read/hooks/useTheme.ts =====
+
+// frontend/src/file_read/hooks/useTheme.ts
+import { useEffect, useState } from "react";
+
+type Theme = "light" | "dark";
+const KEY = "theme";
+
+export function useTheme() {
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = (localStorage.getItem(KEY) as Theme) || null;
+    if (saved) return saved;
+    const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") root.classList.add("dark");
+    else root.classList.remove("dark");
+    localStorage.setItem(KEY, theme);
+  }, [theme]);
+
+  const toggle = () => setTheme(t => (t === "dark" ? "light" : "dark"));
+  return { theme, toggle };
+}
+
+# ===== frontend/src/file_read/hooks/useToast.ts =====
+
+import { useState } from "react";
+
+export function useToast() {
+  const [toast, setToast] = useState<string | null>(null);
+  function show(msg: string, ms = 1800) {
+    setToast(msg);
+    window.clearTimeout((show as any)._t);
+    (show as any)._t = window.setTimeout(() => setToast(null), ms);
+  }
+  return { toast, show };
+}
+
+# ===== frontend/src/file_read/index.css =====
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+# ===== frontend/src/file_read/main.tsx =====
+
+import { StrictMode } from 'react'
+import './index.css';
+import { createRoot } from 'react-dom/client'
+import App from './App.tsx'
+
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+# ===== frontend/src/file_read/pages/AgentRunner.tsx =====
+
+// frontend/src/file_read/pages/AgentRunner.tsx
+import { useEffect, useState } from "react";
+import ChatContainer from "../components/ChatContainer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
+import { useChatStream } from "../hooks/useChatStream";
+import { useSidebar } from "../hooks/useSidebar";
+import { useToast } from "../hooks/useToast";
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import Toast from "../shared/ui/Toast";
+import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
+
+const PAGE_SIZE = 30;
+const LS_KEY = "lastSessionId";
+
+export default function AgentRunner() {
+  const chat = useChatStream();
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [autoFollow, setAutoFollow] = useState(true); // NEW
+  const { toast, show } = useToast();
+  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const ceil = new Date().toISOString();
+        const page = await listChatsPage(0, PAGE_SIZE, ceil);
+        const saved = localStorage.getItem(LS_KEY) || "";
+        const targetId =
+          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
+          page.content[0]?.sessionId ||
+          "";
+        if (targetId) {
+          await chat.loadHistory(targetId);
+          localStorage.setItem(LS_KEY, targetId);
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function newChat(): Promise<void> {
+    const id = crypto.randomUUID();
+    chat.setSessionId(id);
+    try { await createChat(id, "New Chat"); } catch {}
+    localStorage.setItem(LS_KEY, id);
+    setRefreshKey((k) => k + 1);
+    chat.setInput("");
+    chat.clearMetrics?.();
+    // Follow to bottom for a fresh chat
+    await refreshFollow();
+  }
+
+  async function openSession(id: string): Promise<void> {
+    if (!id) return;
+    await chat.loadHistory(id);
+    localStorage.setItem(LS_KEY, id);
+    chat.setInput("");
+    chat.clearMetrics?.();
+    // Follow when explicitly opening a session
+    await refreshFollow();
+  }
+
+  // --- TWO REFRESH HELPERS ---
+
+  // 1) Follow-to-bottom refresh (normal)
+  async function refreshFollow() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    setAutoFollow(true); // enable ChatView auto-follow
+    await chat.loadHistory(sid);
+    const el = document.getElementById("chat-scroll-container");
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  // 2) Preserve-scroll refresh (use for deletions, etc.)
+  async function refreshPreserve() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    const el = document.getElementById("chat-scroll-container");
+    const prevTop = el?.scrollTop ?? 0;
+    const prevHeight = el?.scrollHeight ?? 0;
+
+    setAutoFollow(false); // temporarily disable auto-follow in ChatView
+    await chat.loadHistory(sid);
+
+    requestAnimationFrame(() => {
+      if (el) {
+        const newHeight = el.scrollHeight;
+        el.scrollTop = prevTop + (newHeight - prevHeight);
+      }
+      // re-enable for normal behavior afterward
+      setAutoFollow(true);
+    });
+  }
+
+  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
+  async function handleDeleteMessages(clientIds: string[]) {
+    const sid = chat.sessionIdRef.current;
+    console.log("handleDeleteMessages", { clientIds, sid });
+
+    if (!sid || !clientIds?.length) return;
+
+    const current = chat.messages;
+    const toDelete = new Set(clientIds);
+
+    const serverIds = current
+      .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
+      .map((m: any) => m.serverId as number);
+
+    const remaining = current.filter((m) => !toDelete.has(m.id));
+
+    // Optimistic local state
+    if ((chat as any).setMessagesForSession) {
+      (chat as any).setMessagesForSession(sid, () => remaining);
+    }
+
+    try {
+      if (serverIds.length) {
+        await deleteMessagesBatch(sid, serverIds);
+      }
+
+      // Preserve scroll on delete
+      await refreshPreserve();
+
+      // Update sidebar (title/lastMessage)
+      setRefreshKey((k) => k + 1);
+      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+
+      show("Message deleted");
+    } catch (err) {
+      show("Failed to delete message");
+      await chat.loadHistory(sid);
+      setRefreshKey((k) => k + 1);
+    }
+  }
+
+  return (
+    <div className="h-screen w-full flex bg-gray-50">
+      {sidebarOpen && (
+        <div className="hidden md:flex h-full">
+          <ChatSidebar
+            onOpen={openSession}
+            onNew={newChat}
+            refreshKey={refreshKey}
+            activeId={chat.sessionIdRef.current}
+            onHideSidebar={() => setSidebarOpen(false)}
+          />
+        </div>
+      )}
+
+      <MobileDrawer
+        onOpenSession={openSession}
+        onNewChat={newChat}
+        refreshKey={refreshKey}
+        activeId={chat.sessionIdRef.current}
+        openMobileDrawer={openMobileDrawer}
+        closeMobileDrawer={closeMobileDrawer}
+      />
+      <div className="md:hidden h-14 shrink-0" />
+
+      <div className="flex-1 min-w-0 flex flex-col">
+        <DesktopHeader sidebarOpen={sidebarOpen} onShowSidebar={() => setSidebarOpen(true)} />
+        <div className="flex-1 min-h-0">
+          <div className="h-full px-3 md:px-6">
+            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
+              <ChatContainer
+                messages={chat.messages}
+                input={chat.input}
+                setInput={chat.setInput}
+                loading={chat.loading}
+                queued={chat.queued}
+                send={chat.send}
+                stop={chat.stop}
+                runMetrics={chat.runMetrics}
+                runJson={chat.runJson}
+                onRefreshChats={() => setRefreshKey((k) => k + 1)}
+                onDeleteMessages={handleDeleteMessages}
+                autoFollow={autoFollow} // NEW
+              />
+              <Toast message={toast} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/pages/AgentShell.tsx =====
+
+// frontend/src/file_read/pages/AgentShell.tsx
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
+import ChatContainer from "../components/ChatContainer";
+
+export default function AgentShell({
+  sidebarOpen, setSidebarOpen,
+  openMobileDrawer, closeMobileDrawer,
+  refreshKey, activeId,
+  onOpenSession, onNewChat,
+  chatProps,
+}: {
+  sidebarOpen: boolean;
+  setSidebarOpen: (v: boolean) => void;
+  openMobileDrawer: () => void;
+  closeMobileDrawer: () => void;
+  refreshKey: number;
+  activeId?: string;
+  onOpenSession: (id: string) => Promise<void>;
+  onNewChat: () => Promise<void>;
+  chatProps: React.ComponentProps<typeof ChatContainer>;
+}) {
+  return (
+    <div className="h-screen w-full flex bg-gray-50">
+      {sidebarOpen && (
+        <div className="hidden md:flex h-full">
+          <ChatSidebar
+            onOpen={onOpenSession}
+            onNew={onNewChat}
+            refreshKey={refreshKey}
+            activeId={activeId}
+            onHideSidebar={() => setSidebarOpen(false)}
+          />
+        </div>
+      )}
+
+      <MobileDrawer
+        onOpenSession={onOpenSession}
+        onNewChat={onNewChat}
+        refreshKey={refreshKey}
+        activeId={activeId}
+        openMobileDrawer={openMobileDrawer}
+        closeMobileDrawer={closeMobileDrawer}
+      />
+      <div className="md:hidden h-14 shrink-0" />
+
+      <div className="flex-1 min-w-0 flex flex-col">
+        <DesktopHeader
+          sidebarOpen={sidebarOpen}
+          onShowSidebar={() => setSidebarOpen(true)}
+        />
+        <div className="flex-1 min-h-0">
+          <div className="h-full px-3 md:px-6">
+            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
+              <ChatContainer {...chatProps} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/pages/useInitialLoad.ts =====
+
+// frontend/src/file_read/pages/useInitialLoad.ts
+import { useEffect } from "react";
+import { listChatsPage } from "../data/chatApi";
+
+export function useInitialLoad(
+  pageSize: number,
+  onPick: (id: string) => Promise<void>,
+  keyName = "lastSessionId"
+) {
+  useEffect(() => {
+    (async () => {
+      try {
+        const ceil = new Date().toISOString();
+        const page = await listChatsPage(0, pageSize, ceil);
+        const saved = localStorage.getItem(keyName) || "";
+        const targetId =
+          (saved && page.content.find(c => c.sessionId === saved)?.sessionId) ||
+          page.content[0]?.sessionId || "";
+        if (targetId) {
+          await onPick(targetId);
+          localStorage.setItem(keyName, targetId);
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+}
+
+# ===== frontend/src/file_read/services/http.ts =====
+
+export const API_BASE = import.meta.env.VITE_API_URL || "";
+
+export async function request<T>(
+  path: string,
+  init?: RequestInit
+): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, init);
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    // bubble a readable error
+    throw new Error(`HTTP ${res.status} – ${text || res.statusText}`);
+  }
+  return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
+}
+
+# ===== frontend/src/file_read/shared/lib/runjson.ts =====
+
+// src/file_read/utils/runjson.ts
+export const MET_START = "[[RUNJSON]]";
+export const MET_END = "[[/RUNJSON]]";
+
+export type GenMetrics = {
+  ttft_ms?: number | null;
+  tok_per_sec?: number | null;
+  output_tokens?: number | null;
+  input_tokens_est?: number | null;
+  total_tokens_est?: number | null;
+  stop_reason?: string | null;
+};
+
+export type RunJson = {
+  stats?: {
+    stopReason?: string | null;
+    tokensPerSecond?: number | null;
+    timeToFirstTokenSec?: number | null;
+    totalTimeSec?: number | null;
+    promptTokensCount?: number | null;
+    predictedTokensCount?: number | null;
+    totalTokensCount?: number | null;
+  };
+  [k: string]: unknown;
+};
+
+// Robustly extract the last [[RUNJSON]] ... [[/RUNJSON]] block, tolerating
+// surrounding spaces/newlines and any placement within the text.
+export function extractRunJsonFromBuffer(
+  buf: string
+): { clean: string; json?: RunJson; flat?: GenMetrics } {
+  // Use a global, dotall regex that captures the JSON payload and allows
+  // optional whitespace around the delimiters.
+  const re =
+    /(?:\s*)\[\[RUNJSON\]\]\s*([\s\S]*?)\s*\[\[\/RUNJSON\]\](?:\s*)/g;
+
+  let match: RegExpExecArray | null = null;
+  let lastMatch: RegExpExecArray | null = null;
+
+  while ((match = re.exec(buf)) !== null) {
+    lastMatch = match; // keep the last one if multiple blocks appear
+  }
+
+  if (!lastMatch) {
+    // nothing found -> leave as-is
+    return { clean: buf };
+  }
+
+  const fullSpan = lastMatch[0];
+  const payload = lastMatch[1] ?? "";
+
+  let parsed: RunJson | undefined;
+  try {
+    parsed = JSON.parse(payload) as RunJson;
+  } catch {
+    // if JSON parse fails, still strip the span from the clean text
+  }
+
+  // Remove exactly the matched span (not all occurrences).
+  const startIdx = (lastMatch.index as number);
+  const endIdx = startIdx + fullSpan.length;
+  const clean = buf.slice(0, startIdx) + buf.slice(endIdx);
+
+  // Flatten if we have stats
+  let flat: GenMetrics | undefined;
+  const s = parsed?.stats;
+  if (s) {
+    flat = {
+      ttft_ms:
+        s.timeToFirstTokenSec != null
+          ? Math.max(0, s.timeToFirstTokenSec) * 1000
+          : null,
+      tok_per_sec: s.tokensPerSecond ?? null,
+      output_tokens: s.predictedTokensCount ?? null,
+      input_tokens_est: s.promptTokensCount ?? null,
+      total_tokens_est: s.totalTokensCount ?? null,
+      stop_reason: s.stopReason ?? null,
+    };
+  }
+
+  return { clean, json: parsed, flat };
+}
+
+// For one-shot responses (e.g., title bot)
+export function stripRunJson(raw: string): {
+  text: string;
+  json?: RunJson;
+  flat?: GenMetrics;
+} {
+  const { clean, json, flat } = extractRunJsonFromBuffer(raw);
+  return { text: clean, json, flat };
+}
+
+// (kept exports for any external references)
+export { MET_START as MET_START_TAG, MET_END as MET_END_TAG };
+
+# ===== frontend/src/file_read/shared/lib/text.ts =====
+
+export function firstLineSmart(s: string, max = 48): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length <= max ? one : one.slice(0, max - 1).trimEnd() + "…";
+}
+
+# ===== frontend/src/file_read/shared/ui/Button.tsx =====
+
+interface Props {
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}
+
+export default function Button({ onClick, disabled, children }: Props) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 ${
+        disabled ? "opacity-50 cursor-not-allowed" : ""
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/CodeCopyButton.tsx =====
+
+// frontend/src/file_read/components/CodeCopyButton.tsx
+import { Copy, Check } from "lucide-react";
+import { useState } from "react";
+
+export default function CodeCopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  async function onCopy() {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+  }
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      title={copied ? "Copied!" : "Copy"}
+      className="inline-flex items-center justify-center w-7 h-7 rounded bg-gray-200 text-gray-600 hover:bg-gray-300 transition"
+    >
+      {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+    </button>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/Spinner.tsx =====
+
+export default function Spinner() {
+  return (
+    <div className="flex justify-center py-6">
+      <div className="h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/Toast.tsx =====
+
+export default function Toast({ message }: { message: string | null }) {
+  if (!message) return null;
+  return (
+    <div className="pointer-events-none fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
+      <div className="px-3 py-2 rounded-lg bg-black text-white text-xs shadow-lg">
+        {message}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/TypingIndicator.tsx =====
+
+// components/TypingIndicator.tsx
+export default function TypingIndicator() {
+  return (
+    <div className="flex items-start gap-2">
+      {/* Optional avatar spot */}
+      <div className="h-8 w-8 rounded-full bg-gray-200 shrink-0" />
+      <div className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600">
+        <span className="inline-flex gap-1">
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.2s]" />
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.1s]" />
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/types/chat.ts =====
+
+export type Role = "user" | "assistant";
+
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export type ChatMsg = {
+  /** Stable UI id that never changes. Always a UUID you assign client-side. */
+  id: string; // == clientId
+  /** Database id if persisted. Null until the backend saves it. */
+  serverId: number | null;
+
+  role: Role;
+  text: string;
+
+  // Per-message telemetry (assistant only is typical)
+  meta?: {
+    runJson?: RunJson | null;
+    flat?: GenMetrics | null;
+  };
+};
+
+export type ChatRow = {
+  id: number;
+  sessionId: string;
+  title: string;
+  lastMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ChatMessageRow = {
+  id: number;              // server id
+  sessionId: string;
+  role: Role;
+  content: string;
+  createdAt: string;
+};
+
+# ===== frontend/src/file_read/utils/metricsCache.ts =====
+
+// Cache per-assistant-message metrics in localStorage so they persist across navigation/reload.
+const KEY = "msgMetrics:v1";
+
+type Stored = Record<string, { runJson?: any | null; flat?: any | null }>;
+
+function loadAll(): Stored {
+  try {
+    const raw = localStorage.getItem(KEY);
+    return raw ? (JSON.parse(raw) as Stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAll(obj: Stored) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(obj));
+  } catch {
+    /* ignore quota errors */
+  }
+}
+
+export function setMsgMetrics(messageId: string, data: { runJson?: any | null; flat?: any | null }) {
+  const all = loadAll();
+  const cur = all[messageId] || {};
+  all[messageId] = {
+    runJson: data.runJson ?? cur.runJson ?? null,
+    flat: data.flat ?? cur.flat ?? null,
+  };
+  saveAll(all);
+}
+
+export function getMsgMetrics(messageId: string) {
+  const all = loadAll();
+  return all[messageId] || null;
+}
+
+export function clearMsgMetrics(messageId: string) {
+  const all = loadAll();
+  if (all[messageId]) {
+    delete all[messageId];
+    saveAll(all);
+  }
+}
+
+# ===== frontend/src/file_read/vite-env.d.ts =====
+
+/// <reference types="vite/client" />

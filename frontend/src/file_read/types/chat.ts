@@ -3,14 +3,18 @@ export type Role = "user" | "assistant";
 import type { GenMetrics, RunJson } from "../shared/lib/runjson";
 
 export type ChatMsg = {
-  id: string;
+  /** Stable UI id that never changes. Always a UUID you assign client-side. */
+  id: string; // == clientId
+  /** Database id if persisted. Null until the backend saves it. */
+  serverId: number | null;
+
   role: Role;
   text: string;
 
-  // Single place to store per-message telemetry (only used on assistant msgs)
+  // Per-message telemetry (assistant only is typical)
   meta?: {
-    runJson?: RunJson | null;   // full structured RUNJSON (if present)
-    flat?: GenMetrics | null;   // flattened quick metrics
+    runJson?: RunJson | null;
+    flat?: GenMetrics | null;
   };
 };
 
@@ -24,7 +28,7 @@ export type ChatRow = {
 };
 
 export type ChatMessageRow = {
-  id: number;
+  id: number;              // server id
   sessionId: string;
   role: Role;
   content: string;

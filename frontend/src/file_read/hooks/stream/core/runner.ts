@@ -1,10 +1,7 @@
-// frontend/src/file_read/hooks/stream/core/runner.ts
-import { appendMessage, updateChatLast } from "../../../data/chatApi";
 import { postStream } from "./network";
 import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
 import type { ChatMsg } from "../../../types/chat";
 import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
-import { MET_START, MET_END } from "../../../shared/lib/runjson";
 import { readStreamLoop } from "./runner_stream";
 import {
   pinLiveMetricsToSession,
@@ -27,6 +24,8 @@ export type RunnerDeps = {
     setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
     setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
     onRetitle: (sid: string, finalText: string) => Promise<void>;
+    /** NEW: patch serverId by clientId */
+    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
   };
   getCancelForSid: () => string | null;
   clearCancelIf: (sid: string) => void;
@@ -39,7 +38,6 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
   const { opts } = d;
   const wasCanceled = () => d.getCancelForSid() === sid;
 
-  // Prep UI + history
   opts.resetMetricsFor(sid);
   opts.setLoadingFor(sid, true);
   ensureAssistantPlaceholder(opts, sid, asstId);
@@ -51,7 +49,6 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     .map((m) => ({ role: m.role, content: m.text }))
     .filter((m) => m.content.trim().length > 0);
 
-  // Network
   const controller = new AbortController();
   d.setController(controller);
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -63,11 +60,10 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     );
     d.setReader(reader);
 
-    // Stream loop (delegated)
     const result = await readStreamLoop(reader, {
       wasCanceled,
-      onDelta: (delta, cleanSoFar) => {
-        // append assistant delta (inline to avoid import cycle with updater)
+      onDelta: (delta) => {
+        // append assistant delta inline
         opts.setMessagesFor(sid, (prev) => {
           const idx = prev.findIndex((m) => m.id === asstId);
           if (idx === -1) return prev;
@@ -88,16 +84,18 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     const { finalText, gotMetrics, lastRunJson } = result;
     let persistJson: RunJson | null = gotMetrics ? lastRunJson : null;
 
-    // No metrics -> synthesize fallback (but don't persist if user canceled)
     if (!gotMetrics) {
       const reason = wasCanceled() ? "user_cancel" : "end_of_stream_no_metrics";
       const fallback = pinFallbackToSessionAndBubble(opts, sid, asstId, reason, finalText);
       if (!wasCanceled()) persistJson = fallback;
     }
 
-    // Persist assistant turn (+RUNJSON) only if not canceled and we have text
     if (!wasCanceled() && finalText.trim()) {
-      await persistAssistantTurn(sid, finalText, persistJson);
+      const newServerId = await persistAssistantTurn(sid, finalText, persistJson);
+      if (newServerId != null) {
+        // patch serverId on the assistant placeholder (identified by clientId = asstId)
+        opts.setServerIdFor(sid, asstId, newServerId);
+      }
       try { await opts.onRetitle(sid, finalText); } catch {}
       try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
     }
@@ -109,7 +107,6 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     const last = snapshotPendingAssistant(opts.getMessagesFor(sid));
     opts.setMetricsFallbackFor(sid, reason, last);
 
-    // If the assistant bubble is still empty, mark it
     opts.setMessagesFor(sid, (prev) => {
       const end = prev[prev.length - 1];
       if (end?.role === "assistant" && !end.text.trim()) {

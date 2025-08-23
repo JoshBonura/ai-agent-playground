@@ -4,6 +4,7 @@ import json, os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
+import sys
 
 # App data dir (override with LOCALAI_DATA_DIR for dev/electron)
 def app_data_dir() -> Path:
@@ -14,12 +15,14 @@ def app_data_dir() -> Path:
     if os.name == "nt":
         base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
         return Path(base) / "LocalAI"
-    elif os.name == "posix":
-        if "darwin" in os.sys.platform:
-            return Path.home() / "Library" / "Application Support" / "LocalAI"
+
+    if sys.platform == "darwin":  # macOS
+        return Path.home() / "Library" / "Application Support" / "LocalAI"
+
+    if os.name == "posix":  # Linux/other UNIX
         return Path.home() / ".local" / "share" / "LocalAI"
-    else:
-        return Path.home() / ".localai"
+
+    return Path.home() / ".localai"
 
 SETTINGS_PATH = app_data_dir() / "settings.json"
 

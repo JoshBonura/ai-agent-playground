@@ -1,6 +1,6 @@
 // frontend/src/file_read/hooks/useRetitle.ts
 import { API_BASE } from "../services/http";
-import { listMessages, updateChatLast } from "../data/chatApi";
+import { listMessages, updateChatLast } from "../hooks/data/chatApi";
 import { stripRunJson } from "../shared/lib/runjson";
 
 const TITLE_MAX_WORDS = 6;
@@ -15,6 +15,7 @@ function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
 
 export function useRetitle(enabled = true) {
   async function retitleNow(sessionId: string, latestAssistant: string) {
+    console.log("1")
     if (!enabled) return;
 
     try {

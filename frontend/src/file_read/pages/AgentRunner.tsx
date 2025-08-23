@@ -8,10 +8,7 @@ import { useToast } from "../hooks/useToast";
 import DesktopHeader from "../components/DesktopHeader";
 import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
-
-// Use a single API layer (services)
-import { createChat, listChatsPage, deleteMessagesBatch, enqueuePendingDelete } from "../hooks/data/chatApi";
-import { cancelSession } from "../hooks/data/aiApi";
+import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
 
 const PAGE_SIZE = 30;
 const LS_KEY = "lastSessionId";
@@ -19,10 +16,10 @@ const LS_KEY = "lastSessionId";
 export default function AgentRunner() {
   const chat = useChatStream();
   const [refreshKey, setRefreshKey] = useState(0);
+  const [autoFollow, setAutoFollow] = useState(true); // NEW
   const { toast, show } = useToast();
   const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
 
-  // initial load: open last or most recent session
   useEffect(() => {
     (async () => {
       try {
@@ -50,6 +47,8 @@ export default function AgentRunner() {
     setRefreshKey((k) => k + 1);
     chat.setInput("");
     chat.clearMetrics?.();
+    // Follow to bottom for a fresh chat
+    await refreshFollow();
   }
 
   async function openSession(id: string): Promise<void> {
@@ -58,50 +57,86 @@ export default function AgentRunner() {
     localStorage.setItem(LS_KEY, id);
     chat.setInput("");
     chat.clearMetrics?.();
+    // Follow when explicitly opening a session
+    await refreshFollow();
   }
 
-  // Single, consolidated delete handler (queues while streaming)
-  async function handleDeleteMessages(ids: string[]) {
+  // --- TWO REFRESH HELPERS ---
+
+  // 1) Follow-to-bottom refresh (normal)
+  async function refreshFollow() {
     const sid = chat.sessionIdRef.current;
-    if (!sid || !ids?.length) return;
+    if (!sid) return;
+    setAutoFollow(true); // enable ChatView auto-follow
+    await chat.loadHistory(sid);
+    const el = document.getElementById("chat-scroll-container");
+    if (el) el.scrollTop = el.scrollHeight;
+  }
 
-    const numericIds = ids.map(Number).filter(Number.isFinite);
+  // 2) Preserve-scroll refresh (use for deletions, etc.)
+  async function refreshPreserve() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    const el = document.getElementById("chat-scroll-container");
+    const prevTop = el?.scrollTop ?? 0;
+    const prevHeight = el?.scrollHeight ?? 0;
 
-    // If the session is currently streaming, queue + cancel.
-    if (chat.loading) {
-      try {
-        // non-numeric ID likely = in-flight assistant bubble
-        const tailAssistant = ids.some((x) => !/^\d+$/.test(x));
-        await enqueuePendingDelete(sid, {
-          messageIds: numericIds.length ? numericIds : undefined,
-          tailAssistant,
-        });
-        await cancelSession(sid); // stop stream; backend applies pending on next append
-        show("Delete queued; will apply as soon as the run settles.");
-      } catch {
-        show("Failed to queue delete");
+    setAutoFollow(false); // temporarily disable auto-follow in ChatView
+    await chat.loadHistory(sid);
+
+    requestAnimationFrame(() => {
+      if (el) {
+        const newHeight = el.scrollHeight;
+        el.scrollTop = prevTop + (newHeight - prevHeight);
       }
-      return;
+      // re-enable for normal behavior afterward
+      setAutoFollow(true);
+    });
+  }
+
+  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
+  async function handleDeleteMessages(clientIds: string[]) {
+    const sid = chat.sessionIdRef.current;
+    console.log("handleDeleteMessages", { clientIds, sid });
+
+    if (!sid || !clientIds?.length) return;
+
+    const current = chat.messages;
+    const toDelete = new Set(clientIds);
+
+    const serverIds = current
+      .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
+      .map((m: any) => m.serverId as number);
+
+    const remaining = current.filter((m) => !toDelete.has(m.id));
+
+    // Optimistic local state
+    if ((chat as any).setMessagesForSession) {
+      (chat as any).setMessagesForSession(sid, () => remaining);
     }
 
-    // Not streaming: perform immediately
-    if (!numericIds.length) {
-      show("Nothing to delete yet");
-      return;
-    }
     try {
-      await deleteMessagesBatch(sid, numericIds);
+      if (serverIds.length) {
+        await deleteMessagesBatch(sid, serverIds);
+      }
+
+      // Preserve scroll on delete
+      await refreshPreserve();
+
+      // Update sidebar (title/lastMessage)
+      setRefreshKey((k) => k + 1);
+      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+
+      show("Message deleted");
+    } catch (err) {
+      show("Failed to delete message");
       await chat.loadHistory(sid);
       setRefreshKey((k) => k + 1);
-      show("Message deleted");
-    } catch {
-      show("Failed to delete message");
     }
   }
 
   return (
     <div className="h-screen w-full flex bg-gray-50">
-      {/* Desktop sidebar */}
       {sidebarOpen && (
         <div className="hidden md:flex h-full">
           <ChatSidebar
@@ -114,7 +149,6 @@ export default function AgentRunner() {
         </div>
       )}
 
-      {/* Mobile controls */}
       <MobileDrawer
         onOpenSession={openSession}
         onNewChat={newChat}
@@ -125,7 +159,6 @@ export default function AgentRunner() {
       />
       <div className="md:hidden h-14 shrink-0" />
 
-      {/* Right column */}
       <div className="flex-1 min-w-0 flex flex-col">
         <DesktopHeader sidebarOpen={sidebarOpen} onShowSidebar={() => setSidebarOpen(true)} />
         <div className="flex-1 min-h-0">
@@ -143,6 +176,7 @@ export default function AgentRunner() {
                 runJson={chat.runJson}
                 onRefreshChats={() => setRefreshKey((k) => k + 1)}
                 onDeleteMessages={handleDeleteMessages}
+                autoFollow={autoFollow} // NEW
               />
               <Toast message={toast} />
             </div>

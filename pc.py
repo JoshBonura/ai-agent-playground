@@ -1,9 +1,16 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, List
 import sys, os, argparse
 
-# Force UTF-8 stdout on Windows so redirects don't garble output
+# ──────────────────────────────────────────────────────────────────────────────
+# Chunked output config
+# ──────────────────────────────────────────────────────────────────────────────
+CHUNK_SIZE = 100000
+OUTPUT_PREFIX = "clean-structure"   # clean-structure-1.txt, clean-structure-2.txt, ...
+OUTPUT_DIR = "."                    # write files here
+
+# Force UTF-8 stdout on Windows so redirects don't garble output (kept for logs)
 if os.name == "nt":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -23,7 +30,6 @@ SEARCH_FOLDERS = [
 # Optional: filename/path substring matches (case-insensitive).
 # If used, any text-like file whose RELATIVE PATH contains one of these strings
 # will be printed (helpful to pull in Dockerfiles, envs, etc. anywhere).
-# (Note: fixed the missing comma before ".java".)
 # ──────────────────────────────────────────────────────────────────────────────
 NAME_MATCHES: list[str] = [
     "env.development",
@@ -57,7 +63,7 @@ ALLOWED_EXTS = {
     ".css", ".scss", ".sass",
     ".html",
     ".sh", ".bat", ".cmd", ".ps1",
-    ".gradle", ".pom",".development"
+    ".gradle", ".pom", ".development"
 }
 
 MAX_SIZE_BYTES = 1_000_000  # skip files > 1MB
@@ -66,7 +72,7 @@ MAX_SIZE_BYTES = 1_000_000  # skip files > 1MB
 def is_texty(p: Path) -> bool:
     if not p.is_file():
         return False
-    if p.name in IGNORE_BASENAMES:   # ⬅️ skip specific files by name
+    if p.name in IGNORE_BASENAMES:
         return False
     if p.suffix.lower() in ALLOWED_EXTS:
         try:
@@ -103,12 +109,14 @@ def _normalize_output(s: str) -> str:
     return s
 
 
-def dump_one(project_root: Path, p: Path, printed: set[str]) -> None:
+def dump_one(project_root: Path, p: Path, printed: set[str], out_parts: List[str]) -> None:
+    """Append file header + contents to out_parts (no printing)."""
     rel = norm_rel(project_root, p)
     if rel in printed:
         return
     printed.add(rel)
-    print(f"\n# ===== {rel} =====\n")
+
+    header = f"\n# ===== {rel} =====\n\n"
     try:
         # try UTF-8 first
         text = p.read_text(encoding="utf-8")
@@ -117,14 +125,16 @@ def dump_one(project_root: Path, p: Path, printed: set[str]) -> None:
         try:
             text = p.read_text(encoding="cp1252")
         except Exception as e:
-            print(f"⚠️ Could not read {rel}: {e}")
+            out_parts.append(f"{header}⚠️ Could not read {rel}: {e}\n")
             return
     except Exception as e:
-        print(f"⚠️ Could not read {rel}: {e}")
+        out_parts.append(f"{header}⚠️ Could not read {rel}: {e}\n")
         return
 
-    # only print once, after decoding succeeded via either path
-    print(_normalize_output(text))
+    out_parts.append(header)
+    out_parts.append(_normalize_output(text))
+    if not text.endswith("\n"):
+        out_parts.append("\n")  # ensure trailing newline for clean separation
 
 
 def walk_selected_folders(project_root: Path) -> Iterable[Path]:
@@ -157,7 +167,7 @@ def walk_name_matches(project_root: Path) -> Iterable[Path]:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Dump project files under selected folders (and/or name matches) to stdout."
+        description="Dump project files under selected folders (and/or name matches) into 3,000-char chunked files."
     )
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--matches", action="store_true",
@@ -168,26 +178,61 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def write_chunked(text: str, chunk_size: int, prefix: str, out_dir: str) -> list[Path]:
+    """
+    Write `text` into sequential files of up to `chunk_size` characters each.
+    Produces <prefix>-1.txt, <prefix>-2.txt, ...
+    """
+    out_dir_path = Path(out_dir).resolve()
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    written: list[Path] = []
+    if not text:
+        return written
+
+    for i in range(0, len(text), chunk_size):
+        part = text[i:i + chunk_size]
+        out_path = out_dir_path / f"{prefix}-{(i // chunk_size) + 1}.txt"
+        out_path.write_text(part, encoding="utf-8")
+        written.append(out_path)
+
+    return written
+
+
 def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
     printed: set[str] = set()
+    out_parts: List[str] = []
 
+    # Build the output in memory (headers + file contents)
     if args.matches:
         for p in walk_name_matches(project_root):
-            dump_one(project_root, p, printed)
-        return
-
-    if args.both:
+            dump_one(project_root, p, printed, out_parts)
+    elif args.both:
         for p in walk_selected_folders(project_root):
-            dump_one(project_root, p, printed)
+            dump_one(project_root, p, printed, out_parts)
         for p in walk_name_matches(project_root):
-            dump_one(project_root, p, printed)
-        return
+            dump_one(project_root, p, printed, out_parts)
+    else:
+        for p in walk_selected_folders(project_root):
+            dump_one(project_root, p, printed, out_parts)
 
-    # default: selected folders only
-    for p in walk_selected_folders(project_root):
-        dump_one(project_root, p, printed)
+    combined = "".join(out_parts)
+
+    # Write chunked files
+    written = write_chunked(
+        text=combined,
+        chunk_size=CHUNK_SIZE,
+        prefix=OUTPUT_PREFIX,
+        out_dir=OUTPUT_DIR,
+    )
+
+    # Short summary
+    print(f"✅ Total characters: {len(combined)}")
+    print(f"✅ Files written: {len(written)}")
+    for p in written:
+        print(f" - {p}")
 
 
 if __name__ == "__main__":

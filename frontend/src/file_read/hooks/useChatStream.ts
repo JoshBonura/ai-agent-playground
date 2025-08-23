@@ -5,6 +5,8 @@ import { useStream } from "./useStream";
 import { useChatState } from "./useChatState";
 import { useRunState } from "./useRunState";
 import { useMetrics } from "./useMetrics";
+// Retitle disabled for now
+// import { useRetitle } from "./useRetitle";
 
 export type { GenMetrics, RunJson } from "../shared/lib/runjson";
 
@@ -13,6 +15,8 @@ export function useChatStream() {
   const chat = useChatState();
   const run = useRunState();
   const met = useMetrics();
+  // Retitle disabled
+  // const { retitleNow } = useRetitle(true);
 
   // session plumbing
   const { sessionIdRef, ensureChatCreated, loadHistory, setSessionId, resetSession } = useSession({
@@ -29,7 +33,10 @@ export function useChatStream() {
     setInput: chat.setInput,
     sessionId: () => sessionIdRef.current,
     ensureChatCreated,
-    onRetitle: async () => {},
+
+    // 🔕 Retitle disabled: provide a no-op with the expected signature
+    onRetitle: async (_sessionId: string, _latestAssistant: string) => { /* no-op */ },
+
     setLoadingForSession: run.setLoadingFor,
     setQueuedForSession: run.setQueuedFor,
     setMetricsForSession: met.setMetricsFor,

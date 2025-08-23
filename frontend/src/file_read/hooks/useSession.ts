@@ -4,26 +4,25 @@ import type { ChatMsg, ChatMessageRow } from "../types/chat";
 import { createChat, listMessages } from "../hooks/data/chatApi";
 import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
 
-function rowsToMsgs(rows: ChatMessageRow[]): ChatMsg[] {
-  return rows.map((r) => {
-    if (r.role === "assistant") {
-      const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
-      const base: ChatMsg = { id: String(r.id), role: r.role, text: clean };
-      // attach run metrics on the message so ChatView can always show the panel
-      if (json || flat) {
-        base.meta = { runJson: json ?? null, flat: flat ?? null };
-      }
-      return base;
-    }
-    // user message: passthrough
-    return { id: String(r.id), role: r.role, text: r.content };
-  });
+function rowToMsg(r: ChatMessageRow): ChatMsg {
+  if (r.role === "assistant") {
+    const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
+    const base: ChatMsg = {
+      id: `cid-${r.id}`,        // stable UI id derived from server id
+      serverId: r.id,
+      role: r.role,
+      text: clean,
+    };
+    if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
+    return base;
+  }
+  return { id: `cid-${r.id}`, serverId: r.id, role: r.role, text: r.content };
 }
 
 export function useSession(opts: {
   setMessagesForSession: (sid: string, msgs: ChatMsg[]) => void;
   getMessagesForSession: (sid: string) => ChatMsg[];
-  isStreaming: (sid: string) => boolean; // NEW
+  isStreaming: (sid: string) => boolean;
 }) {
   const { setMessagesForSession, getMessagesForSession, isStreaming } = opts;
   const sessionIdRef = useRef<string>(crypto.randomUUID());
@@ -49,38 +48,32 @@ export function useSession(opts: {
 
     try {
       const rows = await listMessages(sessionId);
+      const serverMsgs = rows.map(rowToMsg);
 
-      // Convert server rows → client messages, extracting RUNJSON for assistants
-      const serverMsgs = rowsToMsgs(rows);
-
-      // Merge back any existing per-message meta from client memory
       const prevClient = getMessagesForSession(sessionId) ?? [];
-      const byId = new Map(prevClient.map((m) => [m.id, m]));
-
-      const merged = serverMsgs.map((m) => {
-        const prev = byId.get(m.id);
-        // prefer freshly parsed metrics; fall back to any existing client meta
-        const meta = (m as any).meta ?? (prev as any)?.meta ?? null;
-        // keep meta only on assistant messages
-        if (m.role === "assistant" && meta) {
-
-          return { ...m, meta };
-        }
-        return m;
-      });
 
       if (isStreaming(sessionId)) {
-        // if streaming, keep the in-flight assistant tail (with its meta)
-        const clientMsgs = prevClient;
+        // When streaming, merge by serverId (preserve any in-flight tail by clientId)
+        const byServer = new Map<number, ChatMsg>(
+          prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
+        );
+        const merged = serverMsgs.map(s => {
+          const prev = byServer.get(s.serverId!);
+          if (!prev) return s;
+          // prefer freshly parsed meta if present, else keep previous meta
+          const meta = s.meta ?? prev.meta ?? undefined;
+          return { ...prev, ...s, meta };
+        });
+
         const tail: ChatMsg[] = [];
-        const last = clientMsgs[clientMsgs.length - 1];
-        // keep last assistant bubble if it has any text (stream-in-progress)
-        if (last?.role === "assistant" && (last.text?.length ?? 0) > 0) {
-          tail.push(last);
+        const last = prevClient[prevClient.length - 1];
+        if (last?.role === "assistant" && (last.text?.length ?? 0) > 0 && last.serverId == null) {
+          tail.push(last); // keep streaming tail bubble (unsaved)
         }
+
         setMessagesForSession(sessionId, [...merged, ...tail]);
       } else {
-        setMessagesForSession(sessionId, merged);
+        setMessagesForSession(sessionId, serverMsgs);
       }
     } catch (e) {
       console.warn("listMessages failed:", e);

@@ -62,55 +62,25 @@ export async function deleteChatsBatch(sessionIds: string[]) {
   return data.deleted;
 }
 
-/** Delete a single message in a chat. Backend should accept this route. */
-export function deleteMessage(sessionId: string, messageId: string) {
+export function deleteMessage(sessionId: string, messageId: string | number) {
   return request<{ deleted: number }>(
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
     { method: "DELETE" }
   );
 }
 
-export function deleteMessagesBatch(
-  sessionId: string,
-  messageIds: number[]
-): Promise<{ deleted: string[] }>;
-export function deleteMessagesBatch(
-  sessionId: string,
-  messageIds: string[]
-): Promise<{ deleted: string[] }>;
-export function deleteMessagesBatch(
-  sessionId: string,
-  messageIds: (number | string)[]
-) {
-  // Coerce to integers and drop anything non-numeric
+/** Delete a batch of messages. Backend returns { deleted: number[] } */
+export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
   const ids = messageIds
     .map((id) => (typeof id === "string" ? Number(id) : id))
     .filter((n) => Number.isFinite(n)) as number[];
 
-  return request<{ deleted: string[] }>(
+  return request<{ deleted: number[] }>(  // <-- number[]
     `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
     {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messageIds: ids }),
-    }
-  );
-}
-
-
-export function enqueuePendingDelete(
-  sessionId: string,
-  opts: { messageIds?: number[]; tailAssistant?: boolean }
-) {
-  return request<{ ok: boolean }>(
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/pending-delete`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messageIds: opts.messageIds ?? null,
-        tailAssistant: !!opts.tailAssistant,
-      }),
     }
   );
 }

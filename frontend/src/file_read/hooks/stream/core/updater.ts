@@ -1,4 +1,3 @@
-// frontend/src/file_read/hooks/stream/core/updater.ts
 import type { ChatMsg } from "../../../types/chat";
 import type { MsgAccessor } from "./types";
 
@@ -11,10 +10,7 @@ export function appendAssistantDelta(
   if (!delta) return;
   access.setMessagesFor(sessionId, (prev) => {
     const idx = prev.findIndex((m) => m.id === asstId);
-    if (idx === -1) {
-      // Strict: do NOT create a new assistant message if the placeholder isn’t found.
-      return prev;
-    }
+    if (idx === -1) return prev;
     const next = [...prev];
     const cur = next[idx];
     next[idx] = { ...cur, text: (cur.text || "") + delta };
@@ -30,7 +26,7 @@ export function ensureAssistantPlaceholder(
   access.setMessagesFor(sessionId, (prev) => {
     const idx = prev.findIndex((m) => m.id === asstId);
     if (idx !== -1) return prev;
-    return [...prev, { id: asstId, role: "assistant", text: "" } as ChatMsg];
+    return [...prev, { id: asstId, serverId: null, role: "assistant", text: "" } as ChatMsg];
   });
 }
 

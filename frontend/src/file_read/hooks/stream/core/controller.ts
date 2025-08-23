@@ -34,23 +34,35 @@ export function createStreamController(opts: StreamCoreOpts): StreamController {
   async function send(override?: string) {
     const prompt = (override ?? "").trim();
     if (!prompt) return;
+
     await opts.ensureChatCreated();
     const sid = opts.getSessionId();
 
-    const asstId = crypto.randomUUID();
+    // Stable UI ids
+    const userCid = crypto.randomUUID();
+    const asstCid = crypto.randomUUID();
+
+    // 1) Optimistically add user + assistant placeholder with serverId=null
     opts.setMessagesFor(sid, (prev) => [
       ...prev,
-      { id: crypto.randomUUID(), role: "user", text: prompt },
-      { id: asstId, role: "assistant", text: "" },
+      { id: userCid, serverId: null, role: "user",      text: prompt },
+      { id: asstCid, serverId: null, role: "assistant", text: ""     },
     ]);
     opts.setInput("");
 
+    // 2) Persist user message; patch serverId when we get it
     appendMessage(sid, "user", prompt)
-      .then(() => { try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {} })
-      .catch(() => {});
+      .then((row) => {
+        if (row?.id != null) {
+          opts.setServerIdFor(sid, userCid, Number(row.id));
+          // Sidebar: make sure the chat shows up as soon as it really exists
+          try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+        }
+      })
+      .catch(() => { /* ignore; UI stays optimistic */ });
 
     try { opts.setQueuedFor(sid, true); } catch {}
-    scheduler.enqueue({ sid, prompt, asstId });
+    scheduler.enqueue({ sid, prompt, asstId: asstCid });
   }
 
   async function stop() { await canceller.stopVisible(); }

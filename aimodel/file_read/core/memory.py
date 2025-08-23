@@ -5,17 +5,25 @@ from typing import Dict, List
 from collections import deque
 from ..model_runtime import get_llm     # <-- use runtime, not a global llm
 from .style import STYLE_SYS
+from ..store import get_summary as store_get_summary
 
 SESSIONS: Dict[str, Dict] = {}
 
 def get_session(session_id: str):
-    return SESSIONS.setdefault(session_id, {
+    st = SESSIONS.setdefault(session_id, {
         "summary": "",
         "recent": deque(maxlen=50),
         "style": STYLE_SYS,
         "short": False,
         "bullets": False,
     })
+    # seed once from storage if empty
+    if not st["summary"]:
+        try:
+            st["summary"] = store_get_summary(session_id) or ""
+        except Exception:
+            pass
+    return st
 
 def approx_tokens(text: str) -> int:
     return max(1, math.ceil(len(text) / 4))
@@ -45,14 +53,16 @@ def build_system(style: str, short: bool, bullets: bool) -> str:
     parts.append("Always follow the user's most recent style instructions.")
     return " ".join(parts)
 
-def pack_messages(style: str, short: bool, bullets: bool, summary: str, recent: deque,
-                  max_ctx: int, out_budget: int):
+def pack_messages(style: str, short: bool, bullets: bool, summary, recent, max_ctx, out_budget):
     input_budget = max_ctx - out_budget - 256
-    system = build_system(style, short, bullets)
-    sys_msgs = [{"role": "system", "content": system}]
+    sys_text = build_system(style, short, bullets)
+
+    # Put “system” guidance into a *user* prologue for Mistral-Instruct
+    prologue = [{"role": "user", "content": sys_text}]
     if summary:
-        sys_msgs.append({"role": "system", "content": f"Conversation summary so far:\n{summary}"})
-    packed = sys_msgs + list(recent)
+        prologue.append({"role": "user", "content": f"Conversation summary so far:\n{summary}"})
+
+    packed = prologue + list(recent)
     return packed, input_budget
 
 def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
@@ -62,9 +72,11 @@ def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
             peel.append(recent.popleft())
         new_sum = summarize_chunks(peel)
         summary = (summary + "\n" + new_sum).strip() if summary else new_sum
+
+        # Rebuild using *user* role, matching pack_messages
         packed = [
-            {"role": "system", "content": system_text},
-            {"role": "system", "content": f"Conversation summary so far:\n{summary}"},
+            {"role": "user", "content": system_text},
+            {"role": "user", "content": f"Conversation summary so far:\n{summary}"},
             *list(recent),
         ]
     return packed, summary

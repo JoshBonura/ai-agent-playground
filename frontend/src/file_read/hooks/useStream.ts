@@ -32,7 +32,6 @@ type UseStreamDeps = {
 };
 
 export function useStream({
-  messages, // eslint-disable-line @typescript-eslint/no-unused-vars
   setMessagesForSession,
   getMessagesForSession,
   setInput,
@@ -67,6 +66,13 @@ export function useStream({
       setMetricsFor: (sid, json, flat) => setMetricsForSession(sid, json, flat),
       setMetricsFallbackFor: (sid, reason, out) =>
         setMetricsFallbackForSession(sid, reason, out),
+
+      // NEW: patch server id onto a bubble identified by clientId
+      setServerIdFor: (sid, clientId, serverId) => {
+        setMessagesForSession(sid, (prev) =>
+          prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
+        );
+      },
 
       // session plumbing
       getSessionId: sessionId,

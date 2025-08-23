@@ -1,11 +1,14 @@
+// frontend/src/file_read/components/ChatComposer.tsx
 import { useEffect, useRef, useState } from "react";
 import { SendHorizonal, Square } from "lucide-react";
+
+const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
 
 type Props = {
   input: string;
   setInput: (v: string) => void;
   loading: boolean;
-  queued?: boolean;              // NEW: show stop while queued too
+  queued?: boolean;
   onSend: (text: string) => void | Promise<void>;
   onStop: () => void | Promise<void>;
   onHeightChange?: (h: number) => void;
@@ -16,7 +19,7 @@ export default function ChatComposer({
   input,
   setInput,
   loading,
-  queued = false,                // NEW
+  queued = false,
   onSend,
   onStop,
   onHeightChange,
@@ -57,13 +60,26 @@ export default function ChatComposer({
 
   const hasText = draft.trim().length > 0;
 
+  // 🔹 NEW: tell ChatView to scroll to bottom
+  const forceScroll = (behavior: ScrollBehavior = "auto") => {
+    window.dispatchEvent(
+      new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } })
+    );
+  };
+
   const handleSendClick = () => {
     const v = draft.trim();
-    if (!v || loading || queued) return; // prevent sending while queued or streaming
+    if (!v || loading || queued) return; // prevent sending while queued/streaming
+
+    // Snap immediately to bottom so user sees the latest area
+    forceScroll("auto");
+
     setDraft("");
     setInput("");
     void Promise.resolve(onSend(v)).finally(() => {
       onRefreshChats?.();
+      // Settle at bottom after DOM updates
+      requestAnimationFrame(() => forceScroll("smooth"));
     });
   };
 

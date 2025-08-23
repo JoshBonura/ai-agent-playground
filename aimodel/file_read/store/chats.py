@@ -2,19 +2,19 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from .base import chat_path, ensure_dirs, atomic_write, now_iso
+from .base import chat_path, atomic_write, now_iso
 from .index import load_index, save_index, refresh_index_after_change, ChatMeta
 
 def _load_chat(session_id: str) -> Dict:
     p = chat_path(session_id)
     if not p.exists():
-        return {"sessionId": session_id, "messages": [], "seq": 0}
+        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}  # add summary
     with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-def _save_chat(session_id: str, data: Dict):
-    atomic_write(chat_path(session_id), data)
-
+        data = json.load(f)
+        if "summary" not in data:
+            data["summary"] = ""  # backfill older files
+        return data
+    
 @dataclass
 class ChatMessageRow:
     id: int
@@ -45,7 +45,7 @@ def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
         "updatedAt": now,
     }
     idx.append(row); save_index(idx)
-    _save_chat(session_id, {"sessionId": session_id, "messages": [], "seq": 0})
+    _save_chat(session_id, {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""})
     return ChatMeta(**row)
 
 def update_last(session_id: str, last_message: Optional[str], maybe_title: Optional[str]) -> ChatMeta:
@@ -151,11 +151,82 @@ def delete_batch(session_ids: List[str]) -> List[str]:
     save_index(keep)
     return session_ids
 
+def merge_chat(source_id: str, target_id: str):
+    source_msgs = list_messages(source_id)
+    target_msgs = list_messages(target_id)
+
+    # Insert source first, then re-add target to preserve order
+    merged = []
+    for m in source_msgs:
+        row = append_message(target_id, m.role, m.content)
+        merged.append(row)
+
+    for m in target_msgs:
+        row = append_message(target_id, m.role, m.content)
+        merged.append(row)
+
+    return merged
+
+def _save_chat(session_id: str, data: Dict):
+    atomic_write(chat_path(session_id), data)
+
+def set_summary(session_id: str, new_summary: str) -> None:
+    data = _load_chat(session_id)
+    data["summary"] = new_summary or ""
+    _save_chat(session_id, data)
+
+def get_summary(session_id: str) -> str:
+    data = _load_chat(session_id)
+    return str(data.get("summary") or "")
+
+def merge_chat_new(source_id: str, target_id: Optional[str] = None):
+    from uuid import uuid4
+    new_id = str(uuid4())
+    upsert_on_first_message(new_id, "Merged Chat")
+
+    merged = []
+
+    # source first
+    for m in list_messages(source_id):
+        row = append_message(new_id, m.role, m.content)
+        merged.append(row)
+
+    # then target (if exists)
+    if target_id:
+        for m in list_messages(target_id):
+            row = append_message(new_id, m.role, m.content)
+            merged.append(row)
+
+    return new_id, merged
+
+def edit_message(session_id: str, message_id: int, new_content: str) -> Optional[ChatMessageRow]:
+    data = _load_chat(session_id)
+    msgs = data.get("messages", [])
+    updated = None
+
+    for m in msgs:
+        if int(m.get("id", -1)) == int(message_id):
+            m["content"] = new_content
+            m["updatedAt"] = now_iso()
+            updated = m
+            break
+
+    if not updated:
+        return None
+
+    _save_chat(session_id, data)
+
+    # refresh index if last message changed
+    refresh_index_after_change(session_id, msgs)
+
+    return ChatMessageRow(**updated)
+
+
 # expose internals for pending ops
 __all__ = [
     "ChatMessageRow",
     "upsert_on_first_message", "update_last", "append_message",
     "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch",
-    "_load_chat", "_save_chat",
+    "list_paged", "delete_batch", "merge_chat", "merge_chat_new",
+    "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary", 
 ]
