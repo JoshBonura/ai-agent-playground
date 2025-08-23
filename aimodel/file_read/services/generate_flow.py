@@ -4,6 +4,7 @@ import asyncio, time, json
 from typing import AsyncGenerator, Dict, List
 from fastapi.responses import StreamingResponse
 from datetime import datetime
+from dataclasses import asdict  # for serializing message rows
 
 from ..model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
@@ -28,13 +29,12 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 def _chars_len(msgs: List[object]) -> int:
-    """Robust char counter for packed messages that may include dicts or strings."""
     total = 0
     for m in msgs:
         if isinstance(m, dict):
             c = m.get("content")
         else:
-            c = m  # plain string (defensive)
+            c = m
         if isinstance(c, str):
             total += len(c)
         elif c is None:
@@ -47,17 +47,9 @@ def _chars_len(msgs: List[object]) -> int:
     return total
 
 def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, object], session_id: str) -> None:
-    """Print the exact payload we send to the model: full messages + key params."""
     try:
         print(f"[{_now()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
-        print(json.dumps(
-            {
-                "messages": messages,
-                "params": params,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ))
+        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
         print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
     except Exception as e:
         print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
@@ -89,9 +81,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
 
         if need_web:
             base_query = proposed_q or str(latest_user_text or "")
-            q_summary = summarize_query(llm, base_query)
-            q_summary = q_summary.strip().strip('"\'')
-
+            q_summary = summarize_query(llm, base_query).strip().strip('"\'')
             print(f"[{_now()}] SUMMARIZER out={q_summary!r}")
 
             k = int(getattr(data, "webK", 3) or 3)
@@ -100,11 +90,9 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
             print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
 
             if block:
-                # CRITICAL: wrap as a proper chat message (dict), not a raw string
                 st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
                     {
                         "role": "assistant",
-                        # *** ONLY REQUIRED CHANGE: mark findings as authoritative in the content ***
                         "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
                     }
                 ]
@@ -135,14 +123,9 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     packed_chars = _chars_len(packed)
     print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
 
-    # dump the exact prompt (messages + params) we will send to the model
     _dump_full_prompt(
         packed,
-        params={
-            "requested_out": out_budget_req,
-            "temperature": (data.temperature or 0.6),
-            "top_p": (data.top_p or 0.9),
-        },
+        params={"requested_out": out_budget_req, "temperature": (data.temperature or 0.6), "top_p": (data.top_p or 0.9)},
         session_id=session_id,
     )
 
@@ -173,11 +156,23 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                 ):
                     yield chunk
             finally:
+                # 1) flush pending ops
                 try:
                     from ..store import apply_pending_for
                     apply_pending_for(session_id)
                 except Exception:
                     pass
+
+                # 2) enqueue retitle AFTER the stream has fully finished (coalesced, with watermark)
+                try:
+                    from ..store import list_messages as store_list_messages
+                    from ..retitle_worker import enqueue as enqueue_retitle
+                    msgs = store_list_messages(session_id)
+                    last_seq = max((int(m.id) for m in msgs), default=0)
+                    enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
+                except Exception:
+                    pass
+
                 print(f"[{_now()}] GEN run_stream END   session={session_id}")
                 mark_active(session_id, -1)
 

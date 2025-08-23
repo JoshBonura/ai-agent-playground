@@ -1,11 +1,13 @@
+# ===== aimodel/file_read/api/chats.py =====
+
 from __future__ import annotations
 from dataclasses import asdict
 from typing import List, Optional, Dict
-from .. import retitle_worker
 
 from fastapi import APIRouter
 from pydantic import BaseModel
-from ..retitle_worker import enqueue as enqueue_retitle
+from ..services.cancel import GEN_SEMAPHORE
+from ..retitle_worker import enqueue as enqueue_retitle  # ✅ import the enqueuer
 
 from ..core.schemas import (
     ChatMetaModel,
@@ -13,7 +15,7 @@ from ..core.schemas import (
     BatchMsgDeleteReq,
     BatchDeleteReq,
     MergeChatReq,
-    EditMessageReq
+    EditMessageReq,
 )
 
 from ..store import (
@@ -27,7 +29,7 @@ from ..store import (
     delete_messages_batch as store_delete_messages_batch,
     merge_chat as store_merge_chat,
     merge_chat_new as store_merge_chat_new,
-    edit_message as edit_message
+    edit_message as edit_message,
 )
 
 router = APIRouter()
@@ -48,8 +50,6 @@ async def api_update_last(session_id: str, body: Dict[str, str]):
     title = body.get("title")
     row = store_update_last(session_id, last_message, title)
     return asdict(row)
-
-
 
 @router.delete("/api/chats/{session_id}/messages/batch")
 async def api_delete_messages_batch(session_id: str, req: BatchMsgDeleteReq):
@@ -81,11 +81,22 @@ async def api_list_messages(session_id: str):
     rows = store_list_messages(session_id)
     return [asdict(r) for r in rows]
 
+# ✅ Single append route; triggers retitle only after assistant turn is persisted
 @router.post("/api/chats/{session_id}/messages")
 async def api_append_message(session_id: str, body: Dict[str, str]):
     role = (body.get("role") or "user").strip()
     content = (body.get("content") or "").rstrip()
     row = store_append(session_id, role, content)
+
+    if role == "assistant":
+        try:
+            msgs = store_list_messages(session_id)
+            last_seq = max((int(m.id) for m in msgs), default=0)
+            enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
+            # print(f"[retitle] ENQUEUE session={session_id} job_seq={last_seq} msgs={len(msgs)}")
+        except Exception:
+            pass
+
     return asdict(row)
 
 @router.delete("/api/chats/batch")
@@ -97,33 +108,14 @@ async def api_delete_batch(req: BatchDeleteReq):
 async def api_merge_chat(req: MergeChatReq):
     if req.newChat:
         new_id, merged = store_merge_chat_new(req.sourceId, req.targetId)
-        return {
-            "newChatId": new_id,
-            "mergedCount": len(merged),
-        }
+        return {"newChatId": new_id, "mergedCount": len(merged)}
     else:
         merged = store_merge_chat(req.sourceId, req.targetId)
         return {"mergedCount": len(merged)}
-
 
 @router.put("/api/chats/{session_id}/messages/{message_id}")
 async def api_edit_message(session_id: str, message_id: int, req: EditMessageReq):
     row = edit_message(session_id, message_id, req.content)
     if not row:
         return {"error": "Message not found"}
-    return asdict(row)
-
-
-@router.post("/api/chats/{session_id}/messages")
-async def api_append_message(session_id: str, body: Dict[str, str]):
-    role = (body.get("role") or "user").strip()
-    content = (body.get("content") or "").rstrip()
-    row = store_append(session_id, role, content)
-
-    # 🚀 Background retitle trigger
-    if role == "user":
-        # get all messages in this session (lightweight index only)
-        msgs = store_list_messages(session_id)
-        enqueue_retitle(session_id, [asdict(m) for m in msgs])
-
     return asdict(row)

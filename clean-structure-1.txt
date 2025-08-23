@@ -880,22 +880,68 @@ def clamp_out_budget(
 
 # aimodel/file_read/services/generate_flow.py
 from __future__ import annotations
-import asyncio, logging, time, json
-from typing import AsyncGenerator, Dict, List, Optional
+import asyncio, time, json
+from typing import AsyncGenerator, Dict, List
 from fastapi.responses import StreamingResponse
+from datetime import datetime
 
 from ..model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
-from ..utils.streaming import RUNJSON_START, RUNJSON_END, STOP_STRINGS, build_run_json, watch_disconnect
 
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
 from .session_io import handle_incoming, persist_summary
 from .packing import build_system_text, pack_with_rollup
 from .context_window import clamp_out_budget
-from .web_block import always_inject_web_block
-from .streaming_worker import run_stream
 
-log = logging.getLogger("aimodel.api.generate")
+# Router + summarizer + orchestrator (web path)
+from ..web.router_ai import decide_web
+from ..web.query_summarizer import summarize_query
+from ..web.orchestrator import build_web_block
+
+# Tell the type checker run_stream is an async iterator of bytes (stops yellow underline)
+from .streaming_worker import run_stream as _run_stream
+from typing import AsyncIterator
+run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream  # type: ignore[assignment]
+
+# ---- helpers for instrumentation --------------------------------------------
+def _now() -> str:
+    return datetime.now().isoformat(timespec="milliseconds")
+
+def _chars_len(msgs: List[object]) -> int:
+    """Robust char counter for packed messages that may include dicts or strings."""
+    total = 0
+    for m in msgs:
+        if isinstance(m, dict):
+            c = m.get("content")
+        else:
+            c = m  # plain string (defensive)
+        if isinstance(c, str):
+            total += len(c)
+        elif c is None:
+            continue
+        else:
+            try:
+                total += len(json.dumps(c, ensure_ascii=False))
+            except Exception:
+                pass
+    return total
+
+def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, object], session_id: str) -> None:
+    """Print the exact payload we send to the model: full messages + key params."""
+    try:
+        print(f"[{_now()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
+        print(json.dumps(
+            {
+                "messages": messages,
+                "params": params,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ))
+        print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
+    except Exception as e:
+        print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+# -----------------------------------------------------------------------------
 
 async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     ensure_ready()
@@ -906,34 +952,86 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         return StreamingResponse(iter([b"No messages provided."]), media_type="text/plain")
 
     incoming = [{"role": m.role, "content": m.content} for m in data.messages]
+    print(f"[{_now()}] GEN request START session={session_id} msgs_in={len(incoming)}")
+
     st = handle_incoming(session_id, incoming)
 
-    # NEW: derive latest user text from *this request's* messages only
+    # latest user text from THIS request only
     latest_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
+    lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
 
-    # Use that for web injection (keeps past turns from hijacking the query)
+    # --- ROUTER → (maybe) SUMMARIZER → (maybe) WEB BLOCK ----------------------
+    t0 = time.perf_counter()
+    print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
     try:
-        await always_inject_web_block(st, latest_user_text, k=int(getattr(data, "webK", 3) or 3))
-    except Exception as e:
-        log.exception("generate: web injection step failed: %s", e)
+        need_web, proposed_q = decide_web(llm, str(latest_user_text or ""))
+        print(f"[{_now()}] ROUTER decision need_web={need_web} proposed_q={proposed_q!r}")
 
-    out_budget = data.max_tokens or 512
+        if need_web:
+            base_query = proposed_q or str(latest_user_text or "")
+            q_summary = summarize_query(llm, base_query)
+            q_summary = q_summary.strip().strip('"\'')
+
+            print(f"[{_now()}] SUMMARIZER out={q_summary!r}")
+
+            k = int(getattr(data, "webK", 3) or 3)
+            print(f"[{_now()}] ORCH build start k={k} q={q_summary!r}")
+            block = await build_web_block(q_summary, k=k)
+            print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
+
+            if block:
+                # CRITICAL: wrap as a proper chat message (dict), not a raw string
+                st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
+                    {
+                        "role": "assistant",
+                        # *** ONLY REQUIRED CHANGE: mark findings as authoritative in the content ***
+                        "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
+                    }
+                ]
+                types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
+                print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
+
+        dt = time.perf_counter() - t0
+        eph_cnt = len(st.get("_ephemeral_web") or [])
+        print(f"[{_now()}] GEN web_inject END   session={session_id} elapsed={dt:.3f}s ephemeral_blocks={eph_cnt}")
+    except Exception as e:
+        dt = time.perf_counter() - t0
+        print(f"[{_now()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
+
+    out_budget_req = data.max_tokens or 512
     system_text = build_system_text()
 
+    # consume ephemeral web block so it doesn't stick across turns
+    ephemeral_once = st.pop("_ephemeral_web", [])
     packed, st["summary"], _ = pack_with_rollup(
         system_text=system_text,
         summary=st["summary"],
         recent=st["recent"],
         max_ctx=4096,
-        out_budget=out_budget,
-        ephemeral=st.get("_ephemeral_web") or [],
+        out_budget=out_budget_req,
+        ephemeral=ephemeral_once,
+    )
+
+    packed_chars = _chars_len(packed)
+    print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
+
+    # dump the exact prompt (messages + params) we will send to the model
+    _dump_full_prompt(
+        packed,
+        params={
+            "requested_out": out_budget_req,
+            "temperature": (data.temperature or 0.6),
+            "top_p": (data.top_p or 0.9),
+        },
+        session_id=session_id,
     )
 
     persist_summary(session_id, st["summary"])
 
     out_budget, input_tokens_est = clamp_out_budget(
-        llm=llm, messages=packed, requested_out=out_budget, margin=32
+        llm=llm, messages=packed, requested_out=out_budget_req, margin=32
     )
+    print(f"[{_now()}] GEN clamp_out_budget  session={session_id} out_budget={out_budget} input_tokens_est={input_tokens_est}")
 
     stop_ev = cancel_event(session_id)
     stop_ev.clear()
@@ -942,6 +1040,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         async with GEN_SEMAPHORE:
             mark_active(session_id, +1)
             try:
+                print(f"[{_now()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
                 async for chunk in run_stream(
                     llm=llm,
                     messages=packed,
@@ -959,6 +1058,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                     apply_pending_for(session_id)
                 except Exception:
                     pass
+                print(f"[{_now()}] GEN run_stream END   session={session_id}")
                 mark_active(session_id, -1)
 
     return StreamingResponse(
@@ -967,7 +1067,6 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
-# cancel endpoints (unchanged)
 async def cancel_session(session_id: str):
     from .cancel import cancel_event
     cancel_event(session_id).set()
@@ -984,12 +1083,18 @@ from typing import Tuple, List, Dict, Optional
 from ..core.memory import build_system, pack_messages, roll_summary_if_needed
 
 def build_system_text() -> str:
-    return build_system(style="", short=False, bullets=False)
+    base = build_system(style="", short=False, bullets=False)
+    guidance = (
+        "\nYou may consult the prior messages to answer questions about the conversation itself "
+        "(e.g., “what did I say first?”). When web context is present, consider it as evidence, "
+        "prefer newer info if it conflicts with older memory, and respond in your own words."
+    )
+    return (base + guidance)
 
 def pack_with_rollup(
     *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
     ephemeral: Optional[List[Dict[str, str]]] = None,
-) -> Tuple[List[Dict[str,str]], str, int]:
+) -> Tuple[List[Dict[str, str]], str, int]:
     packed, input_budget = pack_messages(
         style="", short=False, bullets=False,
         summary=summary, recent=recent, max_ctx=max_ctx, out_budget=out_budget
@@ -998,9 +1103,21 @@ def pack_with_rollup(
         packed=packed, recent=recent, summary=summary,
         input_budget=input_budget, system_text=system_text
     )
-    # ⬇⬇⬇ Append ephemeral web-only messages AFTER rollup so they are never summarized
+
+    # Inject ephemeral (web findings) BEFORE the last user message, so the final turn is still user.
     if ephemeral:
-        packed = packed + list(ephemeral)
+        last_user_idx = None
+        for i in range(len(packed) - 1, -1, -1):
+            m = packed[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user_idx = i
+                break
+        eph = list(ephemeral)
+        if last_user_idx is not None:
+            packed = packed[:last_user_idx] + eph + packed[last_user_idx:]
+        else:
+            packed = packed + eph
+
     return packed, new_summary, input_budget
 
 # ===== aimodel/file_read/services/session_io.py =====
@@ -1868,6 +1985,7 @@ async def watch_disconnect(request, stop_ev):
 from __future__ import annotations
 from typing import List, Optional, Tuple
 import asyncio, time
+from urllib.parse import urlparse
 
 # Prefer new package; fallback for compatibility
 try:
@@ -1902,10 +2020,18 @@ def _cache_get(query: str) -> Optional[List[SearchHit]]:
 def _cache_set(query: str, hits: List[SearchHit]) -> None:
     _CACHE[_cache_key(query)] = (time.time(), hits)
 
+def _host(u: str) -> str:
+    try:
+        h = (urlparse(u).hostname or "").lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
 # -------- DDGS (official client) ---------------------------------------------
 def _ddg_sync_search(query: str, k: int) -> List[SearchHit]:
     results: List[SearchHit] = []
     if DDGS is None:
+        print(f"[{time.strftime('%X')}] ddg: PROVIDER MISSING (DDGS=None)")
         return results
     with DDGS() as ddg:
         for i, r in enumerate(ddg.text(query, max_results=max(1, k),
@@ -1925,8 +2051,12 @@ class DuckDuckGoProvider:
     async def search(self, query: str, k: int = 3) -> List[SearchHit]:
         """
         Returns top-k SearchHit results via DDGS.
-        Prints timestamps for start, after hits, and before return.
-        Caches top 10 and slices to k.
+
+        Added prints:
+          - START with normalized query, k
+          - CACHE HIT / MISS with timing
+          - For fetched results: total count, top items (idx, host, title, url)
+          - RETURN with timing and top titles
         """
         t0 = time.time()
         q_norm = (query or "").strip()
@@ -1941,7 +2071,8 @@ class DuckDuckGoProvider:
         if cached is not None:
             dt = time.time() - t0
             out = cached[:k]
-            print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={dt:.2f}s hits={len(out)}")
+            top_preview = [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]]
+            print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={dt:.2f}s hits={len(out)} top={top_preview}")
             return out
 
         # fetch superset once
@@ -1951,9 +2082,15 @@ class DuckDuckGoProvider:
             try:
                 step = time.time()
                 hits = await asyncio.to_thread(_ddg_sync_search, q_norm, sup_k)
-                print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={time.time() - step:.2f}s count={len(hits)}")
+                dt_fetch = time.time() - step
+                print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={dt_fetch:.2f}s count={len(hits)}")
+                # verbose preview of first few results
+                for h in hits[:5]:
+                    print(f"[{time.strftime('%X')}] ddg:   {h.rank:>2} | host={_host(h.url)} | title={(h.title or '')[:80]!r} | url={h.url}")
             except Exception as e:
                 print(f"[{time.strftime('%X')}] ddg: ERROR {e}")
+        else:
+            print(f"[{time.strftime('%X')}] ddg: SKIP (DDGS unavailable)")
 
         # store superset and return slice
         _cache_set(q_norm, hits)
@@ -2000,29 +2137,22 @@ async def fetch_many(urls: List[str], per_timeout_s: float = 8.0, cap_chars: int
 
 # ===== aimodel/file_read/web/orchestrator.py =====
 
+# aimodel/file_read/web/orchestrator.py
 from __future__ import annotations
-from typing import Optional, List, Tuple
+from typing import List, Tuple
 from urllib.parse import urlparse
-import logging
 import time
+import re
 
 from .duckduckgo import DuckDuckGoProvider
 from .provider import SearchHit
 from .fetch import fetch_many
 
-logger = logging.getLogger("aimodel.web.orchestrator")
-
-DEFAULT_K = 2                 # ↓ fewer sources by default (was 3)
-MAX_BLOCK_TOKENS_EST = 700    # you already had this; we’ll respect ~char budget below
-TOTAL_CHAR_BUDGET = 1600      # ~ 400 tokens (≈4 chars/token); tune to your model speed
-PER_DOC_CHAR_BUDGET = 900     # trim each page harder (was 1200)
+DEFAULT_K = 2                 # fewer sources by default
+MAX_BLOCK_TOKENS_EST = 700    # respect ~char budget below
+TOTAL_CHAR_BUDGET = 1600      # ~ 400 tokens (≈4 chars/token)
+PER_DOC_CHAR_BUDGET = 900     # trim each page harder
 MAX_PARALLEL_FETCH = 2        # avoid overfetching & reduce prompt bloat
-
-TRUSTED_DOMAINS = {"healthcare.gov", "kff.org", "irs.gov", "who.int", "cdc.gov"}
-
-def _char_budget_from_tokens(tokens: int) -> int:
-    # crude 4 chars/token rule of thumb
-    return max(400, int(tokens * 4))
 
 def _clean_ws(s: str) -> str:
     return " ".join((s or "").split())
@@ -2035,7 +2165,7 @@ def _head_tail(text: str, max_chars: int) -> str:
     return _clean_ws(text[:head] + " … " + text[-tail:])
 
 def condense_doc(title: str, url: str, text: str, max_chars: int = PER_DOC_CHAR_BUDGET) -> str:
-    # keep title, the final URL (no query params noise if you want), and a trimmed body
+    # keep title, final URL, and a trimmed body
     body = _head_tail(text or "", max_chars)
     safe_title = _clean_ws(title or url)
     return f"- {safe_title}\n  {url}\n  {body}"
@@ -2044,127 +2174,150 @@ def _host(url: str) -> str:
     h = (urlparse(url).hostname or "").lower()
     return h[4:] if h.startswith("www.") else h
 
-def score_hit(hit: SearchHit, year_hint: Optional[str] = None) -> int:
+def _tokens(s: str) -> List[str]:
+    return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
+
+def score_hit(hit: SearchHit, query: str) -> int:
+    """
+    Generic, content-based scoring (no hardcoded domains, no date/month/year rules).
+    Signals:
+      - exact phrase in title (+3) / substring in title (+2)
+      - token coverage in title (+0..2)
+      - token touch in snippet (+1 if any)
+    """
     score = 0
-    host = _host(hit.url)
-    if host in TRUSTED_DOMAINS:
-        score += 5
-    if year_hint and year_hint in (hit.title or ""):
-        score += 2
+    q = (query or "").strip().lower()
+    title = (hit.title or "").strip()
+    snippet = (hit.snippet or "").strip()
+    title_l = title.lower()
+    snip_l  = snippet.lower()
+
+    if q:
+        if title_l == q:
+            score += 3
+        elif q in title_l:
+            score += 2
+
+    qtoks = _tokens(q)
+    if qtoks:
+        cov_title = sum(1 for t in qtoks if t in title_l)
+        if cov_title == len(qtoks):
+            score += 2
+        elif cov_title > 0:
+            score += 1
+
+        cov_snip = sum(1 for t in qtoks if t in snip_l)
+        if cov_snip > 0:
+            score += 1
+
     return score
 
-def _year_hint_from_query(query: str) -> Optional[str]:
-    for token in (query or "").split():
-        if token.isdigit() and len(token) == 4:
-            return token
-    return None
-
-async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: float = 8.0) -> Optional[str]:
-    q_short = (query[:140] + "…") if len(query) > 140 else query
-    logger.info("orch: start q=%r k=%d per_timeout=%.1fs", q_short, k, per_url_timeout_s)
+async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: float = 8.0) -> str | None:
+    start_time = time.time()
+    print(f"[orchestrator] IN  @ {start_time:.3f}s | query={query!r}")
 
     t0 = time.perf_counter()
     provider = DuckDuckGoProvider()
 
     # --- SEARCH (light overfetch) ---
-    t_s = time.perf_counter()
     overfetch = max(k + 1, int(k * 1.5))
-    logger.info("orch: calling DDG with query=%r k=%d (overfetch=%d)", query, k, overfetch)
+    print(f"[orchestrator] SEARCH start overfetch={overfetch} k={k}")
     try:
         hits: List[SearchHit] = await provider.search(query, k=overfetch)
     except Exception as e:
-        logger.exception("orch: provider.search error: %s", e)
+        print(f"[orchestrator] ERROR during search for {query!r}: {e}")
         return None
-    dt_s = time.perf_counter() - t_s
-    logger.info("orch: search done hits=%d dt=%.3fs", len(hits or []), dt_s)
-
-    for i, h in enumerate(hits[:5]):
-        logger.debug("orch: raw[%d] title=%r url=%s", i, (h.title or "")[:120], h.url)
+    print(f"[orchestrator] SEARCH done hits={len(hits)} dt={time.perf_counter() - t0:.3f}s")
 
     if not hits:
-        logger.warning("orch: no search hits")
+        print(f"[orchestrator] OUT @ {time.time():.3f}s | no hits | elapsed={time.time()-start_time:.3f}s")
         return None
 
     # --- SCORING / DEDUPE ---
-    year_hint = _year_hint_from_query(query)
-    logger.debug("orch: year_hint=%r", year_hint)
-
+    print(f"[orchestrator] SCORING generic (no hardcoded boosts)")
     seen = set()
     scored: List[Tuple[int, SearchHit]] = []
-    for h in hits:
+    for idx, h in enumerate(hits):
         u = (h.url or "").strip()
-        if not u or u in seen:
+        if not u:
+            print(f"[orchestrator]   skip[{idx}] empty url")
+            continue
+        if u in seen:
+            print(f"[orchestrator]   dup [{idx}] host={_host(u)} title={(h.title or '')[:60]!r}")
             continue
         seen.add(u)
-        scored.append((score_hit(h, year_hint), h))
-    logger.info("orch: scored=%d unique=%d", len(scored), len(seen))
+        s = score_hit(h, query)
+        scored.append((s, h))
+        print(f"[orchestrator]   meta[{idx}] score={s} host={_host(u)} title={(h.title or '')[:80]!r} url={u}")
 
     if not scored:
-        logger.warning("orch: no unique hits after dedupe")
+        print(f"[orchestrator] OUT @ {time.time():.3f}s | no unique hits | elapsed={time.time()-start_time:.3f}s")
         return None
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top_hits = [h for _, h in scored[:k]]
 
     for i, h in enumerate(top_hits, 1):
-        logger.info("orch: pick[%d/%d] score=%d host=%s title=%r url=%s",
-                    i, k, score_hit(h, year_hint), _host(h.url), (h.title or "")[:80], h.url)
+        print(f"[orchestrator] PICK {i}/{k} score={score_hit(h, query)} host={_host(h.url)} title={(h.title or '')[:80]!r}")
 
     # --- FETCH (tighter caps) ---
     urls = [h.url for h in top_hits]
     meta = [(h.title or h.url, h.url) for h in top_hits]
-    logger.info("orch: fetch_many urls=%s", urls)
+    print(f"[orchestrator] FETCH start urls={[ _host(u) for u in urls ]}")
 
     t_f = time.perf_counter()
     results = await fetch_many(
         urls,
         per_timeout_s=per_url_timeout_s,
-        cap_chars=min(2000, PER_DOC_CHAR_BUDGET * 2),  # hard cap upstream text
-        max_parallel=MAX_PARALLEL_FETCH,               # fewer parallel fetches
+        cap_chars=min(2000, PER_DOC_CHAR_BUDGET * 2),
+        max_parallel=MAX_PARALLEL_FETCH,
     )
     dt_f = time.perf_counter() - t_f
-    logger.info("orch: fetch_many done n=%d dt=%.3fs", len(results), dt_f)
+    print(f"[orchestrator] FETCH done n={len(results)} dt={dt_f:.3f}s")
 
     chunks: List[str] = []
     for original_url, res in results:
         if not res:
-            logger.warning("orch: fetch miss url=%s", original_url)
+            print(f"[orchestrator]   fetch MISS url={original_url}")
             continue
         final_url, status, text = res
         title = next((t for (t, u) in meta if u == original_url), final_url)
-        logger.debug("orch: fetched url=%s -> final=%s status=%s text_len=%d",
-                     original_url, final_url, status, len(text or ""))
+        tl = len(text or "")
+        print(f"[orchestrator]   fetch OK   status={status} host={_host(final_url)} text_len={tl} title={(title or '')[:80]!r}")
         if not text:
             continue
-        chunks.append(condense_doc(title, final_url, text, max_chars=PER_DOC_CHAR_BUDGET))
+        chunk = condense_doc(title, final_url, text, max_chars=PER_DOC_CHAR_BUDGET)
+        chunks.append(chunk)
+        print(f"[orchestrator]   chunk len={len(chunk)} host={_host(final_url)}")
 
     if not chunks:
-        logger.warning("orch: no chunks built from fetched pages")
+        print(f"[orchestrator] OUT @ {time.time():.3f}s | no chunks | elapsed={time.time()-start_time:.3f}s")
         return None
 
     # --- ENFORCE TOTAL BUDGET ---
-    # Reserve a little for the header; then trim chunk list to fit TOTAL_CHAR_BUDGET
     header = f"Web findings for: {query}"
     available = max(200, TOTAL_CHAR_BUDGET - len(header) - 2)
     block_parts: List[str] = []
     used = 0
-    for ch in chunks:
+    for idx, ch in enumerate(chunks):
         cl = len(ch)
-        if used + cl + (2 if block_parts else 0) > available:
-            # try a half-size version to squeeze one more in
-            shrunk = _head_tail(ch, max(200, available - used - (2 if block_parts else 0)))
+        sep = (2 if block_parts else 0)
+        if used + cl + sep > available:
+            shrunk = _head_tail(ch, max(200, available - used - sep))
+            print(f"[orchestrator]   budget hit at chunk[{idx}] orig={cl} shrunk={len(shrunk)} used_before={used} avail={available}")
             if len(shrunk) > 200:
                 block_parts.append(shrunk)
-                used += len(shrunk) + (2 if block_parts else 0)
+                used += len(shrunk) + sep
             break
         block_parts.append(ch)
-        used += cl + (2 if block_parts else 0)
+        used += cl + sep
+        print(f"[orchestrator]   take chunk[{idx}] len={cl} used_total={used}/{available}")
 
     body = "\n\n".join(block_parts)
     block = f"{header}\n\n{body}"
 
-    logger.info("orch: block_ready chunks=%d total_chars=%d total_dt=%.3fs",
-                len(block_parts), len(block), time.perf_counter() - t0)
+    end_time = time.time()
+    print(f"[orchestrator] OUT @ {end_time:.3f}s | elapsed={end_time-start_time:.3f}s | chunks={len(block_parts)} | chars={len(block)}")
     return block
 
 # ===== aimodel/file_read/web/provider.py =====
@@ -2189,54 +2342,64 @@ class SearchProvider:
 # aimodel/file_read/web/query_summarizer.py
 from __future__ import annotations
 from typing import Any
+import re
 
 _PROMPT = """Summarize the user's request into a concise web search query.
 Keep only the key entities and terms.
-Do not explain, just output the query text.
+Do not explain, and do not surround the result in quotation marks or other punctuation.
+You may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.
+Keep the original word order. Output only the query text.
 
 User: {text}
 Query:"""
 
+def _tokens(s: str) -> set[str]:
+    # simple, generic normalization (no term lists)
+    return set(re.findall(r"\w+", (s or "").lower()))
+
 def summarize_query(llm: Any, user_text: str) -> str:
-  out = llm.create_chat_completion(
-      messages=[{"role": "user", "content": _PROMPT.format(text=user_text)}],
-      max_tokens=32,
-      temperature=0.0,
-      top_p=0.9,
-      stream=False,
-      stop=["\n", "</s>"],
-  )
-  return out["choices"][0]["message"]["content"].strip()
+    txt = (user_text or "").strip()
+    print(f"[SUMMARIZER] IN user_text={txt!r}")
+
+    # 1) Bypass LLM for tiny inputs to avoid paraphrase drift
+    if len(txt) <= 32 and len(txt.split()) <= 3:
+        print(f"[SUMMARIZER] BYPASS (short) -> {txt!r}")
+        return txt
+
+    out = llm.create_chat_completion(
+        messages=[{"role": "user", "content": _PROMPT.format(text=txt)}],
+        max_tokens=32,
+        temperature=0.0,
+        top_p=1.0,           # fully greedy; reduces unintended paraphrasing
+        stream=False,
+        stop=["\n", "</s>"],
+    )
+    result = (out["choices"][0]["message"]["content"] or "").strip()
+
+    # 2) Similarity fallback (generic, no special terms)
+    src_toks = _tokens(txt)
+    out_toks = _tokens(result)
+    if not result or not out_toks:
+        print(f"[SUMMARIZER] RETAIN (empty/none) -> {txt!r}")
+        print(f"[SUMMARIZER] OUT query={txt!r}")
+        return txt
+
+    jaccard = (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
+    if jaccard < 0.6:
+        print(f"[SUMMARIZER] RETAIN (low overlap {jaccard:.2f}) -> {txt!r}")
+        print(f"[SUMMARIZER] OUT query={txt!r}")
+        return txt
+
+    print(f"[SUMMARIZER] OUT query={result!r} (overlap {jaccard:.2f})")
+    return result
 
 # ===== aimodel/file_read/web/router_ai.py =====
 
+# aimodel/file_read/web/router_ai.py
 from __future__ import annotations
 from typing import Tuple, Optional, Any
 import json
 import re
-import logging
-
-logger = logging.getLogger("aimodel.web.router_ai")
-
-# Local facts (don't route to web)
-_LOCAL_FACT_RE = re.compile(
-    r"\b("
-    r"what('?| i)s\s+(today'?s|the)\s+(date|day)|"
-    r"(what\s*time\s+is\s+it)|(current\s+time)"
-    r")\b",
-    re.I,
-)
-
-# Recency / prices / schedules -> web
-_RECENCY_RE = re.compile(
-    r"\b("
-    r"today|now|latest|this\s+(week|month|year)|new(est)?|recent|current|as\s+of|"
-    r"price|prices|cost|deadline|enrollment|open\s+enrollment|"
-    r"score|scores|schedule|released|release|update|news|"
-    r"law|regulation|policy|tax|weather|forecast"
-    r")\b",
-    re.I,
-)
 
 # IMPORTANT: Double braces to escape JSON in .format()
 _PROMPT = (
@@ -2259,34 +2422,25 @@ def _force_json(s: str) -> Optional[dict]:
             return None
 
 def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
+    """
+    General-purpose router with no hardcoded heuristics.
+    - Lets the model decide if web is needed.
+    - Supports explicit overrides via "web:" / "search:".
+    - Returns (need_web, query_if_needed).
+    """
     if not user_text or not user_text.strip():
-        logger.debug("router: empty user_text -> need=False")
         return (False, None)
 
     t = user_text.strip()
-    short = (t[:140] + "…") if len(t) > 140 else t
-    logger.info("router: start text=%r", short)
-
-    # explicit override
     low = t.lower()
+
+    # Explicit override: allow caller to force web and optionally supply a query
     if low.startswith("web:") or low.startswith("search:"):
         q = t.split(":", 1)[1].strip() or t
-        logger.info("router: explicit override -> need=True query=%r", q)
         return (True, q)
 
-    # local facts (date/time/day) -> no web
-    if _LOCAL_FACT_RE.search(t):
-        logger.info("router: local-fact match -> need=False")
-        return (False, None)
-
-    # recency/price/schedule heuristic
-    if _RECENCY_RE.search(t):
-        logger.info("router: recency heuristic -> need=True query=%r", t)
-        return (True, t)
-
-    # fallback to LLM
+    # Model-based decision (no regex/rule hardcodes)
     try:
-        logger.debug("router: calling LLM for decision")
         out = llm.create_chat_completion(
             messages=[{"role": "user", "content": _PROMPT.format(text=t)}],
             max_tokens=64,
@@ -2296,15 +2450,13 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
             stop=["</s>", "\n\n"],
         )
         text = out["choices"][0]["message"]["content"].strip()
-        logger.debug("router: LLM raw response=%r", text)
-    except Exception as e:
-        logger.exception("router: LLM decision call failed: %s", e)
+    except Exception:
+        # If the decision model fails, default to no web to avoid surprises
         return (False, None)
 
     data = _force_json(text) or {}
     need = bool(data.get("need", False))
     query = (str(data.get("query") or "")).strip() or (t if need else None)
-    logger.info("router: decision need=%s query=%r parsed=%s", need, query, bool(data))
     return (need, query if need else None)
 
 # ===== frontend/src/file_read/App.tsx =====
@@ -2874,214 +3026,4 @@ export default function ChatSidebar({
         style={{ WebkitOverflowScrolling: "touch" }}
       >
         {initialLoading && (
-          <div className="px-2 py-1 text-xs text-gray-500">Loading…</div>
-        )}
-
-        <ul className="space-y-1">
-          {chats.map((c: ChatRow) => (
-            <SidebarListItem
-              key={c.sessionId}
-              c={c}
-              isActive={activeId === c.sessionId}
-              isEditing={isEditing}
-              isChecked={selected.has(c.sessionId)}
-              onToggle={() => toggleOne(c.sessionId)}
-              onOpen={() => void onOpen(c.sessionId)}
-            />
-          ))}
-        </ul>
-
-        <div className="h-6" ref={sentinelRef} />
-
-        {hasMore && (
-          <div className="px-2 pb-2">
-            <button
-              className={`w-full text-xs px-3 py-1 rounded border ${loadingMore ? "opacity-50 cursor-wait" : ""}`}
-              onClick={() => void loadMore()}
-              disabled={loadingMore}
-              title="Load next page"
-            >
-              {loadingMore ? "Loading…" : `Load more (${chats.length}/${total || "?"})`}
-            </button>
-          </div>
-        )}
-
-        {!hasMore && chats.length > 0 && (
-          <div className="px-2 py-2 text-[11px] text-gray-400 text-center">
-            End of list • showing {chats.length} of {total || chats.length}
-          </div>
-        )}
-      </div>
-
-      {/* FOOTER META */}
-      <div className="border-t px-3 py-2 text-[11px] text-gray-500">
-        <span className="uppercase tracking-wide">Chats</span>{" "}
-        <span className="text-gray-400">
-          ({chats.length}{total ? `/${total}` : ""} • page {Math.max(page, 1)} of {Math.max(totalPages || 1, 1)})
-        </span>
-        {isEditing && (
-          <label className="ml-2 text-[11px]">
-            <input
-              type="checkbox"
-              className="mr-1 align-middle"
-              checked={allSelected}
-              onChange={toggleAll}
-            />
-            Select all
-          </label>
-        )}
-      </div>
-    </aside>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatSidebar/SidebarHeader.tsx =====
-
-import { PanelLeftClose, Plus, Pencil, Trash2 } from "lucide-react";
-
-export default function SidebarHeader({
-  isEditing, setIsEditing, newPending, onNew, onHideSidebar,
-  selectedCount, deleting, onDelete,
-}: {
-  isEditing: boolean;
-  setIsEditing: (v: boolean) => void;
-  newPending: boolean;
-  onNew: () => Promise<void>;
-  onHideSidebar?: () => void;
-  selectedCount: number;
-  deleting: boolean;
-  onDelete: () => void;
-}) {
-  return (
-    <div className="sticky top-0 z-10 bg-white border-b">
-      <div className="flex items-center justify-between px-3 py-2">
-        <div className="text-[11px] md:text-xs uppercase text-gray-500">Chats</div>
-        <div className="flex items-center gap-2">
-          <button
-            className={`h-9 px-3 inline-flex items-center gap-2 justify-center rounded border ${
-              newPending ? "opacity-50 cursor-not-allowed" : ""
-            }`}
-            onClick={async () => { if (!newPending) await onNew(); }}
-            title="New chat"
-            disabled={newPending}
-          >
-            <Plus className="w-4 h-4" />
-            <span className="text-xs md:text-[11px] leading-none">New</span>
-          </button>
-
-          <button
-            className="h-9 px-3 inline-flex items-center gap-2 justify-center rounded border"
-            onClick={() => setIsEditing(!isEditing)}
-            aria-pressed={isEditing}
-            title={isEditing ? "Exit edit mode" : "Edit chats"}
-          >
-            <Pencil className="w-4 h-4" />
-            <span className="text-xs md:text-[11px] leading-none">
-              {isEditing ? "Done" : "Edit"}
-            </span>
-          </button>
-
-          {onHideSidebar && (
-            <button
-              className="hidden md:inline-flex h-9 w-9 items-center justify-center rounded border"
-              onClick={onHideSidebar}
-              title="Hide sidebar"
-              aria-label="Hide sidebar"
-            >
-              <PanelLeftClose className="w-4 h-4" />
-            </button>
-          )}
-        </div>
-      </div>
-
-      {isEditing && (
-        <div className="px-3 py-2 border-t bg-white flex items-center gap-3">
-          <div className="text-sm text-gray-600">{selectedCount} selected</div>
-          <button
-            className={`ml-auto inline-flex items-center gap-2 text-sm px-3 py-1 rounded ${
-              selectedCount && !deleting
-                ? "bg-red-600 text-white"
-                : "bg-gray-200 text-gray-500 cursor-not-allowed"
-            }`}
-            disabled={!selectedCount || deleting}
-            onClick={onDelete}
-            title={selectedCount ? "Delete selected chats" : "Select chats to delete"}
-          >
-            <Trash2 className="w-4 h-4" />
-            {deleting ? "Deleting…" : `Delete (${selectedCount})`}
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatSidebar/SidebarListItem.tsx =====
-
-import { firstLineSmart } from "../../shared/lib/text";
-import type { ChatRow } from "../../types/chat";
-
-export default function SidebarListItem({
-  c, isActive, isEditing, isChecked, onToggle, onOpen,
-}: {
-  c: ChatRow;
-  isActive: boolean;
-  isEditing: boolean;
-  isChecked: boolean;
-  onToggle: () => void;
-  onOpen: () => void;
-}) {
-  const displayTitle =
-    (c.title && c.title.trim()) ||
-    firstLineSmart(c.lastMessage || "", 48) ||
-    "New Chat";
-  const preview = c.lastMessage ? firstLineSmart(c.lastMessage, 120) : "";
-
-  return (
-    <li>
-      <div
-        className={`w-full flex items-start gap-2 px-2 py-2 rounded ${
-          isActive ? "bg-black text-white" : "hover:bg-gray-50"
-        }`}
-      >
-        {isEditing && (
-          <input
-            type="checkbox"
-            checked={isChecked}
-            onChange={onToggle}
-            className="mt-1"
-            aria-label={`Select chat ${displayTitle}`}
-          />
-        )}
-        <button
-          className="text-left flex-1"
-          aria-current={isActive ? "true" : undefined}
-          onClick={() => { if (!isEditing) onOpen(); }}
-          title={displayTitle}
-        >
-          <div className="font-medium truncate">{displayTitle}</div>
-          {preview && (
-            <div className={`text-xs line-clamp-2 ${isActive ? "text-white/80" : "text-gray-500"}`}>
-              {preview}
-            </div>
-          )}
-          <div className="text-[10px] mt-1 opacity-60">
-            {new Date(c.updatedAt).toLocaleString()}
-          </div>
-        </button>
-      </div>
-    </li>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatView/ChatView.tsx =====
-
-// frontend/src/file_read/components/ChatView/ChatView.tsx
-import { useEffect, useMemo, useRef } from "react";
-import type { ChatMsg } from "../../types/chat";
-import type { GenMetrics, RunJson } from "../../hooks/useChatStream";
-import ChatItem from "../ChatItem";
-import TypingIndicator from "../../shared/ui/TypingIndicator";
-
-// Autofollow sensitivity as a fraction of the visible height.
-const SCROLL_THRESHOLD_VH = 0.7
+          <div className="px-2 py-1 text-xs 

@@ -1,4 +1,214 @@
-5;
+text-gray-500">Loading…</div>
+        )}
+
+        <ul className="space-y-1">
+          {chats.map((c: ChatRow) => (
+            <SidebarListItem
+              key={c.sessionId}
+              c={c}
+              isActive={activeId === c.sessionId}
+              isEditing={isEditing}
+              isChecked={selected.has(c.sessionId)}
+              onToggle={() => toggleOne(c.sessionId)}
+              onOpen={() => void onOpen(c.sessionId)}
+            />
+          ))}
+        </ul>
+
+        <div className="h-6" ref={sentinelRef} />
+
+        {hasMore && (
+          <div className="px-2 pb-2">
+            <button
+              className={`w-full text-xs px-3 py-1 rounded border ${loadingMore ? "opacity-50 cursor-wait" : ""}`}
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              title="Load next page"
+            >
+              {loadingMore ? "Loading…" : `Load more (${chats.length}/${total || "?"})`}
+            </button>
+          </div>
+        )}
+
+        {!hasMore && chats.length > 0 && (
+          <div className="px-2 py-2 text-[11px] text-gray-400 text-center">
+            End of list • showing {chats.length} of {total || chats.length}
+          </div>
+        )}
+      </div>
+
+      {/* FOOTER META */}
+      <div className="border-t px-3 py-2 text-[11px] text-gray-500">
+        <span className="uppercase tracking-wide">Chats</span>{" "}
+        <span className="text-gray-400">
+          ({chats.length}{total ? `/${total}` : ""} • page {Math.max(page, 1)} of {Math.max(totalPages || 1, 1)})
+        </span>
+        {isEditing && (
+          <label className="ml-2 text-[11px]">
+            <input
+              type="checkbox"
+              className="mr-1 align-middle"
+              checked={allSelected}
+              onChange={toggleAll}
+            />
+            Select all
+          </label>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatSidebar/SidebarHeader.tsx =====
+
+import { PanelLeftClose, Plus, Pencil, Trash2 } from "lucide-react";
+
+export default function SidebarHeader({
+  isEditing, setIsEditing, newPending, onNew, onHideSidebar,
+  selectedCount, deleting, onDelete,
+}: {
+  isEditing: boolean;
+  setIsEditing: (v: boolean) => void;
+  newPending: boolean;
+  onNew: () => Promise<void>;
+  onHideSidebar?: () => void;
+  selectedCount: number;
+  deleting: boolean;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="sticky top-0 z-10 bg-white border-b">
+      <div className="flex items-center justify-between px-3 py-2">
+        <div className="text-[11px] md:text-xs uppercase text-gray-500">Chats</div>
+        <div className="flex items-center gap-2">
+          <button
+            className={`h-9 px-3 inline-flex items-center gap-2 justify-center rounded border ${
+              newPending ? "opacity-50 cursor-not-allowed" : ""
+            }`}
+            onClick={async () => { if (!newPending) await onNew(); }}
+            title="New chat"
+            disabled={newPending}
+          >
+            <Plus className="w-4 h-4" />
+            <span className="text-xs md:text-[11px] leading-none">New</span>
+          </button>
+
+          <button
+            className="h-9 px-3 inline-flex items-center gap-2 justify-center rounded border"
+            onClick={() => setIsEditing(!isEditing)}
+            aria-pressed={isEditing}
+            title={isEditing ? "Exit edit mode" : "Edit chats"}
+          >
+            <Pencil className="w-4 h-4" />
+            <span className="text-xs md:text-[11px] leading-none">
+              {isEditing ? "Done" : "Edit"}
+            </span>
+          </button>
+
+          {onHideSidebar && (
+            <button
+              className="hidden md:inline-flex h-9 w-9 items-center justify-center rounded border"
+              onClick={onHideSidebar}
+              title="Hide sidebar"
+              aria-label="Hide sidebar"
+            >
+              <PanelLeftClose className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {isEditing && (
+        <div className="px-3 py-2 border-t bg-white flex items-center gap-3">
+          <div className="text-sm text-gray-600">{selectedCount} selected</div>
+          <button
+            className={`ml-auto inline-flex items-center gap-2 text-sm px-3 py-1 rounded ${
+              selectedCount && !deleting
+                ? "bg-red-600 text-white"
+                : "bg-gray-200 text-gray-500 cursor-not-allowed"
+            }`}
+            disabled={!selectedCount || deleting}
+            onClick={onDelete}
+            title={selectedCount ? "Delete selected chats" : "Select chats to delete"}
+          >
+            <Trash2 className="w-4 h-4" />
+            {deleting ? "Deleting…" : `Delete (${selectedCount})`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatSidebar/SidebarListItem.tsx =====
+
+import { firstLineSmart } from "../../shared/lib/text";
+import type { ChatRow } from "../../types/chat";
+
+export default function SidebarListItem({
+  c, isActive, isEditing, isChecked, onToggle, onOpen,
+}: {
+  c: ChatRow;
+  isActive: boolean;
+  isEditing: boolean;
+  isChecked: boolean;
+  onToggle: () => void;
+  onOpen: () => void;
+}) {
+  const displayTitle =
+    (c.title && c.title.trim()) ||
+    firstLineSmart(c.lastMessage || "", 48) ||
+    "New Chat";
+  const preview = c.lastMessage ? firstLineSmart(c.lastMessage, 120) : "";
+
+  return (
+    <li>
+      <div
+        className={`w-full flex items-start gap-2 px-2 py-2 rounded ${
+          isActive ? "bg-black text-white" : "hover:bg-gray-50"
+        }`}
+      >
+        {isEditing && (
+          <input
+            type="checkbox"
+            checked={isChecked}
+            onChange={onToggle}
+            className="mt-1"
+            aria-label={`Select chat ${displayTitle}`}
+          />
+        )}
+        <button
+          className="text-left flex-1"
+          aria-current={isActive ? "true" : undefined}
+          onClick={() => { if (!isEditing) onOpen(); }}
+          title={displayTitle}
+        >
+          <div className="font-medium truncate">{displayTitle}</div>
+          {preview && (
+            <div className={`text-xs line-clamp-2 ${isActive ? "text-white/80" : "text-gray-500"}`}>
+              {preview}
+            </div>
+          )}
+          <div className="text-[10px] mt-1 opacity-60">
+            {new Date(c.updatedAt).toLocaleString()}
+          </div>
+        </button>
+      </div>
+    </li>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatView/ChatView.tsx =====
+
+// frontend/src/file_read/components/ChatView/ChatView.tsx
+import { useEffect, useMemo, useRef } from "react";
+import type { ChatMsg } from "../../types/chat";
+import type { GenMetrics, RunJson } from "../../hooks/useChatStream";
+import ChatItem from "../ChatItem";
+import TypingIndicator from "../../shared/ui/TypingIndicator";
+
+// Autofollow sensitivity as a fraction of the visible height.
+const SCROLL_THRESHOLD_VH = 0.75;
 const MIN_THRESHOLD_PX = 24;
 
 // Custom event name dispatched by ChatComposer on Send
@@ -1349,7 +1559,8 @@ import { useStream } from "./useStream";
 import { useChatState } from "./useChatState";
 import { useRunState } from "./useRunState";
 import { useMetrics } from "./useMetrics";
-import { useRetitle } from "./useRetitle";
+// Retitle disabled for now
+// import { useRetitle } from "./useRetitle";
 
 export type { GenMetrics, RunJson } from "../shared/lib/runjson";
 
@@ -1358,7 +1569,8 @@ export function useChatStream() {
   const chat = useChatState();
   const run = useRunState();
   const met = useMetrics();
-  const { retitleNow } = useRetitle(true);
+  // Retitle disabled
+  // const { retitleNow } = useRetitle(true);
 
   // session plumbing
   const { sessionIdRef, ensureChatCreated, loadHistory, setSessionId, resetSession } = useSession({
@@ -1375,7 +1587,10 @@ export function useChatStream() {
     setInput: chat.setInput,
     sessionId: () => sessionIdRef.current,
     ensureChatCreated,
-    onRetitle: retitleNow,  
+
+    // 🔕 Retitle disabled: provide a no-op with the expected signature
+    onRetitle: async (_sessionId: string, _latestAssistant: string) => { /* no-op */ },
+
     setLoadingForSession: run.setLoadingFor,
     setQueuedForSession: run.setQueuedFor,
     setMetricsForSession: met.setMetricsFor,
@@ -1419,7 +1634,6 @@ export function useChatStream() {
     send,
     stop,
     cancelSessions,
-    onRetitle: retitleNow,
 
     // session ctl
     setSessionId,
