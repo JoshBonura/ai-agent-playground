@@ -15,14 +15,16 @@ __all__ = [
 
 # ===== aimodel/file_read/api/chats.py =====
 
+# ===== aimodel/file_read/api/chats.py =====
+
 from __future__ import annotations
 from dataclasses import asdict
 from typing import List, Optional, Dict
-from .. import retitle_worker
 
 from fastapi import APIRouter
 from pydantic import BaseModel
-from ..retitle_worker import enqueue as enqueue_retitle
+from ..services.cancel import GEN_SEMAPHORE
+from ..retitle_worker import enqueue as enqueue_retitle  # ✅ import the enqueuer
 
 from ..core.schemas import (
     ChatMetaModel,
@@ -30,7 +32,7 @@ from ..core.schemas import (
     BatchMsgDeleteReq,
     BatchDeleteReq,
     MergeChatReq,
-    EditMessageReq
+    EditMessageReq,
 )
 
 from ..store import (
@@ -44,7 +46,7 @@ from ..store import (
     delete_messages_batch as store_delete_messages_batch,
     merge_chat as store_merge_chat,
     merge_chat_new as store_merge_chat_new,
-    edit_message as edit_message
+    edit_message as edit_message,
 )
 
 router = APIRouter()
@@ -65,8 +67,6 @@ async def api_update_last(session_id: str, body: Dict[str, str]):
     title = body.get("title")
     row = store_update_last(session_id, last_message, title)
     return asdict(row)
-
-
 
 @router.delete("/api/chats/{session_id}/messages/batch")
 async def api_delete_messages_batch(session_id: str, req: BatchMsgDeleteReq):
@@ -98,11 +98,22 @@ async def api_list_messages(session_id: str):
     rows = store_list_messages(session_id)
     return [asdict(r) for r in rows]
 
+# ✅ Single append route; triggers retitle only after assistant turn is persisted
 @router.post("/api/chats/{session_id}/messages")
 async def api_append_message(session_id: str, body: Dict[str, str]):
     role = (body.get("role") or "user").strip()
     content = (body.get("content") or "").rstrip()
     row = store_append(session_id, role, content)
+
+    if role == "assistant":
+        try:
+            msgs = store_list_messages(session_id)
+            last_seq = max((int(m.id) for m in msgs), default=0)
+            enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
+            # print(f"[retitle] ENQUEUE session={session_id} job_seq={last_seq} msgs={len(msgs)}")
+        except Exception:
+            pass
+
     return asdict(row)
 
 @router.delete("/api/chats/batch")
@@ -114,35 +125,16 @@ async def api_delete_batch(req: BatchDeleteReq):
 async def api_merge_chat(req: MergeChatReq):
     if req.newChat:
         new_id, merged = store_merge_chat_new(req.sourceId, req.targetId)
-        return {
-            "newChatId": new_id,
-            "mergedCount": len(merged),
-        }
+        return {"newChatId": new_id, "mergedCount": len(merged)}
     else:
         merged = store_merge_chat(req.sourceId, req.targetId)
         return {"mergedCount": len(merged)}
-
 
 @router.put("/api/chats/{session_id}/messages/{message_id}")
 async def api_edit_message(session_id: str, message_id: int, req: EditMessageReq):
     row = edit_message(session_id, message_id, req.content)
     if not row:
         return {"error": "Message not found"}
-    return asdict(row)
-
-
-@router.post("/api/chats/{session_id}/messages")
-async def api_append_message(session_id: str, body: Dict[str, str]):
-    role = (body.get("role") or "user").strip()
-    content = (body.get("content") or "").rstrip()
-    row = store_append(session_id, role, content)
-
-    # 🚀 Background retitle trigger
-    if role == "user":
-        # get all messages in this session (lightweight index only)
-        msgs = store_list_messages(session_id)
-        enqueue_retitle(session_id, [asdict(m) for m in msgs])
-
     return asdict(row)
 
 # ===== aimodel/file_read/api/generate_router.py =====
@@ -172,22 +164,6 @@ async def _cancel_session(session_id: str):
 @router.post("/api/ai/cancel/{session_id}")
 async def _cancel_session_alias(session_id: str):
     return await cancel_session_alias(session_id)
-
-# ===== aimodel/file_read/api/health.py =====
-
-from __future__ import annotations
-from fastapi import APIRouter
-from ..model_runtime import current_model_info
-
-router = APIRouter()
-
-@router.get("/health")
-async def health():
-    try:
-        info = current_model_info()
-        return {"ok": True, "model": info}
-    except Exception as e:
-        return {"ok": True, "model": {"loaded": False, "error": str(e)}}
 
 # ===== aimodel/file_read/api/models.py =====
 
@@ -240,42 +216,6 @@ async def api_update_settings(patch: Dict[str, object]):
     s = write_settings(patch)
     return s
 
-# ===== aimodel/file_read/api/search.py =====
-
-from __future__ import annotations
-from fastapi import APIRouter, Query
-from pydantic import BaseModel
-from typing import List, Optional
-from ..web.duckduckgo import DuckDuckGoProvider
-from ..web.fetch import fetch_clean
-from fastapi.responses import JSONResponse
-router = APIRouter()
-
-class WebResult(BaseModel):
-    title: str
-    url: str
-    snippet: Optional[str] = None
-    rank: int
-
-
-# ...
-@router.get("/api/search", response_model=List[WebResult])
-async def api_search(q: str = Query(..., min_length=2), k: int = 3):
-    try:
-        prov = DuckDuckGoProvider()
-        hits = await prov.search(q, k=k)
-        if not hits:
-            return JSONResponse({"error": "No results (search may be blocked or rate-limited)."}, status_code=502)
-        return [WebResult(title=h.title, url=h.url, snippet=h.snippet, rank=h.rank) for h in hits]
-    except Exception as e:
-        return JSONResponse({"error": f"search failed: {e}"}, status_code=500)
-
-
-@router.get("/api/fetch")
-async def api_fetch(url: str):
-    final_url, status, text = await fetch_clean(url)
-    return {"url": final_url, "status": status, "preview": text[:2000]}
-
 # ===== aimodel/file_read/app.py =====
 
 # aimodel/file_read/app.py
@@ -285,12 +225,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .paths import bootstrap
 from .retitle_worker import start_worker
-from .api.health import router as health_router
+
 from .api.models import router as models_router
 from .api.chats import router as chats_router
-from .store import process_all_pending
 from .model_runtime import load_model
-from .api.search import router as search_router
 from .api.generate_router import router as generate_router
 from .services.cancel import is_active
 
@@ -305,11 +243,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(health_router)
 app.include_router(models_router)
 app.include_router(chats_router)
 app.include_router(generate_router)
-app.include_router(search_router)
+
 
 @app.on_event("startup")
 async def _startup():
@@ -319,15 +256,6 @@ async def _startup():
     except Exception as e:
         print(f"❌ llama failed to load at startup: {e}")
 
-    async def worker():
-        while True:
-            try:
-                await asyncio.to_thread(process_all_pending, is_active)
-            except Exception:
-                pass
-            await asyncio.sleep(2.0)
-
-    asyncio.create_task(worker(), name="pending_worker")
     asyncio.create_task(start_worker(), name="retitle_worker")
 
 # ===== aimodel/file_read/core/__init__.py =====
@@ -745,6 +673,873 @@ def write_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
     SETTINGS_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return cfg
 
+# ===== aimodel/file_read/policy.py/capability_probe.py =====
+
+# aimodel/file_read/services/capability_probe.py
+from __future__ import annotations
+import asyncio
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional, Tuple
+
+# Optional imports – all guarded
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
+# Local runtime hooks
+try:
+    from ..model_runtime import current_model_info
+except Exception:  # pragma: no cover
+    def current_model_info() -> Dict[str, Any]:  # type: ignore
+        return {"loaded": False, "config": None}
+
+# --------------------------------------------------------------------------------------
+# Data models
+# --------------------------------------------------------------------------------------
+
+@dataclass
+class GPUInfo:
+    index: int
+    name: str
+    vram_total_mb: int
+    vram_free_mb: int
+    driver: Optional[str] = None
+    temperature_c: Optional[float] = None
+
+@dataclass
+class CapabilityReport:
+    # Hardware/OS
+    os: str
+    arch: str
+    backend: str  # "cuda"|"rocm"|"mps"|"cpu"
+    cpu_cores: int
+    load_1m: Optional[float]
+    ram_total_mb: int
+    ram_free_mb: int
+
+    # GPUs
+    gpu_count: int
+    gpus: List[GPUInfo] = field(default_factory=list)
+
+    # Model/runtime config snapshot
+    model_ctx_tokens: int
+    n_threads: int
+    n_gpu_layers: int
+    n_batch: int
+
+    # App/runtime signals (optional, filled by integrators)
+    active_sessions: int = 0
+    p95_latency_ms_decode: Optional[float] = None
+    p95_latency_ms_tokenize: Optional[float] = None
+    tokenizer_tps: Optional[float] = None
+
+    ts_unix: float = field(default_factory=lambda: time.time())
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # dataclasses of GPUs are already dicts because of asdict recursion
+        return d
+
+# --------------------------------------------------------------------------------------
+# Helpers – CPU/RAM
+# --------------------------------------------------------------------------------------
+
+def _cpu_cores() -> int:
+    try:
+        return os.cpu_count() or 1
+    except Exception:
+        return 1
+
+
+def _load_1m() -> Optional[float]:
+    try:
+        if hasattr(os, "getloadavg"):
+            return float(os.getloadavg()[0])
+    except Exception:
+        pass
+    return None
+
+
+def _ram_tot_free_mb() -> Tuple[int, int]:
+    # Prefer psutil when present
+    if psutil is not None:
+        try:
+            vm = psutil.virtual_memory()  # type: ignore[attr-defined]
+            return int(vm.total // (1024 * 1024)), int(vm.available // (1024 * 1024))
+        except Exception:
+            pass
+
+    # Fallbacks by OS
+    try:
+        if platform.system() == "Linux":
+            total = free = 0
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total = int(re.findall(r"\d+", line)[0]) // 1024
+                    elif line.startswith("MemAvailable:"):
+                        free = int(re.findall(r"\d+", line)[0]) // 1024
+            if total and free:
+                return total, free
+        elif platform.system() == "Darwin":
+            # macOS: use vm_stat (pages) as a rough estimate
+            out = subprocess.check_output(["vm_stat"], text=True)
+            m = re.findall(r"page size of (\d+) bytes", out)
+            page = int(m[0]) if m else 4096
+            pages_free = 0
+            for line in out.splitlines():
+                if line.startswith("Pages free") or line.startswith("Pages speculative"):
+                    pages_free += int(re.findall(r"\d+", line)[0])
+                if line.startswith("Pages active") or line.startswith("Pages inactive") or line.startswith("Pages wired down"):
+                    # not used directly; we'll compute total via sysctl
+                    pass
+            total_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
+            free_bytes = pages_free * page
+            return total_bytes // (1024 * 1024), free_bytes // (1024 * 1024)
+        elif platform.system() == "Windows":
+            out = subprocess.check_output(["wmic", "OS", "get", "TotalVisibleMemorySize,FreePhysicalMemory", "/Value"], text=True)
+            kv = dict(
+                (k.strip(), v.strip())
+                for k, v in (line.split("=", 1) for line in out.splitlines() if "=" in line)
+            )
+            total_kib = int(kv.get("TotalVisibleMemorySize", "0") or 0)
+            free_kib = int(kv.get("FreePhysicalMemory", "0") or 0)
+            return total_kib // 1024, free_kib // 1024
+    except Exception:
+        pass
+
+    # Ultimate fallback
+    return 0, 0
+
+# --------------------------------------------------------------------------------------
+# Helpers – GPU detection
+# --------------------------------------------------------------------------------------
+
+_DEF_TIMEOUT = 2.5  # seconds for small probe calls
+
+
+def _run(cmd: List[str]) -> Optional[str]:
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=_DEF_TIMEOUT)
+    except Exception:
+        return None
+
+
+def _probe_nvidia() -> Tuple[str, List[GPUInfo]]:
+    """Return (driver, gpus[]) if nvidia-smi is available, else ("", [])."""
+    if not shutil.which("nvidia-smi"):
+        return "", []
+
+    q = _run([
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.total,memory.free,driver_version,temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ])
+    if not q:
+        return "", []
+
+    gpus: List[GPUInfo] = []
+    driver = None
+    for line in q.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
+            continue
+        try:
+            idx = int(parts[0])
+            name = parts[1]
+            total_mb = int(parts[2])
+            free_mb = int(parts[3])
+            driver = parts[4]
+            temp_c = float(parts[5]) if len(parts) > 5 else None
+            gpus.append(GPUInfo(index=idx, name=name, vram_total_mb=total_mb, vram_free_mb=free_mb, driver=driver, temperature_c=temp_c))
+        except Exception:
+            continue
+    return (driver or ""), gpus
+
+
+def _probe_rocm() -> Tuple[str, List[GPUInfo]]:
+    # Try rocm-smi JSON first; fall back to text parse
+    exe = shutil.which("rocm-smi") or shutil.which("amd-smi")
+    if not exe:
+        return "", []
+
+    out = _run([exe, "--showproductname", "--showid", "--showmeminfo", "vram", "--showtemp"])
+    if not out:
+        return "", []
+
+    # Very loose parsing (rocm-smi text varies)
+    gpus: List[GPUInfo] = []
+    total_mb = free_mb = None
+    name = None
+    idx = -1
+    for line in out.splitlines():
+        if re.search(r"GPU\s*\[?\d+\]?", line):
+            idx += 1
+            total_mb = free_mb = None
+            name = None
+        m_name = re.search(r"Product\s*Name\s*:\s*(.*)$", line)
+        if m_name:
+            name = m_name.group(1).strip()
+        m_total = re.search(r"VRAM Total:\s*(\d+)\s*MiB", line)
+        if m_total:
+            total_mb = int(m_total.group(1))
+        m_free = re.search(r"VRAM Free:\s*(\d+)\s*MiB", line)
+        if m_free:
+            free_mb = int(m_free.group(1))
+        if name and total_mb is not None and free_mb is not None:
+            gpus.append(GPUInfo(index=max(idx, len(gpus)), name=name, vram_total_mb=total_mb, vram_free_mb=free_mb))
+            name = None
+            total_mb = free_mb = None
+    return ("rocm" if gpus else ""), gpus
+
+
+def _probe_mps() -> Tuple[str, List[GPUInfo]]:
+    if platform.system() != "Darwin":
+        return "", []
+    # Quick check for Apple GPU via system_profiler
+    if not shutil.which("system_profiler"):
+        return "", []
+    out = _run(["system_profiler", "SPDisplaysDataType"])
+    if not out:
+        return "", []
+    # We can't get VRAM free reliably here; report total per adapter when available
+    gpus: List[GPUInfo] = []
+    idx = -1
+    for block in out.split("\n\n"):
+        if "Chipset Model" in block or "Apple" in block:
+            idx += 1
+            name_m = re.search(r"Chipset Model:\s*(.*)", block)
+            vram_m = re.search(r"VRAM.*:\s*(\d+(?:\.\d+)?)\s*GB", block)
+            name = name_m.group(1).strip() if name_m else "Apple GPU"
+            total_mb = int(float(vram_m.group(1)) * 1024) if vram_m else 0
+            gpus.append(GPUInfo(index=idx, name=name, vram_total_mb=total_mb, vram_free_mb=0))
+    return ("mps" if gpus else ""), gpus
+
+
+# --------------------------------------------------------------------------------------
+# Probe – aggregate
+# --------------------------------------------------------------------------------------
+
+def _detect_backend_and_gpus() -> Tuple[str, List[GPUInfo]]:
+    # Priority: CUDA > ROCm > MPS > CPU
+    drv, gpus = _probe_nvidia()
+    if gpus:
+        return "cuda", gpus
+
+    drv, gpus = _probe_rocm()
+    if gpus:
+        return "rocm", gpus
+
+    drv, gpus = _probe_mps()
+    if gpus:
+        return "mps", gpus
+
+    return "cpu", []
+
+
+def _model_cfg_snapshot() -> Tuple[int, int, int, int]:
+    try:
+        info = current_model_info() or {}
+        cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
+        return (
+            int(cfg.get("nCtx") or 4096),
+            int(cfg.get("nThreads") or 0),
+            int(cfg.get("nGpuLayers") or 0),
+            int(cfg.get("nBatch") or 0),
+        )
+    except Exception:
+        return (4096, 0, 0, 0)
+
+
+def probe_once() -> CapabilityReport:
+    os_name = platform.system()
+    arch = platform.machine()
+
+    backend, gpus = _detect_backend_and_gpus()
+    cpu_cores = _cpu_cores()
+    load_1m = _load_1m()
+    ram_total_mb, ram_free_mb = _ram_tot_free_mb()
+
+    nctx, nthreads, ngpu_layers, nbatch = _model_cfg_snapshot()
+
+    return CapabilityReport(
+        os=os_name,
+        arch=arch,
+        backend=backend,
+        cpu_cores=cpu_cores,
+        load_1m=load_1m,
+        ram_total_mb=ram_total_mb,
+        ram_free_mb=ram_free_mb,
+        gpu_count=len(gpus),
+        gpus=gpus,
+        model_ctx_tokens=nctx,
+        n_threads=nthreads,
+        n_gpu_layers=ngpu_layers,
+        n_batch=nbatch,
+    )
+
+# --------------------------------------------------------------------------------------
+# Public API – cached access + periodic refresh
+# --------------------------------------------------------------------------------------
+
+_refresh_interval_s = 12.0
+_cache_ttl_s = 9.0
+_latest_lock = threading.RLock()
+_latest: Optional[CapabilityReport] = None
+_task: Optional[asyncio.Task] = None
+
+
+def collect_capabilities(force: bool = False) -> CapabilityReport:
+    global _latest
+    with _latest_lock:
+        if not force and _latest and (time.time() - _latest.ts_unix) < _cache_ttl_s:
+            return _latest
+        rep = probe_once()
+        _latest = rep
+        return rep
+
+
+async def _periodic_loop():  # pragma: no cover
+    global _latest
+    while True:
+        try:
+            rep = probe_once()
+            with _latest_lock:
+                _latest = rep
+        except Exception:
+            # Keep going on probe errors; next loop may succeed
+            pass
+        await asyncio.sleep(_refresh_interval_s)
+
+
+def start_periodic_refresh(interval_s: float = 12.0, cache_ttl_s: float = 9.0) -> None:
+    """Start a background task that keeps the capability snapshot fresh.
+
+    Safe to call multiple times; it will start once.
+    """
+    global _task, _refresh_interval_s, _cache_ttl_s
+    _refresh_interval_s = max(3.0, float(interval_s))
+    _cache_ttl_s = max(1.0, float(cache_ttl_s))
+
+    if _task and not _task.done():
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop running (e.g., during unit tests); create a temporary loop thread
+        def _runner():
+            asyncio.run(_periodic_loop())
+        t = threading.Thread(target=_runner, name="cap_probe", daemon=True)
+        t.start()
+        return
+
+    _task = loop.create_task(_periodic_loop(), name="capability_probe")
+
+
+# --------------------------------------------------------------------------------------
+# Debug helpers
+# --------------------------------------------------------------------------------------
+
+def debug_dump() -> str:
+    rep = collect_capabilities()
+    return json.dumps(rep.to_dict(), indent=2)
+
+
+# ===== aimodel/file_read/policy.py/policy_config.py =====
+
+"""Adaptive policy configuration for routing, summarization, and budgets.
+
+This module converts a CapabilityReport (from capability_probe.py) into a concrete
+set of runtime policies used by the app: context budgeting, summarization
+aggressiveness, web-search breadth, and streaming parameters.
+
+Design goals
+------------
+- Deterministic, side‑effect free mapping from capabilities → knobs
+- Safe minimums on low-spec systems; scale up gracefully on high-spec
+- Central place for all heuristics and guardrails
+
+How to use
+----------
+from capability_probe import collect_capabilities
+from policy_config import compute_policy
+
+report = collect_capabilities()               # snapshot of host + llama runtime
+policy = compute_policy(report)               # PolicyBundle
+
+# Example: sizing a generation
+safe_out, prompt_est = policy.inference.clamp_for_ctx(
+    prompt_tokens_est, requested_out_tokens
+)
+
+# Example: how many sources to fetch
+k = policy.web.search_k
+
+You can pass user/admin overrides to compute_policy(overrides=...).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Any
+
+# Optional: tolerate absence if capability_probe isn't wired yet
+try:
+    from capability_probe import CapabilityReport
+except Exception:  # pragma: no cover
+    @dataclass
+    class CapabilityReport:  # minimal shim
+        cpu_logical: int = 4
+        cpu_score: float = 1.0
+        ram_total_gb: float = 8.0
+        vram_total_gb: Optional[float] = None
+        gpu_backend: str = "none"
+        llama: Dict[str, Any] | None = None
+
+
+# -------------------------------
+# Policy data classes
+# -------------------------------
+
+@dataclass
+class InferencePolicy:
+    # Context/budgeting
+    n_ctx: int
+    margin_tokens: int
+    max_out_tokens_default: int
+
+    def clamp_for_ctx(self, prompt_tokens_est: int, requested_out: int) -> tuple[int, int]:
+        """Return (safe_out, prompt_tokens_est) with margin enforcement.
+        Matches services/context_window.clamp_out_budget, but centralized.
+        """
+        n_ctx = max(512, int(self.n_ctx))
+        margin = max(16, int(self.margin_tokens))
+        prompt = max(0, int(prompt_tokens_est or 0))
+        available = max(16, n_ctx - prompt - margin)
+        safe_out = max(16, min(int(requested_out or self.max_out_tokens_default), available))
+        return safe_out, prompt
+
+
+@dataclass
+class SummarizationPolicy:
+    # How aggressively we roll older turns into the summary
+    # Higher = more aggressive summarization (peel more turns per rollup)
+    aggressiveness: int  # 1..5
+    # Max number of tail turns kept verbatim before summarization kicks in
+    tail_turns: int
+    # Router text budgets
+    router_summary_chars: int
+    router_max_chars: int
+
+
+@dataclass
+class WebPolicy:
+    # Search breadth (number of sources to fetch)
+    search_k: int
+    # Fetch parallelism & timeouts (seconds)
+    fetch_parallel: int
+    per_url_timeout_s: float
+    # Total assembled web block character budget
+    total_char_budget: int
+    per_doc_char_budget: int
+
+
+@dataclass
+class RouterPolicy:
+    # Whether to even attempt live web
+    enable_auto_web: bool
+
+
+@dataclass
+class PolicyBundle:
+    inference: InferencePolicy
+    summarization: SummarizationPolicy
+    web: WebPolicy
+    router: RouterPolicy
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "inference": asdict(self.inference),
+            "summarization": asdict(self.summarization),
+            "web": asdict(self.web),
+            "router": asdict(self.router),
+        }
+
+
+# -------------------------------
+# Tiering helpers
+# -------------------------------
+
+def _vram_tier(vram_gb: Optional[float]) -> str:
+    if not vram_gb or vram_gb <= 0.0:
+        return "none"
+    if vram_gb < 4:
+        return "tiny"
+    if vram_gb < 8:
+        return "small"
+    if vram_gb < 16:
+        return "mid"
+    if vram_gb < 24:
+        return "large"
+    return "xl"
+
+
+def _cpu_tier(threads: int, cpu_score: float) -> str:
+    t = max(1, threads)
+    # cpu_score is an abstracted 0.0..N measure; we blend both
+    eff = (t * max(0.5, cpu_score))
+    if eff < 6:
+        return "low"
+    if eff < 16:
+        return "mid"
+    if eff < 32:
+        return "high"
+    return "ultra"
+
+
+# -------------------------------
+# Main mapping logic
+# -------------------------------
+
+def compute_policy(report: CapabilityReport, overrides: Optional[Dict[str, Any]] = None) -> PolicyBundle:
+    """Map host+runtime capability → policies.
+
+    The mapping is intentionally conservative and monotonic: higher VRAM/CPU
+    never reduces budgets, only raises them within safe bounds.
+    """
+    overrides = overrides or {}
+
+    # Derive tiers
+    llama_cfg = (report.llama or {}).get("config", {}) if isinstance(report.llama, dict) else {}
+    n_ctx = int(llama_cfg.get("nCtx" , 4096))
+    n_threads = int(llama_cfg.get("nThreads" , report.cpu_logical or 4))
+
+    vram_gb = report.vram_total_gb
+    vram = _vram_tier(vram_gb)
+    cpu = _cpu_tier(n_threads, float(getattr(report, "cpu_score", 1.0) or 1.0))
+
+    # ---------------- Inference policy ----------------
+    # Margin scales slightly with ctx to reduce overflow retries
+    if n_ctx <= 2048:
+        margin = 64
+        default_out = 256
+    elif n_ctx <= 4096:
+        margin = 64
+        default_out = 384
+    elif n_ctx <= 8192:
+        margin = 96
+        default_out = 512
+    else:
+        margin = 128
+        default_out = 768
+
+    inference = InferencePolicy(
+        n_ctx=n_ctx,
+        margin_tokens=overrides.get("margin_tokens", margin),
+        max_out_tokens_default=overrides.get("max_out_tokens_default", default_out),
+    )
+
+    # ---------------- Summarization policy ----------------
+    # Base values
+    tail_turns = 6
+    router_summary_chars = 600
+    router_max_chars = 1400
+    aggr = 2
+
+    # Scale with capabilities: bigger ctx/VRAM → keep more tail, less aggressive
+    if n_ctx >= 8192 or vram in {"mid", "large", "xl"}:
+        tail_turns = 8
+        aggr = 2
+        router_summary_chars = 900
+        router_max_chars = 1800
+    if n_ctx >= 12288 or vram in {"large", "xl"}:
+        tail_turns = 10
+        aggr = 1
+        router_summary_chars = 1200
+        router_max_chars = 2200
+
+    # But clamp if CPU is very weak (router/summarizer are model calls)
+    if cpu == "low":
+        aggr = max(aggr, 3)
+        router_summary_chars = min(router_summary_chars, 800)
+        router_max_chars = min(router_max_chars, 1600)
+
+    summarization = SummarizationPolicy(
+        aggressiveness=overrides.get("summarize_aggressiveness", aggr),
+        tail_turns=overrides.get("tail_turns", tail_turns),
+        router_summary_chars=overrides.get("router_summary_chars", router_summary_chars),
+        router_max_chars=overrides.get("router_max_chars", router_max_chars),
+    )
+
+    # ---------------- Web policy ----------------
+    # Start conservative to avoid prompt bloat; scale with tiers
+    search_k = 2
+    fetch_parallel = 2
+    per_url_timeout_s = 8.0
+    total_char_budget = 1600
+    per_doc_char_budget = 900
+
+    if vram in {"mid", "large", "xl"} or cpu in {"high", "ultra"}:
+        search_k = 3
+        fetch_parallel = 3
+        total_char_budget = 2000
+        per_doc_char_budget = 1100
+    if vram in {"large", "xl"} and cpu in {"high", "ultra"}:
+        search_k = 4
+        fetch_parallel = 4
+        per_url_timeout_s = 10.0
+        total_char_budget = 2400
+        per_doc_char_budget = 1200
+
+    web = WebPolicy(
+        search_k=int(overrides.get("search_k", search_k)),
+        fetch_parallel=int(overrides.get("fetch_parallel", fetch_parallel)),
+        per_url_timeout_s=float(overrides.get("per_url_timeout_s", per_url_timeout_s)),
+        total_char_budget=int(overrides.get("total_char_budget", total_char_budget)),
+        per_doc_char_budget=int(overrides.get("per_doc_char_budget", per_doc_char_budget)),
+    )
+
+    # ---------------- Router policy ----------------
+    enable_auto_web = True
+    # On extremely weak devices, you might want to default off
+    if cpu == "low" and vram in {"none", "tiny"}:
+        enable_auto_web = True  # keep on but rely on small k/timeouts
+
+    router = RouterPolicy(enable_auto_web=overrides.get("enable_auto_web", enable_auto_web))
+
+    return PolicyBundle(
+        inference=inference,
+        summarization=summarization,
+        web=web,
+        router=router,
+    )
+
+
+# -------------------------------
+# Small utility: pretty debug line
+# -------------------------------
+
+def debug_line(policy: PolicyBundle) -> str:
+    p = policy.to_dict()
+    inf = p["inference"]; summ = p["summarization"]; web = p["web"]; r = p["router"]
+    return (
+        f"INF[n_ctx={inf['n_ctx']}, margin={inf['margin_tokens']}, out_def={inf['max_out_tokens_default']}] "
+        f"SUMM[aggr={summ['aggressiveness']}, tail={summ['tail_turns']}, rs={summ['router_summary_chars']}, rmax={summ['router_max_chars']}] "
+        f"WEB[k={web['search_k']}, par={web['fetch_parallel']}, t={web['per_url_timeout_s']}s, T={web['total_char_budget']}, per={web['per_doc_char_budget']}] "
+        f"ROUTER[auto={r['enable_auto_web']}]"
+    )
+
+# ===== aimodel/file_read/policy.py/policy_engine.py =====
+
+# policy_engine.py
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from dataclasses import asdict
+from typing import Any, Callable, Dict, Optional
+
+from .policy_config import Policy, PolicyOverrides, compute_policy
+from .capability_probe import CapabilityReport, probe_capabilities
+from .model_runtime import current_model_info
+
+
+class PolicyEngine:
+    """
+    Central adaptive policy manager.
+
+    Responsibilities
+    - Run a hardware/model capability probe and compute an execution Policy
+    - Expose the current Policy to callers (router, packer, web)
+    - Periodically refresh in the background (configurable interval)
+    - Allow runtime overrides (e.g., admin knob, user preference)
+    - Notify subscribers when the policy changes
+    """
+
+    def __init__(self, *, refresh_interval_sec: int = 600) -> None:
+        self._lock = asyncio.Lock()
+        self._policy: Optional[Policy] = None
+        self._report: Optional[CapabilityReport] = None
+        self._overrides: PolicyOverrides = {}
+        self._refresh_interval = max(10, int(refresh_interval_sec))
+        self._bg_task: Optional[asyncio.Task] = None
+        self._subscribers: set[Callable[[Policy], None]] = set()
+
+    # ------------------------------- lifecycle -------------------------------
+    async def start(self) -> None:
+        """Start background refresh loop (idempotent)."""
+        async with self._lock:
+            if self._bg_task and not self._bg_task.done():
+                return
+            # initial compute immediately
+            await self._refresh_locked(reason="startup")
+            # spawn periodic refresher
+            self._bg_task = asyncio.create_task(self._run_loop(), name="policy_engine_loop")
+
+    async def stop(self) -> None:
+        task = self._bg_task
+        if task:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+            self._bg_task = None
+
+    async def _run_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._refresh_interval)
+                async with self._lock:
+                    await self._refresh_locked(reason="periodic")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # keep the loop alive; next tick will retry
+                pass
+
+    # ------------------------------ core updates -----------------------------
+    async def refresh_now(self, *, reason: str = "manual") -> Policy:
+        async with self._lock:
+            await self._refresh_locked(reason=reason)
+            assert self._policy is not None
+            return self._policy
+
+    async def _refresh_locked(self, *, reason: str) -> None:
+        # 1) Probe system/model
+        report = await probe_capabilities()
+
+        # 2) Pull current model context length if available
+        try:
+            info = current_model_info() or {}
+            cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
+            if cfg.get("nCtx"):
+                report.model_ctx = int(cfg.get("nCtx"))
+        except Exception:
+            pass
+
+        # 3) Merge env overrides (lowest precedence of overrides)
+        env_overrides = _read_env_overrides()
+        merged_overrides = {**env_overrides, **self._overrides}
+
+        # 4) Compute policy
+        new_policy = compute_policy(report, overrides=merged_overrides)
+
+        # 5) Set & notify if changed
+        changed = (self._policy is None) or (asdict(self._policy) != asdict(new_policy))
+        self._policy = new_policy
+        self._report = report
+        if changed:
+            for fn in list(self._subscribers):
+                try:
+                    fn(new_policy)
+                except Exception:
+                    pass
+
+    # ------------------------------ subscriptions ----------------------------
+    def subscribe(self, fn: Callable[[Policy], None]) -> None:
+        self._subscribers.add(fn)
+
+    def unsubscribe(self, fn: Callable[[Policy], None]) -> None:
+        self._subscribers.discard(fn)
+
+    # -------------------------------- getters --------------------------------
+    def get_policy(self) -> Policy:
+        if self._policy is None:
+            # best-effort synchronous bootstrap (blocking probe via loop.run_until?)
+            # In async servers, call start() at app startup to avoid this path.
+            raise RuntimeError("PolicyEngine not started. Call await policy_engine.start().")
+        return self._policy
+
+    def get_report(self) -> CapabilityReport:
+        if self._report is None:
+            raise RuntimeError("PolicyEngine not started. Call await policy_engine.start().")
+        return self._report
+
+    def snapshot(self) -> Dict[str, Any]:
+        p = self.get_policy()
+        r = self.get_report()
+        return {
+            "policy": asdict(p),
+            "report": asdict(r),
+            "refreshIntervalSec": self._refresh_interval,
+        }
+
+    # -------------------------------- overrides ------------------------------
+    async def set_overrides(self, overrides: PolicyOverrides) -> Policy:
+        async with self._lock:
+            self._overrides = dict(overrides or {})
+            await self._refresh_locked(reason="overrides")
+            return self._policy  # type: ignore[return-value]
+
+    async def clear_overrides(self) -> Policy:
+        return await self.set_overrides({})
+
+
+# --------------------------- module-level singleton ---------------------------
+_policy_engine: Optional[PolicyEngine] = None
+
+
+def get_engine() -> PolicyEngine:
+    global _policy_engine
+    if _policy_engine is None:
+        # Default interval can be nudged via env
+        refresh = int(os.getenv("LOCALAI_POLICY_REFRESH_SEC", "600") or "600")
+        _policy_engine = PolicyEngine(refresh_interval_sec=refresh)
+    return _policy_engine
+
+
+async def start_engine() -> None:
+    await get_engine().start()
+
+
+# ------------------------------ env utilities ------------------------------
+
+def _read_env_overrides() -> PolicyOverrides:
+    """Read optional JSON from LOCALAI_POLICY_OVERRIDES.
+
+    Example:
+      export LOCALAI_POLICY_OVERRIDES='{"inference.maxTokens":768,"web.k":4}'
+    """
+    raw = os.getenv("LOCALAI_POLICY_OVERRIDES", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    # Accept either flat keys or nested dicts
+    # (compute_policy can handle both due to dot-walking in its merge)
+    if not isinstance(data, dict):
+        return {}
+    return data  # type: ignore[return-value]
+
+
+# ----------------------------- handy convenience -----------------------------
+
+async def current_policy() -> Policy:
+    eng = get_engine()
+    if eng._policy is None:
+        await eng.start()
+    return eng.get_policy()
+
+
+async def current_snapshot() -> Dict[str, Any]:
+    eng = get_engine()
+    if eng._policy is None:
+        await eng.start()
+    return eng.snapshot()
+
 # ===== aimodel/file_read/requirements.txt =====
 
 fastapi==0.116.1
@@ -752,7 +1547,7 @@ uvicorn==0.30.6
 pydantic==2.11.7
 starlette==0.47.2
 llama-cpp-python==0.3.4
-ddgs=9.5.4
+ddgs==9.5.4
 httpx==0.27.0
 trafilatura==1.9.0
 lxml[html_clean]>=5.3
@@ -761,58 +1556,222 @@ lxml[html_clean]>=5.3
 
 # aimodel/file_read/retitle_worker.py
 from __future__ import annotations
-import asyncio, logging
+import asyncio, logging, re
+from typing import Dict, List, Optional, Tuple
+
 from .model_runtime import get_llm
 from .store.index import load_index, save_index
 from .store.base import now_iso
+from .services.cancel import is_active, GEN_SEMAPHORE  # serialize with main generation
+from .store.chats import _load_chat  # for current seq watermark
 
-# Shared queue (session_id, messages)
-queue: asyncio.Queue[tuple[str, list[dict]]] = asyncio.Queue()
+# -----------------------------------------------------------------------------
+# Coalesced per-session queue (last-write-wins)
+# -----------------------------------------------------------------------------
+# We store only the latest snapshot + watermark per session. The worker consumes
+# session IDs; when it handles a session, it reads the latest snapshot once.
+_PENDING: Dict[str, dict] = {}
+_ENQUEUED: set[str] = set()
+_queue: asyncio.Queue[str] = asyncio.Queue()
+_lock = asyncio.Lock()  # guards _PENDING/_ENQUEUED
 
+# ---- Timings (intervals) -----------------------------------------------------
+_GRACE_MS = 1000  # debounce after stream (was 500)
+_ACTIVE_BACKOFF_START_MS = 75     # initial wait while session is active (was fixed 100ms)
+_ACTIVE_BACKOFF_MAX_MS = 600      # cap per-iteration sleep
+_ACTIVE_BACKOFF_TOTAL_MS = 20000  # max total wait while active (~20s)
+
+def _preview(s: str, n: int = 60) -> str:
+    s = s or ""
+    return (s[:n] + "…") if len(s) > n else s
+
+def _is_substantial(text: str) -> bool:
+    t = (text or "").strip()
+    return len(t) >= 12 and re.search(r"[A-Za-z]", t) is not None
+
+def _pick_source(messages: List[dict]) -> Optional[str]:
+    """Choose best text to title: first substantial user message; fallback to latest substantial user."""
+    if not messages:
+        return None
+    # first substantial user
+    for m in messages:
+        if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
+            return m.get("content", "")
+    # fallback: latest substantial user
+    for m in reversed(messages):
+        if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
+            return m.get("content", "")
+    # final fallback: first user at all
+    for m in messages:
+        if m.get("role") == "user":
+            return m.get("content", "")
+    return None
+
+def _sanitize_title(s: str) -> str:
+    """Single line, 3–5 words, no quotes/numbering/punct clutter."""
+    if not s:
+        return ""
+    s = s.strip()
+    # drop common prefixes like "Expanded explanation:", bullets, quotes
+    s = re.sub(r'^\s*("[^"]*"|\'[^\']*\'|[-*•]+|\d+\.)\s*', "", s)
+    s = s.strip().strip('"\'').strip()
+    # keep letters, digits, spaces; collapse spaces
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # limit to 5 words / ~40 chars
+    words = s.split()
+    s = " ".join(words[:5])
+    if len(s) > 40:
+        s = s[:40].rstrip()
+    return s
+
+def _make_title(llm, src: str) -> str:
+    sys = (
+        "You generate ultra-concise chat titles.\n"
+        "Rules: 2–5 words, Title Case, nouns/adjectives only.\n"
+        "No articles (a, an, the). No verbs. No punctuation. One line.\n"
+        "Output only the title."
+    )
+
+    examples = [
+        {"role": "user", "content": "police station"},
+        {"role": "assistant", "content": "Police Station"},
+        {"role": "user", "content": "fire truck"},
+        {"role": "assistant", "content": "Fire Truck"},
+        {"role": "user", "content": "how do i install node on windows"},
+        {"role": "assistant", "content": "Node Installation Windows"},
+    ]
+
+    out = llm.create_chat_completion(
+        messages=[{"role": "system", "content": sys}, *examples, {"role": "user", "content": src}],
+        max_tokens=12,
+        temperature=0.1,
+        top_p=1.0,
+        stream=False,
+        stop=["\n", "."],  # cut off if it tries to continue a sentence
+    )
+    # trust the model to format; just trim whitespace/quotes
+    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
+    return raw
 
 async def start_worker():
     """Background loop to process retitle jobs one by one."""
     while True:
-        session_id, messages = await queue.get()
+        sid = await _queue.get()
         try:
-            await _do_retitle(session_id, messages)
-        except Exception as e:
+            await _process_session(sid)
+        except Exception:
             logging.exception("Retitle worker failed")
         finally:
-            queue.task_done()
+            _queue.task_done()
 
+def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
+    msgs = snapshot.get("messages") or []
+    job_seq = int(snapshot.get("job_seq") or 0)
+    return msgs, job_seq
 
-async def _do_retitle(session_id: str, messages: list[dict]):
-    # Find first user message text
-    first_user = next((m.get("content") for m in messages if m.get("role") == "user"), "")
-    if not first_user:
+async def _process_session(session_id: str):
+    # allow quick follow-up enqueues to coalesce
+    await asyncio.sleep(_GRACE_MS / 1000.0)
+
+    # lower priority than generation: wait while this session is active
+    waited = 0
+    backoff = _ACTIVE_BACKOFF_START_MS
+    while is_active(session_id) and waited < _ACTIVE_BACKOFF_TOTAL_MS:
+        await asyncio.sleep(backoff / 1000.0)
+        waited += backoff
+        # exponential backoff with cap
+        backoff = min(int(backoff * 1.5), _ACTIVE_BACKOFF_MAX_MS)
+
+    # fetch latest coalesced snapshot
+    async with _lock:
+        snapshot = _PENDING.pop(session_id, None)
+        _ENQUEUED.discard(session_id)
+
+    if not snapshot:
         return
 
-    llm = get_llm()
-    out = llm.create_completion(
-        prompt=f"Summarize this in 3–5 words: {first_user}",
-        max_tokens=16,
-        temperature=0.3,
-    )
-    title = out["choices"][0]["text"].strip()
+    messages, job_seq = _extract_job(snapshot)
 
-    if title:
-        idx = load_index()
-        row = next((r for r in idx if r["sessionId"] == session_id), None)
-        if row:
-            row["title"] = title
-            row["updatedAt"] = now_iso()
-            save_index(idx)
-
-
-def enqueue(session_id: str, messages: list[dict]):
-    """Non-blocking add to queue."""
-    if not messages:
-        return
+    # stale guard: if chat seq has advanced, skip (a newer enqueue will run)
     try:
-        queue.put_nowait((session_id, messages))
-    except Exception as e:
-        logging.warning(f"Failed to enqueue retitle: {e}")
+        cur_seq = int((_load_chat(session_id) or {}).get("seq") or 0)
+    except Exception:
+        cur_seq = job_seq
+    if cur_seq > job_seq:
+        print(f"[retitle] SKIP (stale) session={session_id} job_seq={job_seq} current_seq={cur_seq}")
+        return
+
+    # pick source text
+    src = _pick_source(messages) or ""
+    if not src.strip():
+        return
+
+    print(f"[retitle] START session={session_id} job_seq={job_seq} src={_preview(src)!r}")
+
+    # Serialize with main generation semaphore; run LLM call in a worker thread
+    async with GEN_SEMAPHORE:
+        llm = get_llm()
+        try:
+            title = await asyncio.to_thread(_make_title, llm, src)
+        except Exception as e:
+            logging.exception("retitle: LLM error: %s", e)
+            return
+        finally:
+            try:
+                llm.reset()
+            except Exception:
+                pass
+
+    print(f"[retitle] FINISH session={session_id} -> {title!r}")
+
+    if not title:
+        return
+
+    # write only if changed
+    idx = load_index()
+    row = next((r for r in idx if r.get("sessionId") == session_id), None)
+    if not row:
+        return
+    if (row.get("title") or "").strip() == title:
+        return
+
+    row["title"] = title
+    row["updatedAt"] = now_iso()
+    save_index(idx)
+
+def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
+    """Coalesced enqueue; last-write-wins per session, with a seq watermark."""
+    if not session_id:
+        return
+    if not isinstance(messages, list):
+        messages = []
+    # infer watermark if not provided (max message id)
+    if job_seq is None:
+        try:
+            job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
+        except Exception:
+            job_seq = 0
+
+    snap = {"messages": messages, "job_seq": int(job_seq)}
+
+    async def _put():
+        async with _lock:
+            _PENDING[session_id] = snap  # overwrite older snapshot
+            if session_id not in _ENQUEUED:
+                _ENQUEUED.add(session_id)
+                try:
+                    _queue.put_nowait(session_id)
+                except Exception as e:
+                    logging.warning(f"Failed to enqueue retitle: {e}")
+
+    # enqueue can be called from sync contexts; schedule safely
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_put())
+    except RuntimeError:
+        # no running loop (unlikely here); fall back to a temp loop
+        asyncio.run(_put())
 
 # ===== aimodel/file_read/services/cancel.py =====
 
@@ -884,6 +1843,7 @@ import asyncio, time, json
 from typing import AsyncGenerator, Dict, List
 from fastapi.responses import StreamingResponse
 from datetime import datetime
+from dataclasses import asdict  # for serializing message rows
 
 from ..model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
@@ -893,10 +1853,11 @@ from .session_io import handle_incoming, persist_summary
 from .packing import build_system_text, pack_with_rollup
 from .context_window import clamp_out_budget
 
-# Router + summarizer + orchestrator (web path)
-from ..web.router_ai import decide_web
-from ..web.query_summarizer import summarize_query
-from ..web.orchestrator import build_web_block
+# Router (router will decide & fetch if needed)
+from ..web.router_ai import decide_web_and_fetch
+
+# Stream meta markers to filter out from the buffered assistant text
+from ..utils.streaming import RUNJSON_START, RUNJSON_END
 
 # Tell the type checker run_stream is an async iterator of bytes (stops yellow underline)
 from .streaming_worker import run_stream as _run_stream
@@ -908,13 +1869,12 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 def _chars_len(msgs: List[object]) -> int:
-    """Robust char counter for packed messages that may include dicts or strings."""
     total = 0
     for m in msgs:
         if isinstance(m, dict):
             c = m.get("content")
         else:
-            c = m  # plain string (defensive)
+            c = m
         if isinstance(c, str):
             total += len(c)
         elif c is None:
@@ -927,20 +1887,67 @@ def _chars_len(msgs: List[object]) -> int:
     return total
 
 def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, object], session_id: str) -> None:
-    """Print the exact payload we send to the model: full messages + key params."""
     try:
         print(f"[{_now()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
-        print(json.dumps(
-            {
-                "messages": messages,
-                "params": params,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ))
+        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
         print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
     except Exception as e:
         print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+
+# ---- tiny helper: last user + recent tail (user & assistant) + summary -------
+def _compose_router_text(
+    recent,
+    latest_user_text: str,
+    summary: str,
+    *,
+    tail_turns: int = 6,
+    summary_chars: int = 600,
+    max_chars: int = 1400,
+) -> str:
+    """
+    Priority input for the router:
+      1) Latest user message (verbatim)
+      2) Short recent tail (user + assistant) so URLs/snippets are visible
+      3) Trimmed slice of the persisted conversation summary
+
+    Hard-caps the final text to max_chars to avoid overfeeding the router.
+    """
+    parts: List[str] = []
+
+    if latest_user_text:
+        parts.append((latest_user_text or "").strip())
+
+    # Convert to list for safe slicing; include both roles
+    try:
+        recent_list = list(recent)
+    except Exception:
+        recent_list = []
+
+    tail_src = recent_list[-tail_turns:]
+    tail_lines: List[str] = []
+    for m in reversed(tail_src):
+        if not isinstance(m, dict):
+            continue
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        role = (m.get("role") or "user").strip()
+        tail_lines.append(f"{role}: {c}")
+
+    if tail_lines:
+        parts.append("Context:\n" + "\n".join(tail_lines))
+
+    if summary:
+        s = summary.strip()
+        if len(s) > summary_chars:
+            s = s[-summary_chars:]  # take the most recent slice of the summary
+        parts.append("Summary:\n" + s)
+
+    out = "\n\n".join(parts).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip()
+    return out
+
 # -----------------------------------------------------------------------------
 
 async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
@@ -960,36 +1967,31 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     latest_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
     lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
 
-    # --- ROUTER → (maybe) SUMMARIZER → (maybe) WEB BLOCK ----------------------
+    # --- ROUTER (one-hop) → maybe WEB BLOCK -----------------------------------
     t0 = time.perf_counter()
     print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
     try:
-        need_web, proposed_q = decide_web(llm, str(latest_user_text or ""))
-        print(f"[{_now()}] ROUTER decision need_web={need_web} proposed_q={proposed_q!r}")
+        k = int(getattr(data, "webK", 3) or 3)
 
-        if need_web:
-            base_query = proposed_q or str(latest_user_text or "")
-            q_summary = summarize_query(llm, base_query)
-            q_summary = q_summary.strip().strip('"\'')
+        # Minimal change: give the router a compact view (last user + tail + summary)
+        router_text = _compose_router_text(
+            st.get("recent", []),
+            str(latest_user_text or ""),
+            st.get("summary", "") or "",
+        )
+        block = await decide_web_and_fetch(llm, router_text, k=k)
 
-            print(f"[{_now()}] SUMMARIZER out={q_summary!r}")
+        print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
 
-            k = int(getattr(data, "webK", 3) or 3)
-            print(f"[{_now()}] ORCH build start k={k} q={q_summary!r}")
-            block = await build_web_block(q_summary, k=k)
-            print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
-
-            if block:
-                # CRITICAL: wrap as a proper chat message (dict), not a raw string
-                st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
-                    {
-                        "role": "assistant",
-                        # *** ONLY REQUIRED CHANGE: mark findings as authoritative in the content ***
-                        "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
-                    }
-                ]
-                types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
-                print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
+        if block:
+            st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
+                {
+                    "role": "assistant",
+                    "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
+                }
+            ]
+            types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
+            print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
 
         dt = time.perf_counter() - t0
         eph_cnt = len(st.get("_ephemeral_web") or [])
@@ -1015,14 +2017,9 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     packed_chars = _chars_len(packed)
     print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
 
-    # dump the exact prompt (messages + params) we will send to the model
     _dump_full_prompt(
         packed,
-        params={
-            "requested_out": out_budget_req,
-            "temperature": (data.temperature or 0.6),
-            "top_p": (data.top_p or 0.9),
-        },
+        params={"requested_out": out_budget_req, "temperature": (data.temperature or 0.6), "top_p": (data.top_p or 0.9)},
         session_id=session_id,
     )
 
@@ -1039,6 +2036,21 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     async def streamer() -> AsyncGenerator[bytes, None]:
         async with GEN_SEMAPHORE:
             mark_active(session_id, +1)
+            # Buffer the assistant text we stream so we can add it to st["recent"]
+            out_buf = bytearray()
+
+            def _accum_visible(chunk_bytes: bytes):
+                if not chunk_bytes:
+                    return
+                s = chunk_bytes.decode("utf-8", errors="ignore")
+                # Skip embedded run-json envelopes entirely
+                if RUNJSON_START in s and RUNJSON_END in s:
+                    return
+                # Skip the “stopped” line if present
+                if s.strip() == "⏹ stopped":
+                    return
+                out_buf.extend(chunk_bytes)
+
             try:
                 print(f"[{_now()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
                 async for chunk in run_stream(
@@ -1051,13 +2063,46 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                     top_p=(data.top_p or 0.9),
                     input_tokens_est=input_tokens_est,
                 ):
+                    # accumulate for router/model future context
+                    if isinstance(chunk, (bytes, bytearray)):
+                        _accum_visible(chunk)
+                    else:
+                        _accum_visible(chunk.encode("utf-8"))
                     yield chunk
             finally:
+                # Append the assistant’s full response to recent so both router and model
+                # will see it on the next turn.
+                try:
+                    full_text = out_buf.decode("utf-8", errors="ignore").strip()
+                    # hard-strip any trailing RUNJSON block that slipped through
+                    start = full_text.find(RUNJSON_START)
+                    if start != -1:
+                        end = full_text.find(RUNJSON_END, start)
+                        if end != -1:
+                            full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
+                    if full_text:
+                        st["recent"].append({"role": "assistant", "content": full_text})
+                        print(f"[{_now()}] RECENT append assistant chars={len(full_text)}")
+                except Exception:
+                    pass
+
+                # 1) flush pending ops
                 try:
                     from ..store import apply_pending_for
                     apply_pending_for(session_id)
                 except Exception:
                     pass
+
+                # 2) enqueue retitle AFTER the stream has fully finished (coalesced, with watermark)
+                try:
+                    from ..store import list_messages as store_list_messages
+                    from ..retitle_worker import enqueue as enqueue_retitle
+                    msgs = store_list_messages(session_id)
+                    last_seq = max((int(m.id) for m in msgs), default=0)
+                    enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
+                except Exception:
+                    pass
+
                 print(f"[{_now()}] GEN run_stream END   session={session_id}")
                 mark_active(session_id, -1)
 
@@ -1281,56 +2326,6 @@ async def run_stream(
         except Exception:
             pass
 
-# ===== aimodel/file_read/services/web_block.py =====
-
-# aimodel/file_read/services/web_block.py
-from __future__ import annotations
-import logging, re
-from typing import Optional
-from ..model_runtime import get_llm
-from ..web.orchestrator import build_web_block
-from ..web.query_summarizer import summarize_query
-
-log = logging.getLogger("aimodel.api.generate")
-
-async def always_inject_web_block(st, latest_user_text: str, *, k: int):
-    """
-    EXACT behavior retained:
-      1) If [[search: ...]] present -> use that literal query.
-      2) Else summarize the user's text into a short query.
-      3) Call orchestrator.build_web_block(query) and APPEND the block to st["recent"].
-    """
-    if not latest_user_text or not latest_user_text.strip():
-        return
-
-    m = re.search(r"\[\[search:\s*(.+?)\s*\]\]", latest_user_text, re.I)
-    if m:
-        query = m.group(1).strip()
-        log.info("generate: explicit [[search:]] query=%r", query)
-    else:
-        try:
-            query = summarize_query(get_llm(), latest_user_text.strip())
-            short_src = (latest_user_text[:120] + "…") if len(latest_user_text) > 120 else latest_user_text
-            log.info("generate: summarized query=%r (from=%r)", query, short_src)
-        except Exception as e:
-            log.exception("generate: summarize_query failed: %s", e)
-            return
-
-    if not query:
-        log.warning("generate: empty summarized query, skipping web")
-        return
-
-    try:
-        block = await build_web_block(query, k=k, per_url_timeout_s=8.0)
-        if block:
-            # ⬇⬇⬇ store as EPHEMERAL, not in recent
-            st.setdefault("_ephemeral_web", []).append({"role": "user", "content": block})
-            log.info("generate: injected web block EPHEMERAL (chars=%d)", len(block))
-        else:
-            log.warning("generate: orchestrator returned no block for query=%r", query)
-    except Exception as e:
-        log.exception("generate: orchestrator failed for query=%r: %s", query, e)
-
 # ===== aimodel/file_read/store/__init__.py =====
 
 from .chats import (
@@ -1341,9 +2336,6 @@ from .chats import (
     merge_chat, merge_chat_new, edit_message, set_summary, get_summary,  # ← add these
 )
 from .index import ChatMeta
-from .pending import (
-    enqueue_pending, apply_pending_for, process_all_pending, list_pending_sessions,
-)
 
 __all__ = [
     # chats
@@ -1355,7 +2347,7 @@ __all__ = [
     # index
     "ChatMeta",
     # pending
-    "enqueue_pending", "apply_pending_for", "process_all_pending", "list_pending_sessions", "set_summary", "get_summary"
+    "set_summary", "get_summary"
 ]
 
 # ===== aimodel/file_read/store/base.py =====
@@ -1701,159 +2693,6 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
     row["lastMessage"] = last_asst
     save_index(idx)
 
-# ===== aimodel/file_read/store/pending.py =====
-
-from __future__ import annotations
-import json
-from typing import Callable, Dict, List
-from .base import PENDING_PATH, OLD_PENDING_DELETES, atomic_write, _lock  # <-- import _lock
-from .chats import _load_chat, _save_chat
-from .index import refresh_index_after_change
-
-
-def _load_pending() -> Dict[str, List[Dict[str, object]]]:
-    try:
-        with PENDING_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
-
-def _save_pending(d: Dict[str, List[Dict[str, object]]]):
-    atomic_write(PENDING_PATH, d)
-
-def _migrate_old_pending_if_any():
-    try:
-        if OLD_PENDING_DELETES.exists():
-            legacy = json.loads(OLD_PENDING_DELETES.read_text("utf-8"))
-            if isinstance(legacy, dict):
-                with _lock:
-                    cur = _load_pending()
-                    for sid, arr in legacy.items():
-                        lst = cur.setdefault(sid, [])
-                        for req in arr or []:
-                            lst.append({
-                                "type": "deleteMessages",
-                                "payload": {
-                                    "messageIds": [int(i) for i in (req.get("messageIds") or [])],
-                                    "tailAssistant": bool(req.get("tailAssistant") or False),
-                                },
-                            })
-                    _save_pending(cur)
-            OLD_PENDING_DELETES.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-def enqueue_pending(session_id: str, op_type: str, payload: Dict[str, object]):
-    _migrate_old_pending_if_any()
-    with _lock:
-        pend = _load_pending()
-        q = pend.setdefault(session_id, [])
-        q.append({"type": op_type, "payload": payload or {}})
-        _save_pending(pend)
-
-def _consume_queue(session_id: str) -> List[Dict[str, object]]:
-    with _lock:
-        pend = _load_pending()
-        arr = pend.pop(session_id, [])
-        _save_pending(pend)
-        return arr
-
-def list_pending_sessions() -> List[str]:
-    _migrate_old_pending_if_any()
-    with _lock:
-        return list(_load_pending().keys())
-    
-    
-
-# ... (rest unchanged) ...
-
-
-# --- op handlers ---
-
-
-def _op_delete_messages(session_id: str, payload: Dict[str, object]) -> List[int]:
-    ids = set(int(i) for i in (payload.get("messageIds") or []))
-    tail_assistant = bool(payload.get("tailAssistant") or False)
-
-    data = _load_chat(session_id)
-    msgs = data.get("messages", [])
-    if not isinstance(msgs, list):
-        msgs = []
-
-    found_tail = False
-    if tail_assistant:
-        # try to include the most recent assistant message
-        for m in reversed(msgs):
-            if m.get("role") == "assistant":
-                try:
-                    ids.add(int(m.get("id")))
-                    found_tail = True
-                except Exception:
-                    pass
-                break
-
-    # If we intended to delete the tail assistant but it hasn't been persisted yet,
-    # DEFER instead of dropping the op. `apply_pending_for` will catch this and requeue.
-    if not ids and tail_assistant and not found_tail:
-        raise RuntimeError("defer_tail_assistant")
-
-    if not ids:
-        return []
-
-    keep, deleted = [], []
-    for m in msgs:
-        mid = int(m.get("id", -1))
-        if mid in ids:
-            deleted.append(mid)
-        else:
-            keep.append(m)
-
-    if deleted:
-        data["messages"] = keep
-        _save_chat(session_id, data)
-        refresh_index_after_change(session_id, keep)
-    return deleted
-
-def _apply_op(session_id: str, op: Dict[str, object]) -> Dict[str, object]:
-    t = str(op.get("type") or "")
-    payload = op.get("payload") or {}
-    if t == "deleteMessages":
-        deleted = _op_delete_messages(session_id, payload)
-        return {"type": t, "ok": True, "deleted": deleted}
-    return {"type": t, "ok": False, "reason": "unknown_op"}
-
-def apply_pending_for(session_id: str) -> List[Dict[str, object]]:
-    ops = _consume_queue(session_id)
-    results: List[Dict[str, object]] = []
-    for op in ops:
-        try:
-            results.append(_apply_op(session_id, op))
-        except Exception as e:
-    # Requeue on failure (front)
-            pend = _load_pending()
-            pend.setdefault(session_id, []).insert(0, op)
-            _save_pending(pend)
-            results.append({"type": op.get("type"), "ok": False, "error": str(e)})
-    return results
-
-def process_all_pending(is_active: Callable[[str], bool]) -> Dict[str, List[Dict[str, object]]]:
-    out: Dict[str, List[Dict[str, object]]] = {}
-    _migrate_old_pending_if_any()
-    sessions = list(_load_pending().keys())
-    for sid in sessions:
-        try:
-            if is_active(sid):
-                continue
-            res = apply_pending_for(sid)
-            if res:
-                out[sid] = res
-        except Exception:
-            pass
-    return out
-
 # ===== aimodel/file_read/utils/streaming.py =====
 
 from __future__ import annotations
@@ -2122,908 +2961,4 @@ async def fetch_clean(url: str, timeout_s: float = 8.0, max_chars: int = 3000) -
         txt = txt.strip().replace("\r", "")
         if len(txt) > max_chars:
             txt = txt[:max_chars]
-        return (str(r.url), r.status_code, txt)
-
-async def fetch_many(urls: List[str], per_timeout_s: float = 8.0, cap_chars: int = 3000, max_parallel: int = 3):
-    sem = asyncio.Semaphore(max_parallel)
-    async def _one(u: str):
-        async with sem:
-            try:
-                return u, await fetch_clean(u, per_timeout_s, cap_chars)
-            except Exception:
-                return u, None
-    tasks = [_one(u) for u in urls]
-    return await asyncio.gather(*tasks)
-
-# ===== aimodel/file_read/web/orchestrator.py =====
-
-# aimodel/file_read/web/orchestrator.py
-from __future__ import annotations
-from typing import List, Tuple
-from urllib.parse import urlparse
-import time
-import re
-
-from .duckduckgo import DuckDuckGoProvider
-from .provider import SearchHit
-from .fetch import fetch_many
-
-DEFAULT_K = 2                 # fewer sources by default
-MAX_BLOCK_TOKENS_EST = 700    # respect ~char budget below
-TOTAL_CHAR_BUDGET = 1600      # ~ 400 tokens (≈4 chars/token)
-PER_DOC_CHAR_BUDGET = 900     # trim each page harder
-MAX_PARALLEL_FETCH = 2        # avoid overfetching & reduce prompt bloat
-
-def _clean_ws(s: str) -> str:
-    return " ".join((s or "").split())
-
-def _head_tail(text: str, max_chars: int) -> str:
-    if not text or len(text) <= max_chars:
-        return _clean_ws(text)
-    head = max_chars - max(200, max_chars // 3)
-    tail = max_chars - head
-    return _clean_ws(text[:head] + " … " + text[-tail:])
-
-def condense_doc(title: str, url: str, text: str, max_chars: int = PER_DOC_CHAR_BUDGET) -> str:
-    # keep title, final URL, and a trimmed body
-    body = _head_tail(text or "", max_chars)
-    safe_title = _clean_ws(title or url)
-    return f"- {safe_title}\n  {url}\n  {body}"
-
-def _host(url: str) -> str:
-    h = (urlparse(url).hostname or "").lower()
-    return h[4:] if h.startswith("www.") else h
-
-def _tokens(s: str) -> List[str]:
-    return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
-
-def score_hit(hit: SearchHit, query: str) -> int:
-    """
-    Generic, content-based scoring (no hardcoded domains, no date/month/year rules).
-    Signals:
-      - exact phrase in title (+3) / substring in title (+2)
-      - token coverage in title (+0..2)
-      - token touch in snippet (+1 if any)
-    """
-    score = 0
-    q = (query or "").strip().lower()
-    title = (hit.title or "").strip()
-    snippet = (hit.snippet or "").strip()
-    title_l = title.lower()
-    snip_l  = snippet.lower()
-
-    if q:
-        if title_l == q:
-            score += 3
-        elif q in title_l:
-            score += 2
-
-    qtoks = _tokens(q)
-    if qtoks:
-        cov_title = sum(1 for t in qtoks if t in title_l)
-        if cov_title == len(qtoks):
-            score += 2
-        elif cov_title > 0:
-            score += 1
-
-        cov_snip = sum(1 for t in qtoks if t in snip_l)
-        if cov_snip > 0:
-            score += 1
-
-    return score
-
-async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: float = 8.0) -> str | None:
-    start_time = time.time()
-    print(f"[orchestrator] IN  @ {start_time:.3f}s | query={query!r}")
-
-    t0 = time.perf_counter()
-    provider = DuckDuckGoProvider()
-
-    # --- SEARCH (light overfetch) ---
-    overfetch = max(k + 1, int(k * 1.5))
-    print(f"[orchestrator] SEARCH start overfetch={overfetch} k={k}")
-    try:
-        hits: List[SearchHit] = await provider.search(query, k=overfetch)
-    except Exception as e:
-        print(f"[orchestrator] ERROR during search for {query!r}: {e}")
-        return None
-    print(f"[orchestrator] SEARCH done hits={len(hits)} dt={time.perf_counter() - t0:.3f}s")
-
-    if not hits:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no hits | elapsed={time.time()-start_time:.3f}s")
-        return None
-
-    # --- SCORING / DEDUPE ---
-    print(f"[orchestrator] SCORING generic (no hardcoded boosts)")
-    seen = set()
-    scored: List[Tuple[int, SearchHit]] = []
-    for idx, h in enumerate(hits):
-        u = (h.url or "").strip()
-        if not u:
-            print(f"[orchestrator]   skip[{idx}] empty url")
-            continue
-        if u in seen:
-            print(f"[orchestrator]   dup [{idx}] host={_host(u)} title={(h.title or '')[:60]!r}")
-            continue
-        seen.add(u)
-        s = score_hit(h, query)
-        scored.append((s, h))
-        print(f"[orchestrator]   meta[{idx}] score={s} host={_host(u)} title={(h.title or '')[:80]!r} url={u}")
-
-    if not scored:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no unique hits | elapsed={time.time()-start_time:.3f}s")
-        return None
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top_hits = [h for _, h in scored[:k]]
-
-    for i, h in enumerate(top_hits, 1):
-        print(f"[orchestrator] PICK {i}/{k} score={score_hit(h, query)} host={_host(h.url)} title={(h.title or '')[:80]!r}")
-
-    # --- FETCH (tighter caps) ---
-    urls = [h.url for h in top_hits]
-    meta = [(h.title or h.url, h.url) for h in top_hits]
-    print(f"[orchestrator] FETCH start urls={[ _host(u) for u in urls ]}")
-
-    t_f = time.perf_counter()
-    results = await fetch_many(
-        urls,
-        per_timeout_s=per_url_timeout_s,
-        cap_chars=min(2000, PER_DOC_CHAR_BUDGET * 2),
-        max_parallel=MAX_PARALLEL_FETCH,
-    )
-    dt_f = time.perf_counter() - t_f
-    print(f"[orchestrator] FETCH done n={len(results)} dt={dt_f:.3f}s")
-
-    chunks: List[str] = []
-    for original_url, res in results:
-        if not res:
-            print(f"[orchestrator]   fetch MISS url={original_url}")
-            continue
-        final_url, status, text = res
-        title = next((t for (t, u) in meta if u == original_url), final_url)
-        tl = len(text or "")
-        print(f"[orchestrator]   fetch OK   status={status} host={_host(final_url)} text_len={tl} title={(title or '')[:80]!r}")
-        if not text:
-            continue
-        chunk = condense_doc(title, final_url, text, max_chars=PER_DOC_CHAR_BUDGET)
-        chunks.append(chunk)
-        print(f"[orchestrator]   chunk len={len(chunk)} host={_host(final_url)}")
-
-    if not chunks:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no chunks | elapsed={time.time()-start_time:.3f}s")
-        return None
-
-    # --- ENFORCE TOTAL BUDGET ---
-    header = f"Web findings for: {query}"
-    available = max(200, TOTAL_CHAR_BUDGET - len(header) - 2)
-    block_parts: List[str] = []
-    used = 0
-    for idx, ch in enumerate(chunks):
-        cl = len(ch)
-        sep = (2 if block_parts else 0)
-        if used + cl + sep > available:
-            shrunk = _head_tail(ch, max(200, available - used - sep))
-            print(f"[orchestrator]   budget hit at chunk[{idx}] orig={cl} shrunk={len(shrunk)} used_before={used} avail={available}")
-            if len(shrunk) > 200:
-                block_parts.append(shrunk)
-                used += len(shrunk) + sep
-            break
-        block_parts.append(ch)
-        used += cl + sep
-        print(f"[orchestrator]   take chunk[{idx}] len={cl} used_total={used}/{available}")
-
-    body = "\n\n".join(block_parts)
-    block = f"{header}\n\n{body}"
-
-    end_time = time.time()
-    print(f"[orchestrator] OUT @ {end_time:.3f}s | elapsed={end_time-start_time:.3f}s | chunks={len(block_parts)} | chars={len(block)}")
-    return block
-
-# ===== aimodel/file_read/web/provider.py =====
-
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Optional
-
-@dataclass
-class SearchHit:
-    title: str
-    url: str
-    snippet: Optional[str] = None
-    rank: int = 0
-
-class SearchProvider:
-    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
-        raise NotImplementedError
-
-# ===== aimodel/file_read/web/query_summarizer.py =====
-
-# aimodel/file_read/web/query_summarizer.py
-from __future__ import annotations
-from typing import Any
-import re
-
-_PROMPT = """Summarize the user's request into a concise web search query.
-Keep only the key entities and terms.
-Do not explain, and do not surround the result in quotation marks or other punctuation.
-You may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.
-Keep the original word order. Output only the query text.
-
-User: {text}
-Query:"""
-
-def _tokens(s: str) -> set[str]:
-    # simple, generic normalization (no term lists)
-    return set(re.findall(r"\w+", (s or "").lower()))
-
-def summarize_query(llm: Any, user_text: str) -> str:
-    txt = (user_text or "").strip()
-    print(f"[SUMMARIZER] IN user_text={txt!r}")
-
-    # 1) Bypass LLM for tiny inputs to avoid paraphrase drift
-    if len(txt) <= 32 and len(txt.split()) <= 3:
-        print(f"[SUMMARIZER] BYPASS (short) -> {txt!r}")
-        return txt
-
-    out = llm.create_chat_completion(
-        messages=[{"role": "user", "content": _PROMPT.format(text=txt)}],
-        max_tokens=32,
-        temperature=0.0,
-        top_p=1.0,           # fully greedy; reduces unintended paraphrasing
-        stream=False,
-        stop=["\n", "</s>"],
-    )
-    result = (out["choices"][0]["message"]["content"] or "").strip()
-
-    # 2) Similarity fallback (generic, no special terms)
-    src_toks = _tokens(txt)
-    out_toks = _tokens(result)
-    if not result or not out_toks:
-        print(f"[SUMMARIZER] RETAIN (empty/none) -> {txt!r}")
-        print(f"[SUMMARIZER] OUT query={txt!r}")
-        return txt
-
-    jaccard = (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
-    if jaccard < 0.6:
-        print(f"[SUMMARIZER] RETAIN (low overlap {jaccard:.2f}) -> {txt!r}")
-        print(f"[SUMMARIZER] OUT query={txt!r}")
-        return txt
-
-    print(f"[SUMMARIZER] OUT query={result!r} (overlap {jaccard:.2f})")
-    return result
-
-# ===== aimodel/file_read/web/router_ai.py =====
-
-# aimodel/file_read/web/router_ai.py
-from __future__ import annotations
-from typing import Tuple, Optional, Any
-import json
-import re
-
-# IMPORTANT: Double braces to escape JSON in .format()
-_PROMPT = (
-    "You ONLY output JSON. Task: Decide if the user's question needs LIVE WEB results "
-    "(news, prices, schedules, laws, 'today/now/latest', changing facts). "
-    'Return exactly: {{"need": true|false, "query": "<concise web query or empty>"}} '
-    "No extra text.\n\nUser: {text}\nJSON:"
-)
-
-def _force_json(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
-    except Exception:
-        m = re.search(r"\{.*\}", s, re.DOTALL)
-        if not m:
-            return None
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-
-def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
-    """
-    General-purpose router with no hardcoded heuristics.
-    - Lets the model decide if web is needed.
-    - Supports explicit overrides via "web:" / "search:".
-    - Returns (need_web, query_if_needed).
-    """
-    if not user_text or not user_text.strip():
-        return (False, None)
-
-    t = user_text.strip()
-    low = t.lower()
-
-    # Explicit override: allow caller to force web and optionally supply a query
-    if low.startswith("web:") or low.startswith("search:"):
-        q = t.split(":", 1)[1].strip() or t
-        return (True, q)
-
-    # Model-based decision (no regex/rule hardcodes)
-    try:
-        out = llm.create_chat_completion(
-            messages=[{"role": "user", "content": _PROMPT.format(text=t)}],
-            max_tokens=64,
-            temperature=0.0,
-            top_p=0.9,
-            stream=False,
-            stop=["</s>", "\n\n"],
-        )
-        text = out["choices"][0]["message"]["content"].strip()
-    except Exception:
-        # If the decision model fails, default to no web to avoid surprises
-        return (False, None)
-
-    data = _force_json(text) or {}
-    need = bool(data.get("need", False))
-    query = (str(data.get("query") or "")).strip() or (t if need else None)
-    return (need, query if need else None)
-
-# ===== frontend/src/file_read/App.tsx =====
-
-
-import AgentRunner from "./pages/AgentRunner";
-
-export default function App() {
-  return (
-    <main className="bg-gray-50 min-h-screen">
-      <AgentRunner />
-    </main>
-  );
-}
-
-# ===== frontend/src/file_read/components/AssistantMetrics.tsx =====
-
-// frontend/src/file_read/components/chat/AssistantMetrics.tsx
-import { Info } from "lucide-react";
-import MetricsHoverCard from "./MetricsHoverCard";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-
-export default function AssistantMetrics({
-  status,
-  runJson,
-  flat,
-  align = "right",
-}: { status: string; runJson?: RunJson | null; flat?: GenMetrics | null; align?: "left" | "right" }) {
-  return (
-    <div className="mt-2 flex justify-start">
-      <div className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-white border shadow-sm text-[11px] text-gray-600">
-        <Info className="w-3.5 h-3.5 opacity-70" />
-        <span className="truncate max-w-[70vw] sm:max-w-none">{status || "Run details"}</span>
-        <MetricsHoverCard
-          data={
-            runJson ??
-            (flat
-              ? {
-                  stats: {
-                    stopReason: flat.stop_reason ?? null,
-                    tokensPerSecond: flat.tok_per_sec ?? null,
-                    timeToFirstTokenSec: flat.ttft_ms != null ? Math.max(0, flat.ttft_ms) / 1000 : null,
-                    totalTimeSec: null,
-                    promptTokensCount: flat.input_tokens_est ?? null,
-                    predictedTokensCount: flat.output_tokens ?? null,
-                    totalTokensCount: flat.total_tokens_est ?? null,
-                  },
-                }
-              : null)
-          }
-          title="Run JSON"
-          align={align}
-          compact
-        />
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatBubble.tsx =====
-
-import { useState } from "react";
-import { Copy, Check, Trash2 } from "lucide-react";
-import MarkdownMessage from "./Markdown/MarkdownMessage";
-
-const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
-
-export default function ChatBubble({
-  role,
-  text,
-  showActions = true, // NEW: parent decides when to show the toolbar
-  onDelete,
-}: {
-  role: "user" | "assistant";
-  text: string;
-  showActions?: boolean;
-  onDelete?: () => void;
-}) {
-  const isUser = role === "user";
-  const content = text?.trim() ?? "";
-  if (role === "assistant" && !content) return null;
-
-  // Never show the decorative stop line in assistant bubbles
-  const display = isUser ? content : content.replace(STOP_SENTINEL_RE, "");
-
-  const [copiedMsg, setCopiedMsg] = useState(false);
-
-  const copyWholeMessage = async () => {
-    try {
-      await navigator.clipboard.writeText(display);
-      setCopiedMsg(true);
-      setTimeout(() => setCopiedMsg(false), 2000);
-    } catch {}
-  };
-
-  return (
-    <div className="mb-2">
-      {/* Bubble */}
-      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-        <div
-          className={`max-w-[80%] w-fit break-words rounded-2xl px-4 py-2 shadow-sm
-                      prose prose-base max-w-none
-            ${isUser ? "bg-black text-white prose-invert" : "bg-white border text-gray-900"}`}
-          style={{ wordBreak: "break-word" }}
-        >
-          <div className="max-w-full">
-            <MarkdownMessage text={display} />
-          </div>
-        </div>
-      </div>
-
-      {/* Under-bubble toolbar (icon-only) */}
-      {showActions && (
-        <div className={`mt-1 flex ${isUser ? "justify-end" : "justify-start"}`}>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={copyWholeMessage}
-              title={copiedMsg ? "Copied" : "Copy"}
-              aria-label={copiedMsg ? "Copied" : "Copy message"}
-              className="inline-flex items-center justify-center w-7 h-7 rounded border
-                         bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
-            >
-              {copiedMsg ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-            </button>
-
-            {/* Delete for BOTH roles when provided */}
-            {onDelete && (
-              <button
-                type="button"
-                onClick={onDelete}
-                title="Delete message"
-                aria-label="Delete message"
-                className="inline-flex items-center justify-center w-7 h-7 rounded border
-                           bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatComposer.tsx =====
-
-// frontend/src/file_read/components/ChatComposer.tsx
-import { useEffect, useRef, useState } from "react";
-import { SendHorizonal, Square } from "lucide-react";
-
-const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
-
-type Props = {
-  input: string;
-  setInput: (v: string) => void;
-  loading: boolean;
-  queued?: boolean;
-  onSend: (text: string) => void | Promise<void>;
-  onStop: () => void | Promise<void>;
-  onHeightChange?: (h: number) => void;
-  onRefreshChats?: () => void;
-};
-
-export default function ChatComposer({
-  input,
-  setInput,
-  loading,
-  queued = false,
-  onSend,
-  onStop,
-  onHeightChange,
-  onRefreshChats,
-}: Props) {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const taRef = useRef<HTMLTextAreaElement>(null);
-  const MAX_HEIGHT_PX = 192;
-  const [isClamped, setIsClamped] = useState(false);
-  const [draft, setDraft] = useState(input);
-
-  useEffect(() => setDraft(input), [input]);
-
-  const autogrow = () => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    const next = Math.min(ta.scrollHeight, MAX_HEIGHT_PX);
-    ta.style.height = `${next}px`;
-    setIsClamped(ta.scrollHeight > MAX_HEIGHT_PX);
-    if (wrapRef.current && onHeightChange) {
-      onHeightChange(wrapRef.current.getBoundingClientRect().height);
-    }
-  };
-
-  useEffect(() => {
-    autogrow();
-    const onResize = () => autogrow();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    autogrow();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft]);
-
-  const hasText = draft.trim().length > 0;
-
-  // 🔹 NEW: tell ChatView to scroll to bottom
-  const forceScroll = (behavior: ScrollBehavior = "auto") => {
-    window.dispatchEvent(
-      new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } })
-    );
-  };
-
-  const handleSendClick = () => {
-    const v = draft.trim();
-    if (!v || loading || queued) return; // prevent sending while queued/streaming
-
-    // Snap immediately to bottom so user sees the latest area
-    forceScroll("auto");
-
-    setDraft("");
-    setInput("");
-    void Promise.resolve(onSend(v)).finally(() => {
-      onRefreshChats?.();
-      // Settle at bottom after DOM updates
-      requestAnimationFrame(() => forceScroll("smooth"));
-    });
-  };
-
-  const handleStopClick = () => {
-    if (!loading && !queued) return;
-    void Promise.resolve(onStop()).finally(() => {
-      onRefreshChats?.(); // refresh once the stop lands
-    });
-  };
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (!loading && !queued) handleSendClick();
-    }
-  }
-
-  return (
-    <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
-      <div className="flex gap-2">
-        <textarea
-          ref={taRef}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            setInput(e.target.value);
-            autogrow();
-          }}
-          onInput={autogrow}
-          onKeyDown={onKeyDown}
-          placeholder="Ask anything…"
-          className={`flex-1 border rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring ${
-            isClamped ? "overflow-y-auto" : "overflow-hidden"
-          }`}
-          rows={1}
-          style={{ maxHeight: MAX_HEIGHT_PX }}
-        />
-
-        <div className="flex items-end gap-2">
-          {(loading || queued) ? (
-            <button
-              className="p-2 rounded-lg border hover:bg-gray-50"
-              onClick={handleStopClick}
-              title={queued ? "Cancel queued message" : "Stop generating"}
-              aria-label={queued ? "Cancel queued message" : "Stop generating"}
-            >
-              <Square size={18} />
-            </button>
-          ) : hasText ? (
-            <button
-              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
-              onClick={handleSendClick}
-              title="Send"
-              aria-label="Send"
-            >
-              <SendHorizonal size={18} />
-            </button>
-          ) : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatContainer.tsx =====
-
-import { useState, useRef, useEffect } from "react";
-import ChatView from "./ChatView/ChatView";
-import ChatComposer from "./ChatComposer";
-import type { ChatMsg } from "../types/chat";
-import type { GenMetrics, RunJson } from "../hooks/useChatStream";
-
-interface Props {
-  messages: ChatMsg[];
-  input: string;
-  setInput: (s: string) => void;
-  loading: boolean;
-  queued?: boolean;
-  send: (text?: string) => Promise<void>;
-  stop: () => Promise<void> | void;
-  runMetrics?: GenMetrics | null;
-  runJson?: RunJson | null;
-  onRefreshChats?: () => void;
-  onDeleteMessages?: (ids: string[]) => void;
-  autoFollow?: boolean;
-}
-
-export default function ChatContainer({
-  messages,
-  input,
-  setInput,
-  loading,
-  queued = false,
-  send,
-  stop,
-  runMetrics,
-  runJson,
-  onRefreshChats,
-  onDeleteMessages,
-  autoFollow = true,
-}: Props) {
-  const [composerH, setComposerH] = useState(0);
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  // Track if the user is scrolled up
-  const [pinned, setPinned] = useState(false);
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-
-    const threshold = 120;
-
-    const isNearBottom = () => {
-      return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
-    };
-
-    const onScroll = () => {
-      // pinned = true if not near bottom
-      setPinned(!isNearBottom());
-    };
-
-    el.addEventListener("scroll", onScroll, { passive: true });
-
-    // initialize
-    setPinned(!isNearBottom());
-
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
-
-  const forceScrollToBottom = (behavior: ScrollBehavior = "smooth") => {
-    const el = containerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior });
-  };
-
-  const handleSend = async (text?: string) => {
-    // Only auto-scroll if user hasn’t scrolled up
-    if (!pinned) {
-      forceScrollToBottom("auto");
-    }
-    await send(text);
-    onRefreshChats?.();
-    if (!pinned) {
-      requestAnimationFrame(() => forceScrollToBottom("smooth"));
-    }
-  };
-
-  return (
-    <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
-      <div
-        ref={containerRef}
-        data-chat-scroll
-        className="flex-1 overflow-y-auto min-w-0"
-      >
-        <ChatView
-          messages={messages}
-          loading={loading}
-          queued={queued}
-          bottomPad={composerH}
-          runMetrics={runMetrics}
-          runJson={runJson}
-          onDeleteMessages={onDeleteMessages}
-          autoFollow={autoFollow}
-        />
-      </div>
-
-      <ChatComposer
-        input={input}
-        setInput={setInput}
-        loading={loading}
-        queued={queued}
-        onSend={handleSend}
-        onStop={stop}
-        onHeightChange={setComposerH}
-        onRefreshChats={onRefreshChats}
-      />
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatItem.tsx =====
-
-// frontend/src/file_read/components/chat/ChatItem.tsx
-import ChatBubble from "./ChatBubble";
-import AssistantMetrics from "./AssistantMetrics";
-import { buildStatus } from "./ChatView/StatusLine";
-import type { ChatMsg } from "../types/chat";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-
-export default function ChatItem({
-  m,
-  idx,
-  loading,
-  lastAssistantIndex,
-  runJsonLive,
-  runMetricsLive,
-  onDelete,
-}: {
-  m: ChatMsg;
-  idx: number;
-  loading: boolean;
-  lastAssistantIndex: number;
-  runJsonLive?: RunJson | null;
-  runMetricsLive?: GenMetrics | null;
-  onDelete?: (id: string) => void;
-}) {
-  const isAssistant = m.role === "assistant";
-  const isCurrentStreamingAssistant = isAssistant && loading && idx === lastAssistantIndex;
-
-  let jsonForThis: RunJson | null = null;
-  let flatForThis: GenMetrics | null = null;
-
-  if (isAssistant) {
-    // @ts-ignore meta bag
-    const meta = m.meta as { runJson?: RunJson | null; flat?: GenMetrics | null } | undefined;
-    jsonForThis = meta?.runJson ?? null;
-    flatForThis = meta?.flat ?? null;
-
-    if (isCurrentStreamingAssistant) {
-      if (runJsonLive) jsonForThis = runJsonLive;
-      if (runMetricsLive) flatForThis = runMetricsLive;
-    }
-  }
-
-  const status = isAssistant ? buildStatus(jsonForThis, flatForThis) : "";
-  const showMetrics = isAssistant && (jsonForThis || flatForThis);
-
-  return (
-    <div>
-      <ChatBubble
-        role={m.role}
-        text={m.text}
-        showActions={m.role === "user" || (m.role === "assistant" && !isCurrentStreamingAssistant)}
-        onDelete={onDelete ? () => onDelete(m.id) : undefined}
-      />
-      {showMetrics && <AssistantMetrics status={status} runJson={jsonForThis} flat={flatForThis} />}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatSidebar/ChatSidebar.tsx =====
-
-import { useState } from "react";
-import { deleteChatsBatch } from "../../hooks/data/chatApi";
-import type { ChatRow } from "../../types/chat";
-import { useMultiSelect } from "../../hooks/useMultiSelect";
-import { useChatsPager } from "../../hooks/useChatsPager";
-import SidebarHeader from "./SidebarHeader";
-import SidebarListItem from "./SidebarListItem";
-
-const PAGE_SIZE = 10;
-
-type Props = {
-  onOpen: (id: string) => Promise<void>;
-  onNew: () => Promise<void>;
-  refreshKey?: number;
-  activeId?: string;
-  onHideSidebar?: () => void;
-  onCancelSessions?: (ids: string[]) => Promise<void>;
-};
-
-export default function ChatSidebar({
-  onOpen, onNew, refreshKey, activeId, onHideSidebar, onCancelSessions,
-}: Props) {
-  const {
-    chats, page, hasMore, total, totalPages,
-    initialLoading, loadingMore,
-    scrollRef, sentinelRef, loadMore, setChats,
-  } = useChatsPager(PAGE_SIZE, refreshKey);
-
-  const [isEditing, setIsEditing] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [newPending, setNewPending] = useState(false);
-
-  const allIds = chats.map(c => c.sessionId);
-  const { selected, setSelected, allSelected, toggleOne, toggleAll } = useMultiSelect(allIds);
-
-  async function handleNew() {
-    if (newPending) return;
-    setNewPending(true);
-    try { await onNew(); } finally { setNewPending(false); }
-  }
-
-  async function onDeleteSelected(): Promise<void> {
-    const count = selected.size;
-    if (!count || deleting) return;
-
-    const isAll = count === chats.length;
-    const ok = window.confirm(
-      isAll
-        ? `Delete ALL ${count} chats? This cannot be undone.`
-        : `Delete ${count} selected chat${count > 1 ? "s" : ""}?`
-    );
-    if (!ok) return;
-
-    const ids = [...selected];
-    try { await onCancelSessions?.(ids); await Promise.resolve(); } catch {}
-
-    const deletingActive = activeId ? selected.has(activeId) : false;
-    const fallback = chats.find(c => !selected.has(c.sessionId))?.sessionId;
-
-    setDeleting(true);
-    try {
-      const deleted = await deleteChatsBatch(ids);
-      if (!deleted.length) return;
-      setChats(prev => prev.filter(c => !deleted.includes(c.sessionId)));
-      setSelected(new Set());
-      setIsEditing(false);
-
-      if (deletingActive) {
-        if (fallback) void onOpen(fallback);
-        else void onOpen("");
-      }
-    } finally {
-      setDeleting(false);
-    }
-  }
-
-  return (
-    <aside className="w-full md:w-72 h-full border-r bg-white p-0 flex flex-col">
-      <SidebarHeader
-        isEditing={isEditing}
-        setIsEditing={(v) => { setIsEditing(v); setSelected(new Set()); }}
-        newPending={newPending}
-        onNew={handleNew}
-        onHideSidebar={onHideSidebar}
-        selectedCount={selected.size}
-        deleting={deleting}
-        onDelete={onDeleteSelected}
-      />
-
-      {/* LIST */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto p-2 overscroll-contain"
-        style={{ WebkitOverflowScrolling: "touch" }}
-      >
-        {initialLoading && (
-          <div className="px-2 py-1 text-xs 
+        return (str(r.url), r.s

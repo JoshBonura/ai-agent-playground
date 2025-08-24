@@ -14,10 +14,11 @@ from .session_io import handle_incoming, persist_summary
 from .packing import build_system_text, pack_with_rollup
 from .context_window import clamp_out_budget
 
-# Router + summarizer + orchestrator (web path)
-from ..web.router_ai import decide_web
-from ..web.query_summarizer import summarize_query
-from ..web.orchestrator import build_web_block
+# Router (router will decide & fetch if needed)
+from ..web.router_ai import decide_web_and_fetch
+
+# Stream meta markers to filter out from the buffered assistant text
+from ..utils.streaming import RUNJSON_START, RUNJSON_END
 
 # Tell the type checker run_stream is an async iterator of bytes (stops yellow underline)
 from .streaming_worker import run_stream as _run_stream
@@ -53,6 +54,62 @@ def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, ob
         print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
     except Exception as e:
         print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+
+# ---- tiny helper: last user + recent tail (user & assistant) + summary -------
+def _compose_router_text(
+    recent,
+    latest_user_text: str,
+    summary: str,
+    *,
+    tail_turns: int = 6,
+    summary_chars: int = 600,
+    max_chars: int = 1400,
+    
+) -> str:
+    """
+    Priority input for the router:
+      1) Latest user message (verbatim)
+      2) Short recent tail (user + assistant) so URLs/snippets are visible
+      3) Trimmed slice of the persisted conversation summary
+
+    Hard-caps the final text to max_chars to avoid overfeeding the router.
+    """
+    parts: List[str] = []
+
+    if latest_user_text:
+        parts.append((latest_user_text or "").strip())
+
+    # Convert to list for safe slicing; include both roles
+    try:
+        recent_list = list(recent)
+    except Exception:
+        recent_list = []
+
+    tail_src = recent_list[-tail_turns:]
+    tail_lines: List[str] = []
+    for m in reversed(tail_src):
+        if not isinstance(m, dict):
+            continue
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        role = (m.get("role") or "user").strip()
+        tail_lines.append(f"{role}: {c}")
+
+    if tail_lines:
+        parts.append("Context:\n" + "\n".join(tail_lines))
+
+    if summary:
+        s = summary.strip()
+        if len(s) > summary_chars:
+            s = s[-summary_chars:]  # take the most recent slice of the summary
+        parts.append("Summary:\n" + s)
+
+    out = "\n\n".join(parts).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip()
+    return out
+
 # -----------------------------------------------------------------------------
 
 async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
@@ -72,32 +129,31 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     latest_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
     lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
 
-    # --- ROUTER → (maybe) SUMMARIZER → (maybe) WEB BLOCK ----------------------
+    # --- ROUTER (one-hop) → maybe WEB BLOCK -----------------------------------
     t0 = time.perf_counter()
     print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
     try:
-        need_web, proposed_q = decide_web(llm, str(latest_user_text or ""))
-        print(f"[{_now()}] ROUTER decision need_web={need_web} proposed_q={proposed_q!r}")
+        k = int(getattr(data, "webK", 3) or 3)
 
-        if need_web:
-            base_query = proposed_q or str(latest_user_text or "")
-            q_summary = summarize_query(llm, base_query).strip().strip('"\'')
-            print(f"[{_now()}] SUMMARIZER out={q_summary!r}")
+        # Minimal change: give the router a compact view (last user + tail + summary)
+        router_text = _compose_router_text(
+            st.get("recent", []),
+            str(latest_user_text or ""),
+            st.get("summary", "") or "", tail_turns=0,summary_chars=0, 
+        )
+        block = await decide_web_and_fetch(llm, router_text, k=k)
 
-            k = int(getattr(data, "webK", 3) or 3)
-            print(f"[{_now()}] ORCH build start k={k} q={q_summary!r}")
-            block = await build_web_block(q_summary, k=k)
-            print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
+        print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
 
-            if block:
-                st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
-                    {
-                        "role": "assistant",
-                        "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
-                    }
-                ]
-                types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
-                print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
+        if block:
+            st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
+                {
+                    "role": "assistant",
+                    "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
+                }
+            ]
+            types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
+            print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
 
         dt = time.perf_counter() - t0
         eph_cnt = len(st.get("_ephemeral_web") or [])
@@ -118,6 +174,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         max_ctx=4096,
         out_budget=out_budget_req,
         ephemeral=ephemeral_once,
+        
     )
 
     packed_chars = _chars_len(packed)
@@ -142,6 +199,21 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     async def streamer() -> AsyncGenerator[bytes, None]:
         async with GEN_SEMAPHORE:
             mark_active(session_id, +1)
+            # Buffer the assistant text we stream so we can add it to st["recent"]
+            out_buf = bytearray()
+
+            def _accum_visible(chunk_bytes: bytes):
+                if not chunk_bytes:
+                    return
+                s = chunk_bytes.decode("utf-8", errors="ignore")
+                # Skip embedded run-json envelopes entirely
+                if RUNJSON_START in s and RUNJSON_END in s:
+                    return
+                # Skip the “stopped” line if present
+                if s.strip() == "⏹ stopped":
+                    return
+                out_buf.extend(chunk_bytes)
+
             try:
                 print(f"[{_now()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
                 async for chunk in run_stream(
@@ -154,8 +226,29 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                     top_p=(data.top_p or 0.9),
                     input_tokens_est=input_tokens_est,
                 ):
+                    # accumulate for router/model future context
+                    if isinstance(chunk, (bytes, bytearray)):
+                        _accum_visible(chunk)
+                    else:
+                        _accum_visible(chunk.encode("utf-8"))
                     yield chunk
             finally:
+                # Append the assistant’s full response to recent so both router and model
+                # will see it on the next turn.
+                try:
+                    full_text = out_buf.decode("utf-8", errors="ignore").strip()
+                    # hard-strip any trailing RUNJSON block that slipped through
+                    start = full_text.find(RUNJSON_START)
+                    if start != -1:
+                        end = full_text.find(RUNJSON_END, start)
+                        if end != -1:
+                            full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
+                    if full_text:
+                        st["recent"].append({"role": "assistant", "content": full_text})
+                        print(f"[{_now()}] RECENT append assistant chars={len(full_text)}")
+                except Exception:
+                    pass
+
                 # 1) flush pending ops
                 try:
                     from ..store import apply_pending_for

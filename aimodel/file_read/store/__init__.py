@@ -6,9 +6,6 @@ from .chats import (
     merge_chat, merge_chat_new, edit_message, set_summary, get_summary,  # ← add these
 )
 from .index import ChatMeta
-from .pending import (
-    enqueue_pending, apply_pending_for, process_all_pending, list_pending_sessions,
-)
 
 __all__ = [
     # chats
@@ -20,5 +17,5 @@ __all__ = [
     # index
     "ChatMeta",
     # pending
-    "enqueue_pending", "apply_pending_for", "process_all_pending", "list_pending_sessions", "set_summary", "get_summary"
+    "set_summary", "get_summary"
 ]

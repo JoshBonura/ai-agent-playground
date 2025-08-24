@@ -1,0 +1,687 @@
+ut),
+
+      // NEW: patch server id onto a bubble identified by clientId
+      setServerIdFor: (sid, clientId, serverId) => {
+        setMessagesForSession(sid, (prev) =>
+          prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
+        );
+      },
+
+      // session plumbing
+      getSessionId: sessionId,
+      ensureChatCreated,
+      onRetitle,
+      resetMetricsFor: (sid) => resetMetricsForSession(sid),
+    });
+    // Intentionally stable: controller owns its own lifecycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    controllerRef.current = controller;
+    return () => controllerRef.current?.dispose();
+  }, [controller]);
+
+  async function send(override?: string) {
+    const text = (override ?? "").trim();
+    if (!text) return;
+    await controller.send(text);
+  }
+
+  async function stop() {
+    await controller.stop();
+  }
+
+  async function cancelBySessionId(sid: string) {
+    await controller.cancelBySessionId(sid);
+  }
+
+  return { loading, send, stop, cancelBySessionId };
+}
+
+# ===== frontend/src/file_read/hooks/useTheme.ts =====
+
+// frontend/src/file_read/hooks/useTheme.ts
+import { useEffect, useState } from "react";
+
+type Theme = "light" | "dark";
+const KEY = "theme";
+
+export function useTheme() {
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = (localStorage.getItem(KEY) as Theme) || null;
+    if (saved) return saved;
+    const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") root.classList.add("dark");
+    else root.classList.remove("dark");
+    localStorage.setItem(KEY, theme);
+  }, [theme]);
+
+  const toggle = () => setTheme(t => (t === "dark" ? "light" : "dark"));
+  return { theme, toggle };
+}
+
+# ===== frontend/src/file_read/hooks/useToast.ts =====
+
+import { useState } from "react";
+
+export function useToast() {
+  const [toast, setToast] = useState<string | null>(null);
+  function show(msg: string, ms = 1800) {
+    setToast(msg);
+    window.clearTimeout((show as any)._t);
+    (show as any)._t = window.setTimeout(() => setToast(null), ms);
+  }
+  return { toast, show };
+}
+
+# ===== frontend/src/file_read/index.css =====
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+# ===== frontend/src/file_read/main.tsx =====
+
+import { StrictMode } from 'react'
+import './index.css';
+import { createRoot } from 'react-dom/client'
+import App from './App.tsx'
+
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+# ===== frontend/src/file_read/pages/AgentRunner.tsx =====
+
+// frontend/src/file_read/pages/AgentRunner.tsx
+import { useEffect, useState } from "react";
+import ChatContainer from "../components/ChatContainer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
+import { useChatStream } from "../hooks/useChatStream";
+import { useSidebar } from "../hooks/useSidebar";
+import { useToast } from "../hooks/useToast";
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import Toast from "../shared/ui/Toast";
+import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
+
+const PAGE_SIZE = 30;
+const LS_KEY = "lastSessionId";
+
+export default function AgentRunner() {
+  const chat = useChatStream();
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [autoFollow, setAutoFollow] = useState(true); // NEW
+  const { toast, show } = useToast();
+  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const ceil = new Date().toISOString();
+        const page = await listChatsPage(0, PAGE_SIZE, ceil);
+        const saved = localStorage.getItem(LS_KEY) || "";
+        const targetId =
+          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
+          page.content[0]?.sessionId ||
+          "";
+        if (targetId) {
+          await chat.loadHistory(targetId);
+          localStorage.setItem(LS_KEY, targetId);
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function newChat(): Promise<void> {
+    const id = crypto.randomUUID();
+    chat.setSessionId(id);
+    try { await createChat(id, "New Chat"); } catch {}
+    localStorage.setItem(LS_KEY, id);
+    setRefreshKey((k) => k + 1);
+    chat.setInput("");
+    chat.clearMetrics?.();
+    // Follow to bottom for a fresh chat
+    await refreshFollow();
+  }
+
+  async function openSession(id: string): Promise<void> {
+    if (!id) return;
+    await chat.loadHistory(id);
+    localStorage.setItem(LS_KEY, id);
+    chat.setInput("");
+    chat.clearMetrics?.();
+    // Follow when explicitly opening a session
+    await refreshFollow();
+  }
+
+  // --- TWO REFRESH HELPERS ---
+
+  // 1) Follow-to-bottom refresh (normal)
+  async function refreshFollow() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    setAutoFollow(true); // enable ChatView auto-follow
+    await chat.loadHistory(sid);
+    const el = document.getElementById("chat-scroll-container");
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  // 2) Preserve-scroll refresh (use for deletions, etc.)
+  async function refreshPreserve() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    const el = document.getElementById("chat-scroll-container");
+    const prevTop = el?.scrollTop ?? 0;
+    const prevHeight = el?.scrollHeight ?? 0;
+
+    setAutoFollow(false); // temporarily disable auto-follow in ChatView
+    await chat.loadHistory(sid);
+
+    requestAnimationFrame(() => {
+      if (el) {
+        const newHeight = el.scrollHeight;
+        el.scrollTop = prevTop + (newHeight - prevHeight);
+      }
+      // re-enable for normal behavior afterward
+      setAutoFollow(true);
+    });
+  }
+
+  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
+  async function handleDeleteMessages(clientIds: string[]) {
+    const sid = chat.sessionIdRef.current;
+    console.log("handleDeleteMessages", { clientIds, sid });
+
+    if (!sid || !clientIds?.length) return;
+
+    const current = chat.messages;
+    const toDelete = new Set(clientIds);
+
+    const serverIds = current
+      .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
+      .map((m: any) => m.serverId as number);
+
+    const remaining = current.filter((m) => !toDelete.has(m.id));
+
+    // Optimistic local state
+    if ((chat as any).setMessagesForSession) {
+      (chat as any).setMessagesForSession(sid, () => remaining);
+    }
+
+    try {
+      if (serverIds.length) {
+        await deleteMessagesBatch(sid, serverIds);
+      }
+
+      // Preserve scroll on delete
+      await refreshPreserve();
+
+      // Update sidebar (title/lastMessage)
+      setRefreshKey((k) => k + 1);
+      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+
+      show("Message deleted");
+    } catch (err) {
+      show("Failed to delete message");
+      await chat.loadHistory(sid);
+      setRefreshKey((k) => k + 1);
+    }
+  }
+
+  return (
+    <div className="h-screen w-full flex bg-gray-50">
+      {sidebarOpen && (
+        <div className="hidden md:flex h-full">
+          <ChatSidebar
+            onOpen={openSession}
+            onNew={newChat}
+            refreshKey={refreshKey}
+            activeId={chat.sessionIdRef.current}
+            onHideSidebar={() => setSidebarOpen(false)}
+          />
+        </div>
+      )}
+
+      <MobileDrawer
+        onOpenSession={openSession}
+        onNewChat={newChat}
+        refreshKey={refreshKey}
+        activeId={chat.sessionIdRef.current}
+        openMobileDrawer={openMobileDrawer}
+        closeMobileDrawer={closeMobileDrawer}
+      />
+      <div className="md:hidden h-14 shrink-0" />
+
+      <div className="flex-1 min-w-0 flex flex-col">
+        <DesktopHeader sidebarOpen={sidebarOpen} onShowSidebar={() => setSidebarOpen(true)} />
+        <div className="flex-1 min-h-0">
+          <div className="h-full px-3 md:px-6">
+            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
+              <ChatContainer
+                messages={chat.messages}
+                input={chat.input}
+                setInput={chat.setInput}
+                loading={chat.loading}
+                queued={chat.queued}
+                send={chat.send}
+                stop={chat.stop}
+                runMetrics={chat.runMetrics}
+                runJson={chat.runJson}
+                onRefreshChats={() => setRefreshKey((k) => k + 1)}
+                onDeleteMessages={handleDeleteMessages}
+                autoFollow={autoFollow} // NEW
+              />
+              <Toast message={toast} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/pages/AgentShell.tsx =====
+
+// frontend/src/file_read/pages/AgentShell.tsx
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
+import ChatContainer from "../components/ChatContainer";
+
+export default function AgentShell({
+  sidebarOpen, setSidebarOpen,
+  openMobileDrawer, closeMobileDrawer,
+  refreshKey, activeId,
+  onOpenSession, onNewChat,
+  chatProps,
+}: {
+  sidebarOpen: boolean;
+  setSidebarOpen: (v: boolean) => void;
+  openMobileDrawer: () => void;
+  closeMobileDrawer: () => void;
+  refreshKey: number;
+  activeId?: string;
+  onOpenSession: (id: string) => Promise<void>;
+  onNewChat: () => Promise<void>;
+  chatProps: React.ComponentProps<typeof ChatContainer>;
+}) {
+  return (
+    <div className="h-screen w-full flex bg-gray-50">
+      {sidebarOpen && (
+        <div className="hidden md:flex h-full">
+          <ChatSidebar
+            onOpen={onOpenSession}
+            onNew={onNewChat}
+            refreshKey={refreshKey}
+            activeId={activeId}
+            onHideSidebar={() => setSidebarOpen(false)}
+          />
+        </div>
+      )}
+
+      <MobileDrawer
+        onOpenSession={onOpenSession}
+        onNewChat={onNewChat}
+        refreshKey={refreshKey}
+        activeId={activeId}
+        openMobileDrawer={openMobileDrawer}
+        closeMobileDrawer={closeMobileDrawer}
+      />
+      <div className="md:hidden h-14 shrink-0" />
+
+      <div className="flex-1 min-w-0 flex flex-col">
+        <DesktopHeader
+          sidebarOpen={sidebarOpen}
+          onShowSidebar={() => setSidebarOpen(true)}
+        />
+        <div className="flex-1 min-h-0">
+          <div className="h-full px-3 md:px-6">
+            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
+              <ChatContainer {...chatProps} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/pages/useInitialLoad.ts =====
+
+// frontend/src/file_read/pages/useInitialLoad.ts
+import { useEffect } from "react";
+import { listChatsPage } from "../data/chatApi";
+
+export function useInitialLoad(
+  pageSize: number,
+  onPick: (id: string) => Promise<void>,
+  keyName = "lastSessionId"
+) {
+  useEffect(() => {
+    (async () => {
+      try {
+        const ceil = new Date().toISOString();
+        const page = await listChatsPage(0, pageSize, ceil);
+        const saved = localStorage.getItem(keyName) || "";
+        const targetId =
+          (saved && page.content.find(c => c.sessionId === saved)?.sessionId) ||
+          page.content[0]?.sessionId || "";
+        if (targetId) {
+          await onPick(targetId);
+          localStorage.setItem(keyName, targetId);
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+}
+
+# ===== frontend/src/file_read/services/http.ts =====
+
+export const API_BASE = import.meta.env.VITE_API_URL || "";
+
+export async function request<T>(
+  path: string,
+  init?: RequestInit
+): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, init);
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    // bubble a readable error
+    throw new Error(`HTTP ${res.status} – ${text || res.statusText}`);
+  }
+  return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
+}
+
+# ===== frontend/src/file_read/shared/lib/runjson.ts =====
+
+// src/file_read/utils/runjson.ts
+export const MET_START = "[[RUNJSON]]";
+export const MET_END = "[[/RUNJSON]]";
+
+export type GenMetrics = {
+  ttft_ms?: number | null;
+  tok_per_sec?: number | null;
+  output_tokens?: number | null;
+  input_tokens_est?: number | null;
+  total_tokens_est?: number | null;
+  stop_reason?: string | null;
+};
+
+export type RunJson = {
+  stats?: {
+    stopReason?: string | null;
+    tokensPerSecond?: number | null;
+    timeToFirstTokenSec?: number | null;
+    totalTimeSec?: number | null;
+    promptTokensCount?: number | null;
+    predictedTokensCount?: number | null;
+    totalTokensCount?: number | null;
+  };
+  [k: string]: unknown;
+};
+
+// Robustly extract the last [[RUNJSON]] ... [[/RUNJSON]] block, tolerating
+// surrounding spaces/newlines and any placement within the text.
+export function extractRunJsonFromBuffer(
+  buf: string
+): { clean: string; json?: RunJson; flat?: GenMetrics } {
+  // Use a global, dotall regex that captures the JSON payload and allows
+  // optional whitespace around the delimiters.
+  const re =
+    /(?:\s*)\[\[RUNJSON\]\]\s*([\s\S]*?)\s*\[\[\/RUNJSON\]\](?:\s*)/g;
+
+  let match: RegExpExecArray | null = null;
+  let lastMatch: RegExpExecArray | null = null;
+
+  while ((match = re.exec(buf)) !== null) {
+    lastMatch = match; // keep the last one if multiple blocks appear
+  }
+
+  if (!lastMatch) {
+    // nothing found -> leave as-is
+    return { clean: buf };
+  }
+
+  const fullSpan = lastMatch[0];
+  const payload = lastMatch[1] ?? "";
+
+  let parsed: RunJson | undefined;
+  try {
+    parsed = JSON.parse(payload) as RunJson;
+  } catch {
+    // if JSON parse fails, still strip the span from the clean text
+  }
+
+  // Remove exactly the matched span (not all occurrences).
+  const startIdx = (lastMatch.index as number);
+  const endIdx = startIdx + fullSpan.length;
+  const clean = buf.slice(0, startIdx) + buf.slice(endIdx);
+
+  // Flatten if we have stats
+  let flat: GenMetrics | undefined;
+  const s = parsed?.stats;
+  if (s) {
+    flat = {
+      ttft_ms:
+        s.timeToFirstTokenSec != null
+          ? Math.max(0, s.timeToFirstTokenSec) * 1000
+          : null,
+      tok_per_sec: s.tokensPerSecond ?? null,
+      output_tokens: s.predictedTokensCount ?? null,
+      input_tokens_est: s.promptTokensCount ?? null,
+      total_tokens_est: s.totalTokensCount ?? null,
+      stop_reason: s.stopReason ?? null,
+    };
+  }
+
+  return { clean, json: parsed, flat };
+}
+
+// For one-shot responses (e.g., title bot)
+export function stripRunJson(raw: string): {
+  text: string;
+  json?: RunJson;
+  flat?: GenMetrics;
+} {
+  const { clean, json, flat } = extractRunJsonFromBuffer(raw);
+  return { text: clean, json, flat };
+}
+
+// (kept exports for any external references)
+export { MET_START as MET_START_TAG, MET_END as MET_END_TAG };
+
+# ===== frontend/src/file_read/shared/lib/text.ts =====
+
+export function firstLineSmart(s: string, max = 48): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length <= max ? one : one.slice(0, max - 1).trimEnd() + "…";
+}
+
+# ===== frontend/src/file_read/shared/ui/Button.tsx =====
+
+interface Props {
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}
+
+export default function Button({ onClick, disabled, children }: Props) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 ${
+        disabled ? "opacity-50 cursor-not-allowed" : ""
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/CodeCopyButton.tsx =====
+
+// frontend/src/file_read/components/CodeCopyButton.tsx
+import { Copy, Check } from "lucide-react";
+import { useState } from "react";
+
+export default function CodeCopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  async function onCopy() {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+  }
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      title={copied ? "Copied!" : "Copy"}
+      className="inline-flex items-center justify-center w-7 h-7 rounded bg-gray-200 text-gray-600 hover:bg-gray-300 transition"
+    >
+      {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+    </button>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/Spinner.tsx =====
+
+export default function Spinner() {
+  return (
+    <div className="flex justify-center py-6">
+      <div className="h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/Toast.tsx =====
+
+export default function Toast({ message }: { message: string | null }) {
+  if (!message) return null;
+  return (
+    <div className="pointer-events-none fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
+      <div className="px-3 py-2 rounded-lg bg-black text-white text-xs shadow-lg">
+        {message}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/TypingIndicator.tsx =====
+
+// components/TypingIndicator.tsx
+export default function TypingIndicator() {
+  return (
+    <div className="flex items-start gap-2">
+      {/* Optional avatar spot */}
+      <div className="h-8 w-8 rounded-full bg-gray-200 shrink-0" />
+      <div className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600">
+        <span className="inline-flex gap-1">
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.2s]" />
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.1s]" />
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/types/chat.ts =====
+
+export type Role = "user" | "assistant";
+
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export type ChatMsg = {
+  /** Stable UI id that never changes. Always a UUID you assign client-side. */
+  id: string; // == clientId
+  /** Database id if persisted. Null until the backend saves it. */
+  serverId: number | null;
+
+  role: Role;
+  text: string;
+
+  // Per-message telemetry (assistant only is typical)
+  meta?: {
+    runJson?: RunJson | null;
+    flat?: GenMetrics | null;
+  };
+};
+
+export type ChatRow = {
+  id: number;
+  sessionId: string;
+  title: string;
+  lastMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ChatMessageRow = {
+  id: number;              // server id
+  sessionId: string;
+  role: Role;
+  content: string;
+  createdAt: string;
+};
+
+# ===== frontend/src/file_read/utils/metricsCache.ts =====
+
+// Cache per-assistant-message metrics in localStorage so they persist across navigation/reload.
+const KEY = "msgMetrics:v1";
+
+type Stored = Record<string, { runJson?: any | null; flat?: any | null }>;
+
+function loadAll(): Stored {
+  try {
+    const raw = localStorage.getItem(KEY);
+    return raw ? (JSON.parse(raw) as Stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAll(obj: Stored) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(obj));
+  } catch {
+    /* ignore quota errors */
+  }
+}
+
+export function setMsgMetrics(messageId: string, data: { runJson?: any | null; flat?: any | null }) {
+  const all = loadAll();
+  const cur = all[messageId] || {};
+  all[messageId] = {
+    runJson: data.runJson ?? cur.runJson ?? null,
+    flat: data.flat ?? cur.flat ?? null,
+  };
+  saveAll(all);
+}
+
+export function getMsgMetrics(messageId: string) {
+  const all = loadAll();
+  return all[messageId] || null;
+}
+
+export function clearMsgMetrics(messageId: string) {
+  const all = loadAll();
+  if (all[messageId]) {
+    delete all[messageId];
+    saveAll(all);
+  }
+}
+
+# ===== frontend/src/file_read/vite-env.d.ts =====
+
+/// <reference types="vite/client" />

@@ -4,12 +4,9 @@ ai-agent-playground/
   body.json
   clean-structure-1.txt
   clean-structure-2.txt
-  docker-compose.dev.yml
   fs.py
   my-structure.txt
   pc.py
-  print2.py
-  test_ddg.py
   .git/
   .venv/
     Include/
@@ -157,8 +154,6 @@ ai-agent-playground/
   .vscode/
     settings.json
   aimodel/
-    .dockerignore
-    Dockerfile
     file_read/
       __init__.py
       app.py
@@ -170,9 +165,7 @@ ai-agent-playground/
         __init__.py
         chats.py
         generate_router.py
-        health.py
         models.py
-        search.py
       backend/
         .env
       core/
@@ -189,15 +182,11 @@ ai-agent-playground/
         packing.py
         session_io.py
         streaming_worker.py
-        web_block.py
       store/
         __init__.py
         base.py
         chats.py
         index.py
-        pending.py
-      trace_logs/
-        calls.log
       utils/
         streaming.py
       web/
@@ -208,11 +197,13 @@ ai-agent-playground/
         provider.py
         query_summarizer.py
         router_ai.py
+    policy.py/
+      capability_probe.py
+      policy_config.py
+      policy_engine.py
   frontend/
-    .dockerignore
     .env.development
     .gitignore
-    Dockerfile
     README.md
     clean-structure.txt
     eslint.config.js
