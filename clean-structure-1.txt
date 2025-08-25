@@ -1,13 +1,387 @@
 
 # ===== aimodel/file_read/__init__.py =====
 
-from .paths import app_data_dir, read_settings, write_settings
-from .model_runtime import ensure_ready, get_llm, current_model_info
+from .adaptive.config.paths import app_data_dir, read_settings, write_settings
+from .runtime.model_runtime import ensure_ready, get_llm, current_model_info
 
 __all__ = [
     "app_data_dir", "read_settings", "write_settings",
     "ensure_ready", "get_llm", "current_model_info",
 ]
+
+# ===== aimodel/file_read/adaptive/config/adaptive_config.py =====
+
+# aimodel/file_read/runtime/adaptive_config.py
+from __future__ import annotations
+import os, shutil, subprocess, platform
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Any
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+try:
+    import torch
+except Exception:
+    torch = None
+
+from .paths import read_settings
+
+def _env_bool(k:str, default:bool)->bool:
+    v = os.getenv(k)
+    if v is None: return default
+    return v.strip().lower() in ("1","true","yes","on")
+
+def _cpu_count()->int:
+    try:
+        import multiprocessing as mp
+        return max(1, mp.cpu_count() or os.cpu_count() or 1)
+    except Exception:
+        return os.cpu_count() or 1
+
+def _avail_ram()->Optional[int]:
+    if not psutil: return None
+    try: return int(psutil.virtual_memory().available)
+    except Exception: return None
+
+def _cuda_vram()->Optional[int]:
+    if torch and torch.cuda.is_available():
+        try:
+            dev = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(dev)
+            return int(props.total_memory)
+        except Exception:
+            pass
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi","--query-gpu=memory.total","--format=csv,noheader,nounits"],
+                text=True, stderr=subprocess.DEVNULL, timeout=2.0
+            )
+            mb = max(int(x.strip()) for x in out.strip().splitlines() if x.strip())
+            return mb * 1024 * 1024
+        except Exception:
+            return None
+    return None
+
+def _gpu_kind()->str:
+    if _cuda_vram(): return "cuda"
+    if torch and getattr(torch.backends,"mps",None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+def _safe_float(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def _pick_dtype_quant(device: str, a: Dict[str, Any], vram_bytes: Optional[int]) -> tuple[Optional[str], Optional[str]]:
+    dq = a.get("dtype_quant", {}) if isinstance(a, dict) else {}
+    if device == "cuda":
+        tiers = dq.get("cuda_tiers") or []
+        vram_gb = (vram_bytes or 0) / (1024**3)
+        best = None
+        for t in sorted(tiers, key=lambda x: float(x.get("min_vram_gb", 0)), reverse=True):
+            if vram_gb >= _safe_float(t.get("min_vram_gb"), 0.0):
+                best = t
+                break
+        if best:
+            return best.get("dtype"), best.get("quant")
+        return dq.get("cuda_default_dtype"), dq.get("cuda_default_quant")
+    if device == "mps":
+        return dq.get("mps_default_dtype"), None
+    return dq.get("cpu_default_dtype"), dq.get("cpu_default_quant")
+
+def _pick_kv(device: str, a: Dict[str, Any], vram_bytes: Optional[int]) -> Optional[str]:
+    kv = a.get("kv_cache", {}) if isinstance(a, dict) else {}
+    if device == "cuda":
+        tiers = kv.get("cuda_tiers") or []
+        vram_gb = (vram_bytes or 0) / (1024**3)
+        best = None
+        for t in sorted(tiers, key=lambda x: float(x.get("min_vram_gb", 0)), reverse=True):
+            if vram_gb >= _safe_float(t.get("min_vram_gb"), 0.0):
+                best = t
+                break
+        if best:
+            return best.get("dtype")
+        return kv.get("cuda_default")
+    if device == "mps":
+        return kv.get("mps_default")
+    return kv.get("cpu_default")
+
+def _pick_capacity(device: str, a: Dict[str, Any], vram_bytes: Optional[int], threads:int) -> tuple[int,int,Optional[int]]:
+    cap = a.get("capacity", {}) if isinstance(a, dict) else {}
+    if device == "cuda":
+        tiers = cap.get("cuda_tiers") or []
+        vram_gb = (vram_bytes or 0) / (1024**3)
+        best = None
+        for t in sorted(tiers, key=lambda x: float(x.get("min_vram_gb", 0)), reverse=True):
+            if vram_gb >= _safe_float(t.get("min_vram_gb"), 0.0):
+                best = t
+                break
+        if best:
+            return int(best.get("seq_len") or 0), int(best.get("batch") or 1), int(best.get("n_gpu_layers") or 0)
+        return 0, 1, 0
+    if device == "mps":
+        m = cap.get("mps", {})
+        return int(m.get("seq_len") or 0), int(m.get("batch") or 1), 0
+    cpu = cap.get("cpu", {})
+    seq_len = int(cpu.get("seq_len") or 0)
+    batch = 1
+    by = cpu.get("batch_by_threads") or []
+    best = None
+    for t in sorted(by, key=lambda x: int(x.get("min_threads", 0)), reverse=True):
+        if threads >= int(t.get("min_threads") or 0):
+            best = t
+            break
+    if best:
+        batch = int(best.get("batch") or 1)
+    return seq_len, batch, 0
+
+def _gpu_mem_fraction(device:str, a: Dict[str, Any]) -> float:
+    table = a.get("gpu_fraction", {}) if isinstance(a, dict) else {}
+    v = table.get(device)
+    return _safe_float(v, 0.0)
+
+def _torch_flags(device:str, a: Dict[str, Any]) -> tuple[bool,bool]:
+    flags = a.get("flags", {}) if isinstance(a, dict) else {}
+    flash = bool(flags.get("enable_flash_attn_cuda")) if device == "cuda" else False
+    tc = bool(flags.get("use_torch_compile_on_cuda_linux")) if (device == "cuda" and platform.system().lower()=="linux") else False
+    return flash, tc
+
+def _threads(a: Dict[str, Any]) -> tuple[int,int,int,int]:
+    policy = a.get("cpu_threads_policy", {}) if isinstance(a, dict) else {}
+    mode = str(policy.get("mode") or "").lower()
+    ncpu = _cpu_count()
+    if mode == "fixed":
+        v = int(policy.get("value") or max(1, ncpu-1))
+        t = max(1, min(v, ncpu))
+    elif mode == "percent":
+        pct = _safe_float(policy.get("value"), 0.0)
+        t = max(1, min(ncpu, int(round(ncpu*pct/100.0))))
+        if t < 1: t = 1
+    else:
+        t = max(1, ncpu-1)
+    intra = t
+    inter = max(1, ncpu//2)
+    return ncpu, t, intra, inter
+
+@dataclass
+class AdaptiveConfig:
+    device: str
+    dtype: Optional[str]
+    quant: Optional[str]
+    kv_cache_dtype: Optional[str]
+    max_seq_len: int
+    max_batch_size: int
+    gpu_memory_fraction: float
+    cpu_threads: int
+    torch_intraop_threads: int
+    torch_interop_threads: int
+    enable_flash_attn: bool
+    use_torch_compile: bool
+    total_vram_bytes: Optional[int]
+    avail_ram_bytes: Optional[int]
+    cpu_count: int
+    def as_dict(self)->Dict[str,Any]:
+        return asdict(self)
+
+def compute_adaptive_config()->AdaptiveConfig:
+    settings = read_settings()
+    a = settings.get("adaptive", {}) if isinstance(settings, dict) else {}
+    device = _gpu_kind()
+    vram = _cuda_vram() if device=="cuda" else None
+    ram = _avail_ram()
+    ncpu, threads, intra, inter = _threads(a)
+    dtype, quant = _pick_dtype_quant(device, a, vram)
+    kv = _pick_kv(device, a, vram)
+    seq_len, batch, n_gpu_layers = _pick_capacity(device, a, vram, threads)
+    frac = _gpu_mem_fraction(device, a)
+    flash, tcompile = _torch_flags(device, a)
+    return AdaptiveConfig(
+        device=device,
+        dtype=dtype,
+        quant=quant,
+        kv_cache_dtype=kv,
+        max_seq_len=int(seq_len or 0),
+        max_batch_size=int(batch or 1),
+        gpu_memory_fraction=frac,
+        cpu_threads=threads,
+        torch_intraop_threads=intra,
+        torch_interop_threads=inter,
+        enable_flash_attn=flash,
+        use_torch_compile=tcompile,
+        total_vram_bytes=vram,
+        avail_ram_bytes=ram,
+        cpu_count=ncpu
+    )
+
+# ===== aimodel/file_read/adaptive/config/paths.py =====
+
+# aimodel/file_read/paths.py
+from __future__ import annotations
+import json, os
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, Optional
+import sys
+
+# App data dir (override with LOCALAI_DATA_DIR for dev/electron)
+def app_data_dir() -> Path:
+    override = os.getenv("LOCALAI_DATA_DIR")
+    if override:
+        return Path(override)
+
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
+        return Path(base) / "LocalAI"
+
+    if sys.platform == "darwin":  # macOS
+        return Path.home() / "Library" / "Application Support" / "LocalAI"
+
+    if os.name == "posix":  # Linux/other UNIX
+        return Path.home() / ".local" / "share" / "LocalAI"
+
+    return Path.home() / ".localai"
+
+SETTINGS_PATH = app_data_dir() / "settings.json"
+
+DEFAULTS = {
+    "modelsDir": str((app_data_dir() / "models").resolve()),
+    "modelPath": "",            # empty = none selected
+    "nCtx": 4096,
+    "nThreads": 8,
+    "nGpuLayers": 40,
+    "nBatch": 256,
+    "ropeFreqBase": None,       # advanced (optional)
+    "ropeFreqScale": None,      # advanced (optional)
+}
+
+def bootstrap() -> None:
+    ad = app_data_dir()
+    ad.mkdir(parents=True, exist_ok=True)
+    md = Path(DEFAULTS["modelsDir"])
+    md.mkdir(parents=True, exist_ok=True)
+    if not SETTINGS_PATH.exists():
+        SETTINGS_PATH.write_text(json.dumps(DEFAULTS, indent=2), encoding="utf-8")
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def read_settings() -> Dict[str, Any]:
+    # precedence: ENV > settings.json > defaults
+    bootstrap()
+    cfg = DEFAULTS | _read_json(SETTINGS_PATH)
+
+    # ENV overrides (optional)
+    env_model = os.getenv("LOCALAI_MODEL_PATH")
+    if env_model:
+        cfg["modelPath"] = env_model
+
+    for key, env in [
+        ("modelsDir", "LOCALAI_MODELS_DIR"),
+        ("nCtx", "LOCALAI_CTX"),
+        ("nThreads", "LOCALAI_THREADS"),
+        ("nGpuLayers", "LOCALAI_GPU_LAYERS"),
+        ("nBatch", "LOCALAI_BATCH"),
+        ("ropeFreqBase", "LOCALAI_ROPE_BASE"),
+        ("ropeFreqScale", "LOCALAI_ROPE_SCALE"),
+    ]:
+        v = os.getenv(env)
+        if v is not None and v != "":
+            try:
+                cfg[key] = int(v) if key in {"nCtx","nThreads","nGpuLayers","nBatch"} else float(v) if key in {"ropeFreqBase","ropeFreqScale"} else v
+            except Exception:
+                cfg[key] = v
+
+    return cfg
+
+def write_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = read_settings()
+    cfg.update({k:v for k,v in patch.items() if v is not None})
+    SETTINGS_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return cfg
+
+# ===== aimodel/file_read/adaptive/config/settings.json =====
+
+{
+  "adaptiveEnabled": false,
+  "adaptive": {
+    "enabled": true,
+    "cpu_threads_policy": {
+      "mode": "leave_one"
+    },
+    "dtype_quant": {
+      "cuda_default_dtype": "float16",
+      "cuda_default_quant": null,
+      "mps_default_dtype": "float16",
+      "cpu_default_dtype": "int8",
+      "cpu_default_quant": "q4_K_M",
+      "cuda_tiers": [
+        { "min_vram_gb": 24, "dtype": "bfloat16", "quant": null },
+        { "min_vram_gb": 12, "dtype": "float16", "quant": null },
+        { "min_vram_gb": 6,  "dtype": "float16", "quant": "bnb-int8" },
+        { "min_vram_gb": 4,  "dtype": "float16", "quant": "bnb-int8" }
+      ]
+    },
+    "kv_cache": {
+      "cuda_default": "fp8",
+      "mps_default": "fp16",
+      "cpu_default": "fp32",
+      "cuda_tiers": [
+        { "min_vram_gb": 16, "dtype": "fp16" },
+        { "min_vram_gb": 0,  "dtype": "fp8" }
+      ]
+    },
+    "capacity": {
+      "cuda_tiers": [
+        { "min_vram_gb": 24, "seq_len": 8192, "batch": 8, "n_gpu_layers": 9999 },
+        { "min_vram_gb": 12, "seq_len": 4096, "batch": 4, "n_gpu_layers": 48 },
+        { "min_vram_gb": 8,  "seq_len": 3072, "batch": 2, "n_gpu_layers": 40 },
+        { "min_vram_gb": 6,  "seq_len": 2048, "batch": 1, "n_gpu_layers": 32 },
+        { "min_vram_gb": 4,  "seq_len": 2048, "batch": 1, "n_gpu_layers": 28 }
+      ],
+      "mps": { "seq_len": 2048, "batch": 1 },
+      "cpu": {
+        "seq_len": 2048,
+        "batch_by_threads": [
+          { "min_threads": 16, "batch": 8 },
+          { "min_threads": 8,  "batch": 4 },
+          { "min_threads": 1,  "batch": 2 }
+        ]
+      }
+    },
+    "gpu_fraction": {
+      "cuda": 0.8,
+      "mps": 0.7,
+      "cpu": 0.0
+    },
+    "flags": {
+      "enable_flash_attn_cuda": true,
+      "use_torch_compile_on_cuda_linux": true
+    },
+    "batchTokenMap": [
+      { "minConcurrency": 8, "n_batch": 512 },
+      { "minConcurrency": 4, "n_batch": 384 },
+      { "minConcurrency": 2, "n_batch": 256 },
+      { "minConcurrency": 1, "n_batch": 192 }
+    ]
+  },
+  "modelPath": "",
+  "nCtx": null,
+  "nThreads": null,
+  "nGpuLayers": null,
+  "nBatch": null
+}
+
+# ===== aimodel/file_read/adaptive/controller.py =====
+
+
 
 # ===== aimodel/file_read/api/__init__.py =====
 
@@ -20,11 +394,11 @@ __all__ = [
 from __future__ import annotations
 from dataclasses import asdict
 from typing import List, Optional, Dict
-
+from ..utils.streaming import strip_runjson
 from fastapi import APIRouter
 from pydantic import BaseModel
 from ..services.cancel import GEN_SEMAPHORE
-from ..retitle_worker import enqueue as enqueue_retitle  # ✅ import the enqueuer
+from ..workers.retitle_worker import enqueue as enqueue_retitle  # ✅ import the enqueuer
 
 from ..core.schemas import (
     ChatMetaModel,
@@ -102,7 +476,7 @@ async def api_list_messages(session_id: str):
 @router.post("/api/chats/{session_id}/messages")
 async def api_append_message(session_id: str, body: Dict[str, str]):
     role = (body.get("role") or "user").strip()
-    content = (body.get("content") or "").rstrip()
+    content = strip_runjson((body.get("content") or "").rstrip())
     row = store_append(session_id, role, content)
 
     if role == "assistant":
@@ -173,8 +547,8 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ..paths import read_settings, write_settings
-from ..model_runtime import (
+from ..adaptive.config.paths import read_settings, write_settings
+from ..runtime.model_runtime import (
     list_local_models, current_model_info,
     load_model, unload_model
 )
@@ -216,6 +590,46 @@ async def api_update_settings(patch: Dict[str, object]):
     s = write_settings(patch)
     return s
 
+# ===== aimodel/file_read/api/settings.py =====
+
+from fastapi import APIRouter, Query, Body
+from typing import Dict, Any, Optional
+
+from ..core.settings import SETTINGS
+
+router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+@router.get("/defaults")
+def get_defaults():
+    return SETTINGS.defaults
+
+@router.get("/overrides")
+def get_overrides():
+    return SETTINGS.overrides
+
+@router.patch("/overrides")
+def patch_overrides(payload: Dict[str, Any] = Body(...)):
+    SETTINGS.patch_overrides(payload)
+    return {"ok": True, "overrides": SETTINGS.overrides}
+
+@router.put("/overrides")
+def put_overrides(payload: Dict[str, Any] = Body(...)):
+    SETTINGS.replace_overrides(payload)
+    return {"ok": True, "overrides": SETTINGS.overrides}
+
+@router.get("/adaptive")
+def get_adaptive(session_id: Optional[str] = Query(default=None, alias="sessionId")):
+    return SETTINGS.adaptive(session_id=session_id)
+
+@router.post("/adaptive/recompute")
+def recompute_adaptive(session_id: Optional[str] = Query(default=None, alias="sessionId")):
+    SETTINGS.recompute_adaptive(session_id=session_id)
+    return {"ok": True, "adaptive": SETTINGS.adaptive(session_id=session_id)}
+
+@router.get("/effective")
+def get_effective(session_id: Optional[str] = Query(default=None, alias="sessionId")):
+    return SETTINGS.effective(session_id=session_id)
+
 # ===== aimodel/file_read/app.py =====
 
 # aimodel/file_read/app.py
@@ -223,15 +637,15 @@ from __future__ import annotations
 import os, asyncio, atexit
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .paths import bootstrap
-from .retitle_worker import start_worker
+from .adaptive.config.paths import bootstrap
+from .workers.retitle_worker import start_worker
 
 from .api.models import router as models_router
 from .api.chats import router as chats_router
-from .model_runtime import load_model
+from .runtime.model_runtime import load_model
 from .api.generate_router import router as generate_router
 from .services.cancel import is_active
-
+from .api import settings as settings_router
 bootstrap()
 app = FastAPI()
 
@@ -246,7 +660,7 @@ app.add_middleware(
 app.include_router(models_router)
 app.include_router(chats_router)
 app.include_router(generate_router)
-
+app.include_router(settings_router.router)
 
 @app.on_event("startup")
 async def _startup():
@@ -262,93 +676,355 @@ async def _startup():
 
 
 
+# ===== aimodel/file_read/core/files.py =====
+
+# aimodel/file_read/core/files.py
+from __future__ import annotations
+from pathlib import Path
+import json, os
+from typing import Any
+
+# Base dirs
+CORE_DIR = Path(__file__).resolve().parent
+STORE_DIR = CORE_DIR.parent / "store"
+
+# Paths (overridable via env)
+EFFECTIVE_SETTINGS_FILE = Path(
+    os.getenv("EFFECTIVE_SETTINGS_PATH", str(STORE_DIR / "effective_settings.json"))
+)
+OVERRIDES_SETTINGS_FILE = Path(
+    os.getenv("OVERRIDES_SETTINGS_PATH", str(STORE_DIR / "override_settings.json"))
+)
+DEFAULTS_SETTINGS_FILE = Path(
+    os.getenv("DEFAULT_SETTINGS_PATH", str(STORE_DIR / "default_settings.json"))
+)
+
+def load_json_file(path: Path, default: Any = None) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {} if default is None else default
+
+def save_json_file(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 # ===== aimodel/file_read/core/memory.py =====
 
-# aimodel/file_read/memory.py
 from __future__ import annotations
-import math
-from typing import Dict, List
+import math, time, json
+from pathlib import Path
+from typing import Dict, List, Tuple
 from collections import deque
-from ..model_runtime import get_llm     # <-- use runtime, not a global llm
+
+from ..runtime.model_runtime import get_llm
 from .style import STYLE_SYS
 from ..store import get_summary as store_get_summary
+from ..store import list_messages as store_list_messages
+from ..utils.streaming import strip_runjson
+from ..core.files import EFFECTIVE_SETTINGS_FILE, load_json_file
 
 SESSIONS: Dict[str, Dict] = {}
 
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def _log(msg: str) -> None:
+    print(f"[{_now()}] {msg}")
+
+def _snapshot(cfg: Dict) -> str:
+    """Short human-readable snapshot of the most important knobs."""
+    keys = [
+        "model_ctx", "out_budget", "reserved_system_tokens", "min_input_budget",
+        "chars_per_token", "prompt_per_message_overhead",
+        "summary_max_chars", "use_fast_summary",
+    ]
+    parts = []
+    for k in keys:
+        if k in cfg:
+            parts.append(f"{k}={cfg[k]}")
+    return ", ".join(parts)
+
+class _SettingsCache:
+    def __init__(self) -> None:
+        self.path: Path = EFFECTIVE_SETTINGS_FILE  # central path
+        self._mtime: float | None = None
+        self._data: Dict = {}
+        _log(f"settings path = {self.path}")
+
+    def get(self) -> Dict:
+        """Load EFFECTIVE settings (defaults ⟶ adaptive ⟶ overrides)."""
+        try:
+            m = self.path.stat().st_mtime
+        except FileNotFoundError:
+            m = None
+
+        if self._mtime != m or not self._data:
+            self._data = load_json_file(self.path, default={})
+            self._mtime = m
+            _log(f"settings reload ok file={self.path.name} snapshot: {_snapshot(self._data)}")
+        return self._data
+
+_SETTINGS = _SettingsCache()
+
+def approx_tokens(text: str) -> int:
+    cfg = _SETTINGS.get()
+    return max(1, math.ceil(len(text) / int(cfg["chars_per_token"])))
+
+def count_prompt_tokens(msgs: List[Dict[str, str]]) -> int:
+    cfg = _SETTINGS.get()
+    overhead = int(cfg["prompt_per_message_overhead"])
+    return sum(approx_tokens(m["content"]) + overhead for m in msgs)
+
 def get_session(session_id: str):
+    cfg = _SETTINGS.get()
+    _log(f"get_session IN session={session_id} (settings: {_snapshot(cfg)})")
     st = SESSIONS.setdefault(session_id, {
         "summary": "",
-        "recent": deque(maxlen=50),
+        "recent": deque(maxlen=int(cfg["recent_maxlen"])),
         "style": STYLE_SYS,
         "short": False,
         "bullets": False,
     })
-    # seed once from storage if empty
     if not st["summary"]:
         try:
             st["summary"] = store_get_summary(session_id) or ""
-        except Exception:
-            pass
+            _log(f"get_session loaded summary len={len(st['summary'])}")
+        except Exception as e:
+            _log(f"get_session summary load error {e}")
+    if not st["recent"]:
+        try:
+            rows = store_list_messages(session_id)
+            tail = rows[-st["recent"].maxlen:]
+            for m in tail:
+                st["recent"].append({"role": m.role, "content": strip_runjson(m.content)})
+            _log(f"get_session hydrated recent={len(st['recent'])}")
+        except Exception as e:
+            _log(f"get_session hydrate error {e}")
     return st
 
-def approx_tokens(text: str) -> int:
-    return max(1, math.ceil(len(text) / 4))
+def _heuristic_bullets(chunks: List[Dict[str,str]], cfg: Dict) -> str:
+    max_bullets = int(cfg["heuristic_max_bullets"])
+    max_words = int(cfg["heuristic_max_words"])
+    prefix = cfg["bullet_prefix"]
+    bullets = []
+    for m in chunks:
+        txt = " ".join((m.get("content") or "").split())
+        if not txt:
+            continue
+        words = txt.replace("\n", " ").split()
+        snippet = " ".join(words[:max_words]) if words else ""
+        bullets.append(f"{prefix}{snippet}" if snippet else prefix.strip())
+        if len(bullets) >= max_bullets:
+            break
+    return "\n".join(bullets) if bullets else prefix.strip()
 
-def count_prompt_tokens(msgs: List[Dict[str, str]]) -> int:
-    return sum(approx_tokens(m["content"]) + 4 for m in msgs)
-
-def summarize_chunks(chunks: List[Dict[str,str]]) -> str:
-    text = "\n".join(f'{m["role"]}: {m["content"]}' for m in chunks)
-    prompt = f"Summarize crisply the key points and decisions:\n\n{text}\n\nSummary:"
+def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
+    cfg = _SETTINGS.get()
+    t0 = time.time()
+    use_fast = bool(cfg["use_fast_summary"])
+    _log(f"summarize_chunks IN chunks={len(chunks)} FAST={use_fast}")
+    if use_fast:
+        txt = _heuristic_bullets(chunks, cfg)
+        dt = time.time() - t0
+        _log(f"summarize_chunks OUT (FAST) bullets={len([l for l in txt.splitlines() if l])} chars={len(txt)} dt={dt:.2f}s")
+        return txt, False
+    text = "\n".join(f'{m.get("role","")}: {m.get("content","")}' for m in chunks)
+    sys_inst = cfg["summary_sys_inst"]
+    user_prompt = cfg["summary_user_prefix"] + text + cfg["summary_user_suffix"]
     llm = get_llm()
     out = llm.create_chat_completion(
-        messages=[{"role":"system","content":"Be concise."},
-                  {"role":"user","content":prompt}],
-        max_tokens=240, temperature=0.2, top_p=0.9, stream=False
+        messages=[
+            {"role": "system", "content": sys_inst},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=int(cfg["llm_summary_max_tokens"]),
+        temperature=float(cfg["llm_summary_temperature"]),
+        top_p=float(cfg["llm_summary_top_p"]),
+        stream=False,
+        stop=list(cfg["llm_summary_stop"]),
     )
-    return out["choices"][0]["message"]["content"].strip()
+    raw = (out["choices"][0]["message"]["content"] or "").strip()
+    lines = [ln.strip() for ln in raw.splitlines()]
+    bullets: List[str] = []
+    seen = set()
+    max_words = int(cfg["heuristic_max_words"])
+    max_bullets = int(cfg["heuristic_max_bullets"])
+    for ln in lines:
+        if not ln.startswith(cfg["bullet_prefix"]):
+            continue
+        norm = " ".join(ln[len(cfg["bullet_prefix"]):].lower().split())
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        words = ln[len(cfg["bullet_prefix"]):].split()
+        if len(words) > max_words:
+            ln = cfg["bullet_prefix"] + " ".join(words[:max_words])
+        bullets.append(ln)
+        if len(bullets) >= max_bullets:
+            break
+    if bullets:
+        txt = "\n".join(bullets)
+        dt = time.time() - t0
+        _log(f"summarize_chunks OUT bullets={len(bullets)} chars={len(txt)} dt={dt:.2f}s")
+        return txt, True
+    s = " ".join(raw.split())[:160]
+    fallback = (cfg["bullet_prefix"] + s) if s else cfg["bullet_prefix"].strip()
+    dt = time.time() - t0
+    _log(f"summarize_chunks OUT bullets=0 chars={len(fallback)} dt={dt:.2f}s (FALLBACK)")
+    return fallback, True
+
+def _compress_summary_block(s: str) -> str:
+    cfg = _SETTINGS.get()
+    max_chars = int(cfg["summary_max_chars"])
+    prefix = cfg["bullet_prefix"]
+    lines = [ln.strip() for ln in (s or "").splitlines()]
+    out, seen = [], set()
+    for ln in lines:
+        if not ln.startswith(prefix):
+            continue
+        norm = " ".join(ln[len(prefix):].lower().split())
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(ln)
+    text = "\n".join(out)
+    _log(f"compress_summary IN chars={len(s)} kept_lines={len(out)}")
+    if len(text) > max_chars:
+        last, total = [], 0
+        for ln in reversed(out):
+            if total + len(ln) + 1 > max_chars:
+                break
+            last.append(ln)
+            total += len(ln) + 1
+        text = "\n".join(reversed(last))
+    _log(f"compress_summary OUT chars={len(text)} lines={len(text.splitlines())}")
+    return text
 
 def build_system(style: str, short: bool, bullets: bool) -> str:
+    cfg = _SETTINGS.get()
+    _log(f"build_system flags short={short} bullets={bullets}")
     parts = [STYLE_SYS]
     if style and style != STYLE_SYS:
         parts.append(style)
     if short:
-        parts.append("Keep answers extremely brief: max 2 sentences OR 5 short bullets.")
+        parts.append(cfg["system_brief_directive"])
     if bullets:
-        parts.append("Use bullet points when possible; each bullet under 15 words.")
-    parts.append("Always follow the user's most recent style instructions.")
+        parts.append(cfg["system_bullets_directive"])
+    parts.append(cfg["system_follow_user_style_directive"])
     return " ".join(parts)
 
 def pack_messages(style: str, short: bool, bullets: bool, summary, recent, max_ctx, out_budget):
-    input_budget = max_ctx - out_budget - 256
+    cfg = _SETTINGS.get()
+    model_ctx = int(max_ctx or cfg["model_ctx"])
+    gen_budget = int(out_budget or cfg["out_budget"])
+    reserved = int(cfg["reserved_system_tokens"])
+    input_budget = model_ctx - gen_budget - reserved
+    if input_budget < int(cfg["min_input_budget"]):
+        input_budget = int(cfg["min_input_budget"])
     sys_text = build_system(style, short, bullets)
-
-    # Put “system” guidance into a *user* prologue for Mistral-Instruct
     prologue = [{"role": "user", "content": sys_text}]
     if summary:
-        prologue.append({"role": "user", "content": f"Conversation summary so far:\n{summary}"})
-
+        prologue.append({"role": "user", "content": cfg["summary_header_prefix"] + summary})
     packed = prologue + list(recent)
+    _log(f"pack_messages SETTINGS snapshot: {_snapshot(cfg)}")
+    _log(f"pack_messages OUT msgs={len(packed)} tokens~{count_prompt_tokens(packed)} "
+         f"(model_ctx={model_ctx}, out_budget={gen_budget}, input_budget={input_budget})")
     return packed, input_budget
 
-def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
-    while count_prompt_tokens(packed) > input_budget and len(recent) > 6:
-        peel = []
-        for _ in range(max(4, len(recent) // 5)):
-            peel.append(recent.popleft())
-        new_sum = summarize_chunks(peel)
-        summary = (summary + "\n" + new_sum).strip() if summary else new_sum
+def _final_safety_trim(packed: List[Dict[str,str]], input_budget: int) -> List[Dict[str,str]]:
+    cfg = _SETTINGS.get()
+    keep_ratio = float(cfg["final_shrink_summary_keep_ratio"])
+    min_keep = int(cfg["final_shrink_summary_min_chars"])
+    def toks() -> int:
+        try:
+            return count_prompt_tokens(packed)
+        except Exception:
+            return 999999
+    _log(f"final_trim START tokens={toks()} budget={input_budget}")
+    keep_head = 2 if len(packed) >= 2 and isinstance(packed[1].get("content"), str) and packed[1]["content"].startswith(cfg["summary_header_prefix"]) else 1
+    while toks() > input_budget and len(packed) > keep_head + 1:
+        dropped = packed.pop(keep_head)
+        _log(f"final_trim DROP msg role={dropped['role']} size~{approx_tokens(dropped['content'])} toks={toks()}")
+    if toks() > input_budget and keep_head == 2 and len(packed) >= 2:
+        summary_msg = packed[1]
+        txt = summary_msg["content"]
+        n = max(min_keep, int(len(txt) * keep_ratio))
+        summary_msg["content"] = txt[-n:]
+        _log(f"final_trim SHRINK summary to {len(summary_msg['content'])} chars toks={toks()}")
+    if toks() > input_budget and keep_head == 2 and len(packed) >= 2:
+        removed = packed.pop(1)
+        _log(f"final_trim REMOVE summary len~{len(removed['content'])} toks={toks()}")
+    while toks() > input_budget and len(packed) > 2:
+        removed = packed.pop(2 if len(packed) > 3 else 1)
+        _log(f"final_trim LAST_RESORT drop size~{approx_tokens(removed['content'])} toks={toks()}")
+    _log(f"final_trim END tokens={toks()} msgs={len(packed)}")
+    return packed
 
-        # Rebuild using *user* role, matching pack_messages
+def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
+    cfg = _SETTINGS.get()
+
+    # --- DEBUG SNAPSHOT ---
+    _log("=== roll_summary_if_needed DEBUG START ===")
+    _log(f"skip_overage_lt={cfg['skip_overage_lt']}, "
+         f"max_peel_per_turn={cfg['max_peel_per_turn']}, "
+         f"peel_min={cfg['peel_min']}, "
+         f"peel_frac={cfg['peel_frac']}, "
+         f"peel_max={cfg['peel_max']}")
+    _log(f"len(recent)={len(recent)}, current_summary_len={len(summary) if summary else 0}")
+    _log(f"input_budget={input_budget}, reserved_system_tokens={cfg['reserved_system_tokens']}")
+    _log(f"model_ctx={cfg['model_ctx']}, out_budget={cfg['out_budget']}")
+    # ----------------------
+
+    def _tok():
+        try:
+            return count_prompt_tokens(packed)
+        except Exception:
+            return 999999
+
+    start_tokens = _tok()
+    overage = start_tokens - input_budget
+    _log(f"roll_summary_if_needed START tokens={start_tokens} "
+         f"input_budget={input_budget} overage={overage}")
+
+    if overage <= int(cfg["skip_overage_lt"]):
+        _log(f"roll_summary_if_needed SKIP (overage {overage} <= {cfg['skip_overage_lt']})")
+        packed = _final_safety_trim(packed, input_budget)
+        return packed, summary
+
+    peels_done = 0
+    if len(recent) > 6 and peels_done < int(cfg["max_peel_per_turn"]):
+        peel_min = int(cfg["peel_min"])
+        peel_frac = float(cfg["peel_frac"])
+        peel_max = int(cfg["peel_max"])
+        target = max(peel_min, min(peel_max, int(len(recent) * peel_frac)))
+        peel = []
+        for _ in range(min(target, len(recent))):
+            peel.append(recent.popleft())
+        _log(f"roll_summary peeled={len(peel)}")
+        new_sum, _used_llm = summarize_chunks(peel)
+        if new_sum.startswith(cfg["bullet_prefix"]):
+            summary = (summary + "\n" + new_sum).strip() if summary else new_sum
+        else:
+            summary = new_sum
+        summary = _compress_summary_block(summary)
         packed = [
             {"role": "user", "content": system_text},
-            {"role": "user", "content": f"Conversation summary so far:\n{summary}"},
+            {"role": "user", "content": cfg["summary_header_prefix"] + summary},
             *list(recent),
         ]
+        _log(f"roll_summary updated summary_len={len(summary)} tokens={_tok()}")
+
+    packed = _final_safety_trim(packed, input_budget)
+    _log(f"roll_summary_if_needed END tokens={count_prompt_tokens(packed)}")
+    _log("=== roll_summary_if_needed DEBUG END ===")
     return packed, summary
 
 # ===== aimodel/file_read/core/schemas.py =====
 
+# core/schemas.py
 from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel
@@ -388,17 +1064,181 @@ class BatchDeleteReq(BaseModel):
 
 class EditMessageReq(BaseModel):
     messageId: int
-    content: str    
+    content: str
 
 class ChatBody(BaseModel):
     sessionId: Optional[str] = None
     messages: Optional[List[ChatMessage]] = None
-    max_tokens: Optional[int] = 512
-    temperature: float = 0.7
-    top_p: float = 0.95
-    # NEW:
-    autoWeb: bool = True
-    webK: int = 3
+
+    # ↓ make optional; defaults come from effective settings
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+
+    # ↓ also optional; defaults come from settings
+    autoWeb: Optional[bool] = None
+    webK: Optional[int] = None
+
+# ===== aimodel/file_read/core/settings.py =====
+
+# aimodel/file_read/core/settings.py
+from __future__ import annotations
+
+import json
+from threading import RLock
+from typing import Any, Dict, Optional
+
+from .files import (
+    DEFAULTS_SETTINGS_FILE,
+    OVERRIDES_SETTINGS_FILE,
+    EFFECTIVE_SETTINGS_FILE,
+    load_json_file,
+    save_json_file,
+)
+
+
+def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(dst)
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)  # type: ignore[arg-type]
+        else:
+            out[k] = v
+    return out
+
+
+class _SettingsManager:
+    """
+    layers: defaults → adaptive(session/_global_) → overrides
+    also persists the merged *global* effective to EFFECTIVE_SETTINGS_FILE
+    (that’s what memory.py watches/loads)
+
+    Dynamic access:
+      - Attribute style: SETTINGS.stream_queue_maxsize
+      - Dict style:      SETTINGS["stream_queue_maxsize"]
+      - Safe get:        SETTINGS.get("stream_queue_maxsize", 64)
+
+    Only keys present in the merged effective map are exposed dynamically.
+    """
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._defaults: Dict[str, Any] = self._load_defaults()
+        self._overrides: Dict[str, Any] = self._load_overrides()
+        self._adaptive_by_session: Dict[str, Dict[str, Any]] = {}
+        # write initial effective so memory.py has something on boot
+        self._persist_effective_unlocked()
+
+    # ---------- loading ----------
+    def _load_defaults(self) -> Dict[str, Any]:
+        return load_json_file(DEFAULTS_SETTINGS_FILE, default={})
+
+    def _load_overrides(self) -> Dict[str, Any]:
+        return load_json_file(OVERRIDES_SETTINGS_FILE, default={})
+
+    # ---------- saving ----------
+    def _save_overrides_unlocked(self) -> None:
+        save_json_file(OVERRIDES_SETTINGS_FILE, self._overrides)
+
+    def _persist_effective_unlocked(self) -> None:
+        # Persist *global* effective (session-less) for memory.py
+        eff = _deep_merge(self._defaults, self._adaptive_by_session.get("_global_", {}))
+        eff = _deep_merge(eff, self._overrides)
+        save_json_file(EFFECTIVE_SETTINGS_FILE, eff)
+
+    # ---------- helpers ----------
+    def _effective_unlocked(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        eff = _deep_merge(self._defaults, self._adaptive_by_session.get(session_id or "_global_", {}))
+        eff = _deep_merge(eff, self._overrides)
+        return eff
+
+    def _get_unlocked(self, key: str, default: Any = None, *, session_id: Optional[str] = None) -> Any:
+        eff = self._effective_unlocked(session_id)
+        if key in eff:
+            return eff[key]
+        if default is not None:
+            return default
+        raise AttributeError(f"_SettingsManager has no key '{key}'")
+
+    # ---------- public read API ----------
+    @property
+    def defaults(self) -> Dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._defaults))
+
+    @property
+    def overrides(self) -> Dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._overrides))
+
+    def adaptive(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        key = session_id or "_global_"
+        with self._lock:
+            return json.loads(json.dumps(self._adaptive_by_session.get(key, {})))
+
+    def effective(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            return self._effective_unlocked(session_id)
+
+    # Dynamic attribute access (e.g., SETTINGS.stream_queue_maxsize)
+    def __getattr__(self, name: str) -> Any:
+        # Only called if normal attributes/methods aren't found
+        with self._lock:
+            return self._get_unlocked(name)
+
+    # Dict-style access (e.g., SETTINGS["stream_queue_maxsize"])
+    def __getitem__(self, key: str) -> Any:
+        with self._lock:
+            return self._get_unlocked(key)
+
+    # Safe getter (optional default)
+    def get(self, key: str, default: Any = None, *, session_id: Optional[str] = None) -> Any:
+        with self._lock:
+            try:
+                return self._get_unlocked(key, default=default, session_id=session_id)
+            except AttributeError:
+                return default
+
+    # ---------- public write API ----------
+    def patch_overrides(self, patch: Dict[str, Any]) -> None:
+        if not isinstance(patch, dict):
+            return
+        with self._lock:
+            self._overrides = _deep_merge(self._overrides, patch)
+            self._save_overrides_unlocked()
+            self._persist_effective_unlocked()
+
+    def replace_overrides(self, new_overrides: Dict[str, Any]) -> None:
+        if not isinstance(new_overrides, dict):
+            new_overrides = {}
+        with self._lock:
+            self._overrides = json.loads(json.dumps(new_overrides))
+            self._save_overrides_unlocked()
+            self._persist_effective_unlocked()
+
+    def reload_overrides(self) -> None:
+        with self._lock:
+            self._overrides = self._load_overrides()
+            self._persist_effective_unlocked()
+
+    def set_adaptive_for_session(self, session_id: Optional[str], values: Dict[str, Any]) -> None:
+        key = session_id or "_global_"
+        if not isinstance(values, dict):
+            values = {}
+        with self._lock:
+            self._adaptive_by_session[key] = json.loads(json.dumps(values))
+            # If updating the global adaptive layer, refresh persisted effective
+            if key == "_global_":
+                self._persist_effective_unlocked()
+
+    def recompute_adaptive(self, session_id: Optional[str] = None) -> None:
+        # placeholder for your controller logic later
+        with self._lock:
+            # after recompute, also refresh persisted effective for global
+            self._persist_effective_unlocked()
+
+
+SETTINGS = _SettingsManager()
 
 # ===== aimodel/file_read/core/style.py =====
 
@@ -435,7 +1275,23 @@ def extract_style_and_prefs(user_text: str) -> Tuple[Optional[str], bool, bool]:
         )
     return style_inst, False, False
 
-# ===== aimodel/file_read/model_runtime.py =====
+# ===== aimodel/file_read/requirements.txt =====
+
+fastapi==0.116.1
+uvicorn==0.30.6
+pydantic==2.11.7
+starlette==0.47.2
+llama-cpp-python==0.3.4
+ddgs==9.5.4
+httpx==0.27.0
+trafilatura==1.9.0
+lxml[html_clean]>=5.3
+
+# ===== aimodel/file_read/runtime/__init__.py =====
+
+
+
+# ===== aimodel/file_read/runtime/model_runtime.py =====
 
 # aimodel/file_read/model_runtime.py
 from __future__ import annotations
@@ -445,7 +1301,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Optional, List
 
-from .paths import read_settings, write_settings
+from ..adaptive.config.paths import read_settings, write_settings
 
 try:
     from llama_cpp import Llama
@@ -584,1204 +1440,16 @@ def list_local_models() -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x["sizeBytes"], reverse=True)
     return out
 
-# ===== aimodel/file_read/paths.py =====
-
-# aimodel/file_read/paths.py
-from __future__ import annotations
-import json, os
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Any, Dict, Optional
-import sys
-
-# App data dir (override with LOCALAI_DATA_DIR for dev/electron)
-def app_data_dir() -> Path:
-    override = os.getenv("LOCALAI_DATA_DIR")
-    if override:
-        return Path(override)
-
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
-        return Path(base) / "LocalAI"
-
-    if sys.platform == "darwin":  # macOS
-        return Path.home() / "Library" / "Application Support" / "LocalAI"
-
-    if os.name == "posix":  # Linux/other UNIX
-        return Path.home() / ".local" / "share" / "LocalAI"
-
-    return Path.home() / ".localai"
-
-SETTINGS_PATH = app_data_dir() / "settings.json"
-
-DEFAULTS = {
-    "modelsDir": str((app_data_dir() / "models").resolve()),
-    "modelPath": "",            # empty = none selected
-    "nCtx": 4096,
-    "nThreads": 8,
-    "nGpuLayers": 40,
-    "nBatch": 256,
-    "ropeFreqBase": None,       # advanced (optional)
-    "ropeFreqScale": None,      # advanced (optional)
-}
-
-def bootstrap() -> None:
-    ad = app_data_dir()
-    ad.mkdir(parents=True, exist_ok=True)
-    md = Path(DEFAULTS["modelsDir"])
-    md.mkdir(parents=True, exist_ok=True)
-    if not SETTINGS_PATH.exists():
-        SETTINGS_PATH.write_text(json.dumps(DEFAULTS, indent=2), encoding="utf-8")
-
-def _read_json(path: Path) -> Dict[str, Any]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def read_settings() -> Dict[str, Any]:
-    # precedence: ENV > settings.json > defaults
-    bootstrap()
-    cfg = DEFAULTS | _read_json(SETTINGS_PATH)
-
-    # ENV overrides (optional)
-    env_model = os.getenv("LOCALAI_MODEL_PATH")
-    if env_model:
-        cfg["modelPath"] = env_model
-
-    for key, env in [
-        ("modelsDir", "LOCALAI_MODELS_DIR"),
-        ("nCtx", "LOCALAI_CTX"),
-        ("nThreads", "LOCALAI_THREADS"),
-        ("nGpuLayers", "LOCALAI_GPU_LAYERS"),
-        ("nBatch", "LOCALAI_BATCH"),
-        ("ropeFreqBase", "LOCALAI_ROPE_BASE"),
-        ("ropeFreqScale", "LOCALAI_ROPE_SCALE"),
-    ]:
-        v = os.getenv(env)
-        if v is not None and v != "":
-            try:
-                cfg[key] = int(v) if key in {"nCtx","nThreads","nGpuLayers","nBatch"} else float(v) if key in {"ropeFreqBase","ropeFreqScale"} else v
-            except Exception:
-                cfg[key] = v
-
-    return cfg
-
-def write_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
-    cfg = read_settings()
-    cfg.update({k:v for k,v in patch.items() if v is not None})
-    SETTINGS_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    return cfg
-
-# ===== aimodel/file_read/policy.py/capability_probe.py =====
-
-# aimodel/file_read/services/capability_probe.py
-from __future__ import annotations
-import asyncio
-import json
-import os
-import platform
-import re
-import shutil
-import subprocess
-import threading
-import time
-from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Optional, Tuple
-
-# Optional imports – all guarded
-try:
-    import psutil  # type: ignore
-except Exception:  # pragma: no cover
-    psutil = None  # type: ignore
-
-# Local runtime hooks
-try:
-    from ..model_runtime import current_model_info
-except Exception:  # pragma: no cover
-    def current_model_info() -> Dict[str, Any]:  # type: ignore
-        return {"loaded": False, "config": None}
-
-# --------------------------------------------------------------------------------------
-# Data models
-# --------------------------------------------------------------------------------------
-
-@dataclass
-class GPUInfo:
-    index: int
-    name: str
-    vram_total_mb: int
-    vram_free_mb: int
-    driver: Optional[str] = None
-    temperature_c: Optional[float] = None
-
-@dataclass
-class CapabilityReport:
-    # Hardware/OS
-    os: str
-    arch: str
-    backend: str  # "cuda"|"rocm"|"mps"|"cpu"
-    cpu_cores: int
-    load_1m: Optional[float]
-    ram_total_mb: int
-    ram_free_mb: int
-
-    # GPUs
-    gpu_count: int
-    gpus: List[GPUInfo] = field(default_factory=list)
-
-    # Model/runtime config snapshot
-    model_ctx_tokens: int
-    n_threads: int
-    n_gpu_layers: int
-    n_batch: int
-
-    # App/runtime signals (optional, filled by integrators)
-    active_sessions: int = 0
-    p95_latency_ms_decode: Optional[float] = None
-    p95_latency_ms_tokenize: Optional[float] = None
-    tokenizer_tps: Optional[float] = None
-
-    ts_unix: float = field(default_factory=lambda: time.time())
-
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        # dataclasses of GPUs are already dicts because of asdict recursion
-        return d
-
-# --------------------------------------------------------------------------------------
-# Helpers – CPU/RAM
-# --------------------------------------------------------------------------------------
-
-def _cpu_cores() -> int:
-    try:
-        return os.cpu_count() or 1
-    except Exception:
-        return 1
-
-
-def _load_1m() -> Optional[float]:
-    try:
-        if hasattr(os, "getloadavg"):
-            return float(os.getloadavg()[0])
-    except Exception:
-        pass
-    return None
-
-
-def _ram_tot_free_mb() -> Tuple[int, int]:
-    # Prefer psutil when present
-    if psutil is not None:
-        try:
-            vm = psutil.virtual_memory()  # type: ignore[attr-defined]
-            return int(vm.total // (1024 * 1024)), int(vm.available // (1024 * 1024))
-        except Exception:
-            pass
-
-    # Fallbacks by OS
-    try:
-        if platform.system() == "Linux":
-            total = free = 0
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        total = int(re.findall(r"\d+", line)[0]) // 1024
-                    elif line.startswith("MemAvailable:"):
-                        free = int(re.findall(r"\d+", line)[0]) // 1024
-            if total and free:
-                return total, free
-        elif platform.system() == "Darwin":
-            # macOS: use vm_stat (pages) as a rough estimate
-            out = subprocess.check_output(["vm_stat"], text=True)
-            m = re.findall(r"page size of (\d+) bytes", out)
-            page = int(m[0]) if m else 4096
-            pages_free = 0
-            for line in out.splitlines():
-                if line.startswith("Pages free") or line.startswith("Pages speculative"):
-                    pages_free += int(re.findall(r"\d+", line)[0])
-                if line.startswith("Pages active") or line.startswith("Pages inactive") or line.startswith("Pages wired down"):
-                    # not used directly; we'll compute total via sysctl
-                    pass
-            total_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
-            free_bytes = pages_free * page
-            return total_bytes // (1024 * 1024), free_bytes // (1024 * 1024)
-        elif platform.system() == "Windows":
-            out = subprocess.check_output(["wmic", "OS", "get", "TotalVisibleMemorySize,FreePhysicalMemory", "/Value"], text=True)
-            kv = dict(
-                (k.strip(), v.strip())
-                for k, v in (line.split("=", 1) for line in out.splitlines() if "=" in line)
-            )
-            total_kib = int(kv.get("TotalVisibleMemorySize", "0") or 0)
-            free_kib = int(kv.get("FreePhysicalMemory", "0") or 0)
-            return total_kib // 1024, free_kib // 1024
-    except Exception:
-        pass
-
-    # Ultimate fallback
-    return 0, 0
-
-# --------------------------------------------------------------------------------------
-# Helpers – GPU detection
-# --------------------------------------------------------------------------------------
-
-_DEF_TIMEOUT = 2.5  # seconds for small probe calls
-
-
-def _run(cmd: List[str]) -> Optional[str]:
-    try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=_DEF_TIMEOUT)
-    except Exception:
-        return None
-
-
-def _probe_nvidia() -> Tuple[str, List[GPUInfo]]:
-    """Return (driver, gpus[]) if nvidia-smi is available, else ("", [])."""
-    if not shutil.which("nvidia-smi"):
-        return "", []
-
-    q = _run([
-        "nvidia-smi",
-        "--query-gpu=index,name,memory.total,memory.free,driver_version,temperature.gpu",
-        "--format=csv,noheader,nounits",
-    ])
-    if not q:
-        return "", []
-
-    gpus: List[GPUInfo] = []
-    driver = None
-    for line in q.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 5:
-            continue
-        try:
-            idx = int(parts[0])
-            name = parts[1]
-            total_mb = int(parts[2])
-            free_mb = int(parts[3])
-            driver = parts[4]
-            temp_c = float(parts[5]) if len(parts) > 5 else None
-            gpus.append(GPUInfo(index=idx, name=name, vram_total_mb=total_mb, vram_free_mb=free_mb, driver=driver, temperature_c=temp_c))
-        except Exception:
-            continue
-    return (driver or ""), gpus
-
-
-def _probe_rocm() -> Tuple[str, List[GPUInfo]]:
-    # Try rocm-smi JSON first; fall back to text parse
-    exe = shutil.which("rocm-smi") or shutil.which("amd-smi")
-    if not exe:
-        return "", []
-
-    out = _run([exe, "--showproductname", "--showid", "--showmeminfo", "vram", "--showtemp"])
-    if not out:
-        return "", []
-
-    # Very loose parsing (rocm-smi text varies)
-    gpus: List[GPUInfo] = []
-    total_mb = free_mb = None
-    name = None
-    idx = -1
-    for line in out.splitlines():
-        if re.search(r"GPU\s*\[?\d+\]?", line):
-            idx += 1
-            total_mb = free_mb = None
-            name = None
-        m_name = re.search(r"Product\s*Name\s*:\s*(.*)$", line)
-        if m_name:
-            name = m_name.group(1).strip()
-        m_total = re.search(r"VRAM Total:\s*(\d+)\s*MiB", line)
-        if m_total:
-            total_mb = int(m_total.group(1))
-        m_free = re.search(r"VRAM Free:\s*(\d+)\s*MiB", line)
-        if m_free:
-            free_mb = int(m_free.group(1))
-        if name and total_mb is not None and free_mb is not None:
-            gpus.append(GPUInfo(index=max(idx, len(gpus)), name=name, vram_total_mb=total_mb, vram_free_mb=free_mb))
-            name = None
-            total_mb = free_mb = None
-    return ("rocm" if gpus else ""), gpus
-
-
-def _probe_mps() -> Tuple[str, List[GPUInfo]]:
-    if platform.system() != "Darwin":
-        return "", []
-    # Quick check for Apple GPU via system_profiler
-    if not shutil.which("system_profiler"):
-        return "", []
-    out = _run(["system_profiler", "SPDisplaysDataType"])
-    if not out:
-        return "", []
-    # We can't get VRAM free reliably here; report total per adapter when available
-    gpus: List[GPUInfo] = []
-    idx = -1
-    for block in out.split("\n\n"):
-        if "Chipset Model" in block or "Apple" in block:
-            idx += 1
-            name_m = re.search(r"Chipset Model:\s*(.*)", block)
-            vram_m = re.search(r"VRAM.*:\s*(\d+(?:\.\d+)?)\s*GB", block)
-            name = name_m.group(1).strip() if name_m else "Apple GPU"
-            total_mb = int(float(vram_m.group(1)) * 1024) if vram_m else 0
-            gpus.append(GPUInfo(index=idx, name=name, vram_total_mb=total_mb, vram_free_mb=0))
-    return ("mps" if gpus else ""), gpus
-
-
-# --------------------------------------------------------------------------------------
-# Probe – aggregate
-# --------------------------------------------------------------------------------------
-
-def _detect_backend_and_gpus() -> Tuple[str, List[GPUInfo]]:
-    # Priority: CUDA > ROCm > MPS > CPU
-    drv, gpus = _probe_nvidia()
-    if gpus:
-        return "cuda", gpus
-
-    drv, gpus = _probe_rocm()
-    if gpus:
-        return "rocm", gpus
-
-    drv, gpus = _probe_mps()
-    if gpus:
-        return "mps", gpus
-
-    return "cpu", []
-
-
-def _model_cfg_snapshot() -> Tuple[int, int, int, int]:
-    try:
-        info = current_model_info() or {}
-        cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
-        return (
-            int(cfg.get("nCtx") or 4096),
-            int(cfg.get("nThreads") or 0),
-            int(cfg.get("nGpuLayers") or 0),
-            int(cfg.get("nBatch") or 0),
-        )
-    except Exception:
-        return (4096, 0, 0, 0)
-
-
-def probe_once() -> CapabilityReport:
-    os_name = platform.system()
-    arch = platform.machine()
-
-    backend, gpus = _detect_backend_and_gpus()
-    cpu_cores = _cpu_cores()
-    load_1m = _load_1m()
-    ram_total_mb, ram_free_mb = _ram_tot_free_mb()
-
-    nctx, nthreads, ngpu_layers, nbatch = _model_cfg_snapshot()
-
-    return CapabilityReport(
-        os=os_name,
-        arch=arch,
-        backend=backend,
-        cpu_cores=cpu_cores,
-        load_1m=load_1m,
-        ram_total_mb=ram_total_mb,
-        ram_free_mb=ram_free_mb,
-        gpu_count=len(gpus),
-        gpus=gpus,
-        model_ctx_tokens=nctx,
-        n_threads=nthreads,
-        n_gpu_layers=ngpu_layers,
-        n_batch=nbatch,
-    )
-
-# --------------------------------------------------------------------------------------
-# Public API – cached access + periodic refresh
-# --------------------------------------------------------------------------------------
-
-_refresh_interval_s = 12.0
-_cache_ttl_s = 9.0
-_latest_lock = threading.RLock()
-_latest: Optional[CapabilityReport] = None
-_task: Optional[asyncio.Task] = None
-
-
-def collect_capabilities(force: bool = False) -> CapabilityReport:
-    global _latest
-    with _latest_lock:
-        if not force and _latest and (time.time() - _latest.ts_unix) < _cache_ttl_s:
-            return _latest
-        rep = probe_once()
-        _latest = rep
-        return rep
-
-
-async def _periodic_loop():  # pragma: no cover
-    global _latest
-    while True:
-        try:
-            rep = probe_once()
-            with _latest_lock:
-                _latest = rep
-        except Exception:
-            # Keep going on probe errors; next loop may succeed
-            pass
-        await asyncio.sleep(_refresh_interval_s)
-
-
-def start_periodic_refresh(interval_s: float = 12.0, cache_ttl_s: float = 9.0) -> None:
-    """Start a background task that keeps the capability snapshot fresh.
-
-    Safe to call multiple times; it will start once.
-    """
-    global _task, _refresh_interval_s, _cache_ttl_s
-    _refresh_interval_s = max(3.0, float(interval_s))
-    _cache_ttl_s = max(1.0, float(cache_ttl_s))
-
-    if _task and not _task.done():
-        return
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No loop running (e.g., during unit tests); create a temporary loop thread
-        def _runner():
-            asyncio.run(_periodic_loop())
-        t = threading.Thread(target=_runner, name="cap_probe", daemon=True)
-        t.start()
-        return
-
-    _task = loop.create_task(_periodic_loop(), name="capability_probe")
-
-
-# --------------------------------------------------------------------------------------
-# Debug helpers
-# --------------------------------------------------------------------------------------
-
-def debug_dump() -> str:
-    rep = collect_capabilities()
-    return json.dumps(rep.to_dict(), indent=2)
-
-
-# ===== aimodel/file_read/policy.py/policy_config.py =====
-
-"""Adaptive policy configuration for routing, summarization, and budgets.
-
-This module converts a CapabilityReport (from capability_probe.py) into a concrete
-set of runtime policies used by the app: context budgeting, summarization
-aggressiveness, web-search breadth, and streaming parameters.
-
-Design goals
-------------
-- Deterministic, side‑effect free mapping from capabilities → knobs
-- Safe minimums on low-spec systems; scale up gracefully on high-spec
-- Central place for all heuristics and guardrails
-
-How to use
-----------
-from capability_probe import collect_capabilities
-from policy_config import compute_policy
-
-report = collect_capabilities()               # snapshot of host + llama runtime
-policy = compute_policy(report)               # PolicyBundle
-
-# Example: sizing a generation
-safe_out, prompt_est = policy.inference.clamp_for_ctx(
-    prompt_tokens_est, requested_out_tokens
-)
-
-# Example: how many sources to fetch
-k = policy.web.search_k
-
-You can pass user/admin overrides to compute_policy(overrides=...).
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any
-
-# Optional: tolerate absence if capability_probe isn't wired yet
-try:
-    from capability_probe import CapabilityReport
-except Exception:  # pragma: no cover
-    @dataclass
-    class CapabilityReport:  # minimal shim
-        cpu_logical: int = 4
-        cpu_score: float = 1.0
-        ram_total_gb: float = 8.0
-        vram_total_gb: Optional[float] = None
-        gpu_backend: str = "none"
-        llama: Dict[str, Any] | None = None
-
-
-# -------------------------------
-# Policy data classes
-# -------------------------------
-
-@dataclass
-class InferencePolicy:
-    # Context/budgeting
-    n_ctx: int
-    margin_tokens: int
-    max_out_tokens_default: int
-
-    def clamp_for_ctx(self, prompt_tokens_est: int, requested_out: int) -> tuple[int, int]:
-        """Return (safe_out, prompt_tokens_est) with margin enforcement.
-        Matches services/context_window.clamp_out_budget, but centralized.
-        """
-        n_ctx = max(512, int(self.n_ctx))
-        margin = max(16, int(self.margin_tokens))
-        prompt = max(0, int(prompt_tokens_est or 0))
-        available = max(16, n_ctx - prompt - margin)
-        safe_out = max(16, min(int(requested_out or self.max_out_tokens_default), available))
-        return safe_out, prompt
-
-
-@dataclass
-class SummarizationPolicy:
-    # How aggressively we roll older turns into the summary
-    # Higher = more aggressive summarization (peel more turns per rollup)
-    aggressiveness: int  # 1..5
-    # Max number of tail turns kept verbatim before summarization kicks in
-    tail_turns: int
-    # Router text budgets
-    router_summary_chars: int
-    router_max_chars: int
-
-
-@dataclass
-class WebPolicy:
-    # Search breadth (number of sources to fetch)
-    search_k: int
-    # Fetch parallelism & timeouts (seconds)
-    fetch_parallel: int
-    per_url_timeout_s: float
-    # Total assembled web block character budget
-    total_char_budget: int
-    per_doc_char_budget: int
-
-
-@dataclass
-class RouterPolicy:
-    # Whether to even attempt live web
-    enable_auto_web: bool
-
-
-@dataclass
-class PolicyBundle:
-    inference: InferencePolicy
-    summarization: SummarizationPolicy
-    web: WebPolicy
-    router: RouterPolicy
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "inference": asdict(self.inference),
-            "summarization": asdict(self.summarization),
-            "web": asdict(self.web),
-            "router": asdict(self.router),
-        }
-
-
-# -------------------------------
-# Tiering helpers
-# -------------------------------
-
-def _vram_tier(vram_gb: Optional[float]) -> str:
-    if not vram_gb or vram_gb <= 0.0:
-        return "none"
-    if vram_gb < 4:
-        return "tiny"
-    if vram_gb < 8:
-        return "small"
-    if vram_gb < 16:
-        return "mid"
-    if vram_gb < 24:
-        return "large"
-    return "xl"
-
-
-def _cpu_tier(threads: int, cpu_score: float) -> str:
-    t = max(1, threads)
-    # cpu_score is an abstracted 0.0..N measure; we blend both
-    eff = (t * max(0.5, cpu_score))
-    if eff < 6:
-        return "low"
-    if eff < 16:
-        return "mid"
-    if eff < 32:
-        return "high"
-    return "ultra"
-
-
-# -------------------------------
-# Main mapping logic
-# -------------------------------
-
-def compute_policy(report: CapabilityReport, overrides: Optional[Dict[str, Any]] = None) -> PolicyBundle:
-    """Map host+runtime capability → policies.
-
-    The mapping is intentionally conservative and monotonic: higher VRAM/CPU
-    never reduces budgets, only raises them within safe bounds.
-    """
-    overrides = overrides or {}
-
-    # Derive tiers
-    llama_cfg = (report.llama or {}).get("config", {}) if isinstance(report.llama, dict) else {}
-    n_ctx = int(llama_cfg.get("nCtx" , 4096))
-    n_threads = int(llama_cfg.get("nThreads" , report.cpu_logical or 4))
-
-    vram_gb = report.vram_total_gb
-    vram = _vram_tier(vram_gb)
-    cpu = _cpu_tier(n_threads, float(getattr(report, "cpu_score", 1.0) or 1.0))
-
-    # ---------------- Inference policy ----------------
-    # Margin scales slightly with ctx to reduce overflow retries
-    if n_ctx <= 2048:
-        margin = 64
-        default_out = 256
-    elif n_ctx <= 4096:
-        margin = 64
-        default_out = 384
-    elif n_ctx <= 8192:
-        margin = 96
-        default_out = 512
-    else:
-        margin = 128
-        default_out = 768
-
-    inference = InferencePolicy(
-        n_ctx=n_ctx,
-        margin_tokens=overrides.get("margin_tokens", margin),
-        max_out_tokens_default=overrides.get("max_out_tokens_default", default_out),
-    )
-
-    # ---------------- Summarization policy ----------------
-    # Base values
-    tail_turns = 6
-    router_summary_chars = 600
-    router_max_chars = 1400
-    aggr = 2
-
-    # Scale with capabilities: bigger ctx/VRAM → keep more tail, less aggressive
-    if n_ctx >= 8192 or vram in {"mid", "large", "xl"}:
-        tail_turns = 8
-        aggr = 2
-        router_summary_chars = 900
-        router_max_chars = 1800
-    if n_ctx >= 12288 or vram in {"large", "xl"}:
-        tail_turns = 10
-        aggr = 1
-        router_summary_chars = 1200
-        router_max_chars = 2200
-
-    # But clamp if CPU is very weak (router/summarizer are model calls)
-    if cpu == "low":
-        aggr = max(aggr, 3)
-        router_summary_chars = min(router_summary_chars, 800)
-        router_max_chars = min(router_max_chars, 1600)
-
-    summarization = SummarizationPolicy(
-        aggressiveness=overrides.get("summarize_aggressiveness", aggr),
-        tail_turns=overrides.get("tail_turns", tail_turns),
-        router_summary_chars=overrides.get("router_summary_chars", router_summary_chars),
-        router_max_chars=overrides.get("router_max_chars", router_max_chars),
-    )
-
-    # ---------------- Web policy ----------------
-    # Start conservative to avoid prompt bloat; scale with tiers
-    search_k = 2
-    fetch_parallel = 2
-    per_url_timeout_s = 8.0
-    total_char_budget = 1600
-    per_doc_char_budget = 900
-
-    if vram in {"mid", "large", "xl"} or cpu in {"high", "ultra"}:
-        search_k = 3
-        fetch_parallel = 3
-        total_char_budget = 2000
-        per_doc_char_budget = 1100
-    if vram in {"large", "xl"} and cpu in {"high", "ultra"}:
-        search_k = 4
-        fetch_parallel = 4
-        per_url_timeout_s = 10.0
-        total_char_budget = 2400
-        per_doc_char_budget = 1200
-
-    web = WebPolicy(
-        search_k=int(overrides.get("search_k", search_k)),
-        fetch_parallel=int(overrides.get("fetch_parallel", fetch_parallel)),
-        per_url_timeout_s=float(overrides.get("per_url_timeout_s", per_url_timeout_s)),
-        total_char_budget=int(overrides.get("total_char_budget", total_char_budget)),
-        per_doc_char_budget=int(overrides.get("per_doc_char_budget", per_doc_char_budget)),
-    )
-
-    # ---------------- Router policy ----------------
-    enable_auto_web = True
-    # On extremely weak devices, you might want to default off
-    if cpu == "low" and vram in {"none", "tiny"}:
-        enable_auto_web = True  # keep on but rely on small k/timeouts
-
-    router = RouterPolicy(enable_auto_web=overrides.get("enable_auto_web", enable_auto_web))
-
-    return PolicyBundle(
-        inference=inference,
-        summarization=summarization,
-        web=web,
-        router=router,
-    )
-
-
-# -------------------------------
-# Small utility: pretty debug line
-# -------------------------------
-
-def debug_line(policy: PolicyBundle) -> str:
-    p = policy.to_dict()
-    inf = p["inference"]; summ = p["summarization"]; web = p["web"]; r = p["router"]
-    return (
-        f"INF[n_ctx={inf['n_ctx']}, margin={inf['margin_tokens']}, out_def={inf['max_out_tokens_default']}] "
-        f"SUMM[aggr={summ['aggressiveness']}, tail={summ['tail_turns']}, rs={summ['router_summary_chars']}, rmax={summ['router_max_chars']}] "
-        f"WEB[k={web['search_k']}, par={web['fetch_parallel']}, t={web['per_url_timeout_s']}s, T={web['total_char_budget']}, per={web['per_doc_char_budget']}] "
-        f"ROUTER[auto={r['enable_auto_web']}]"
-    )
-
-# ===== aimodel/file_read/policy.py/policy_engine.py =====
-
-# policy_engine.py
-from __future__ import annotations
-
-import asyncio
-import json
-import os
-from dataclasses import asdict
-from typing import Any, Callable, Dict, Optional
-
-from .policy_config import Policy, PolicyOverrides, compute_policy
-from .capability_probe import CapabilityReport, probe_capabilities
-from .model_runtime import current_model_info
-
-
-class PolicyEngine:
-    """
-    Central adaptive policy manager.
-
-    Responsibilities
-    - Run a hardware/model capability probe and compute an execution Policy
-    - Expose the current Policy to callers (router, packer, web)
-    - Periodically refresh in the background (configurable interval)
-    - Allow runtime overrides (e.g., admin knob, user preference)
-    - Notify subscribers when the policy changes
-    """
-
-    def __init__(self, *, refresh_interval_sec: int = 600) -> None:
-        self._lock = asyncio.Lock()
-        self._policy: Optional[Policy] = None
-        self._report: Optional[CapabilityReport] = None
-        self._overrides: PolicyOverrides = {}
-        self._refresh_interval = max(10, int(refresh_interval_sec))
-        self._bg_task: Optional[asyncio.Task] = None
-        self._subscribers: set[Callable[[Policy], None]] = set()
-
-    # ------------------------------- lifecycle -------------------------------
-    async def start(self) -> None:
-        """Start background refresh loop (idempotent)."""
-        async with self._lock:
-            if self._bg_task and not self._bg_task.done():
-                return
-            # initial compute immediately
-            await self._refresh_locked(reason="startup")
-            # spawn periodic refresher
-            self._bg_task = asyncio.create_task(self._run_loop(), name="policy_engine_loop")
-
-    async def stop(self) -> None:
-        task = self._bg_task
-        if task:
-            task.cancel()
-            try:
-                await task
-            except Exception:
-                pass
-            self._bg_task = None
-
-    async def _run_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(self._refresh_interval)
-                async with self._lock:
-                    await self._refresh_locked(reason="periodic")
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                # keep the loop alive; next tick will retry
-                pass
-
-    # ------------------------------ core updates -----------------------------
-    async def refresh_now(self, *, reason: str = "manual") -> Policy:
-        async with self._lock:
-            await self._refresh_locked(reason=reason)
-            assert self._policy is not None
-            return self._policy
-
-    async def _refresh_locked(self, *, reason: str) -> None:
-        # 1) Probe system/model
-        report = await probe_capabilities()
-
-        # 2) Pull current model context length if available
-        try:
-            info = current_model_info() or {}
-            cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
-            if cfg.get("nCtx"):
-                report.model_ctx = int(cfg.get("nCtx"))
-        except Exception:
-            pass
-
-        # 3) Merge env overrides (lowest precedence of overrides)
-        env_overrides = _read_env_overrides()
-        merged_overrides = {**env_overrides, **self._overrides}
-
-        # 4) Compute policy
-        new_policy = compute_policy(report, overrides=merged_overrides)
-
-        # 5) Set & notify if changed
-        changed = (self._policy is None) or (asdict(self._policy) != asdict(new_policy))
-        self._policy = new_policy
-        self._report = report
-        if changed:
-            for fn in list(self._subscribers):
-                try:
-                    fn(new_policy)
-                except Exception:
-                    pass
-
-    # ------------------------------ subscriptions ----------------------------
-    def subscribe(self, fn: Callable[[Policy], None]) -> None:
-        self._subscribers.add(fn)
-
-    def unsubscribe(self, fn: Callable[[Policy], None]) -> None:
-        self._subscribers.discard(fn)
-
-    # -------------------------------- getters --------------------------------
-    def get_policy(self) -> Policy:
-        if self._policy is None:
-            # best-effort synchronous bootstrap (blocking probe via loop.run_until?)
-            # In async servers, call start() at app startup to avoid this path.
-            raise RuntimeError("PolicyEngine not started. Call await policy_engine.start().")
-        return self._policy
-
-    def get_report(self) -> CapabilityReport:
-        if self._report is None:
-            raise RuntimeError("PolicyEngine not started. Call await policy_engine.start().")
-        return self._report
-
-    def snapshot(self) -> Dict[str, Any]:
-        p = self.get_policy()
-        r = self.get_report()
-        return {
-            "policy": asdict(p),
-            "report": asdict(r),
-            "refreshIntervalSec": self._refresh_interval,
-        }
-
-    # -------------------------------- overrides ------------------------------
-    async def set_overrides(self, overrides: PolicyOverrides) -> Policy:
-        async with self._lock:
-            self._overrides = dict(overrides or {})
-            await self._refresh_locked(reason="overrides")
-            return self._policy  # type: ignore[return-value]
-
-    async def clear_overrides(self) -> Policy:
-        return await self.set_overrides({})
-
-
-# --------------------------- module-level singleton ---------------------------
-_policy_engine: Optional[PolicyEngine] = None
-
-
-def get_engine() -> PolicyEngine:
-    global _policy_engine
-    if _policy_engine is None:
-        # Default interval can be nudged via env
-        refresh = int(os.getenv("LOCALAI_POLICY_REFRESH_SEC", "600") or "600")
-        _policy_engine = PolicyEngine(refresh_interval_sec=refresh)
-    return _policy_engine
-
-
-async def start_engine() -> None:
-    await get_engine().start()
-
-
-# ------------------------------ env utilities ------------------------------
-
-def _read_env_overrides() -> PolicyOverrides:
-    """Read optional JSON from LOCALAI_POLICY_OVERRIDES.
-
-    Example:
-      export LOCALAI_POLICY_OVERRIDES='{"inference.maxTokens":768,"web.k":4}'
-    """
-    raw = os.getenv("LOCALAI_POLICY_OVERRIDES", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return {}
-    # Accept either flat keys or nested dicts
-    # (compute_policy can handle both due to dot-walking in its merge)
-    if not isinstance(data, dict):
-        return {}
-    return data  # type: ignore[return-value]
-
-
-# ----------------------------- handy convenience -----------------------------
-
-async def current_policy() -> Policy:
-    eng = get_engine()
-    if eng._policy is None:
-        await eng.start()
-    return eng.get_policy()
-
-
-async def current_snapshot() -> Dict[str, Any]:
-    eng = get_engine()
-    if eng._policy is None:
-        await eng.start()
-    return eng.snapshot()
-
-# ===== aimodel/file_read/requirements.txt =====
-
-fastapi==0.116.1
-uvicorn==0.30.6
-pydantic==2.11.7
-starlette==0.47.2
-llama-cpp-python==0.3.4
-ddgs==9.5.4
-httpx==0.27.0
-trafilatura==1.9.0
-lxml[html_clean]>=5.3
-
-# ===== aimodel/file_read/retitle_worker.py =====
-
-# aimodel/file_read/retitle_worker.py
-from __future__ import annotations
-import asyncio, logging, re
-from typing import Dict, List, Optional, Tuple
-
-from .model_runtime import get_llm
-from .store.index import load_index, save_index
-from .store.base import now_iso
-from .services.cancel import is_active, GEN_SEMAPHORE  # serialize with main generation
-from .store.chats import _load_chat  # for current seq watermark
-
-# -----------------------------------------------------------------------------
-# Coalesced per-session queue (last-write-wins)
-# -----------------------------------------------------------------------------
-# We store only the latest snapshot + watermark per session. The worker consumes
-# session IDs; when it handles a session, it reads the latest snapshot once.
-_PENDING: Dict[str, dict] = {}
-_ENQUEUED: set[str] = set()
-_queue: asyncio.Queue[str] = asyncio.Queue()
-_lock = asyncio.Lock()  # guards _PENDING/_ENQUEUED
-
-# ---- Timings (intervals) -----------------------------------------------------
-_GRACE_MS = 1000  # debounce after stream (was 500)
-_ACTIVE_BACKOFF_START_MS = 75     # initial wait while session is active (was fixed 100ms)
-_ACTIVE_BACKOFF_MAX_MS = 600      # cap per-iteration sleep
-_ACTIVE_BACKOFF_TOTAL_MS = 20000  # max total wait while active (~20s)
-
-def _preview(s: str, n: int = 60) -> str:
-    s = s or ""
-    return (s[:n] + "…") if len(s) > n else s
-
-def _is_substantial(text: str) -> bool:
-    t = (text or "").strip()
-    return len(t) >= 12 and re.search(r"[A-Za-z]", t) is not None
-
-def _pick_source(messages: List[dict]) -> Optional[str]:
-    """Choose best text to title: first substantial user message; fallback to latest substantial user."""
-    if not messages:
-        return None
-    # first substantial user
-    for m in messages:
-        if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
-            return m.get("content", "")
-    # fallback: latest substantial user
-    for m in reversed(messages):
-        if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
-            return m.get("content", "")
-    # final fallback: first user at all
-    for m in messages:
-        if m.get("role") == "user":
-            return m.get("content", "")
-    return None
-
-def _sanitize_title(s: str) -> str:
-    """Single line, 3–5 words, no quotes/numbering/punct clutter."""
-    if not s:
-        return ""
-    s = s.strip()
-    # drop common prefixes like "Expanded explanation:", bullets, quotes
-    s = re.sub(r'^\s*("[^"]*"|\'[^\']*\'|[-*•]+|\d+\.)\s*', "", s)
-    s = s.strip().strip('"\'').strip()
-    # keep letters, digits, spaces; collapse spaces
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    # limit to 5 words / ~40 chars
-    words = s.split()
-    s = " ".join(words[:5])
-    if len(s) > 40:
-        s = s[:40].rstrip()
-    return s
-
-def _make_title(llm, src: str) -> str:
-    sys = (
-        "You generate ultra-concise chat titles.\n"
-        "Rules: 2–5 words, Title Case, nouns/adjectives only.\n"
-        "No articles (a, an, the). No verbs. No punctuation. One line.\n"
-        "Output only the title."
-    )
-
-    examples = [
-        {"role": "user", "content": "police station"},
-        {"role": "assistant", "content": "Police Station"},
-        {"role": "user", "content": "fire truck"},
-        {"role": "assistant", "content": "Fire Truck"},
-        {"role": "user", "content": "how do i install node on windows"},
-        {"role": "assistant", "content": "Node Installation Windows"},
-    ]
-
-    out = llm.create_chat_completion(
-        messages=[{"role": "system", "content": sys}, *examples, {"role": "user", "content": src}],
-        max_tokens=12,
-        temperature=0.1,
-        top_p=1.0,
-        stream=False,
-        stop=["\n", "."],  # cut off if it tries to continue a sentence
-    )
-    # trust the model to format; just trim whitespace/quotes
-    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
-    return raw
-
-async def start_worker():
-    """Background loop to process retitle jobs one by one."""
-    while True:
-        sid = await _queue.get()
-        try:
-            await _process_session(sid)
-        except Exception:
-            logging.exception("Retitle worker failed")
-        finally:
-            _queue.task_done()
-
-def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
-    msgs = snapshot.get("messages") or []
-    job_seq = int(snapshot.get("job_seq") or 0)
-    return msgs, job_seq
-
-async def _process_session(session_id: str):
-    # allow quick follow-up enqueues to coalesce
-    await asyncio.sleep(_GRACE_MS / 1000.0)
-
-    # lower priority than generation: wait while this session is active
-    waited = 0
-    backoff = _ACTIVE_BACKOFF_START_MS
-    while is_active(session_id) and waited < _ACTIVE_BACKOFF_TOTAL_MS:
-        await asyncio.sleep(backoff / 1000.0)
-        waited += backoff
-        # exponential backoff with cap
-        backoff = min(int(backoff * 1.5), _ACTIVE_BACKOFF_MAX_MS)
-
-    # fetch latest coalesced snapshot
-    async with _lock:
-        snapshot = _PENDING.pop(session_id, None)
-        _ENQUEUED.discard(session_id)
-
-    if not snapshot:
-        return
-
-    messages, job_seq = _extract_job(snapshot)
-
-    # stale guard: if chat seq has advanced, skip (a newer enqueue will run)
-    try:
-        cur_seq = int((_load_chat(session_id) or {}).get("seq") or 0)
-    except Exception:
-        cur_seq = job_seq
-    if cur_seq > job_seq:
-        print(f"[retitle] SKIP (stale) session={session_id} job_seq={job_seq} current_seq={cur_seq}")
-        return
-
-    # pick source text
-    src = _pick_source(messages) or ""
-    if not src.strip():
-        return
-
-    print(f"[retitle] START session={session_id} job_seq={job_seq} src={_preview(src)!r}")
-
-    # Serialize with main generation semaphore; run LLM call in a worker thread
-    async with GEN_SEMAPHORE:
-        llm = get_llm()
-        try:
-            title = await asyncio.to_thread(_make_title, llm, src)
-        except Exception as e:
-            logging.exception("retitle: LLM error: %s", e)
-            return
-        finally:
-            try:
-                llm.reset()
-            except Exception:
-                pass
-
-    print(f"[retitle] FINISH session={session_id} -> {title!r}")
-
-    if not title:
-        return
-
-    # write only if changed
-    idx = load_index()
-    row = next((r for r in idx if r.get("sessionId") == session_id), None)
-    if not row:
-        return
-    if (row.get("title") or "").strip() == title:
-        return
-
-    row["title"] = title
-    row["updatedAt"] = now_iso()
-    save_index(idx)
-
-def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
-    """Coalesced enqueue; last-write-wins per session, with a seq watermark."""
-    if not session_id:
-        return
-    if not isinstance(messages, list):
-        messages = []
-    # infer watermark if not provided (max message id)
-    if job_seq is None:
-        try:
-            job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
-        except Exception:
-            job_seq = 0
-
-    snap = {"messages": messages, "job_seq": int(job_seq)}
-
-    async def _put():
-        async with _lock:
-            _PENDING[session_id] = snap  # overwrite older snapshot
-            if session_id not in _ENQUEUED:
-                _ENQUEUED.add(session_id)
-                try:
-                    _queue.put_nowait(session_id)
-                except Exception as e:
-                    logging.warning(f"Failed to enqueue retitle: {e}")
-
-    # enqueue can be called from sync contexts; schedule safely
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_put())
-    except RuntimeError:
-        # no running loop (unlikely here); fall back to a temp loop
-        asyncio.run(_put())
-
 # ===== aimodel/file_read/services/cancel.py =====
 
-# aimodel/file_read/services/cancel.py
 from __future__ import annotations
 import asyncio
 from threading import Event
 from typing import Dict
+from ..core.settings import SETTINGS
 
-GEN_SEMAPHORE = asyncio.Semaphore(1)
+eff = SETTINGS.effective()
+GEN_SEMAPHORE = asyncio.Semaphore(int(eff["gen_semaphore_permits"]))
 _ACTIVE: Dict[str, int] = {}
 _CANCELS: Dict[str, Event] = {}
 
@@ -1802,11 +1470,11 @@ def cancel_event(session_id: str) -> Event:
 
 # ===== aimodel/file_read/services/context_window.py =====
 
-# aimodel/file_read/services/context_window.py
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 from ..utils.streaming import safe_token_count_messages
-from ..model_runtime import current_model_info
+from ..runtime.model_runtime import current_model_info
+from ..core.settings import SETTINGS
 
 def estimate_tokens(llm, messages: List[Dict[str,str]]) -> Optional[int]:
     try:
@@ -1815,37 +1483,39 @@ def estimate_tokens(llm, messages: List[Dict[str,str]]) -> Optional[int]:
         return None
 
 def current_n_ctx() -> int:
+    eff = SETTINGS.effective()
     try:
         info = current_model_info() or {}
         cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
-        return int(cfg.get("nCtx") or 4096)
+        return int(cfg.get("nCtx") or eff["nctx_fallback"])
     except Exception:
-        return 4096
+        return int(eff["nctx_fallback"])
 
 def clamp_out_budget(
     *, llm, messages: List[Dict[str,str]], requested_out: int, margin: int = 32
 ) -> Tuple[int, int]:
+    eff = SETTINGS.effective()
     inp_est = estimate_tokens(llm, messages)
     try:
         prompt_est = inp_est if inp_est is not None else safe_token_count_messages(llm, messages)
     except Exception:
-        prompt_est = 1024
+        prompt_est = int(eff["token_estimate_fallback"])
     n_ctx = current_n_ctx()
-    available = max(16, n_ctx - prompt_est - margin)
-    safe_out = max(16, min(requested_out, available))
+    available = max(int(eff["min_out_tokens"]), n_ctx - prompt_est - margin)
+    safe_out = max(int(eff["min_out_tokens"]), min(requested_out, available))
     return safe_out, (inp_est if inp_est is not None else None)
 
 # ===== aimodel/file_read/services/generate_flow.py =====
 
-# aimodel/file_read/services/generate_flow.py
 from __future__ import annotations
 import asyncio, time, json
-from typing import AsyncGenerator, Dict, List
+from typing import AsyncGenerator, Dict, List, Optional
 from fastapi.responses import StreamingResponse
 from datetime import datetime
-from dataclasses import asdict  # for serializing message rows
+from dataclasses import asdict
 
-from ..model_runtime import ensure_ready, get_llm
+from ..core.settings import SETTINGS
+from ..runtime.model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
 
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
@@ -1853,18 +1523,13 @@ from .session_io import handle_incoming, persist_summary
 from .packing import build_system_text, pack_with_rollup
 from .context_window import clamp_out_budget
 
-# Router (router will decide & fetch if needed)
 from ..web.router_ai import decide_web_and_fetch
-
-# Stream meta markers to filter out from the buffered assistant text
 from ..utils.streaming import RUNJSON_START, RUNJSON_END
 
-# Tell the type checker run_stream is an async iterator of bytes (stops yellow underline)
 from .streaming_worker import run_stream as _run_stream
 from typing import AsyncIterator
 run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream  # type: ignore[assignment]
 
-# ---- helpers for instrumentation --------------------------------------------
 def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
@@ -1894,36 +1559,32 @@ def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, ob
     except Exception as e:
         print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
 
-# ---- tiny helper: last user + recent tail (user & assistant) + summary -------
 def _compose_router_text(
     recent,
     latest_user_text: str,
     summary: str,
     *,
-    tail_turns: int = 6,
-    summary_chars: int = 600,
-    max_chars: int = 1400,
+    tail_turns: Optional[int] = None,
+    summary_chars: Optional[int] = None,
+    max_chars: Optional[int] = None,
 ) -> str:
-    """
-    Priority input for the router:
-      1) Latest user message (verbatim)
-      2) Short recent tail (user + assistant) so URLs/snippets are visible
-      3) Trimmed slice of the persisted conversation summary
+    eff = SETTINGS.effective()
+    tt = int(eff["router_tail_turns"]) if tail_turns is None else int(tail_turns)
+    sc = int(eff["router_summary_chars"]) if summary_chars is None else int(summary_chars)
+    mc = int(eff["router_max_chars"]) if max_chars is None else int(max_chars)
+    context_label = eff["router_context_label"]
+    summary_label = eff["router_summary_label"]
 
-    Hard-caps the final text to max_chars to avoid overfeeding the router.
-    """
     parts: List[str] = []
-
     if latest_user_text:
         parts.append((latest_user_text or "").strip())
 
-    # Convert to list for safe slicing; include both roles
     try:
         recent_list = list(recent)
     except Exception:
         recent_list = []
 
-    tail_src = recent_list[-tail_turns:]
+    tail_src = recent_list[-tt:] if tt > 0 else []
     tail_lines: List[str] = []
     for m in reversed(tail_src):
         if not isinstance(m, dict):
@@ -1935,51 +1596,62 @@ def _compose_router_text(
         tail_lines.append(f"{role}: {c}")
 
     if tail_lines:
-        parts.append("Context:\n" + "\n".join(tail_lines))
+        parts.append(context_label + "\n" + "\n".join(tail_lines))
 
     if summary:
         s = summary.strip()
-        if len(s) > summary_chars:
-            s = s[-summary_chars:]  # take the most recent slice of the summary
-        parts.append("Summary:\n" + s)
+        if sc > 0 and len(s) > sc:
+            s = s[-sc:]
+        parts.append(summary_label + "\n" + s)
 
     out = "\n\n".join(parts).strip()
-    if len(out) > max_chars:
-        out = out[:max_chars].rstrip()
+    if len(out) > mc:
+        out = out[:mc].rstrip()
     return out
-
-# -----------------------------------------------------------------------------
 
 async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     ensure_ready()
     llm = get_llm()
 
-    session_id = data.sessionId or "default"
+    eff0 = SETTINGS.effective()
+    session_id = data.sessionId or eff0["default_session_id"]
+    eff = SETTINGS.effective(session_id=session_id)
+
     if not data.messages:
-        return StreamingResponse(iter([b"No messages provided."]), media_type="text/plain")
+        return StreamingResponse(iter([eff["empty_messages_response"].encode("utf-8")]), media_type="text/plain")
+
+    temperature = data.temperature if getattr(data, "temperature", None) is not None else float(eff["default_temperature"])
+    top_p = data.top_p if getattr(data, "top_p", None) is not None else float(eff["default_top_p"])
+    out_budget_req = int(data.max_tokens) if getattr(data, "max_tokens", None) is not None else int(eff["default_max_tokens"])
+
+    auto_web = data.autoWeb if getattr(data, "autoWeb", None) is not None else bool(eff["default_auto_web"])
+    web_k = int(data.webK) if getattr(data, "webK", None) is not None else int(eff["default_web_k"])
+    web_k = max(int(eff["web_k_min"]), min(web_k, int(eff["web_k_max"])))
+
+    model_ctx = int(eff["model_ctx"])
 
     incoming = [{"role": m.role, "content": m.content} for m in data.messages]
     print(f"[{_now()}] GEN request START session={session_id} msgs_in={len(incoming)}")
 
     st = handle_incoming(session_id, incoming)
 
-    # latest user text from THIS request only
     latest_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
     lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
 
-    # --- ROUTER (one-hop) → maybe WEB BLOCK -----------------------------------
     t0 = time.perf_counter()
     print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
     try:
-        k = int(getattr(data, "webK", 3) or 3)
-
-        # Minimal change: give the router a compact view (last user + tail + summary)
-        router_text = _compose_router_text(
-            st.get("recent", []),
-            str(latest_user_text or ""),
-            st.get("summary", "") or "",
-        )
-        block = await decide_web_and_fetch(llm, router_text, k=k)
+        block = None
+        if auto_web:
+            router_text = _compose_router_text(
+                st.get("recent", []),
+                str(latest_user_text or ""),
+                st.get("summary", "") or "",
+                tail_turns=int(eff["router_tail_turns"]),
+                summary_chars=int(eff["router_summary_chars"]),
+                max_chars=int(eff["router_max_chars"]),
+            )
+            block = await decide_web_and_fetch(llm, router_text, k=web_k)
 
         print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
 
@@ -1987,7 +1659,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
             st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
                 {
                     "role": "assistant",
-                    "content": "Web findings (authoritative — use these to answer accurately; override older knowledge):\n\n" + block,
+                    "content": eff["web_block_preamble"] + "\n\n" + block,
                 }
             ]
             types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
@@ -2000,16 +1672,14 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         dt = time.perf_counter() - t0
         print(f"[{_now()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
 
-    out_budget_req = data.max_tokens or 512
     system_text = build_system_text()
 
-    # consume ephemeral web block so it doesn't stick across turns
     ephemeral_once = st.pop("_ephemeral_web", [])
     packed, st["summary"], _ = pack_with_rollup(
         system_text=system_text,
         summary=st["summary"],
         recent=st["recent"],
-        max_ctx=4096,
+        max_ctx=model_ctx,
         out_budget=out_budget_req,
         ephemeral=ephemeral_once,
     )
@@ -2019,14 +1689,18 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
 
     _dump_full_prompt(
         packed,
-        params={"requested_out": out_budget_req, "temperature": (data.temperature or 0.6), "top_p": (data.top_p or 0.9)},
+        params={
+            "requested_out": out_budget_req,
+            "temperature": temperature,
+            "top_p": top_p,
+        },
         session_id=session_id,
     )
 
     persist_summary(session_id, st["summary"])
 
     out_budget, input_tokens_est = clamp_out_budget(
-        llm=llm, messages=packed, requested_out=out_budget_req, margin=32
+        llm=llm, messages=packed, requested_out=out_budget_req, margin=int(eff["clamp_margin"])
     )
     print(f"[{_now()}] GEN clamp_out_budget  session={session_id} out_budget={out_budget} input_tokens_est={input_tokens_est}")
 
@@ -2036,18 +1710,15 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     async def streamer() -> AsyncGenerator[bytes, None]:
         async with GEN_SEMAPHORE:
             mark_active(session_id, +1)
-            # Buffer the assistant text we stream so we can add it to st["recent"]
             out_buf = bytearray()
 
             def _accum_visible(chunk_bytes: bytes):
                 if not chunk_bytes:
                     return
                 s = chunk_bytes.decode("utf-8", errors="ignore")
-                # Skip embedded run-json envelopes entirely
                 if RUNJSON_START in s and RUNJSON_END in s:
                     return
-                # Skip the “stopped” line if present
-                if s.strip() == "⏹ stopped":
+                if s.strip() == eff["stopped_line_marker"]:
                     return
                 out_buf.extend(chunk_bytes)
 
@@ -2059,22 +1730,18 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                     out_budget=out_budget,
                     stop_ev=stop_ev,
                     request=request,
-                    temperature=(data.temperature or 0.6),
-                    top_p=(data.top_p or 0.9),
+                    temperature=temperature,
+                    top_p=top_p,
                     input_tokens_est=input_tokens_est,
                 ):
-                    # accumulate for router/model future context
                     if isinstance(chunk, (bytes, bytearray)):
                         _accum_visible(chunk)
                     else:
                         _accum_visible(chunk.encode("utf-8"))
                     yield chunk
             finally:
-                # Append the assistant’s full response to recent so both router and model
-                # will see it on the next turn.
                 try:
                     full_text = out_buf.decode("utf-8", errors="ignore").strip()
-                    # hard-strip any trailing RUNJSON block that slipped through
                     start = full_text.find(RUNJSON_START)
                     if start != -1:
                         end = full_text.find(RUNJSON_END, start)
@@ -2085,24 +1752,19 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                         print(f"[{_now()}] RECENT append assistant chars={len(full_text)}")
                 except Exception:
                     pass
-
-                # 1) flush pending ops
                 try:
                     from ..store import apply_pending_for
                     apply_pending_for(session_id)
                 except Exception:
                     pass
-
-                # 2) enqueue retitle AFTER the stream has fully finished (coalesced, with watermark)
                 try:
                     from ..store import list_messages as store_list_messages
-                    from ..retitle_worker import enqueue as enqueue_retitle
+                    from ..workers.retitle_worker import enqueue as enqueue_retitle
                     msgs = store_list_messages(session_id)
                     last_seq = max((int(m.id) for m in msgs), default=0)
                     enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
                 except Exception:
                     pass
-
                 print(f"[{_now()}] GEN run_stream END   session={session_id}")
                 mark_active(session_id, -1)
 
@@ -2125,28 +1787,44 @@ async def cancel_session_alias(session_id: str):
 # aimodel/file_read/services/packing.py
 from __future__ import annotations
 from typing import Tuple, List, Dict, Optional
+
+from ..core.settings import SETTINGS
 from ..core.memory import build_system, pack_messages, roll_summary_if_needed
 
+
 def build_system_text() -> str:
-    base = build_system(style="", short=False, bullets=False)
-    guidance = (
-        "\nYou may consult the prior messages to answer questions about the conversation itself "
-        "(e.g., “what did I say first?”). When web context is present, consider it as evidence, "
-        "prefer newer info if it conflicts with older memory, and respond in your own words."
+    eff = SETTINGS.effective()
+    base = build_system(
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
     )
-    return (base + guidance)
+    guidance = str(eff["packing_guidance"])
+    return base + guidance
+
 
 def pack_with_rollup(
     *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
     ephemeral: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[List[Dict[str, str]], str, int]:
+    eff = SETTINGS.effective()
+
     packed, input_budget = pack_messages(
-        style="", short=False, bullets=False,
-        summary=summary, recent=recent, max_ctx=max_ctx, out_budget=out_budget
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
+        summary=summary,
+        recent=recent,
+        max_ctx=max_ctx,
+        out_budget=out_budget,
     )
+
     packed, new_summary = roll_summary_if_needed(
-        packed=packed, recent=recent, summary=summary,
-        input_budget=input_budget, system_text=system_text
+        packed=packed,
+        recent=recent,
+        summary=summary,
+        input_budget=input_budget,
+        system_text=system_text,
     )
 
     # Inject ephemeral (web findings) BEFORE the last user message, so the final turn is still user.
@@ -2174,7 +1852,6 @@ from ..store import set_summary as store_set_summary
 
 def handle_incoming(session_id: str, incoming: List[Dict[str, str]]):
     st = get_session(session_id)
-    # ensure ephemeral web bucket exists
     st.setdefault("_ephemeral_web", [])
     for m in incoming:
         st["recent"].append(m)
@@ -2184,7 +1861,7 @@ def persist_summary(session_id: str, summary: str):
     try:
         store_set_summary(session_id, summary)
     except Exception:
-        pass  # preserve original non-fatal behavior
+        pass
 
 # ===== aimodel/file_read/services/streaming_worker.py =====
 
@@ -2192,8 +1869,10 @@ def persist_summary(session_id: str, summary: str):
 from __future__ import annotations
 import asyncio, json, time, logging
 from typing import AsyncGenerator, Optional, List
+
+from ..core.settings import SETTINGS
 from ..utils.streaming import (
-    RUNJSON_START, RUNJSON_END, STOP_STRINGS,
+    RUNJSON_START, RUNJSON_END,
     build_run_json, watch_disconnect,
 )
 
@@ -2203,7 +1882,7 @@ async def run_stream(
     *, llm, messages, out_budget, stop_ev, request,
     temperature: float, top_p: float, input_tokens_est: Optional[int]
 ) -> AsyncGenerator[bytes, None]:
-    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
 
     def produce():
@@ -2222,23 +1901,29 @@ async def run_stream(
                     max_tokens=out_budget,
                     temperature=temperature,
                     top_p=top_p,
-                    top_k=40,
-                    repeat_penalty=1.25,
-                    stop=STOP_STRINGS,
+                    top_k=SETTINGS.stream_top_k,
+                    repeat_penalty=SETTINGS.stream_repeat_penalty,
+                    stop=SETTINGS.stream_stop_strings,
                 )
             except ValueError as ve:
                 if "exceed context window" in str(ve).lower():
-                    retry_tokens = max(64, out_budget // 2)
-                    log.warning("generate: context overflow, retrying with max_tokens=%d", retry_tokens)
+                    retry_tokens = max(
+                        SETTINGS.stream_retry_min_tokens,
+                        int(out_budget * SETTINGS.stream_retry_fraction)
+                    )
+                    log.warning(
+                        "generate: context overflow, retrying with max_tokens=%d",
+                        retry_tokens
+                    )
                     stream = llm.create_chat_completion(
                         messages=messages,
                         stream=True,
                         max_tokens=retry_tokens,
                         temperature=temperature,
                         top_p=top_p,
-                        top_k=40,
-                        repeat_penalty=1.25,
-                        stop=STOP_STRINGS,
+                        top_k=SETTINGS.stream_top_k,
+                        repeat_penalty=SETTINGS.stream_repeat_penalty,
+                        stop=SETTINGS.stream_stop_strings,
                     )
                 else:
                     raise
@@ -2269,7 +1954,7 @@ async def run_stream(
                         q.put_nowait(piece)
                         break
                     except asyncio.QueueFull:
-                        time.sleep(0.005)
+                        time.sleep(SETTINGS.stream_backpressure_sleep_sec)
 
         except Exception as e:
             err_text = str(e)
@@ -2287,7 +1972,11 @@ async def run_stream(
             try:
                 out_text = "".join(out_parts)
                 run_json = build_run_json(
-                    request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
+                    request_cfg={
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "max_tokens": out_budget
+                    },
                     out_text=out_text,
                     t_start=t_start,
                     t_first=t_first,
@@ -2296,7 +1985,8 @@ async def run_stream(
                     finish_reason=finish_reason,
                     input_tokens_est=input_tokens_est,
                 )
-                q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
+                if SETTINGS.runjson_emit:
+                    q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
             except Exception:
                 pass
 
@@ -2316,13 +2006,13 @@ async def run_stream(
             if stop_ev.is_set():
                 break
             yield (item if isinstance(item, bytes) else item.encode("utf-8"))
-        if stop_ev.is_set():
-            yield b"\n\u23F9 stopped\n"
+        if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
+            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")
     finally:
         stop_ev.set()
         disconnect_task.cancel()
         try:
-            await asyncio.wait_for(producer, timeout=2.0)
+            await asyncio.wait_for(producer, timeout=SETTINGS.stream_producer_join_timeout_sec)
         except Exception:
             pass
 
@@ -2357,7 +2047,7 @@ import json, os, shutil, tempfile, threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
-from ..paths import app_data_dir
+from ..adaptive.config.paths import app_data_dir
 
 # -------- Directories & Paths --------
 APP_DIR = app_data_dir()
@@ -2418,12 +2108,16 @@ __all__ = [
 
 # ===== aimodel/file_read/store/chats.py =====
 
+# aimodel/file_read/store/chats.py
 from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+from ..core.settings import SETTINGS
 from .base import chat_path, atomic_write, now_iso
 from .index import load_index, save_index, refresh_index_after_change, ChatMeta
+
 
 def _load_chat(session_id: str) -> Dict:
     p = chat_path(session_id)
@@ -2434,7 +2128,8 @@ def _load_chat(session_id: str) -> Dict:
         if "summary" not in data:
             data["summary"] = ""  # backfill older files
         return data
-    
+
+
 @dataclass
 class ChatMessageRow:
     id: int
@@ -2442,6 +2137,7 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
+
 
 def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     idx = load_index()
@@ -2459,14 +2155,16 @@ def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     row = {
         "id": next_id,
         "sessionId": session_id,
-        "title": (title.strip() or "New Chat"),
+        "title": (title.strip() or SETTINGS["chat_default_title"]),
         "lastMessage": None,
         "createdAt": now,
         "updatedAt": now,
     }
-    idx.append(row); save_index(idx)
+    idx.append(row)
+    save_index(idx)
     _save_chat(session_id, {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""})
     return ChatMeta(**row)
+
 
 def update_last(session_id: str, last_message: Optional[str], maybe_title: Optional[str]) -> ChatMeta:
     idx = load_index()
@@ -2482,14 +2180,19 @@ def update_last(session_id: str, last_message: Optional[str], maybe_title: Optio
     row.setdefault("lastMessage", None)
     return ChatMeta(**row)
 
+
 def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
     data = _load_chat(session_id)
     seq = int(data.get("seq", 0)) + 1
     msg = {
-        "id": seq, "sessionId": session_id, "role": role,
-        "content": content, "createdAt": now_iso(),
+        "id": seq,
+        "sessionId": session_id,
+        "role": role,
+        "content": content,
+        "createdAt": now_iso(),
     }
-    data["messages"].append(msg); data["seq"] = seq
+    data["messages"].append(msg)
+    data["seq"] = seq
     _save_chat(session_id, data)
 
     idx = load_index()
@@ -2503,6 +2206,7 @@ def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
     # pending ops are applied by pending.apply_pending_for() from the router after appends
     return ChatMessageRow(**msg)
 
+
 def delete_message(session_id: str, message_id: int) -> int:
     data = _load_chat(session_id)
     msgs = data.get("messages", [])
@@ -2514,6 +2218,7 @@ def delete_message(session_id: str, message_id: int) -> int:
     _save_chat(session_id, data)
     refresh_index_after_change(session_id, msgs)
     return 1
+
 
 def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
     wanted = {int(i) for i in (message_ids or [])}
@@ -2535,9 +2240,11 @@ def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
     refresh_index_after_change(session_id, keep)
     return deleted
 
+
 def list_messages(session_id: str) -> List[ChatMessageRow]:
     data = _load_chat(session_id)
     return [ChatMessageRow(**m) for m in data.get("messages", [])]
+
 
 def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[ChatMeta], int, int, bool]:
     rows = load_index()
@@ -2546,7 +2253,9 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
         rows = [r for r in rows if r["updatedAt"] <= ceiling_iso]
 
     total = len(rows)
-    size = max(1, min(100, int(size)))
+    min_size = int(SETTINGS["chat_page_min_size"])
+    max_size = int(SETTINGS["chat_page_max_size"])
+    size = max(min_size, min(max_size, int(size)))
     page = max(0, int(page))
 
     start = page * size
@@ -2562,14 +2271,18 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
         metas.append(ChatMeta(**r))
     return metas, total, total_pages, last_flag
 
+
 def delete_batch(session_ids: List[str]) -> List[str]:
     for sid in session_ids:
-        try: chat_path(sid).unlink(missing_ok=True)
-        except Exception: pass
+        try:
+            chat_path(sid).unlink(missing_ok=True)
+        except Exception:
+            pass
     idx = load_index()
     keep = [r for r in idx if r["sessionId"] not in set(session_ids)]
     save_index(keep)
     return session_ids
+
 
 def merge_chat(source_id: str, target_id: str):
     source_msgs = list_messages(source_id)
@@ -2587,22 +2300,26 @@ def merge_chat(source_id: str, target_id: str):
 
     return merged
 
+
 def _save_chat(session_id: str, data: Dict):
     atomic_write(chat_path(session_id), data)
+
 
 def set_summary(session_id: str, new_summary: str) -> None:
     data = _load_chat(session_id)
     data["summary"] = new_summary or ""
     _save_chat(session_id, data)
 
+
 def get_summary(session_id: str) -> str:
     data = _load_chat(session_id)
     return str(data.get("summary") or "")
 
+
 def merge_chat_new(source_id: str, target_id: Optional[str] = None):
     from uuid import uuid4
     new_id = str(uuid4())
-    upsert_on_first_message(new_id, "Merged Chat")
+    upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
 
     merged = []
 
@@ -2618,6 +2335,7 @@ def merge_chat_new(source_id: str, target_id: Optional[str] = None):
             merged.append(row)
 
     return new_id, merged
+
 
 def edit_message(session_id: str, message_id: int, new_content: str) -> Optional[ChatMessageRow]:
     data = _load_chat(session_id)
@@ -2648,8 +2366,204 @@ __all__ = [
     "upsert_on_first_message", "update_last", "append_message",
     "delete_message", "delete_messages_batch", "list_messages",
     "list_paged", "delete_batch", "merge_chat", "merge_chat_new",
-    "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary", 
+    "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary",
 ]
+
+# ===== aimodel/file_read/store/default_settings.json =====
+
+{
+  "__comment_general": "=== Tokenization & Prompt Overhead ===",
+  "chars_per_token": 4,
+  "prompt_per_message_overhead": 4,
+  "__comment_memory": "=== Session / Memory Settings ===",
+  "recent_maxlen": 50,
+  "__comment_summary": "=== Summarization & Compression ===",
+  "heuristic_max_bullets": 5,
+  "heuristic_max_words": 12,
+  "bullet_prefix": "- ",
+  "use_fast_summary": true,
+  "llm_summary_max_tokens": 60,
+  "llm_summary_temperature": 0,
+  "llm_summary_top_p": 1,
+  "llm_summary_stop": [
+    "\n\n",
+    "\n\n- ",
+    "\n\n\n"
+  ],
+  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
+  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
+  "summary_user_suffix": "\n\nOutput:\n- ",
+  "summary_max_chars": 1200,
+  "summary_header_prefix": "Conversation summary so far:\n",
+  "final_shrink_summary_keep_ratio": 0.5,
+  "final_shrink_summary_min_chars": 200,
+  "__comment_system_directives": "=== System Directives for Model Output ===",
+  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
+  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
+  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
+  "__comment_context": "=== Context Window & Budgets ===",
+  "model_ctx": 2048,
+  "out_budget": 512,
+  "reserved_system_tokens": 256,
+  "min_input_budget": 512,
+  "skip_overage_lt": 128,
+  "max_peel_per_turn": 1,
+  "peel_min": 4,
+  "peel_frac": 0.33,
+  "peel_max": 12,
+  "__comment_generation_defaults": "=== Generation Defaults ===",
+  "default_temperature": 0.7,
+  "default_top_p": 0.95,
+  "default_max_tokens": 512,
+  "__comment_web_search": "=== Web Search & Router ===",
+  "default_auto_web": true,
+  "default_web_k": 3,
+  "web_k_min": 1,
+  "web_k_max": 8,
+  "router_tail_turns": 0,
+  "router_summary_chars": 0,
+  "router_max_chars": 1400,
+  "router_context_label": "Context:",
+  "router_summary_label": "Summary:",
+  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
+  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
+  "pack_style": "",
+  "pack_short": false,
+  "pack_bullets": false,
+  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
+  "__comment_misc": "=== Miscellaneous ===",
+  "empty_messages_response": "No messages provided.",
+  "clamp_margin": 32,
+  "default_session_id": "default",
+  "stopped_line_marker": "⏹ stopped",
+  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
+  "gen_semaphore_permits": 1,
+  "nctx_fallback": 4096,
+  "token_estimate_fallback": 1024,
+  "min_out_tokens": 16,
+  "__comment_store": "=== Chat storage ===",
+  "chat_default_title": "New Chat",
+  "chat_merged_title": "Merged Chat",
+  "chat_page_min_size": 1,
+  "chat_page_max_size": 100,
+    "__comment_web_search_provider": "=== DuckDuckGo provider ===",
+  "web_search_cache_ttl_sec": 300,
+  "web_search_cache_superset_k": 10,
+  "web_search_region": "us-en",
+  "web_search_safesearch": "moderate",
+  "web_search_debug_logging": false,
+  "__comment_streaming": "=== Streaming worker tuning ===",
+  "stream_queue_maxsize": 64,
+  "stream_backpressure_sleep_sec": 0.005,
+  "stream_top_k": 40,
+  "stream_repeat_penalty": 1.25,
+  "stream_retry_min_tokens": 64,
+  "stream_retry_fraction": 0.5,
+  "stream_stop_strings": [
+    "\n⏹ stopped\n"
+  ],
+  "stream_emit_stopped_line": true,
+  "stream_producer_join_timeout_sec": 2.0,
+  "runjson_emit": true
+}
+
+# ===== aimodel/file_read/store/effective_settings.json =====
+
+{
+  "__comment_general": "=== Tokenization & Prompt Overhead ===",
+  "chars_per_token": 4,
+  "prompt_per_message_overhead": 4,
+  "__comment_memory": "=== Session / Memory Settings ===",
+  "recent_maxlen": 50,
+  "__comment_summary": "=== Summarization & Compression ===",
+  "heuristic_max_bullets": 5,
+  "heuristic_max_words": 12,
+  "bullet_prefix": "- ",
+  "use_fast_summary": true,
+  "llm_summary_max_tokens": 60,
+  "llm_summary_temperature": 0,
+  "llm_summary_top_p": 1,
+  "llm_summary_stop": [
+    "\n\n",
+    "\n\n- ",
+    "\n\n\n"
+  ],
+  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
+  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
+  "summary_user_suffix": "\n\nOutput:\n- ",
+  "summary_max_chars": 1200,
+  "summary_header_prefix": "Conversation summary so far:\n",
+  "final_shrink_summary_keep_ratio": 0.5,
+  "final_shrink_summary_min_chars": 200,
+  "__comment_system_directives": "=== System Directives for Model Output ===",
+  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
+  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
+  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
+  "__comment_context": "=== Context Window & Budgets ===",
+  "model_ctx": 2048,
+  "out_budget": 512,
+  "reserved_system_tokens": 256,
+  "min_input_budget": 512,
+  "skip_overage_lt": 128,
+  "max_peel_per_turn": 1,
+  "peel_min": 4,
+  "peel_frac": 0.33,
+  "peel_max": 12,
+  "__comment_generation_defaults": "=== Generation Defaults ===",
+  "default_temperature": 0.7,
+  "default_top_p": 0.95,
+  "default_max_tokens": 512,
+  "__comment_web_search": "=== Web Search & Router ===",
+  "default_auto_web": true,
+  "default_web_k": 3,
+  "web_k_min": 1,
+  "web_k_max": 8,
+  "router_tail_turns": 0,
+  "router_summary_chars": 0,
+  "router_max_chars": 1400,
+  "router_context_label": "Context:",
+  "router_summary_label": "Summary:",
+  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
+  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
+  "pack_style": "",
+  "pack_short": false,
+  "pack_bullets": false,
+  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
+  "__comment_misc": "=== Miscellaneous ===",
+  "empty_messages_response": "No messages provided.",
+  "clamp_margin": 32,
+  "default_session_id": "default",
+  "stopped_line_marker": "⏹ stopped",
+  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
+  "gen_semaphore_permits": 1,
+  "nctx_fallback": 4096,
+  "token_estimate_fallback": 1024,
+  "min_out_tokens": 16,
+  "__comment_store": "=== Chat storage ===",
+  "chat_default_title": "New Chat",
+  "chat_merged_title": "Merged Chat",
+  "chat_page_min_size": 1,
+  "chat_page_max_size": 100,
+  "__comment_web_search_provider": "=== DuckDuckGo provider ===",
+  "web_search_cache_ttl_sec": 300,
+  "web_search_cache_superset_k": 10,
+  "web_search_region": "us-en",
+  "web_search_safesearch": "moderate",
+  "web_search_debug_logging": false,
+  "__comment_streaming": "=== Streaming worker tuning ===",
+  "stream_queue_maxsize": 64,
+  "stream_backpressure_sleep_sec": 0.005,
+  "stream_top_k": 40,
+  "stream_repeat_penalty": 1.25,
+  "stream_retry_min_tokens": 64,
+  "stream_retry_fraction": 0.5,
+  "stream_stop_strings": [
+    "\n⏹ stopped\n"
+  ],
+  "stream_emit_stopped_line": true,
+  "stream_producer_join_timeout_sec": 2.0,
+  "runjson_emit": true
+}
 
 # ===== aimodel/file_read/store/index.py =====
 
@@ -2693,6 +2607,104 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
     row["lastMessage"] = last_asst
     save_index(idx)
 
+# ===== aimodel/file_read/store/override_settings.json =====
+
+{
+  "__comment_general": "=== Tokenization & Prompt Overhead ===",
+  "chars_per_token": 4,
+  "prompt_per_message_overhead": 4,
+  "__comment_memory": "=== Session / Memory Settings ===",
+  "recent_maxlen": 50,
+  "__comment_summary": "=== Summarization & Compression ===",
+  "heuristic_max_bullets": 5,
+  "heuristic_max_words": 12,
+  "bullet_prefix": "- ",
+  "use_fast_summary": true,
+  "llm_summary_max_tokens": 60,
+  "llm_summary_temperature": 0,
+  "llm_summary_top_p": 1,
+  "llm_summary_stop": [
+    "\n\n",
+    "\n\n- ",
+    "\n\n\n"
+  ],
+  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
+  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
+  "summary_user_suffix": "\n\nOutput:\n- ",
+  "summary_max_chars": 1200,
+  "summary_header_prefix": "Conversation summary so far:\n",
+  "final_shrink_summary_keep_ratio": 0.5,
+  "final_shrink_summary_min_chars": 200,
+  "__comment_system_directives": "=== System Directives for Model Output ===",
+  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
+  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
+  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
+  "__comment_context": "=== Context Window & Budgets ===",
+  "model_ctx": 2048,
+  "out_budget": 512,
+  "reserved_system_tokens": 256,
+  "min_input_budget": 512,
+  "skip_overage_lt": 128,
+  "max_peel_per_turn": 1,
+  "peel_min": 4,
+  "peel_frac": 0.33,
+  "peel_max": 12,
+  "__comment_generation_defaults": "=== Generation Defaults ===",
+  "default_temperature": 0.7,
+  "default_top_p": 0.95,
+  "default_max_tokens": 512,
+  "__comment_web_search": "=== Web Search & Router ===",
+  "default_auto_web": true,
+  "default_web_k": 3,
+  "web_k_min": 1,
+  "web_k_max": 8,
+  "router_tail_turns": 0,
+  "router_summary_chars": 0,
+  "router_max_chars": 1400,
+  "router_context_label": "Context:",
+  "router_summary_label": "Summary:",
+  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
+  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
+  "pack_style": "",
+  "pack_short": false,
+  "pack_bullets": false,
+  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
+  "__comment_misc": "=== Miscellaneous ===",
+  "empty_messages_response": "No messages provided.",
+  "clamp_margin": 32,
+  "default_session_id": "default",
+  "stopped_line_marker": "⏹ stopped",
+  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
+  "gen_semaphore_permits": 1,
+  "nctx_fallback": 4096,
+  "token_estimate_fallback": 1024,
+  "min_out_tokens": 16,
+  "__comment_store": "=== Chat storage ===",
+  "chat_default_title": "New Chat",
+  "chat_merged_title": "Merged Chat",
+  "chat_page_min_size": 1,
+  "chat_page_max_size": 100,
+    "__comment_web_search_provider": "=== DuckDuckGo provider ===",
+  "web_search_cache_ttl_sec": 300,
+  "web_search_cache_superset_k": 10,
+  "web_search_region": "us-en",
+  "web_search_safesearch": "moderate",
+  "web_search_debug_logging": false,
+  "__comment_streaming": "=== Streaming worker tuning ===",
+  "stream_queue_maxsize": 64,
+  "stream_backpressure_sleep_sec": 0.005,
+  "stream_top_k": 40,
+  "stream_repeat_penalty": 1.25,
+  "stream_retry_min_tokens": 64,
+  "stream_retry_fraction": 0.5,
+  "stream_stop_strings": [
+    "\n⏹ stopped\n"
+  ],
+  "stream_emit_stopped_line": true,
+  "stream_producer_join_timeout_sec": 2.0,
+  "runjson_emit": true
+}
+
 # ===== aimodel/file_read/utils/streaming.py =====
 
 from __future__ import annotations
@@ -2701,7 +2713,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..model_runtime import current_model_info, get_llm
+from ..runtime.model_runtime import current_model_info, get_llm
 
 # Markers MUST match the frontend parser
 RUNJSON_START = "\n[[RUNJSON]]\n"
@@ -2711,6 +2723,22 @@ RUNJSON_END = "\n[[/RUNJSON]]\n"
 STOP_STRINGS = ["</s>", "User:", "\nUser:"]
 
 # ---------- token + model helpers ----------
+
+def strip_runjson(s: str) -> str:
+    if not isinstance(s, str) or not s:
+        return s
+    out, i = [], 0
+    while True:
+        start = s.find(RUNJSON_START, i)
+        if start == -1:
+            out.append(s[i:])
+            break
+        out.append(s[i:start])
+        end = s.find(RUNJSON_END, start)
+        if end == -1:
+            break  # unmatched start → drop tail
+        i = end + len(RUNJSON_END)
+    return "".join(out).strip()
 
 def safe_token_count_text(llm: Any, text: str) -> int:
     try:
@@ -2847,118 +2875,4 @@ def _cache_key(query: str) -> str:
 
 def _cache_get(query: str) -> Optional[List[SearchHit]]:
     key = _cache_key(query)
-    v = _CACHE.get(key)
-    if not v:
-        return None
-    ts, hits = v
-    if (time.time() - ts) > CACHE_TTL_SEC:
-        _CACHE.pop(key, None)
-        return None
-    return hits
-
-def _cache_set(query: str, hits: List[SearchHit]) -> None:
-    _CACHE[_cache_key(query)] = (time.time(), hits)
-
-def _host(u: str) -> str:
-    try:
-        h = (urlparse(u).hostname or "").lower()
-        return h[4:] if h.startswith("www.") else h
-    except Exception:
-        return ""
-
-# -------- DDGS (official client) ---------------------------------------------
-def _ddg_sync_search(query: str, k: int) -> List[SearchHit]:
-    results: List[SearchHit] = []
-    if DDGS is None:
-        print(f"[{time.strftime('%X')}] ddg: PROVIDER MISSING (DDGS=None)")
-        return results
-    with DDGS() as ddg:
-        for i, r in enumerate(ddg.text(query, max_results=max(1, k),
-                                       safesearch="moderate", region="us-en")):
-            title = (r.get("title") or "").strip()
-            url = (r.get("href") or "").strip()
-            snippet: Optional[str] = (r.get("body") or "").strip() or None
-            if not url:
-                continue
-            results.append(SearchHit(title=title or url, url=url, snippet=snippet, rank=i))
-            if i + 1 >= k:
-                break
-    return results
-
-# -------- public provider ----------------------------------------------------
-class DuckDuckGoProvider:
-    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
-        """
-        Returns top-k SearchHit results via DDGS.
-
-        Added prints:
-          - START with normalized query, k
-          - CACHE HIT / MISS with timing
-          - For fetched results: total count, top items (idx, host, title, url)
-          - RETURN with timing and top titles
-        """
-        t0 = time.time()
-        q_norm = (query or "").strip()
-        if not q_norm:
-            print("ddg: empty query")
-            return []
-
-        print(f"[{time.strftime('%X')}] ddg: START q={q_norm!r} k={k}")
-
-        # superset cache
-        cached = _cache_get(q_norm)
-        if cached is not None:
-            dt = time.time() - t0
-            out = cached[:k]
-            top_preview = [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]]
-            print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={dt:.2f}s hits={len(out)} top={top_preview}")
-            return out
-
-        # fetch superset once
-        sup_k = max(k, CACHE_SUPERSET_K)
-        hits: List[SearchHit] = []
-        if DDGS is not None:
-            try:
-                step = time.time()
-                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, sup_k)
-                dt_fetch = time.time() - step
-                print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={dt_fetch:.2f}s count={len(hits)}")
-                # verbose preview of first few results
-                for h in hits[:5]:
-                    print(f"[{time.strftime('%X')}] ddg:   {h.rank:>2} | host={_host(h.url)} | title={(h.title or '')[:80]!r} | url={h.url}")
-            except Exception as e:
-                print(f"[{time.strftime('%X')}] ddg: ERROR {e}")
-        else:
-            print(f"[{time.strftime('%X')}] ddg: SKIP (DDGS unavailable)")
-
-        # store superset and return slice
-        _cache_set(q_norm, hits)
-        dt = time.time() - t0
-        out = hits[:k]
-        top_titles = [h.title for h in out[:3]]
-        print(f"[{time.strftime('%X')}] ddg: RETURN dt={dt:.2f}s hits={len(out)} top={top_titles}")
-        return out
-
-# ===== aimodel/file_read/web/fetch.py =====
-
-from __future__ import annotations
-import asyncio
-from typing import Tuple, List
-import httpx
-import trafilatura
-
-HEADERS = {"User-Agent": "LocalAI/0.1 (+clean-fetch)"}
-
-async def fetch_clean(url: str, timeout_s: float = 8.0, max_chars: int = 3000) -> Tuple[str, int, str]:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
-        r = await client.get(url, headers=HEADERS)
-        r.raise_for_status()
-        # trafilatura extracts readable article text (Apache-2.0)
-        txt = trafilatura.extract(r.text, url=str(r.url)) or ""
-        if not txt:
-            # fallback: raw text up to cap
-            txt = r.text
-        txt = txt.strip().replace("\r", "")
-        if len(txt) > max_chars:
-            txt = txt[:max_chars]
-        return (str(r.url), r.s
+    v = _CA

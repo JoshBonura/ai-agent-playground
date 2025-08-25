@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..model_runtime import current_model_info, get_llm
+from ..runtime.model_runtime import current_model_info, get_llm
 
 # Markers MUST match the frontend parser
 RUNJSON_START = "\n[[RUNJSON]]\n"
@@ -14,6 +14,22 @@ RUNJSON_END = "\n[[/RUNJSON]]\n"
 STOP_STRINGS = ["</s>", "User:", "\nUser:"]
 
 # ---------- token + model helpers ----------
+
+def strip_runjson(s: str) -> str:
+    if not isinstance(s, str) or not s:
+        return s
+    out, i = [], 0
+    while True:
+        start = s.find(RUNJSON_START, i)
+        if start == -1:
+            out.append(s[i:])
+            break
+        out.append(s[i:start])
+        end = s.find(RUNJSON_END, start)
+        if end == -1:
+            break  # unmatched start → drop tail
+        i = end + len(RUNJSON_END)
+    return "".join(out).strip()
 
 def safe_token_count_text(llm: Any, text: str) -> int:
     try:

@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Optional, List
 
-from .paths import read_settings, write_settings
+from ..adaptive.config.paths import read_settings, write_settings
 
 try:
     from llama_cpp import Llama

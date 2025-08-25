@@ -1,28 +1,44 @@
 # aimodel/file_read/services/packing.py
 from __future__ import annotations
 from typing import Tuple, List, Dict, Optional
+
+from ..core.settings import SETTINGS
 from ..core.memory import build_system, pack_messages, roll_summary_if_needed
 
+
 def build_system_text() -> str:
-    base = build_system(style="", short=False, bullets=False)
-    guidance = (
-        "\nYou may consult the prior messages to answer questions about the conversation itself "
-        "(e.g., “what did I say first?”). When web context is present, consider it as evidence, "
-        "prefer newer info if it conflicts with older memory, and respond in your own words."
+    eff = SETTINGS.effective()
+    base = build_system(
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
     )
-    return (base + guidance)
+    guidance = str(eff["packing_guidance"])
+    return base + guidance
+
 
 def pack_with_rollup(
     *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
     ephemeral: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[List[Dict[str, str]], str, int]:
+    eff = SETTINGS.effective()
+
     packed, input_budget = pack_messages(
-        style="", short=False, bullets=False,
-        summary=summary, recent=recent, max_ctx=max_ctx, out_budget=out_budget
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
+        summary=summary,
+        recent=recent,
+        max_ctx=max_ctx,
+        out_budget=out_budget,
     )
+
     packed, new_summary = roll_summary_if_needed(
-        packed=packed, recent=recent, summary=summary,
-        input_budget=input_budget, system_text=system_text
+        packed=packed,
+        recent=recent,
+        summary=summary,
+        input_budget=input_budget,
+        system_text=system_text,
     )
 
     # Inject ephemeral (web findings) BEFORE the last user message, so the final turn is still user.

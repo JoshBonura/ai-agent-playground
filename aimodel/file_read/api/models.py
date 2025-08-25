@@ -4,8 +4,8 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ..paths import read_settings, write_settings
-from ..model_runtime import (
+from ..adaptive.config.paths import read_settings, write_settings
+from ..runtime.model_runtime import (
     list_local_models, current_model_info,
     load_model, unload_model
 )

@@ -1,10 +1,11 @@
-# aimodel/file_read/services/cancel.py
 from __future__ import annotations
 import asyncio
 from threading import Event
 from typing import Dict
+from ..core.settings import SETTINGS
 
-GEN_SEMAPHORE = asyncio.Semaphore(1)
+eff = SETTINGS.effective()
+GEN_SEMAPHORE = asyncio.Semaphore(int(eff["gen_semaphore_permits"]))
 _ACTIVE: Dict[str, int] = {}
 _CANCELS: Dict[str, Event] = {}
 

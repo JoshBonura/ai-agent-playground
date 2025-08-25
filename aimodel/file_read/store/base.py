@@ -3,7 +3,7 @@ import json, os, shutil, tempfile, threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
-from ..paths import app_data_dir
+from ..adaptive.config.paths import app_data_dir
 
 # -------- Directories & Paths --------
 APP_DIR = app_data_dir()

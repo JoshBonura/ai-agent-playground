@@ -3,15 +3,15 @@ from __future__ import annotations
 import os, asyncio, atexit
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .paths import bootstrap
-from .retitle_worker import start_worker
+from .adaptive.config.paths import bootstrap
+from .workers.retitle_worker import start_worker
 
 from .api.models import router as models_router
 from .api.chats import router as chats_router
-from .model_runtime import load_model
+from .runtime.model_runtime import load_model
 from .api.generate_router import router as generate_router
 from .services.cancel import is_active
-
+from .api import settings as settings_router
 bootstrap()
 app = FastAPI()
 
@@ -26,7 +26,7 @@ app.add_middleware(
 app.include_router(models_router)
 app.include_router(chats_router)
 app.include_router(generate_router)
-
+app.include_router(settings_router.router)
 
 @app.on_event("startup")
 async def _startup():

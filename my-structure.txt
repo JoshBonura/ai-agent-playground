@@ -4,6 +4,7 @@ ai-agent-playground/
   body.json
   clean-structure-1.txt
   clean-structure-2.txt
+  clean-structure-3.txt
   fs.py
   my-structure.txt
   pc.py
@@ -157,24 +158,31 @@ ai-agent-playground/
     file_read/
       __init__.py
       app.py
-      model_runtime.py
-      paths.py
       requirements.txt
-      retitle_worker.py
+      adaptive/
+        controller.py
+        config/
+          adaptive_config.py
+          paths.py
+          settings.json
       api/
         __init__.py
         chats.py
         generate_router.py
         models.py
+        settings.py
       backend/
         .env
       core/
         __init__.py
+        files.py
         memory.py
         schemas.py
+        settings.py
         style.py
       runtime/
-        utils/
+        __init__.py
+        model_runtime.py
       services/
         cancel.py
         context_window.py
@@ -186,7 +194,10 @@ ai-agent-playground/
         __init__.py
         base.py
         chats.py
+        effective_settings.json
         index.py
+        memory_settings.json
+        settings_override.json
       utils/
         streaming.py
       web/
@@ -197,10 +208,8 @@ ai-agent-playground/
         provider.py
         query_summarizer.py
         router_ai.py
-    policy.py/
-      capability_probe.py
-      policy_config.py
-      policy_engine.py
+      workers/
+        retitle_worker.py
   frontend/
     .env.development
     .gitignore
@@ -542,6 +551,7 @@ ai-agent-playground/
           DesktopHeader.tsx
           MetricsHoverCard.tsx
           MobileDrawer.tsx
+          SettingsPanel.tsx
           ChatSidebar/
             ChatSidebar.tsx
             SidebarHeader.tsx
@@ -552,6 +562,7 @@ ai-agent-playground/
           Markdown/
             MarkdownMessage.tsx
         data/
+          settingsApi.ts
         features/
           chat/
         hooks/
@@ -566,6 +577,7 @@ ai-agent-playground/
           useRunMetrics.ts
           useRunState.ts
           useSession.ts
+          useSettings.ts
           useSidebar.ts
           useStream.ts
           useTheme.ts

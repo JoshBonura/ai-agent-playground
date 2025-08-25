@@ -3,11 +3,11 @@
 from __future__ import annotations
 from dataclasses import asdict
 from typing import List, Optional, Dict
-
+from ..utils.streaming import strip_runjson
 from fastapi import APIRouter
 from pydantic import BaseModel
 from ..services.cancel import GEN_SEMAPHORE
-from ..retitle_worker import enqueue as enqueue_retitle  # ✅ import the enqueuer
+from ..workers.retitle_worker import enqueue as enqueue_retitle  # ✅ import the enqueuer
 
 from ..core.schemas import (
     ChatMetaModel,
@@ -85,15 +85,21 @@ async def api_list_messages(session_id: str):
 @router.post("/api/chats/{session_id}/messages")
 async def api_append_message(session_id: str, body: Dict[str, str]):
     role = (body.get("role") or "user").strip()
+    # 🔴 was: content = strip_runjson(...)
     content = (body.get("content") or "").rstrip()
     row = store_append(session_id, role, content)
 
     if role == "assistant":
+        # Retitle should *not* see RUNJSON blobs
         try:
             msgs = store_list_messages(session_id)
             last_seq = max((int(m.id) for m in msgs), default=0)
-            enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
-            # print(f"[retitle] ENQUEUE session={session_id} job_seq={last_seq} msgs={len(msgs)}")
+            msgs_clean = []
+            for m in msgs:
+                dm = asdict(m)
+                dm["content"] = strip_runjson(dm.get("content") or "")
+                msgs_clean.append(dm)
+            enqueue_retitle(session_id, msgs_clean, job_seq=last_seq)
         except Exception:
             pass
 

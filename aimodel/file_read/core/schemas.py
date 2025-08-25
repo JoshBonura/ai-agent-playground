@@ -1,3 +1,4 @@
+# core/schemas.py
 from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel
@@ -37,14 +38,17 @@ class BatchDeleteReq(BaseModel):
 
 class EditMessageReq(BaseModel):
     messageId: int
-    content: str    
+    content: str
 
 class ChatBody(BaseModel):
     sessionId: Optional[str] = None
     messages: Optional[List[ChatMessage]] = None
-    max_tokens: Optional[int] = 512
-    temperature: float = 0.7
-    top_p: float = 0.95
-    # NEW:
-    autoWeb: bool = True
-    webK: int = 3
+
+    # ↓ make optional; defaults come from effective settings
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+
+    # ↓ also optional; defaults come from settings
+    autoWeb: Optional[bool] = None
+    webK: Optional[int] = None

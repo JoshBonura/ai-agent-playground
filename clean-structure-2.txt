@@ -1,4 +1,118 @@
-tatus_code, txt)
+CHE.get(key)
+    if not v:
+        return None
+    ts, hits = v
+    if (time.time() - ts) > CACHE_TTL_SEC:
+        _CACHE.pop(key, None)
+        return None
+    return hits
+
+def _cache_set(query: str, hits: List[SearchHit]) -> None:
+    _CACHE[_cache_key(query)] = (time.time(), hits)
+
+def _host(u: str) -> str:
+    try:
+        h = (urlparse(u).hostname or "").lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
+# -------- DDGS (official client) ---------------------------------------------
+def _ddg_sync_search(query: str, k: int) -> List[SearchHit]:
+    results: List[SearchHit] = []
+    if DDGS is None:
+        print(f"[{time.strftime('%X')}] ddg: PROVIDER MISSING (DDGS=None)")
+        return results
+    with DDGS() as ddg:
+        for i, r in enumerate(ddg.text(query, max_results=max(1, k),
+                                       safesearch="moderate", region="us-en")):
+            title = (r.get("title") or "").strip()
+            url = (r.get("href") or "").strip()
+            snippet: Optional[str] = (r.get("body") or "").strip() or None
+            if not url:
+                continue
+            results.append(SearchHit(title=title or url, url=url, snippet=snippet, rank=i))
+            if i + 1 >= k:
+                break
+    return results
+
+# -------- public provider ----------------------------------------------------
+class DuckDuckGoProvider:
+    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
+        """
+        Returns top-k SearchHit results via DDGS.
+
+        Added prints:
+          - START with normalized query, k
+          - CACHE HIT / MISS with timing
+          - For fetched results: total count, top items (idx, host, title, url)
+          - RETURN with timing and top titles
+        """
+        t0 = time.time()
+        q_norm = (query or "").strip()
+        if not q_norm:
+            print("ddg: empty query")
+            return []
+
+        print(f"[{time.strftime('%X')}] ddg: START q={q_norm!r} k={k}")
+
+        # superset cache
+        cached = _cache_get(q_norm)
+        if cached is not None:
+            dt = time.time() - t0
+            out = cached[:k]
+            top_preview = [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]]
+            print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={dt:.2f}s hits={len(out)} top={top_preview}")
+            return out
+
+        # fetch superset once
+        sup_k = max(k, CACHE_SUPERSET_K)
+        hits: List[SearchHit] = []
+        if DDGS is not None:
+            try:
+                step = time.time()
+                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, sup_k)
+                dt_fetch = time.time() - step
+                print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={dt_fetch:.2f}s count={len(hits)}")
+                # verbose preview of first few results
+                for h in hits[:5]:
+                    print(f"[{time.strftime('%X')}] ddg:   {h.rank:>2} | host={_host(h.url)} | title={(h.title or '')[:80]!r} | url={h.url}")
+            except Exception as e:
+                print(f"[{time.strftime('%X')}] ddg: ERROR {e}")
+        else:
+            print(f"[{time.strftime('%X')}] ddg: SKIP (DDGS unavailable)")
+
+        # store superset and return slice
+        _cache_set(q_norm, hits)
+        dt = time.time() - t0
+        out = hits[:k]
+        top_titles = [h.title for h in out[:3]]
+        print(f"[{time.strftime('%X')}] ddg: RETURN dt={dt:.2f}s hits={len(out)} top={top_titles}")
+        return out
+
+# ===== aimodel/file_read/web/fetch.py =====
+
+from __future__ import annotations
+import asyncio
+from typing import Tuple, List
+import httpx
+import trafilatura
+
+HEADERS = {"User-Agent": "LocalAI/0.1 (+clean-fetch)"}
+
+async def fetch_clean(url: str, timeout_s: float = 8.0, max_chars: int = 3000) -> Tuple[str, int, str]:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
+        r = await client.get(url, headers=HEADERS)
+        r.raise_for_status()
+        # trafilatura extracts readable article text (Apache-2.0)
+        txt = trafilatura.extract(r.text, url=str(r.url)) or ""
+        if not txt:
+            # fallback: raw text up to cap
+            txt = r.text
+        txt = txt.strip().replace("\r", "")
+        if len(txt) > max_chars:
+            txt = txt[:max_chars]
+        return (str(r.url), r.status_code, txt)
 
 async def fetch_many(urls: List[str], per_timeout_s: float = 8.0, cap_chars: int = 3000, max_parallel: int = 3):
     sem = asyncio.Semaphore(max_parallel)
@@ -15,20 +129,20 @@ async def fetch_many(urls: List[str], per_timeout_s: float = 8.0, cap_chars: int
 
 # aimodel/file_read/web/orchestrator.py
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from urllib.parse import urlparse
 import time
 import re
 
 from .duckduckgo import DuckDuckGoProvider
 from .provider import SearchHit
-from .fetch import fetch_many
+from .fetch import fetch_many  # optional JS path resolved dynamically (see below)
 
-DEFAULT_K = 2                 # fewer sources by default
+DEFAULT_K = 3                 # fewer sources by default
 MAX_BLOCK_TOKENS_EST = 700    # respect ~char budget below
-TOTAL_CHAR_BUDGET = 1600      # ~ 400 tokens (≈4 chars/token)
-PER_DOC_CHAR_BUDGET = 900     # trim each page harder
-MAX_PARALLEL_FETCH = 2        # avoid overfetching & reduce prompt bloat
+TOTAL_CHAR_BUDGET = 2000      # ~ 400 tokens (≈4 chars/token)
+PER_DOC_CHAR_BUDGET = 1200    # trim each page harder
+MAX_PARALLEL_FETCH = 4        # small bump for resilience
 
 def _clean_ws(s: str) -> str:
     return " ".join((s or "").split())
@@ -88,6 +202,91 @@ def score_hit(hit: SearchHit, query: str) -> int:
 
     return score
 
+# -------------------- NEW: generic content-quality scoring --------------------
+
+def _type_ratio(text: str, sub: str) -> float:
+    # rough indicator: how often a pattern appears (e.g., 'script', '{', etc.)
+    if not text:
+        return 1.0
+    cnt = text.lower().count(sub)
+    return float(cnt) / max(1, len(text))
+
+def content_quality_score(text: str) -> float:
+    """
+    Purely generic quality estimate:
+      - + length (more text = better up to a point)
+      - + token diversity (unique tokens vs total)
+      - - script-ish / code-ish indicators (lots of braces, 'script', 'function')
+    No domain/intent/keyword heuristics.
+    Returns 0..1 (higher is better).
+    """
+    if not text:
+        return 0.0
+    t = text.strip()
+    n = len(t)
+    # length contribution (sigmoid-like clamp)
+    length_score = min(1.0, n / 2000.0)  # ~2k chars reaches 1.0
+
+    toks = _tokens(t)
+    if not toks:
+        return 0.1 * length_score
+    uniq = len(set(toks))
+    diversity = uniq / max(1.0, len(toks))
+    # penalize obvious boilerplate/code dominance
+    penalty = 0.0
+    penalty += min(0.3, _type_ratio(t, "<script>") * 50.0)
+    penalty += min(0.3, _type_ratio(t, "function(") * 20.0)
+    penalty += min(0.2, _type_ratio(t, "{") * 5.0 + _type_ratio(t, "}") * 5.0)
+
+    raw = 0.55 * length_score + 0.55 * diversity - penalty
+    return max(0.0, min(1.0, raw))
+
+def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
+    picked: List[SearchHit] = []
+    seen_hosts = set()
+    for s, h in sorted(scored_hits, key=lambda x: x[0], reverse=True):
+        u = (h.url or "").strip()
+        if not u:
+            continue
+        host = _host(u)
+        if host in seen_hosts:
+            continue
+        seen_hosts.add(host)
+        picked.append(h)
+        if len(picked) >= k:
+            break
+    return picked
+
+# ------------------------------------------------------------------------------
+
+async def _fetch_round(
+    urls: List[str],
+    meta: List[Tuple[str, str]],
+    per_url_timeout_s: float,
+    max_parallel: int,
+    use_js: bool = False,
+) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
+    """
+    One fetch round, optionally using a JS renderer if available.
+    If use_js is True, try calling fetch_many_js (if present). Otherwise fall back to fetch_many.
+    """
+    # Resolve JS-capable fetcher if exported by .fetch (keeps this generic)
+    fetch_fn = fetch_many
+    if use_js:
+        try:
+            from . import fetch as _fetch_mod  # type: ignore
+            fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
+        except Exception:
+            fetch_fn = fetch_many
+
+    results = await fetch_fn(
+        urls,
+        per_timeout_s=per_url_timeout_s,
+        cap_chars=min(2000, PER_DOC_CHAR_BUDGET * 2),
+        max_parallel=max_parallel,
+    )
+    return results
+
 async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: float = 8.0) -> str | None:
     start_time = time.time()
     print(f"[orchestrator] IN  @ {start_time:.3f}s | query={query!r}")
@@ -95,8 +294,8 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
     t0 = time.perf_counter()
     provider = DuckDuckGoProvider()
 
-    # --- SEARCH (light overfetch) ---
-    overfetch = max(k + 1, int(k * 1.5))
+    # --- SEARCH (wider overfetch, still generic) ---
+    overfetch = max(k + 2, int(k * 2))  # slightly wider to beat JS-only pages
     print(f"[orchestrator] SEARCH start overfetch={overfetch} k={k}")
     try:
         hits: List[SearchHit] = await provider.search(query, k=overfetch)
@@ -109,19 +308,19 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         print(f"[orchestrator] OUT @ {time.time():.3f}s | no hits | elapsed={time.time()-start_time:.3f}s")
         return None
 
-    # --- SCORING / DEDUPE ---
+    # --- SCORING / DEDUPE (no hardcoded boosts) ---
     print(f"[orchestrator] SCORING generic (no hardcoded boosts)")
-    seen = set()
+    seen_urls = set()
     scored: List[Tuple[int, SearchHit]] = []
     for idx, h in enumerate(hits):
         u = (h.url or "").strip()
         if not u:
             print(f"[orchestrator]   skip[{idx}] empty url")
             continue
-        if u in seen:
+        if u in seen_urls:
             print(f"[orchestrator]   dup [{idx}] host={_host(u)} title={(h.title or '')[:60]!r}")
             continue
-        seen.add(u)
+        seen_urls.add(u)
         s = score_hit(h, query)
         scored.append((s, h))
         print(f"[orchestrator]   meta[{idx}] score={s} host={_host(u)} title={(h.title or '')[:80]!r} url={u}")
@@ -130,28 +329,28 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         print(f"[orchestrator] OUT @ {time.time():.3f}s | no unique hits | elapsed={time.time()-start_time:.3f}s")
         return None
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top_hits = [h for _, h in scored[:k]]
+    # Prefer unique hosts among the top scorers
+    top_hits = _dedupe_by_host(scored, k)
 
     for i, h in enumerate(top_hits, 1):
         print(f"[orchestrator] PICK {i}/{k} score={score_hit(h, query)} host={_host(h.url)} title={(h.title or '')[:80]!r}")
 
-    # --- FETCH (tighter caps) ---
+    # --- FETCH ROUND 1 (static) ---
     urls = [h.url for h in top_hits]
     meta = [(h.title or h.url, h.url) for h in top_hits]
-    print(f"[orchestrator] FETCH start urls={[ _host(u) for u in urls ]}")
+    print(f"[orchestrator] FETCH[1] start urls={[ _host(u) for u in urls ]}")
 
     t_f = time.perf_counter()
-    results = await fetch_many(
-        urls,
-        per_timeout_s=per_url_timeout_s,
-        cap_chars=min(2000, PER_DOC_CHAR_BUDGET * 2),
-        max_parallel=MAX_PARALLEL_FETCH,
+    results = await _fetch_round(
+        urls, meta, per_url_timeout_s=per_url_timeout_s, max_parallel=MAX_PARALLEL_FETCH, use_js=False
     )
     dt_f = time.perf_counter() - t_f
-    print(f"[orchestrator] FETCH done n={len(results)} dt={dt_f:.3f}s")
+    print(f"[orchestrator] FETCH[1] done n={len(results)} dt={dt_f:.3f}s")
 
-    chunks: List[str] = []
+    # Evaluate quality; if overall weak, optionally do a JS-render pass
+    texts: List[Tuple[str, str, str]] = []  # (title, final_url, text)
+    quality_scores: List[float] = []
+
     for original_url, res in results:
         if not res:
             print(f"[orchestrator]   fetch MISS url={original_url}")
@@ -159,16 +358,54 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         final_url, status, text = res
         title = next((t for (t, u) in meta if u == original_url), final_url)
         tl = len(text or "")
-        print(f"[orchestrator]   fetch OK   status={status} host={_host(final_url)} text_len={tl} title={(title or '')[:80]!r}")
-        if not text:
-            continue
+        qscore = content_quality_score(text or "")
+        quality_scores.append(qscore)
+        print(f"[orchestrator]   fetch OK   status={status} host={_host(final_url)} len={tl} q={qscore:.2f} title={(title or '')[:80]!r}")
+        if text:
+            texts.append((title, final_url, text))
+
+    # Decide on JS-render retry generically: if most pages are very low-signal
+    try_js = False
+    if quality_scores:
+        avg_q = sum(quality_scores) / len(quality_scores)
+        lowish = sum(1 for q in quality_scores if q < 0.45)  # <- raise threshold
+        if avg_q < 0.55 or lowish >= max(1, len(quality_scores) // 2):
+            try_js = True
+
+    if try_js:
+        print("[orchestrator] FETCH[2-JS] trying JS-rendered fetch due to low content quality")
+        results_js = await _fetch_round(
+            urls, meta, per_url_timeout_s=min(per_url_timeout_s + 4.0, 12.0),
+            max_parallel=max(2, MAX_PARALLEL_FETCH - 1), use_js=True
+        )
+        texts_js: List[Tuple[str, str, str]] = []
+        for original_url, res in results_js:
+            if not res:
+                continue
+            final_url, status, text = res
+            title = next((t for (t, u) in meta if u == original_url), final_url)
+            tl = len(text or "")
+            qscore = content_quality_score(text or "")
+            print(f"[orchestrator]   fetch JS OK status={status} host={_host(final_url)} len={tl} q={qscore:.2f} title={(title or '')[:80]!r}")
+            if text:
+                texts_js.append((title, final_url, text))
+
+        # Prefer JS results where they improved the quality score
+        if texts_js:
+            texts = texts_js
+
+    if not texts:
+        print(f"[orchestrator] OUT @ {time.time():.3f}s | no chunks | elapsed={time.time()-start_time:.3f}s")
+        return None
+
+    # Build chunks; order by generic quality (best first)
+    texts.sort(key=lambda t: content_quality_score(t[2]), reverse=True)
+
+    chunks: List[str] = []
+    for title, final_url, text in texts:
         chunk = condense_doc(title, final_url, text, max_chars=PER_DOC_CHAR_BUDGET)
         chunks.append(chunk)
         print(f"[orchestrator]   chunk len={len(chunk)} host={_host(final_url)}")
-
-    if not chunks:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no chunks | elapsed={time.time()-start_time:.3f}s")
-        return None
 
     # --- ENFORCE TOTAL BUDGET ---
     header = f"Web findings for: {query}"
@@ -274,98 +511,153 @@ def summarize_query(llm: Any, user_text: str) -> str:
 # aimodel/file_read/web/router_ai.py
 from __future__ import annotations
 from typing import Tuple, Optional, Any
-import json
-import re
+import json, re
 
-# IMPORTANT: Double braces to escape JSON in .format()
-_PROMPT = (
-    "You ONLY output JSON.\n"
-    "Task:\n"
-    "  1) Determine whether the provided text ALREADY contains a direct, credible answer "
-    "     to the user’s most recent question.\n"
-    "     - If YES, do NOT use the web.\n"
-    "  2) Otherwise, decide if the question requires LIVE WEB results "
-    "     (e.g., news, prices, schedules, laws, 'today/now/latest', or other changing facts).\n"
-    'Return exactly: {{"need": true|false, "query": "<concise web query or empty>"}} '
-    "No explanations.\n\n"
-    "User: {text}\n"
+# ---- Minimal JSON-only prompt (model decides; no heuristics) -----------------
+# IMPORTANT: All braces are doubled {{ }} so .format(text=...) doesn't try to
+# substitute keys like "need" and "query".
+_DECIDE_PROMPT = (
+    "You are a router deciding whether answering the text requires the public web.\n"
+    "Respond with JSON only in exactly this schema:\n"
+    "{{\"need\": true|false, \"query\": \"<text or empty>\"}}\n\n"
+    "Decision principle:\n"
+    "- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n"
+    "- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n"
+    "- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n"
+    "- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n"
+    "- When uncertain whether real-time state is required, prefer need=true.\n\n"
+    "Text:\n{text}\n"
     "JSON:"
 )
-
-def _force_json(s: str) -> Optional[dict]:
-    """Best-effort to recover a JSON object from model output without relying on keywords."""
+# ---- Robust JSON extraction (no content heuristics) --------------------------
+def _force_json(s: str) -> dict:
+    if not s:
+        return {}
     try:
-        return json.loads(s)
+        v = json.loads(s)
+        return v if isinstance(v, dict) else {}
     except Exception:
-        m = re.search(r"\{.*\}", s, re.DOTALL)
+        m = re.search(r"\{.*\}", s or "", re.DOTALL)
         if not m:
-            return None
+            return {}
         try:
-            return json.loads(m.group(0))
+            v = json.loads(m.group(0))
+            return v if isinstance(v, dict) else {}
         except Exception:
-            return None
+            return {}
 
+# ---- Strip wrappers (Context:, Summary:) for cleaner routing -----------------
+def _strip_wrappers(text: str) -> str:
+    """
+    Keep only the leading user question. Cut at first blank line and stop
+    when a line looks like a section header (.*:). Formatting cleanup only.
+    """
+    t = (text or "").strip()
+    head = t.split("\n\n", 1)[0]
+    out = []
+    for ln in head.splitlines():
+        if re.match(r"^\s*\w[^:\n]{0,40}:\s*$", ln):
+            break
+        out.append(ln)
+    core = " ".join(" ".join(out).split())
+    return core or t
+
+# ---- Core router -------------------------------------------------------------
 def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
-    """
-    Model-only decision:
-      - If the existing text already includes a direct answer, {need:false}.
-      - Else decide if live web is required; if so, include a concise query.
-    Supports explicit overrides via 'web:' or 'search:' at the start of user_text.
-    Returns (need_web, query_if_needed).
-    """
-    if not user_text or not user_text.strip():
-        print("[ROUTER] SKIP (empty user_text)")
-        return (False, None)
-
-    t = user_text.strip()
-    low = t.lower()
-
-    # Explicit override (still allowed)
-    if low.startswith("web:") or low.startswith("search:"):
-        q = t.split(":", 1)[1].strip() or t
-        print(f"[ROUTER] EXPLICIT override need_web=True query={q!r}")
-        return (True, q)
-
-    # Model-based decision (no hardcoded heuristics)
     try:
-        prompt = _PROMPT.format(text=t)
-        print(f"[ROUTER] IN user_text={t!r}")
+        if not user_text or not user_text.strip():
+            print("[ROUTER] SKIP (empty user_text)")
+            return (False, None)
+
+        t_raw = user_text.strip()
+        core_text = _strip_wrappers(t_raw)
+
+        print(f"[ROUTER] INPUT raw={t_raw!r} core={core_text!r}")
+
+        # Explicit override (user forces web)
+        low = t_raw.lower()
+        if low.startswith("web:") or low.startswith("search:"):
+            q = t_raw.split(":", 1)[1].strip() or t_raw
+            q = _strip_wrappers(q)
+            print(f"[ROUTER] EXPLICIT override need_web=True query={q!r}")
+            return (True, q)
+
+        # Model-based decision (no heuristics). Prefer no web if undecided.
+        prompt = _DECIDE_PROMPT.format(text=core_text)
         print(f"[ROUTER] PROMPT >>>\n{prompt}\n<<< PROMPT")
 
-        out = llm.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=64,
-            temperature=0.0,
-            top_p=0.9,
-            stream=False,
-            stop=["</s>", "\n\n"],
-        )
-        text = out["choices"][0]["message"]["content"].strip()
-        print(f"[ROUTER] RAW OUT={text!r}")
+        text_out = ""
+        raw_out_obj = None
+        try:
+            raw_out_obj = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=96,
+                temperature=0.0,
+                top_p=1.0,
+                stream=False,
+                # Avoid stopping on '\n\n' which can truncate JSON.
+                stop=["</s>"],
+            )
+            text_out = (raw_out_obj.get("choices", [{}])[0]
+                                      .get("message", {})
+                                      .get("content") or "").strip()
+        except Exception as e:
+            print(f"[ROUTER] primary call error: {type(e).__name__}: {e}")
+            # Fallback retry without stop tokens (some wrappers are picky)
+            try:
+                raw_out_obj = llm.create_chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=96,
+                    temperature=0.0,
+                    top_p=1.0,
+                    stream=False,
+                )
+                text_out = (raw_out_obj.get("choices", [{}])[0]
+                                          .get("message", {})
+                                          .get("content") or "").strip()
+            except Exception as e2:
+                print(f"[ROUTER] fallback call error: {type(e2).__name__}: {e2}")
+                text_out = ""
+
+        try:
+            if isinstance(raw_out_obj, dict):
+                print(f"[ROUTER] RAW OBJ keys={list(raw_out_obj.keys())}")
+            else:
+                print(f"[ROUTER] RAW OBJ type={type(raw_out_obj)}")
+        except Exception:
+            pass
+        print(f"[ROUTER] RAW OUT str={text_out!r}")
+
+        data = _force_json(text_out) or {}
+        print(f"[ROUTER] PARSED JSON={data}")
+
+        need_val = data.get("need", None)
+        need = bool(need_val) if isinstance(need_val, bool) else False
+
+        query_field = data.get("query", "")
+        try:
+            query = _strip_wrappers(str(query_field or "").strip())
+        except Exception:
+            query = ""
+
+        if not need:
+            query = None
+
+        print(f"[ROUTER] DECISION need_web={need} query={query!r}")
+        return (need, query)
+
     except Exception as e:
-        print(f"[ROUTER] ERROR during create_chat_completion: {type(e).__name__}: {e}")
-        # On failure, default to no web
+        print(f"[ROUTER] FATAL in decide_web: {type(e).__name__}: {e}")
         return (False, None)
 
-    data = _force_json(text) or {}
-    need = bool(data.get("need", False))
-    query = (str(data.get("query") or "")).strip() or (t if need else None)
-    print(f"[ROUTER] DECISION need_web={need} query={query!r}")
-    return (need, query if need else None)
-
+# ---- One-hop decide + fetch --------------------------------------------------
 async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Optional[str]:
-    """
-    Wrapper used by generate_flow:
-      - decide_web()
-      - if needed: summarize_query() -> build_web_block()
-      - return the assembled web block (or None).
-    """
     t = (user_text or "").strip()
-    print(f"[ROUTER:FETCH] IN text_len={len(t)} k={k} text_preview={(t[:160] + '…') if len(t) > 160 else t!r}")
+    prev = (t[:160] + "…") if len(t) > 160 else t
+    print(f"[ROUTER:FETCH] IN text_len={len(t)} k={k} text_preview={prev!r}")
 
     need, proposed_q = decide_web(llm, t)
     print(f"[ROUTER:FETCH] decide_web -> need={need} proposed_q={proposed_q!r}")
-
     if not need:
         print("[ROUTER:FETCH] no web needed")
         return None
@@ -374,9 +666,10 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Optio
     from .query_summarizer import summarize_query
     from .orchestrator import build_web_block
 
-    base_query = (proposed_q or t).strip()
+    base_query = _strip_wrappers((proposed_q or t).strip())
     try:
-        q_summary = (summarize_query(llm, base_query) or "").strip().strip('"\'') or base_query
+        q_summary = (summarize_query(llm, base_query) or "").strip().strip('"\'' ) or base_query
+        q_summary = _strip_wrappers(q_summary)
         print(f"[ROUTER:FETCH] summarize_query base={base_query!r} -> q_summary={q_summary!r}")
     except Exception as e:
         print(f"[ROUTER:FETCH] summarize_query ERROR {type(e).__name__}: {e}")
@@ -390,6 +683,227 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Optio
         block = None
 
     return block or None
+
+# ===== aimodel/file_read/workers/retitle_worker.py =====
+
+# aimodel/file_read/retitle_worker.py
+from __future__ import annotations
+import asyncio, logging, re
+from typing import Dict, List, Optional, Tuple
+
+from ..runtime.model_runtime import get_llm
+from ..store.index import load_index, save_index
+from ..store.base import now_iso
+from ..services.cancel import is_active, GEN_SEMAPHORE  # serialize with main generation
+from ..store.chats import _load_chat  # for current seq watermark
+
+# -----------------------------------------------------------------------------
+# Coalesced per-session queue (last-write-wins)
+# -----------------------------------------------------------------------------
+# We store only the latest snapshot + watermark per session. The worker consumes
+# session IDs; when it handles a session, it reads the latest snapshot once.
+_PENDING: Dict[str, dict] = {}
+_ENQUEUED: set[str] = set()
+_queue: asyncio.Queue[str] = asyncio.Queue()
+_lock = asyncio.Lock()  # guards _PENDING/_ENQUEUED
+
+# ---- Timings (intervals) -----------------------------------------------------
+_GRACE_MS = 1000  # debounce after stream (was 500)
+_ACTIVE_BACKOFF_START_MS = 75     # initial wait while session is active (was fixed 100ms)
+_ACTIVE_BACKOFF_MAX_MS = 600      # cap per-iteration sleep
+_ACTIVE_BACKOFF_TOTAL_MS = 20000  # max total wait while active (~20s)
+
+def _preview(s: str, n: int = 60) -> str:
+    s = s or ""
+    return (s[:n] + "…") if len(s) > n else s
+
+def _is_substantial(text: str) -> bool:
+    t = (text or "").strip()
+    return len(t) >= 12 and re.search(r"[A-Za-z]", t) is not None
+
+def _pick_source(messages: List[dict]) -> Optional[str]:
+    """Choose best text to title: first substantial user message; fallback to latest substantial user."""
+    if not messages:
+        return None
+    # first substantial user
+    for m in messages:
+        if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
+            return m.get("content", "")
+    # fallback: latest substantial user
+    for m in reversed(messages):
+        if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
+            return m.get("content", "")
+    # final fallback: first user at all
+    for m in messages:
+        if m.get("role") == "user":
+            return m.get("content", "")
+    return None
+
+def _sanitize_title(s: str) -> str:
+    """Single line, 3–5 words, no quotes/numbering/punct clutter."""
+    if not s:
+        return ""
+    s = s.strip()
+    # drop common prefixes like "Expanded explanation:", bullets, quotes
+    s = re.sub(r'^\s*("[^"]*"|\'[^\']*\'|[-*•]+|\d+\.)\s*', "", s)
+    s = s.strip().strip('"\'').strip()
+    # keep letters, digits, spaces; collapse spaces
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # limit to 5 words / ~40 chars
+    words = s.split()
+    s = " ".join(words[:5])
+    if len(s) > 40:
+        s = s[:40].rstrip()
+    return s
+
+def _make_title(llm, src: str) -> str:
+    sys = (
+        "You generate ultra-concise chat titles.\n"
+        "Rules: 2–5 words, Title Case, nouns/adjectives only.\n"
+        "No articles (a, an, the). No verbs. No punctuation. One line.\n"
+        "Output only the title."
+    )
+
+    examples = [
+        {"role": "user", "content": "police station"},
+        {"role": "assistant", "content": "Police Station"},
+        {"role": "user", "content": "fire truck"},
+        {"role": "assistant", "content": "Fire Truck"},
+        {"role": "user", "content": "how do i install node on windows"},
+        {"role": "assistant", "content": "Node Installation Windows"},
+    ]
+
+    out = llm.create_chat_completion(
+        messages=[{"role": "system", "content": sys}, *examples, {"role": "user", "content": src}],
+        max_tokens=12,
+        temperature=0.1,
+        top_p=1.0,
+        stream=False,
+        stop=["\n", "."],  # cut off if it tries to continue a sentence
+    )
+    # trust the model to format; just trim whitespace/quotes
+    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
+    return raw
+
+async def start_worker():
+    """Background loop to process retitle jobs one by one."""
+    while True:
+        sid = await _queue.get()
+        try:
+            await _process_session(sid)
+        except Exception:
+            logging.exception("Retitle worker failed")
+        finally:
+            _queue.task_done()
+
+def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
+    msgs = snapshot.get("messages") or []
+    job_seq = int(snapshot.get("job_seq") or 0)
+    return msgs, job_seq
+
+async def _process_session(session_id: str):
+    # allow quick follow-up enqueues to coalesce
+    await asyncio.sleep(_GRACE_MS / 1000.0)
+
+    # lower priority than generation: wait while this session is active
+    waited = 0
+    backoff = _ACTIVE_BACKOFF_START_MS
+    while is_active(session_id) and waited < _ACTIVE_BACKOFF_TOTAL_MS:
+        await asyncio.sleep(backoff / 1000.0)
+        waited += backoff
+        # exponential backoff with cap
+        backoff = min(int(backoff * 1.5), _ACTIVE_BACKOFF_MAX_MS)
+
+    # fetch latest coalesced snapshot
+    async with _lock:
+        snapshot = _PENDING.pop(session_id, None)
+        _ENQUEUED.discard(session_id)
+
+    if not snapshot:
+        return
+
+    messages, job_seq = _extract_job(snapshot)
+
+    # stale guard: if chat seq has advanced, skip (a newer enqueue will run)
+    try:
+        cur_seq = int((_load_chat(session_id) or {}).get("seq") or 0)
+    except Exception:
+        cur_seq = job_seq
+    if cur_seq > job_seq:
+        print(f"[retitle] SKIP (stale) session={session_id} job_seq={job_seq} current_seq={cur_seq}")
+        return
+
+    # pick source text
+    src = _pick_source(messages) or ""
+    if not src.strip():
+        return
+
+    print(f"[retitle] START session={session_id} job_seq={job_seq} src={_preview(src)!r}")
+
+    # Serialize with main generation semaphore; run LLM call in a worker thread
+    async with GEN_SEMAPHORE:
+        llm = get_llm()
+        try:
+            title = await asyncio.to_thread(_make_title, llm, src)
+        except Exception as e:
+            logging.exception("retitle: LLM error: %s", e)
+            return
+        finally:
+            try:
+                llm.reset()
+            except Exception:
+                pass
+
+    print(f"[retitle] FINISH session={session_id} -> {title!r}")
+
+    if not title:
+        return
+
+    # write only if changed
+    idx = load_index()
+    row = next((r for r in idx if r.get("sessionId") == session_id), None)
+    if not row:
+        return
+    if (row.get("title") or "").strip() == title:
+        return
+
+    row["title"] = title
+    row["updatedAt"] = now_iso()
+    save_index(idx)
+
+def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
+    """Coalesced enqueue; last-write-wins per session, with a seq watermark."""
+    if not session_id:
+        return
+    if not isinstance(messages, list):
+        messages = []
+    # infer watermark if not provided (max message id)
+    if job_seq is None:
+        try:
+            job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
+        except Exception:
+            job_seq = 0
+
+    snap = {"messages": messages, "job_seq": int(job_seq)}
+
+    async def _put():
+        async with _lock:
+            _PENDING[session_id] = snap  # overwrite older snapshot
+            if session_id not in _ENQUEUED:
+                _ENQUEUED.add(session_id)
+                try:
+                    _queue.put_nowait(session_id)
+                except Exception as e:
+                    logging.warning(f"Failed to enqueue retitle: {e}")
+
+    # enqueue can be called from sync contexts; schedule safely
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_put())
+    except RuntimeError:
+        # no running loop (unlikely here); fall back to a temp loop
+        asyncio.run(_put())
 
 # ===== frontend/src/file_read/App.tsx =====
 
@@ -1652,6 +2166,183 @@ export default function MobileDrawer({
   );
 }
 
+# ===== frontend/src/file_read/components/SettingsPanel.tsx =====
+
+import { useEffect, useMemo, useState } from "react";
+import { useSettings } from "../hooks/useSettings";
+
+export default function SettingsPanel({ sessionId, onClose }: { sessionId?: string; onClose?: () => void }) {
+  const { loading, error, effective, overrides, defaults, adaptive, saveOverrides, runAdaptive, reload } =
+    useSettings(sessionId);
+
+  const [tab, setTab] = useState<"effective"|"overrides"|"adaptive"|"defaults">("effective");
+  const [draft, setDraft] = useState(() => JSON.stringify(overrides ?? {}, null, 2));
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  useEffect(() => { setDraft(JSON.stringify(overrides ?? {}, null, 2)); }, [overrides]);
+
+  const view = useMemo(() => {
+    switch (tab) {
+      case "effective": return effective;
+      case "adaptive":  return adaptive;
+      case "defaults":  return defaults;
+      case "overrides": return null;
+    }
+  }, [tab, effective, adaptive, defaults]);
+
+  async function onSave(method: "patch" | "put") {
+    setSaveErr(null); setSaveBusy(true);
+    try {
+      const parsed = draft.trim() ? JSON.parse(draft) : {};
+      await saveOverrides(parsed, method);
+    } catch (e: any) {
+      setSaveErr(e?.message || "Invalid JSON or save failed");
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
+      <div className="w-full max-w-4xl rounded-2xl bg-white shadow-xl border">
+        {/* header */}
+        <div className="px-4 py-3 border-b flex items-center gap-2">
+          <div className="font-semibold">Settings</div>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
+              onClick={() => runAdaptive()}
+              title="Recompute adaptive with current context"
+            >
+              Recompute Adaptive
+            </button>
+            <button
+              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
+              onClick={() => reload()}
+              title="Reload"
+            >
+              Reload
+            </button>
+            <button
+              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
+              onClick={onClose}
+              title="Close"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+
+        {/* tabs */}
+        <div className="px-4 py-2 border-b">
+          {(["effective","overrides","adaptive","defaults"] as const).map(key => (
+            <button
+              key={key}
+              onClick={() => setTab(key)}
+              className={`text-xs mr-2 px-3 py-1.5 rounded ${tab===key ? "bg-black text-white" : "border hover:bg-gray-50"}`}
+            >
+              {key}
+            </button>
+          ))}
+        </div>
+
+        {/* body */}
+        <div className="p-4">
+          {loading && <div className="text-sm text-gray-500">Loading…</div>}
+          {error && <div className="text-sm text-red-600">{error}</div>}
+
+          {tab !== "overrides" && (
+            <pre className="text-xs bg-gray-50 border rounded p-3 overflow-auto max-h-[60vh]">
+              {JSON.stringify(view ?? {}, null, 2)}
+            </pre>
+          )}
+
+          {tab === "overrides" && (
+            <div className="space-y-2">
+              <div className="text-xs text-gray-600">
+                Edit <code>user_overrides</code> JSON. Use <b>Patch</b> to merge or <b>Replace</b> to overwrite.
+              </div>
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                className="w-full h-[50vh] border rounded p-2 font-mono text-xs"
+                spellCheck={false}
+              />
+              <div className="flex items-center gap-2">
+                <button
+                  className={`text-xs px-3 py-1.5 rounded ${saveBusy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"}`}
+                  disabled={saveBusy}
+                  onClick={() => onSave("patch")}
+                  title="Deep-merge with existing overrides"
+                >
+                  Save (Patch)
+                </button>
+                <button
+                  className={`text-xs px-3 py-1.5 rounded border ${saveBusy ? "opacity-60 cursor-not-allowed" : "hover:bg-gray-50"}`}
+                  disabled={saveBusy}
+                  onClick={() => onSave("put")}
+                  title="Replace overrides entirely"
+                >
+                  Save (Replace)
+                </button>
+                {saveErr && <div className="text-xs text-red-600 ml-2">{saveErr}</div>}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/data/settingsApi.ts =====
+
+// frontend/src/file_read/data/settingsApi.ts
+import { request } from "../services/http";
+
+export function getDefaults() {
+  return request<Record<string, any>>("/api/settings/defaults");
+}
+
+export function getAdaptive(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<Record<string, any>>(`/api/settings/adaptive${qs}`);
+}
+
+export function getOverrides() {
+  return request<Record<string, any>>("/api/settings/overrides");
+}
+
+export function getEffective(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<Record<string, any>>(`/api/settings/effective${qs}`);
+}
+
+export function putOverrides(overrides: Record<string, any>) {
+  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(overrides), // ← send raw object
+  });
+}
+
+export function patchOverrides(patch: Record<string, any>) {
+  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch), // ← send raw object
+  });
+}
+
+export function recomputeAdaptive(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<{ ok: boolean; adaptive: any }>(
+    `/api/settings/adaptive/recompute${qs}`,
+    { method: "POST" }
+  );
+}
+
 # ===== frontend/src/file_read/hooks/data/aiApi.ts =====
 
 import { API_BASE } from "../../services/http";
@@ -2253,849 +2944,4 @@ export async function readStreamLoop(
     if (d.wasCanceled() && stopTimeout == null) {
       stopTimeout = window.setTimeout(() => {
         if (!gotMetrics) d.onCancelTimeout(cleanSoFar);
-      }, STOP_FLUSH_TIMEOUT_MS) as unknown as number;
-    }
-  }
-
-  if (stopTimeout != null) clearTimeout(stopTimeout);
-  return { finalText: cleanSoFar, gotMetrics, lastRunJson };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/types.ts =====
-
-import type { ChatMsg } from "../../../types/chat";
-import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
-
-export type MsgAccessor = {
-  getMessagesFor: (sessionId: string) => ChatMsg[];
-  setMessagesFor: (sessionId: string, updater: (prev: ChatMsg[]) => ChatMsg[]) => void;
-};
-
-export type UiHooks = {
-  setInput: (v: string) => void;
-  setLoadingFor: (sessionId: string, v: boolean) => void;
-  setQueuedFor: (sessionId: string, v: boolean) => void;
-  setMetricsFor: (sessionId: string, json?: RunJson, flat?: GenMetrics) => void;
-  setMetricsFallbackFor: (sessionId: string, reason: string, partialOut: string) => void;
-
-  /** NEW: patch the server id for a bubble identified by clientId */
-  setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
-};
-
-export type SessionPlumbing = {
-  getSessionId: () => string;
-  ensureChatCreated: () => Promise<void>;
-  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
-  resetMetricsFor: (sessionId: string) => void;
-};
-
-export type StreamCoreOpts = MsgAccessor & UiHooks & SessionPlumbing;
-
-export type StreamController = {
-  send: (override?: string) => Promise<void>;
-  stop: () => Promise<void>;
-  cancelBySessionId: (sid: string) => Promise<void>;
-  dispose: () => void;
-};
-
-# ===== frontend/src/file_read/hooks/stream/core/updater.ts =====
-
-import type { ChatMsg } from "../../../types/chat";
-import type { MsgAccessor } from "./types";
-
-export function appendAssistantDelta(
-  access: MsgAccessor,
-  sessionId: string,
-  asstId: string,
-  delta: string
-) {
-  if (!delta) return;
-  access.setMessagesFor(sessionId, (prev) => {
-    const idx = prev.findIndex((m) => m.id === asstId);
-    if (idx === -1) return prev;
-    const next = [...prev];
-    const cur = next[idx];
-    next[idx] = { ...cur, text: (cur.text || "") + delta };
-    return next;
-  });
-}
-
-export function ensureAssistantPlaceholder(
-  access: MsgAccessor,
-  sessionId: string,
-  asstId: string
-) {
-  access.setMessagesFor(sessionId, (prev) => {
-    const idx = prev.findIndex((m) => m.id === asstId);
-    if (idx !== -1) return prev;
-    return [...prev, { id: asstId, serverId: null, role: "assistant", text: "" } as ChatMsg];
-  });
-}
-
-export function snapshotPendingAssistant(msgs: ChatMsg[]): string {
-  if (!msgs.length) return "";
-  const last = msgs[msgs.length - 1];
-  return last.role === "assistant" ? last.text : "";
-}
-
-# ===== frontend/src/file_read/hooks/useAutoScroll.ts =====
-
-// frontend/src/file_read/hooks/useAutoScroll.ts
-import { useEffect } from "react";
-
-type AnyRef<T extends HTMLElement> = { current: T | null };
-
-/**
- * Auto-scrolls to bottom when the user is already near the bottom.
- * Supports BOTH:
- *   1) useAutoScroll(ref, [dep1, dep2],)          // old style
- *   2) useAutoScroll(ref, thresholdPx, dep1, dep2) // new style with threshold
- */
-export function useAutoScroll<T extends HTMLElement>(
-  ref: AnyRef<T>,
-  depsOrThreshold: any[] | number = [],
-  ...restDeps: any[]
-) {
-  const thresholdPx =
-    typeof depsOrThreshold === "number" ? depsOrThreshold : 24;
-  const deps = Array.isArray(depsOrThreshold) ? depsOrThreshold : restDeps;
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const atBottom = distanceFromBottom <= thresholdPx;
-
-    if (atBottom) {
-      // wait a tick so layout paints, then scroll
-      requestAnimationFrame(() => {
-        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-      });
-    }
-    // include threshold so changing it retriggers
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thresholdPx, ...deps]);
-}
-
-# ===== frontend/src/file_read/hooks/useChatsPager.ts =====
-
-import { useEffect, useMemo, useRef, useState } from "react";
-import { listChatsPage } from "../hooks/data/chatApi";
-import type { ChatRow } from "../types/chat";
-
-export function useChatsPager(pageSize = 10, refreshKey?: number) {
-  const [chats, setChats] = useState<ChatRow[]>([]);
-  const [page, setPage] = useState(0);
-  const [hasMore, setHasMore] = useState(true);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
-  const [ceiling, setCeiling] = useState<string | null>(null);
-  const [initialLoading, setInitialLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const loadingMoreRef = useRef(false);
-
-  const seenIds = useMemo(() => new Set(chats.map(c => c.sessionId)), [chats]);
-
-  async function loadFirst() {
-    setInitialLoading(true);
-    try {
-      const ceil = new Date().toISOString();
-      setCeiling(ceil);
-      const res = await listChatsPage(0, pageSize, ceil);
-      setChats(res.content);
-      setPage(1);
-      setHasMore(!res.last);
-      setTotal(res.totalElements ?? 0);
-      setTotalPages(res.totalPages ?? 0);
-    } catch {
-      setChats([]); setPage(0); setHasMore(false); setTotal(0); setTotalPages(0);
-    } finally {
-      setInitialLoading(false);
-    }
-  }
-
-  async function loadMore() {
-    if (loadingMoreRef.current || loadingMore || !hasMore || !ceiling) return;
-    loadingMoreRef.current = true;
-    setLoadingMore(true);
-    try {
-      const res = await listChatsPage(page, pageSize, ceiling);
-      const next = res.content.filter(c => !seenIds.has(c.sessionId));
-      setChats(prev => [...prev, ...next]);
-      setPage(p => p + 1);
-      setHasMore(!res.last);
-      setTotal(res.totalElements ?? total);
-      setTotalPages(res.totalPages ?? totalPages);
-    } catch {
-      setHasMore(false);
-    } finally {
-      loadingMoreRef.current = false;
-      setLoadingMore(false);
-    }
-  }
-
-  async function refreshFirst() {
-    setChats([]); setPage(0); setHasMore(true);
-    setTotal(0); setTotalPages(0); setCeiling(null);
-    await loadFirst();
-  }
-
-  // external refreshes
-  useEffect(() => { void refreshFirst(); /* eslint-disable-next-line */ }, [refreshKey]);
-  useEffect(() => {
-    const onRefresh = () => void refreshFirst();
-    window.addEventListener("chats:refresh", onRefresh);
-    return () => window.removeEventListener("chats:refresh", onRefresh);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // infinite scroll
-  useEffect(() => {
-    const rootEl = scrollRef.current, sentinel = sentinelRef.current;
-    if (!rootEl || !sentinel) return;
-    const hasOverflow = rootEl.scrollHeight - rootEl.clientHeight > 8;
-    if (!hasOverflow) return;
-
-    const io = new IntersectionObserver((entries) => {
-      const entry = entries[0];
-      if (entry?.isIntersecting) void loadMore();
-    }, { root: rootEl, rootMargin: "96px 0px", threshold: 0.01 });
-
-    io.observe(sentinel);
-    return () => io.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chats.length, page, hasMore, ceiling]);
-
-  return {
-    // state
-    chats, page, hasMore, total, totalPages,
-    initialLoading, loadingMore,
-    // refs
-    scrollRef, sentinelRef,
-    // actions
-    loadMore, refreshFirst, setChats,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useChatState.ts =====
-
-import { useState } from "react";
-import type { ChatMsg } from "../types/chat";
-
-type BySession<T> = Record<string, T>;
-
-export function useChatState() {
-  const [bySession, setBySession] = useState<BySession<ChatMsg[]>>({});
-  const [input, setInput] = useState("");
-
-  const getMsgs = (sid: string) => bySession[sid] ?? [];
-  const setMsgs = (
-    sid: string,
-    upd: ((prev: ChatMsg[]) => ChatMsg[]) | ChatMsg[]
-  ) => {
-    setBySession((prev) => {
-      const cur = prev[sid] ?? [];
-      const next = Array.isArray(upd) ? upd : upd(cur);
-      return next === cur ? prev : { ...prev, [sid]: next };
-    });
-  };
-
-  const resetMsgs = (sid: string) =>
-    setBySession((prev) => (prev[sid] ? { ...prev, [sid]: [] } : prev));
-
-  return { bySession, input, setInput, getMsgs, setMsgs, resetMsgs };
-}
-
-# ===== frontend/src/file_read/hooks/useChatStream.ts =====
-
-import { useMemo } from "react";
-import type { ChatMsg } from "../types/chat";
-import { useSession } from "./useSession";
-import { useStream } from "./useStream";
-import { useChatState } from "./useChatState";
-import { useRunState } from "./useRunState";
-import { useMetrics } from "./useMetrics";
-// Retitle disabled for now
-// import { useRetitle } from "./useRetitle";
-
-export type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-export function useChatStream() {
-  // state slices
-  const chat = useChatState();
-  const run = useRunState();
-  const met = useMetrics();
-  // Retitle disabled
-  // const { retitleNow } = useRetitle(true);
-
-  // session plumbing
-  const { sessionIdRef, ensureChatCreated, loadHistory, setSessionId, resetSession } = useSession({
-    setMessagesForSession: (sid: string, msgs: ChatMsg[]) => chat.setMsgs(sid, msgs),
-    getMessagesForSession: (sid: string) => chat.getMsgs(sid),
-    isStreaming: (sid: string) => !!run.loadingBy[sid],
-  });
-
-  // stream controller
-  const { send, stop, cancelBySessionId } = useStream({
-    messages: chat.getMsgs(sessionIdRef.current), // keeps deps stable
-    setMessagesForSession: (sid, updater) => chat.setMsgs(sid, updater),
-    getMessagesForSession: chat.getMsgs,
-    setInput: chat.setInput,
-    sessionId: () => sessionIdRef.current,
-    ensureChatCreated,
-
-    // 🔕 Retitle disabled: provide a no-op with the expected signature
-    onRetitle: async (_sessionId: string, _latestAssistant: string) => { /* no-op */ },
-
-    setLoadingForSession: run.setLoadingFor,
-    setQueuedForSession: run.setQueuedFor,
-    setMetricsForSession: met.setMetricsFor,
-    setMetricsFallbackForSession: met.setMetricsFallbackFor,
-    resetMetricsForSession: met.resetMetricsFor,
-  });
-
-  async function cancelSessions(ids: string[]) {
-    await Promise.all(ids.map(cancelBySessionId));
-  }
-
-  // derived (active session)
-  const activeId = sessionIdRef.current;
-  const messages = useMemo(() => chat.getMsgs(activeId), [chat.bySession, activeId]);
-  const loading = !!run.loadingBy[activeId];
-  const queued = !!run.queuedBy[activeId];
-  const runJson = met.metricsBy[activeId]?.runJson ?? null;
-  const runMetrics = met.metricsBy[activeId]?.flat ?? null;
-
-  function reset() {
-    chat.setInput("");
-    met.resetMetricsFor(activeId);
-    resetSession();
-  }
-
-  function snapshotPendingAssistant(): string {
-    const msgs = chat.getMsgs(activeId);
-    const last = msgs[msgs.length - 1];
-    return last?.role === "assistant" ? (last.text ?? "") : "";
-  }
-
-  return {
-    // chat state
-    messages,
-    input: chat.input,
-    setInput: chat.setInput,
-    loading,
-    queued,
-
-    // actions
-    send,
-    stop,
-    cancelSessions,
-
-    // session ctl
-    setSessionId,
-    sessionIdRef,
-    loadHistory,
-    reset,
-    snapshotPendingAssistant,
-
-    // metrics (active only)
-    runMetrics,
-    runJson,
-    clearMetrics: () => met.resetMetricsFor(activeId),
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useLockBodyScroll.ts =====
-
-import { useEffect } from "react";
-
-export function useLockBodyScroll(lock: boolean) {
-  useEffect(() => {
-    const { overflow } = document.body.style;
-    if (lock) document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = overflow; };
-  }, [lock]);
-}
-
-# ===== frontend/src/file_read/hooks/useMetrics.ts =====
-
-import { useState } from "react";
-import type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-type BySession<T> = Record<string, T>;
-type Pair = { runJson: RunJson | null; flat: GenMetrics | null };
-
-export function useMetrics() {
-  const [metricsBy, setMetricsBy] = useState<BySession<Pair>>({});
-
-  function resetMetricsFor(sid: string) {
-    setMetricsBy((prev) => ({ ...prev, [sid]: { runJson: null, flat: null } }));
-  }
-
-  function setMetricsFor(sid: string, json?: RunJson, flat?: GenMetrics) {
-    setMetricsBy((prev) => {
-      const cur = prev[sid] ?? { runJson: null, flat: null };
-      return { ...prev, [sid]: { runJson: json ?? cur.runJson, flat: flat ?? cur.flat } };
-    });
-  }
-
-  function setMetricsFallbackFor(sid: string, reason: string, partialOut: string) {
-    const json: RunJson = {
-      stats: {
-        stopReason: reason,
-        tokensPerSecond: null,
-        timeToFirstTokenSec: null,
-        totalTimeSec: null,
-        promptTokensCount: null,
-        predictedTokensCount: partialOut ? partialOut.length : 0,
-        totalTokensCount: null,
-      },
-    };
-    const flat: GenMetrics = {
-      stop_reason: reason,
-      tok_per_sec: null,
-      ttft_ms: null,
-      output_tokens: null,
-      input_tokens_est: null,
-      total_tokens_est: null,
-    };
-    setMetricsFor(sid, json, flat);
-  }
-
-  return { metricsBy, resetMetricsFor, setMetricsFor, setMetricsFallbackFor };
-}
-
-# ===== frontend/src/file_read/hooks/useMultiSelect.ts =====
-
-// frontend/src/file_read/hooks/useMultiSelect.ts
-import { useEffect, useMemo, useState } from "react";
-
-export function useMultiSelect(allIds: string[]) {
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-
-  // keep selection pruned when the list of ids changes
-  useEffect(() => {
-    setSelected(prev => {
-      const next = new Set([...prev].filter(id => allIds.includes(id)));
-      // only update if it actually changed
-      return next.size === prev.size ? prev : next;
-    });
-  }, [allIds]);
-
-  const allSelected = useMemo(
-    () => selected.size > 0 && selected.size === allIds.length,
-    [selected, allIds.length]
-  );
-
-  const toggleOne = (id: string) => {
-    setSelected(prev => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-  };
-
-  const toggleAll = () => {
-    setSelected(prev =>
-      prev.size === allIds.length ? new Set() : new Set(allIds)
-    );
-  };
-
-  return { selected, setSelected, allSelected, toggleOne, toggleAll };
-}
-
-# ===== frontend/src/file_read/hooks/useRetitle.ts =====
-
-// frontend/src/file_read/hooks/useRetitle.ts
-import { API_BASE } from "../services/http";
-import { listMessages, updateChatLast } from "../hooks/data/chatApi";
-import { stripRunJson } from "../shared/lib/runjson";
-
-const TITLE_MAX_WORDS = 6;
-
-function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
-  let t = (raw.split(/\r?\n/)[0] ?? "");
-  t = t.replace(/[^\p{L}\p{N} ]+/gu, " ");
-  t = t.replace(/\s+/g, " ").trim();
-  t = t.split(" ").slice(0, maxWords).join(" ").trim();
-  return t;
-}
-
-export function useRetitle(enabled = true) {
-  async function retitleNow(sessionId: string, latestAssistant: string) {
-    console.log("1")
-    if (!enabled) return;
-
-    try {
-      // Build a minimal transcript to title on
-      const rows = await listMessages(sessionId);
-      const textDump = rows
-        .map((r) => `${r.role === "user" ? "User" : "Assistant"}: ${r.content}`)
-        .join("\n");
-
-      // Ask the local model for a very short title
-      const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: `${sessionId}::titlebot`,
-          messages: [
-            {
-              role: "system",
-              content: "You output ultra-concise, neutral chat titles and nothing else.",
-            },
-            {
-              role: "user",
-              content:
-                "Write ONE short title summarizing the conversation below.\n" +
-                "Rules: at most 6 words — sentence or title case — no punctuation — no emojis — no quotes — return ONLY the title\n\n" +
-                textDump +
-                "\n\nTitle:",
-            },
-          ],
-          max_tokens: 24,
-          temperature: 0.2,
-          top_p: 0.9,
-        }),
-      });
-
-      if (!res.ok || !res.body) return;
-
-      // Gather the streamed text + strip runjson
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let raw = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value) raw += decoder.decode(value, { stream: true });
-      }
-
-      const { text } = stripRunJson(raw);
-      const title = sanitizeTitle(text);
-      if (!title) return;
-
-      // Save title + lastMessage (lastMessage stays the full assistant text)
-      await updateChatLast(sessionId, latestAssistant, title).catch(() => {});
-      // Nudge sidebar so it shows new title immediately
-      try {
-        window.dispatchEvent(new CustomEvent("chats:refresh"));
-      } catch {}
-    } catch (e) {
-      console.warn("retitleNow failed:", e);
-    }
-  }
-
-  return { retitleNow };
-}
-
-# ===== frontend/src/file_read/hooks/useRunMetrics.ts =====
-
-import { useState } from "react";
-import type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-export function useRunMetrics() {
-  const [runMetrics, setRunMetrics] = useState<GenMetrics | null>(null);
-  const [runJson, setRunJson] = useState<RunJson | null>(null);
-
-  function resetMetrics() {
-    setRunMetrics(null);
-    setRunJson(null);
-  }
-
-  function setFromParsed(json?: RunJson, flat?: GenMetrics) {
-    if (json) setRunJson(json);
-    if (flat) setRunMetrics(flat);
-  }
-
-  function synthesizeStop(reason: string, partialOut: string) {
-    const json: RunJson = {
-      stats: {
-        stopReason: reason,
-        tokensPerSecond: null,
-        timeToFirstTokenSec: null,
-        totalTimeSec: null,
-        promptTokensCount: null,
-        predictedTokensCount: partialOut ? partialOut.length : 0,
-        totalTokensCount: null,
-      },
-    };
-    const flat: GenMetrics = {
-      stop_reason: reason,
-      tok_per_sec: null,
-      ttft_ms: null,
-      output_tokens: null,
-      input_tokens_est: null,
-      total_tokens_est: null,
-    };
-    return { json, flat };
-  }
-
-  function setFallback(reason: string, partialOut: string) {
-    const { json, flat } = synthesizeStop(reason, partialOut);
-    setRunJson(prev => prev ?? json);
-    setRunMetrics(prev => prev ?? flat);
-  }
-
-  return {
-    runMetrics,
-    runJson,
-    resetMetrics,
-    setFromParsed,
-    setFallback,
-  };
-}
-
-export type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-# ===== frontend/src/file_read/hooks/useRunState.ts =====
-
-import { useState } from "react";
-
-type BySession<T> = Record<string, T>;
-
-export function useRunState() {
-  const [loadingBy, setLoadingBy] = useState<BySession<boolean>>({});
-  const [queuedBy, setQueuedBy] = useState<BySession<boolean>>({});
-
-  const setBool =
-    (setter: React.Dispatch<React.SetStateAction<BySession<boolean>>>) =>
-    (sid: string, v: boolean) =>
-      setter((prev) => (prev[sid] === v ? prev : { ...prev, [sid]: v }));
-
-  return {
-    loadingBy,
-    queuedBy,
-    setLoadingFor: setBool(setLoadingBy),
-    setQueuedFor: setBool(setQueuedBy),
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useSession.ts =====
-
-// frontend/src/file_read/hooks/useSession.ts
-import { useRef } from "react";
-import type { ChatMsg, ChatMessageRow } from "../types/chat";
-import { createChat, listMessages } from "../hooks/data/chatApi";
-import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
-
-function rowToMsg(r: ChatMessageRow): ChatMsg {
-  if (r.role === "assistant") {
-    const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
-    const base: ChatMsg = {
-      id: `cid-${r.id}`,        // stable UI id derived from server id
-      serverId: r.id,
-      role: r.role,
-      text: clean,
-    };
-    if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
-    return base;
-  }
-  return { id: `cid-${r.id}`, serverId: r.id, role: r.role, text: r.content };
-}
-
-export function useSession(opts: {
-  setMessagesForSession: (sid: string, msgs: ChatMsg[]) => void;
-  getMessagesForSession: (sid: string) => ChatMsg[];
-  isStreaming: (sid: string) => boolean;
-}) {
-  const { setMessagesForSession, getMessagesForSession, isStreaming } = opts;
-  const sessionIdRef = useRef<string>(crypto.randomUUID());
-  const hasCreatedRef = useRef(false);
-
-  async function ensureChatCreated() {
-    if (!sessionIdRef.current) {
-      sessionIdRef.current = crypto.randomUUID();
-      hasCreatedRef.current = false;
-    }
-    if (hasCreatedRef.current) return;
-    try {
-      await createChat(sessionIdRef.current, "New Chat");
-      hasCreatedRef.current = true;
-    } catch (e) {
-      console.warn("createChat failed:", e);
-    }
-  }
-
-  async function loadHistory(sessionId: string): Promise<void> {
-    sessionIdRef.current = sessionId;
-    hasCreatedRef.current = true;
-
-    try {
-      const rows = await listMessages(sessionId);
-      const serverMsgs = rows.map(rowToMsg);
-
-      const prevClient = getMessagesForSession(sessionId) ?? [];
-
-      if (isStreaming(sessionId)) {
-        // When streaming, merge by serverId (preserve any in-flight tail by clientId)
-        const byServer = new Map<number, ChatMsg>(
-          prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
-        );
-        const merged = serverMsgs.map(s => {
-          const prev = byServer.get(s.serverId!);
-          if (!prev) return s;
-          // prefer freshly parsed meta if present, else keep previous meta
-          const meta = s.meta ?? prev.meta ?? undefined;
-          return { ...prev, ...s, meta };
-        });
-
-        const tail: ChatMsg[] = [];
-        const last = prevClient[prevClient.length - 1];
-        if (last?.role === "assistant" && (last.text?.length ?? 0) > 0 && last.serverId == null) {
-          tail.push(last); // keep streaming tail bubble (unsaved)
-        }
-
-        setMessagesForSession(sessionId, [...merged, ...tail]);
-      } else {
-        setMessagesForSession(sessionId, serverMsgs);
-      }
-    } catch (e) {
-      console.warn("listMessages failed:", e);
-      if (!isStreaming(sessionId)) setMessagesForSession(sessionId, []);
-    }
-  }
-
-  function setSessionId(newId: string) {
-    sessionIdRef.current = newId;
-    hasCreatedRef.current = false;
-    setMessagesForSession(newId, []);
-  }
-
-  function resetSession() {
-    const id = sessionIdRef.current;
-    if (id) setMessagesForSession(id, []);
-  }
-
-  return {
-    sessionIdRef,
-    ensureChatCreated,
-    loadHistory,
-    setSessionId,
-    resetSession,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useSidebar.ts =====
-
-// frontend/src/file_read/hooks/useSidebar.ts
-import { useEffect, useState } from "react";
-
-export function useSidebar() {
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
-
-  // pin on desktop
-  useEffect(() => {
-    const onResize = () => {
-      if (window.innerWidth >= 768) setSidebarOpen(true);
-    };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-
-  // Ctrl+B toggle
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
-        e.preventDefault();
-        setSidebarOpen((v) => !v);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // mobile drawer helpers (DOM-level; safe here)
-  const openMobileDrawer = () => {
-    document.getElementById("mobile-drawer")?.classList.remove("hidden");
-    document.getElementById("mobile-backdrop")?.classList.remove("hidden");
-    document.body.style.overflow = "hidden";
-  };
-  const closeMobileDrawer = () => {
-    document.getElementById("mobile-drawer")?.classList.add("hidden");
-    document.getElementById("mobile-backdrop")?.classList.add("hidden");
-    document.body.style.overflow = "";
-  };
-
-  return {
-    sidebarOpen,
-    setSidebarOpen,
-    openMobileDrawer,
-    closeMobileDrawer,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useStream.ts =====
-
-// frontend/src/file_read/hooks/useStream.ts
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMsg } from "../types/chat";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-import { createStreamController } from "./stream/core/controller";
-
-type UseStreamDeps = {
-  // not read directly; keeps memo deps stable
-  messages: ChatMsg[];
-
-  // message state per session
-  setMessagesForSession: (
-    sid: string,
-    updater: (prev: ChatMsg[]) => ChatMsg[]
-  ) => void;
-  getMessagesForSession: (sid: string) => ChatMsg[];
-
-  // ui
-  setInput: (v: string) => void;
-
-  // session plumbing
-  sessionId: () => string;
-  ensureChatCreated: () => Promise<void>;
-  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
-
-  // per-session flags/metrics
-  setLoadingForSession: (sid: string, v: boolean) => void;
-  setQueuedForSession?: (sid: string, v: boolean) => void;
-  setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-  setMetricsFallbackForSession: (sid: string, reason: string, partialOut: string) => void;
-  resetMetricsForSession: (sid: string) => void;
-};
-
-export function useStream({
-  setMessagesForSession,
-  getMessagesForSession,
-  setInput,
-  sessionId,
-  ensureChatCreated,
-  onRetitle,
-  setLoadingForSession,
-  setQueuedForSession,
-  setMetricsForSession,
-  setMetricsFallbackForSession,
-  resetMetricsForSession,
-}: UseStreamDeps) {
-  const [loading, setLoading] = useState(false);
-  const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
-
-  // Build the controller once; it manages its own queue + aborts.
-  const controller = useMemo(() => {
-    return createStreamController({
-      // message access
-      getMessagesFor: (sid) => getMessagesForSession(sid),
-      setMessagesFor: (sid, updater) => setMessagesForSession(sid, updater),
-
-      // ui hooks
-      setInput: () => setInput(""),
-      setLoadingFor: (sid, v) => {
-        if (sid === sessionId()) setLoading(v);
-        setLoadingForSession(sid, v);
-      },
-      setQueuedFor: setQueuedForSession ?? (() => {}),
-
-      // metrics
-      setMetricsFor: (sid, json, flat) => setMetricsForSession(sid, json, flat),
-      setMetricsFallbackFor: (sid, reason, out) =>
-        setMetricsFallbackForSession(sid, reason, o
+      }, STOP_FLUSH_TIMEOUT_MS

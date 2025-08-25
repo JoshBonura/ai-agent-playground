@@ -5,47 +5,83 @@ from urllib.parse import urlparse
 import time
 import re
 
+from ..core.settings import SETTINGS
 from .duckduckgo import DuckDuckGoProvider
 from .provider import SearchHit
 from .fetch import fetch_many  # optional JS path resolved dynamically (see below)
 
-DEFAULT_K = 3                 # fewer sources by default
-MAX_BLOCK_TOKENS_EST = 700    # respect ~char budget below
-TOTAL_CHAR_BUDGET = 2000      # ~ 400 tokens (≈4 chars/token)
-PER_DOC_CHAR_BUDGET = 1200    # trim each page harder
-MAX_PARALLEL_FETCH = 4        # small bump for resilience
+# ===== helpers to read config (strict: no silent defaults) ====================
+
+def _req(key: str):
+    return SETTINGS[key]
+
+def _as_int(key: str) -> int: return int(_req(key))
+def _as_float(key: str) -> float: return float(_req(key))
+def _as_bool(key: str) -> bool: return bool(_req(key))
+def _as_str(key: str) -> str:
+    v = _req(key)
+    return "" if v is None else str(v)
+
+# ===== small utils ============================================================
 
 def _clean_ws(s: str) -> str:
     return " ".join((s or "").split())
 
-def _head_tail(text: str, max_chars: int) -> str:
-    if not text or len(text) <= max_chars:
-        return _clean_ws(text)
-    head = max_chars - max(200, max_chars // 3)
-    tail = max_chars - head
-    return _clean_ws(text[:head] + " … " + text[-tail:])
-
-def condense_doc(title: str, url: str, text: str, max_chars: int = PER_DOC_CHAR_BUDGET) -> str:
-    # keep title, final URL, and a trimmed body
-    body = _head_tail(text or "", max_chars)
-    safe_title = _clean_ws(title or url)
-    return f"- {safe_title}\n  {url}\n  {body}"
-
 def _host(url: str) -> str:
     h = (urlparse(url).hostname or "").lower()
-    return h[4:] if h.startswith("www.") else h
+    pref = _as_str("web_orch_www_prefix")
+    return h[len(pref):] if pref and h.startswith(pref) else h
 
 def _tokens(s: str) -> List[str]:
     return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
 
+def _head_tail(text: str, max_chars: int) -> str:
+    """
+    Trim long text to head/tail, using settings:
+      - web_orch_head_fraction
+      - web_orch_tail_min_chars
+      - web_orch_ellipsis
+    Mirrors the old behavior but configurable.
+    """
+    text = text or ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return _clean_ws(text)
+
+    head_frac      = _as_float("web_orch_head_fraction")      # e.g., 0.67
+    tail_min_chars = _as_int("web_orch_tail_min_chars")       # e.g., 200
+    ellipsis       = _as_str("web_orch_ellipsis")             # e.g., " … "
+
+    head = int(max_chars * head_frac)
+    tail = max_chars - head
+    if tail < tail_min_chars:
+        head = max(1, max_chars - tail_min_chars)
+        tail = tail_min_chars
+
+    return _clean_ws(text[:head] + ellipsis + text[-tail:])
+
+def condense_doc(title: str, url: str, text: str, *, max_chars: int) -> str:
+    body = _head_tail(text or "", max_chars)
+    safe_title = _clean_ws(title or url)
+    bullet = _as_str("web_orch_bullet_prefix") or "- "
+    indent = _as_str("web_orch_indent_prefix") or "  "
+    return f"{bullet}{safe_title}\n{indent}{url}\n{indent}{body}"
+
+# ===== scoring (generic; no domain/date heuristics) ===========================
+
 def score_hit(hit: SearchHit, query: str) -> int:
     """
-    Generic, content-based scoring (no hardcoded domains, no date/month/year rules).
-    Signals:
-      - exact phrase in title (+3) / substring in title (+2)
-      - token coverage in title (+0..2)
-      - token touch in snippet (+1 if any)
+    Generic, content-based scoring.
+      - exact phrase in title (+web_orch_score_w_exact)
+      - substring in title (+web_orch_score_w_substr)
+      - token coverage in title (+0..web_orch_score_w_title_full/title_part)
+      - any token in snippet (+web_orch_score_w_snip_touch)
     """
+    w_exact      = _as_int("web_orch_score_w_exact")
+    w_substr     = _as_int("web_orch_score_w_substr")
+    w_title_full = _as_int("web_orch_score_w_title_full")
+    w_title_part = _as_int("web_orch_score_w_title_part")
+    w_snip_touch = _as_int("web_orch_score_w_snip_touch")
+
     score = 0
     q = (query or "").strip().lower()
     title = (hit.title or "").strip()
@@ -55,61 +91,59 @@ def score_hit(hit: SearchHit, query: str) -> int:
 
     if q:
         if title_l == q:
-            score += 3
+            score += w_exact
         elif q in title_l:
-            score += 2
+            score += w_substr
 
     qtoks = _tokens(q)
     if qtoks:
         cov_title = sum(1 for t in qtoks if t in title_l)
-        if cov_title == len(qtoks):
-            score += 2
+        if cov_title == len(qtoks) and len(qtoks) > 0:
+            score += w_title_full
         elif cov_title > 0:
-            score += 1
-
+            score += w_title_part
         cov_snip = sum(1 for t in qtoks if t in snip_l)
         if cov_snip > 0:
-            score += 1
+            score += w_snip_touch
 
     return score
 
-# -------------------- NEW: generic content-quality scoring --------------------
+# ===== quality estimate (generic; configurable penalties) =====================
 
 def _type_ratio(text: str, sub: str) -> float:
-    # rough indicator: how often a pattern appears (e.g., 'script', '{', etc.)
     if not text:
         return 1.0
     cnt = text.lower().count(sub)
     return float(cnt) / max(1, len(text))
 
 def content_quality_score(text: str) -> float:
-    """
-    Purely generic quality estimate:
-      - + length (more text = better up to a point)
-      - + token diversity (unique tokens vs total)
-      - - script-ish / code-ish indicators (lots of braces, 'script', 'function')
-    No domain/intent/keyword heuristics.
-    Returns 0..1 (higher is better).
-    """
     if not text:
         return 0.0
     t = text.strip()
     n = len(t)
-    # length contribution (sigmoid-like clamp)
-    length_score = min(1.0, n / 2000.0)  # ~2k chars reaches 1.0
+
+    len_div     = _as_float("web_orch_q_len_norm_divisor")
+    w_len       = _as_float("web_orch_q_len_weight")
+    w_div       = _as_float("web_orch_q_diversity_weight")
+
+    length_score = min(1.0, n / len_div) if len_div > 0 else 0.0
 
     toks = _tokens(t)
     if not toks:
-        return 0.1 * length_score
-    uniq = len(set(toks))
-    diversity = uniq / max(1.0, len(toks))
-    # penalize obvious boilerplate/code dominance
-    penalty = 0.0
-    penalty += min(0.3, _type_ratio(t, "<script>") * 50.0)
-    penalty += min(0.3, _type_ratio(t, "function(") * 20.0)
-    penalty += min(0.2, _type_ratio(t, "{") * 5.0 + _type_ratio(t, "}") * 5.0)
+        return 0.1 * length_score  # tiny signal if no tokens
 
-    raw = 0.55 * length_score + 0.55 * diversity - penalty
+    uniq = len(set(toks))
+    diversity = uniq / max(1.0, float(len(toks)))
+
+    pen = 0.0
+    # penalties: [{"token": str, "mult": float, "cap": float}, ...]
+    for rule in _req("web_orch_q_penalties"):
+        token = str(rule.get("token") or "")
+        mult  = float(rule.get("mult") or 0.0)
+        cap   = float(rule.get("cap") or 1.0)
+        pen += min(cap, _type_ratio(t, token) * mult)
+
+    raw = (w_len * length_score) + (w_div * diversity) - pen
     return max(0.0, min(1.0, raw))
 
 def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
@@ -128,7 +162,7 @@ def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[Se
             break
     return picked
 
-# ------------------------------------------------------------------------------
+# ===== fetch layer ============================================================
 
 async def _fetch_round(
     urls: List[str],
@@ -137,11 +171,7 @@ async def _fetch_round(
     max_parallel: int,
     use_js: bool = False,
 ) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
-    """
-    One fetch round, optionally using a JS renderer if available.
-    If use_js is True, try calling fetch_many_js (if present). Otherwise fall back to fetch_many.
-    """
-    # Resolve JS-capable fetcher if exported by .fetch (keeps this generic)
+
     fetch_fn = fetch_many
     if use_js:
         try:
@@ -150,24 +180,60 @@ async def _fetch_round(
         except Exception:
             fetch_fn = fetch_many
 
+    # Cap per doc by multiplier, but never exceed global max bytes/chars
+    cap_mult        = _as_float("web_orch_fetch_cap_multiplier")
+    per_doc_budget  = _as_int("web_orch_per_doc_char_budget")
+    fetch_max_chars = _as_int("web_fetch_max_chars")
+    per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
+
     results = await fetch_fn(
         urls,
         per_timeout_s=per_url_timeout_s,
-        cap_chars=min(2000, PER_DOC_CHAR_BUDGET * 2),
+        cap_chars=per_doc_cap,
         max_parallel=max_parallel,
     )
     return results
 
-async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: float = 8.0) -> str | None:
+# ===== main ===================================================================
+
+async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> str | None:
+    # pull config each call (to honor hot-reloads)
+    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
+    total_char_budget   = _as_int("web_orch_total_char_budget")
+    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
+    max_parallel        = _as_int("web_orch_max_parallel_fetch")
+    overfetch_factor    = _as_float("web_orch_overfetch_factor")
+    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
+
+    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
+    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
+    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
+    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
+    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
+    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
+    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
+    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
+
+    header_tpl          = _as_str("web_block_header")
+    sep_str             = _as_str("web_orch_block_separator")
+    min_block_reserve   = _as_int("web_orch_min_block_reserve")
+    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
+
+    # timeouts
+    per_timeout = (float(per_url_timeout_s)
+                   if per_url_timeout_s is not None
+                   else _as_float("web_fetch_timeout_sec"))
+
     start_time = time.time()
     print(f"[orchestrator] IN  @ {start_time:.3f}s | query={query!r}")
 
-    t0 = time.perf_counter()
     provider = DuckDuckGoProvider()
 
-    # --- SEARCH (wider overfetch, still generic) ---
-    overfetch = max(k + 2, int(k * 2))  # slightly wider to beat JS-only pages
-    print(f"[orchestrator] SEARCH start overfetch={overfetch} k={k}")
+    # --- SEARCH (configurable overfetch) ---
+    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
+    print(f"[orchestrator] SEARCH start overfetch={overfetch} k={cfg_k}")
+
+    t0 = time.perf_counter()
     try:
         hits: List[SearchHit] = await provider.search(query, k=overfetch)
     except Exception as e:
@@ -179,7 +245,7 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         print(f"[orchestrator] OUT @ {time.time():.3f}s | no hits | elapsed={time.time()-start_time:.3f}s")
         return None
 
-    # --- SCORING / DEDUPE (no hardcoded boosts) ---
+    # --- SCORING / DEDUPE ---
     print(f"[orchestrator] SCORING generic (no hardcoded boosts)")
     seen_urls = set()
     scored: List[Tuple[int, SearchHit]] = []
@@ -200,11 +266,11 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         print(f"[orchestrator] OUT @ {time.time():.3f}s | no unique hits | elapsed={time.time()-start_time:.3f}s")
         return None
 
-    # Prefer unique hosts among the top scorers
-    top_hits = _dedupe_by_host(scored, k)
-
+    top_hits = _dedupe_by_host(scored, cfg_k)
     for i, h in enumerate(top_hits, 1):
-        print(f"[orchestrator] PICK {i}/{k} score={score_hit(h, query)} host={_host(h.url)} title={(h.title or '')[:80]!r}")
+        # reuse computed scores when printing
+        s = next((sc for sc, hh in scored if hh is h), 0)
+        print(f"[orchestrator] PICK {i}/{cfg_k} score={s} host={_host(h.url)} title={(h.title or '')[:80]!r}")
 
     # --- FETCH ROUND 1 (static) ---
     urls = [h.url for h in top_hits]
@@ -213,12 +279,11 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
 
     t_f = time.perf_counter()
     results = await _fetch_round(
-        urls, meta, per_url_timeout_s=per_url_timeout_s, max_parallel=MAX_PARALLEL_FETCH, use_js=False
+        urls, meta, per_url_timeout_s=per_timeout, max_parallel=max_parallel, use_js=False
     )
     dt_f = time.perf_counter() - t_f
     print(f"[orchestrator] FETCH[1] done n={len(results)} dt={dt_f:.3f}s")
 
-    # Evaluate quality; if overall weak, optionally do a JS-render pass
     texts: List[Tuple[str, str, str]] = []  # (title, final_url, text)
     quality_scores: List[float] = []
 
@@ -235,19 +300,21 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         if text:
             texts.append((title, final_url, text))
 
-    # Decide on JS-render retry generically: if most pages are very low-signal
+    # --- JS retry decision (configurable thresholds) ---
     try_js = False
-    if quality_scores:
+    if enable_js_retry and quality_scores:
         avg_q = sum(quality_scores) / len(quality_scores)
-        lowish = sum(1 for q in quality_scores if q < 0.45)  # <- raise threshold
-        if avg_q < 0.55 or lowish >= max(1, len(quality_scores) // 2):
+        lowish = sum(1 for q in quality_scores if q < js_low_q_thresh)
+        if avg_q < js_avg_q_thresh or (lowish / max(1, len(quality_scores))) >= js_lowish_ratio:
             try_js = True
 
     if try_js:
         print("[orchestrator] FETCH[2-JS] trying JS-rendered fetch due to low content quality")
+        js_timeout   = min(per_timeout + js_timeout_add, js_timeout_cap)
+        js_parallel  = max(js_min_parallel, max_parallel + js_parallel_delta)
+
         results_js = await _fetch_round(
-            urls, meta, per_url_timeout_s=min(per_url_timeout_s + 4.0, 12.0),
-            max_parallel=max(2, MAX_PARALLEL_FETCH - 1), use_js=True
+            urls, meta, per_url_timeout_s=js_timeout, max_parallel=js_parallel, use_js=True
         )
         texts_js: List[Tuple[str, str, str]] = []
         for original_url, res in results_js:
@@ -261,7 +328,6 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
             if text:
                 texts_js.append((title, final_url, text))
 
-        # Prefer JS results where they improved the quality score
         if texts_js:
             texts = texts_js
 
@@ -269,36 +335,38 @@ async def build_web_block(query: str, k: int = DEFAULT_K, per_url_timeout_s: flo
         print(f"[orchestrator] OUT @ {time.time():.3f}s | no chunks | elapsed={time.time()-start_time:.3f}s")
         return None
 
-    # Build chunks; order by generic quality (best first)
+    # --- Build chunks; order by quality ---
     texts.sort(key=lambda t: content_quality_score(t[2]), reverse=True)
 
     chunks: List[str] = []
     for title, final_url, text in texts:
-        chunk = condense_doc(title, final_url, text, max_chars=PER_DOC_CHAR_BUDGET)
+        chunk = condense_doc(title, final_url, text, max_chars=per_doc_budget)
         chunks.append(chunk)
         print(f"[orchestrator]   chunk len={len(chunk)} host={_host(final_url)}")
 
-    # --- ENFORCE TOTAL BUDGET ---
-    header = f"Web findings for: {query}"
-    available = max(200, TOTAL_CHAR_BUDGET - len(header) - 2)
+    # --- Enforce total budget ---
+    header = header_tpl.format(query=query)
+    sep = _as_str("web_orch_block_separator")
+    available = max(_as_int("web_orch_min_block_reserve"),
+                    total_char_budget - len(header) - len(sep))
     block_parts: List[str] = []
     used = 0
     for idx, ch in enumerate(chunks):
         cl = len(ch)
-        sep = (2 if block_parts else 0)
-        if used + cl + sep > available:
-            shrunk = _head_tail(ch, max(200, available - used - sep))
+        sep_len = (len(sep) if block_parts else 0)
+        if used + cl + sep_len > available:
+            shrunk = _head_tail(ch, max(min_chunk_after, available - used - sep_len))
             print(f"[orchestrator]   budget hit at chunk[{idx}] orig={cl} shrunk={len(shrunk)} used_before={used} avail={available}")
-            if len(shrunk) > 200:
+            if len(shrunk) > min_chunk_after:
                 block_parts.append(shrunk)
-                used += len(shrunk) + sep
+                used += len(shrunk) + sep_len
             break
         block_parts.append(ch)
-        used += cl + sep
+        used += cl + sep_len
         print(f"[orchestrator]   take chunk[{idx}] len={cl} used_total={used}/{available}")
 
-    body = "\n\n".join(block_parts)
-    block = f"{header}\n\n{body}"
+    body = sep.join(block_parts)
+    block = f"{header}{sep}{body}" if body else header
 
     end_time = time.time()
     print(f"[orchestrator] OUT @ {end_time:.3f}s | elapsed={end_time-start_time:.3f}s | chunks={len(block_parts)} | chars={len(block)}")

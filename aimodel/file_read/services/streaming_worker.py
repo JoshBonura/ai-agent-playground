@@ -2,8 +2,10 @@
 from __future__ import annotations
 import asyncio, json, time, logging
 from typing import AsyncGenerator, Optional, List
+
+from ..core.settings import SETTINGS
 from ..utils.streaming import (
-    RUNJSON_START, RUNJSON_END, STOP_STRINGS,
+    RUNJSON_START, RUNJSON_END,
     build_run_json, watch_disconnect,
 )
 
@@ -13,7 +15,7 @@ async def run_stream(
     *, llm, messages, out_budget, stop_ev, request,
     temperature: float, top_p: float, input_tokens_est: Optional[int]
 ) -> AsyncGenerator[bytes, None]:
-    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
 
     def produce():
@@ -32,23 +34,29 @@ async def run_stream(
                     max_tokens=out_budget,
                     temperature=temperature,
                     top_p=top_p,
-                    top_k=40,
-                    repeat_penalty=1.25,
-                    stop=STOP_STRINGS,
+                    top_k=SETTINGS.stream_top_k,
+                    repeat_penalty=SETTINGS.stream_repeat_penalty,
+                    stop=SETTINGS.stream_stop_strings,
                 )
             except ValueError as ve:
                 if "exceed context window" in str(ve).lower():
-                    retry_tokens = max(64, out_budget // 2)
-                    log.warning("generate: context overflow, retrying with max_tokens=%d", retry_tokens)
+                    retry_tokens = max(
+                        SETTINGS.stream_retry_min_tokens,
+                        int(out_budget * SETTINGS.stream_retry_fraction)
+                    )
+                    log.warning(
+                        "generate: context overflow, retrying with max_tokens=%d",
+                        retry_tokens
+                    )
                     stream = llm.create_chat_completion(
                         messages=messages,
                         stream=True,
                         max_tokens=retry_tokens,
                         temperature=temperature,
                         top_p=top_p,
-                        top_k=40,
-                        repeat_penalty=1.25,
-                        stop=STOP_STRINGS,
+                        top_k=SETTINGS.stream_top_k,
+                        repeat_penalty=SETTINGS.stream_repeat_penalty,
+                        stop=SETTINGS.stream_stop_strings,
                     )
                 else:
                     raise
@@ -79,7 +87,7 @@ async def run_stream(
                         q.put_nowait(piece)
                         break
                     except asyncio.QueueFull:
-                        time.sleep(0.005)
+                        time.sleep(SETTINGS.stream_backpressure_sleep_sec)
 
         except Exception as e:
             err_text = str(e)
@@ -97,7 +105,11 @@ async def run_stream(
             try:
                 out_text = "".join(out_parts)
                 run_json = build_run_json(
-                    request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
+                    request_cfg={
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "max_tokens": out_budget
+                    },
                     out_text=out_text,
                     t_start=t_start,
                     t_first=t_first,
@@ -106,7 +118,8 @@ async def run_stream(
                     finish_reason=finish_reason,
                     input_tokens_est=input_tokens_est,
                 )
-                q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
+                if SETTINGS.runjson_emit:
+                    q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
             except Exception:
                 pass
 
@@ -126,12 +139,12 @@ async def run_stream(
             if stop_ev.is_set():
                 break
             yield (item if isinstance(item, bytes) else item.encode("utf-8"))
-        if stop_ev.is_set():
-            yield b"\n\u23F9 stopped\n"
+        if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
+            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")
     finally:
         stop_ev.set()
         disconnect_task.cancel()
         try:
-            await asyncio.wait_for(producer, timeout=2.0)
+            await asyncio.wait_for(producer, timeout=SETTINGS.stream_producer_join_timeout_sec)
         except Exception:
             pass

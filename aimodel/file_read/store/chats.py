@@ -1,9 +1,14 @@
+# ===== aimodel/file_read/store/chats.py =====
 from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+from ..core.settings import SETTINGS
+from ..utils.streaming import strip_runjson
 from .base import chat_path, atomic_write, now_iso
 from .index import load_index, save_index, refresh_index_after_change, ChatMeta
+
 
 def _load_chat(session_id: str) -> Dict:
     p = chat_path(session_id)
@@ -14,7 +19,8 @@ def _load_chat(session_id: str) -> Dict:
         if "summary" not in data:
             data["summary"] = ""  # backfill older files
         return data
-    
+
+
 @dataclass
 class ChatMessageRow:
     id: int
@@ -22,6 +28,7 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
+
 
 def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     idx = load_index()
@@ -39,14 +46,16 @@ def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     row = {
         "id": next_id,
         "sessionId": session_id,
-        "title": (title.strip() or "New Chat"),
+        "title": (title.strip() or SETTINGS["chat_default_title"]),
         "lastMessage": None,
         "createdAt": now,
         "updatedAt": now,
     }
-    idx.append(row); save_index(idx)
+    idx.append(row)
+    save_index(idx)
     _save_chat(session_id, {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""})
     return ChatMeta(**row)
+
 
 def update_last(session_id: str, last_message: Optional[str], maybe_title: Optional[str]) -> ChatMeta:
     idx = load_index()
@@ -62,26 +71,34 @@ def update_last(session_id: str, last_message: Optional[str], maybe_title: Optio
     row.setdefault("lastMessage", None)
     return ChatMeta(**row)
 
+
 def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
     data = _load_chat(session_id)
     seq = int(data.get("seq", 0)) + 1
     msg = {
-        "id": seq, "sessionId": session_id, "role": role,
-        "content": content, "createdAt": now_iso(),
+        "id": seq,
+        "sessionId": session_id,
+        "role": role,
+        "content": content,
+        "createdAt": now_iso(),
     }
-    data["messages"].append(msg); data["seq"] = seq
+    # Persist RAW content (may include RUNJSON)
+    data["messages"].append(msg)
+    data["seq"] = seq
     _save_chat(session_id, data)
 
+    # Update index meta; keep lastMessage clean for sidebar preview
     idx = load_index()
     row = next((r for r in idx if r["sessionId"] == session_id), None)
     if row:
         row["updatedAt"] = msg["createdAt"]
         if role == "assistant":
-            row["lastMessage"] = content
+            row["lastMessage"] = strip_runjson(content)
         save_index(idx)
 
     # pending ops are applied by pending.apply_pending_for() from the router after appends
     return ChatMessageRow(**msg)
+
 
 def delete_message(session_id: str, message_id: int) -> int:
     data = _load_chat(session_id)
@@ -94,6 +111,7 @@ def delete_message(session_id: str, message_id: int) -> int:
     _save_chat(session_id, data)
     refresh_index_after_change(session_id, msgs)
     return 1
+
 
 def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
     wanted = {int(i) for i in (message_ids or [])}
@@ -115,9 +133,11 @@ def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
     refresh_index_after_change(session_id, keep)
     return deleted
 
+
 def list_messages(session_id: str) -> List[ChatMessageRow]:
     data = _load_chat(session_id)
     return [ChatMessageRow(**m) for m in data.get("messages", [])]
+
 
 def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[ChatMeta], int, int, bool]:
     rows = load_index()
@@ -126,7 +146,9 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
         rows = [r for r in rows if r["updatedAt"] <= ceiling_iso]
 
     total = len(rows)
-    size = max(1, min(100, int(size)))
+    min_size = int(SETTINGS["chat_page_min_size"])
+    max_size = int(SETTINGS["chat_page_max_size"])
+    size = max(min_size, min(max_size, int(size)))
     page = max(0, int(page))
 
     start = page * size
@@ -142,14 +164,18 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
         metas.append(ChatMeta(**r))
     return metas, total, total_pages, last_flag
 
+
 def delete_batch(session_ids: List[str]) -> List[str]:
     for sid in session_ids:
-        try: chat_path(sid).unlink(missing_ok=True)
-        except Exception: pass
+        try:
+            chat_path(sid).unlink(missing_ok=True)
+        except Exception:
+            pass
     idx = load_index()
     keep = [r for r in idx if r["sessionId"] not in set(session_ids)]
     save_index(keep)
     return session_ids
+
 
 def merge_chat(source_id: str, target_id: str):
     source_msgs = list_messages(source_id)
@@ -167,22 +193,26 @@ def merge_chat(source_id: str, target_id: str):
 
     return merged
 
+
 def _save_chat(session_id: str, data: Dict):
     atomic_write(chat_path(session_id), data)
+
 
 def set_summary(session_id: str, new_summary: str) -> None:
     data = _load_chat(session_id)
     data["summary"] = new_summary or ""
     _save_chat(session_id, data)
 
+
 def get_summary(session_id: str) -> str:
     data = _load_chat(session_id)
     return str(data.get("summary") or "")
 
+
 def merge_chat_new(source_id: str, target_id: Optional[str] = None):
     from uuid import uuid4
     new_id = str(uuid4())
-    upsert_on_first_message(new_id, "Merged Chat")
+    upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
 
     merged = []
 
@@ -198,6 +228,7 @@ def merge_chat_new(source_id: str, target_id: Optional[str] = None):
             merged.append(row)
 
     return new_id, merged
+
 
 def edit_message(session_id: str, message_id: int, new_content: str) -> Optional[ChatMessageRow]:
     data = _load_chat(session_id)
@@ -228,5 +259,5 @@ __all__ = [
     "upsert_on_first_message", "update_last", "append_message",
     "delete_message", "delete_messages_batch", "list_messages",
     "list_paged", "delete_batch", "merge_chat", "merge_chat_new",
-    "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary", 
+    "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary",
 ]

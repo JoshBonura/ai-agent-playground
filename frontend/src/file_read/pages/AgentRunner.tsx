@@ -10,15 +10,21 @@ import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
 import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
 
+// NEW: settings panel
+import SettingsPanel from "../components/SettingsPanel";
+
 const PAGE_SIZE = 30;
 const LS_KEY = "lastSessionId";
 
 export default function AgentRunner() {
   const chat = useChatStream();
   const [refreshKey, setRefreshKey] = useState(0);
-  const [autoFollow, setAutoFollow] = useState(true); // NEW
+  const [autoFollow, setAutoFollow] = useState(true);
   const { toast, show } = useToast();
   const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
+
+  // NEW: settings modal
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -47,7 +53,6 @@ export default function AgentRunner() {
     setRefreshKey((k) => k + 1);
     chat.setInput("");
     chat.clearMetrics?.();
-    // Follow to bottom for a fresh chat
     await refreshFollow();
   }
 
@@ -57,7 +62,6 @@ export default function AgentRunner() {
     localStorage.setItem(LS_KEY, id);
     chat.setInput("");
     chat.clearMetrics?.();
-    // Follow when explicitly opening a session
     await refreshFollow();
   }
 
@@ -67,7 +71,7 @@ export default function AgentRunner() {
   async function refreshFollow() {
     const sid = chat.sessionIdRef.current;
     if (!sid) return;
-    setAutoFollow(true); // enable ChatView auto-follow
+    setAutoFollow(true);
     await chat.loadHistory(sid);
     const el = document.getElementById("chat-scroll-container");
     if (el) el.scrollTop = el.scrollHeight;
@@ -81,7 +85,7 @@ export default function AgentRunner() {
     const prevTop = el?.scrollTop ?? 0;
     const prevHeight = el?.scrollHeight ?? 0;
 
-    setAutoFollow(false); // temporarily disable auto-follow in ChatView
+    setAutoFollow(false);
     await chat.loadHistory(sid);
 
     requestAnimationFrame(() => {
@@ -89,7 +93,6 @@ export default function AgentRunner() {
         const newHeight = el.scrollHeight;
         el.scrollTop = prevTop + (newHeight - prevHeight);
       }
-      // re-enable for normal behavior afterward
       setAutoFollow(true);
     });
   }
@@ -97,8 +100,6 @@ export default function AgentRunner() {
   // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
   async function handleDeleteMessages(clientIds: string[]) {
     const sid = chat.sessionIdRef.current;
-    console.log("handleDeleteMessages", { clientIds, sid });
-
     if (!sid || !clientIds?.length) return;
 
     const current = chat.messages;
@@ -120,15 +121,13 @@ export default function AgentRunner() {
         await deleteMessagesBatch(sid, serverIds);
       }
 
-      // Preserve scroll on delete
       await refreshPreserve();
 
-      // Update sidebar (title/lastMessage)
       setRefreshKey((k) => k + 1);
       try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
 
       show("Message deleted");
-    } catch (err) {
+    } catch {
       show("Failed to delete message");
       await chat.loadHistory(sid);
       setRefreshKey((k) => k + 1);
@@ -160,29 +159,57 @@ export default function AgentRunner() {
       <div className="md:hidden h-14 shrink-0" />
 
       <div className="flex-1 min-w-0 flex flex-col">
-        <DesktopHeader sidebarOpen={sidebarOpen} onShowSidebar={() => setSidebarOpen(true)} />
+        <DesktopHeader
+          sidebarOpen={sidebarOpen}
+          onShowSidebar={() => setSidebarOpen(true)}
+        />
+
+        {/* NEW: small settings trigger row above the chat */}
+        <div className="px-3 md:px-6 pt-2">
+          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end">
+            <button
+              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
+              onClick={() => setShowSettings(true)}
+              title="Open Settings"
+            >
+              Settings
+            </button>
+          </div>
+        </div>
+
         <div className="flex-1 min-h-0">
           <div className="h-full px-3 md:px-6">
             <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              <ChatContainer
-                messages={chat.messages}
-                input={chat.input}
-                setInput={chat.setInput}
-                loading={chat.loading}
-                queued={chat.queued}
-                send={chat.send}
-                stop={chat.stop}
-                runMetrics={chat.runMetrics}
-                runJson={chat.runJson}
-                onRefreshChats={() => setRefreshKey((k) => k + 1)}
-                onDeleteMessages={handleDeleteMessages}
-                autoFollow={autoFollow} // NEW
-              />
+              {/* Note: add id on the scroll container wrapper for refresh helpers */}
+              <div id="chat-scroll-container" className="h-full">
+                <ChatContainer
+                  messages={chat.messages}
+                  input={chat.input}
+                  setInput={chat.setInput}
+                  loading={chat.loading}
+                  queued={chat.queued}
+                  send={chat.send}
+                  stop={chat.stop}
+                  runMetrics={chat.runMetrics}
+                  runJson={chat.runJson}
+                  onRefreshChats={() => setRefreshKey((k) => k + 1)}
+                  onDeleteMessages={handleDeleteMessages}
+                  autoFollow={autoFollow}
+                />
+              </div>
               <Toast message={toast} />
             </div>
           </div>
         </div>
       </div>
+
+      {/* NEW: settings modal */}
+      {showSettings && (
+        <SettingsPanel
+          sessionId={chat.sessionIdRef.current}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
     </div>
   );
 }
