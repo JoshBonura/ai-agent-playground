@@ -1,4 +1,271 @@
-error: {e}")
+          s = chunk_bytes.decode("utf-8", errors="ignore")
+                if RUNJSON_START in s and RUNJSON_END in s:
+                    return
+                if s.strip() == eff["stopped_line_marker"]:
+                    return
+                out_buf.extend(chunk_bytes)
+
+            try:
+                print(f"[{_now()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
+                async for chunk in run_stream(
+                    llm=llm,
+                    messages=packed,
+                    out_budget=out_budget,
+                    stop_ev=stop_ev,
+                    request=request,
+                    temperature=temperature,
+                    top_p=top_p,
+                    input_tokens_est=input_tokens_est,
+                ):
+                    if isinstance(chunk, (bytes, bytearray)):
+                        _accum_visible(chunk)
+                    else:
+                        _accum_visible(chunk.encode("utf-8"))
+                    yield chunk
+            finally:
+                try:
+                    full_text = out_buf.decode("utf-8", errors="ignore").strip()
+                    start = full_text.find(RUNJSON_START)
+                    if start != -1:
+                        end = full_text.find(RUNJSON_END, start)
+                        if end != -1:
+                            full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
+                    if full_text:
+                        st["recent"].append({"role": "assistant", "content": full_text})
+                        print(f"[{_now()}] RECENT append assistant chars={len(full_text)}")
+                except Exception:
+                    pass
+                try:
+                    from ..store import apply_pending_for
+                    apply_pending_for(session_id)
+                except Exception:
+                    pass
+                try:
+                    from ..store import list_messages as store_list_messages
+                    from ..workers.retitle_worker import enqueue as enqueue_retitle
+                    msgs = store_list_messages(session_id)
+                    last_seq = max((int(m.id) for m in msgs), default=0)
+                    enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
+                except Exception:
+                    pass
+                print(f"[{_now()}] GEN run_stream END   session={session_id}")
+                mark_active(session_id, -1)
+
+    return StreamingResponse(
+        streamer(),
+        media_type="text/plain",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+async def cancel_session(session_id: str):
+    from .cancel import cancel_event
+    cancel_event(session_id).set()
+    return {"ok": True}
+
+
+async def cancel_session_alias(session_id: str):
+    return await cancel_session(session_id)
+
+# ===== aimodel/file_read/services/packing.py =====
+
+# aimodel/file_read/services/packing.py
+from __future__ import annotations
+from typing import Tuple, List, Dict, Optional
+from ..rag.retrieve import build_rag_block
+from ..core.settings import SETTINGS
+from ..core.memory import build_system, pack_messages, roll_summary_if_needed
+
+
+def build_system_text() -> str:
+    eff = SETTINGS.effective()
+    base = build_system(
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
+    )
+    guidance = str(eff["packing_guidance"])
+    return base + guidance
+
+
+def pack_with_rollup(
+    *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
+    ephemeral: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[List[Dict[str, str]], str, int]:
+    eff = SETTINGS.effective()
+
+    packed, input_budget = pack_messages(
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
+        summary=summary,
+        recent=recent,
+        max_ctx=max_ctx,
+        out_budget=out_budget,
+    )
+
+    packed, new_summary = roll_summary_if_needed(
+        packed=packed,
+        recent=recent,
+        summary=summary,
+        input_budget=input_budget,
+        system_text=system_text,
+    )
+
+    # Inject ephemeral (web findings) BEFORE the last user message, so the final turn is still user.
+    if ephemeral:
+        last_user_idx = None
+        for i in range(len(packed) - 1, -1, -1):
+            m = packed[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user_idx = i
+                break
+        eph = list(ephemeral)
+        if last_user_idx is not None:
+            packed = packed[:last_user_idx] + eph + packed[last_user_idx:]
+        else:
+            packed = packed + eph
+
+    return packed, new_summary, input_budget
+
+def maybe_inject_rag_block(messages: list[dict], *, session_id: str | None,
+                           skip_rag: bool = False, rag_query: str | None = None) -> list[dict]:
+    if skip_rag:
+        return messages
+    if not SETTINGS.get("rag_enabled", True):
+        return messages
+    if not messages or messages[-1].get("role") != "user":
+        return messages
+
+    user_q = rag_query or (messages[-1].get("content") or "")
+    block = build_rag_block(user_q, session_id=session_id)
+
+    if not block:
+        print(f"[RAG INJECT] no hits (session={session_id}) q={(user_q or '')!r}")
+        return messages
+
+    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
+    injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
+    return injected
+
+# ===== aimodel/file_read/services/session_io.py =====
+
+from __future__ import annotations
+from typing import Dict, List
+from ..core.memory import get_session
+from ..store import set_summary as store_set_summary
+
+def handle_incoming(session_id: str, incoming: List[Dict[str, str]]):
+    st = get_session(session_id)
+    st.setdefault("_ephemeral_web", [])
+    for m in incoming:
+        st["recent"].append(m)
+    return st
+
+def persist_summary(session_id: str, summary: str):
+    try:
+        store_set_summary(session_id, summary)
+    except Exception:
+        pass
+
+# ===== aimodel/file_read/services/streaming_worker.py =====
+
+# aimodel/file_read/services/streaming_worker.py
+from __future__ import annotations
+import asyncio, json, time, logging
+from typing import AsyncGenerator, Optional, List
+
+from ..core.settings import SETTINGS
+from ..utils.streaming import (
+    RUNJSON_START, RUNJSON_END,
+    build_run_json, watch_disconnect,
+)
+
+log = logging.getLogger("aimodel.api.generate")
+
+async def run_stream(
+    *, llm, messages, out_budget, stop_ev, request,
+    temperature: float, top_p: float, input_tokens_est: Optional[int]
+) -> AsyncGenerator[bytes, None]:
+    q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
+    SENTINEL = object()
+
+    def produce():
+        t_start = time.perf_counter()
+        t_first: Optional[float] = None
+        t_last: Optional[float] = None
+        finish_reason: Optional[str] = None
+        err_text: Optional[str] = None
+        out_parts: List[str] = []
+
+        try:
+            try:
+                stream = llm.create_chat_completion(
+                    messages=messages,
+                    stream=True,
+                    max_tokens=out_budget,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=SETTINGS.stream_top_k,
+                    repeat_penalty=SETTINGS.stream_repeat_penalty,
+                    stop=SETTINGS.stream_stop_strings,
+                )
+            except ValueError as ve:
+                if "exceed context window" in str(ve).lower():
+                    retry_tokens = max(
+                        SETTINGS.stream_retry_min_tokens,
+                        int(out_budget * SETTINGS.stream_retry_fraction)
+                    )
+                    log.warning(
+                        "generate: context overflow, retrying with max_tokens=%d",
+                        retry_tokens
+                    )
+                    stream = llm.create_chat_completion(
+                        messages=messages,
+                        stream=True,
+                        max_tokens=retry_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=SETTINGS.stream_top_k,
+                        repeat_penalty=SETTINGS.stream_repeat_penalty,
+                        stop=SETTINGS.stream_stop_strings,
+                    )
+                else:
+                    raise
+
+            for chunk in stream:
+                if stop_ev.is_set():
+                    break
+
+                try:
+                    fr = chunk["choices"][0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                except Exception:
+                    pass
+
+                piece = chunk["choices"][0]["delta"].get("content", "")
+                if not piece:
+                    continue
+
+                now = time.perf_counter()
+                if t_first is None:
+                    t_first = now
+                t_last = now
+                out_parts.append(piece)
+
+                while not stop_ev.is_set():
+                    try:
+                        q.put_nowait(piece)
+                        break
+                    except asyncio.QueueFull:
+                        time.sleep(SETTINGS.stream_backpressure_sleep_sec)
+
+        except Exception as e:
+            err_text = str(e)
+            log.exception("generate: llm stream error: %s", e)
+            try:
+                q.put_nowait(f"[aimodel] error: {e}")
             except Exception:
                 pass
         finally:
@@ -655,6 +922,7 @@ __all__ = [
   "rag_max_chars_per_chunk": 1200,
   "rag_chunk_overlap_chars": 150,
   "rag_min_chars": 300,
+  "rag_total_char_budget": 2200,
   "rag_db_path": "corpus.sqlite",
   "rag_block_header": "Local knowledge:",
   "rag_block_bullet_prefix": "- ",
@@ -674,15 +942,20 @@ __all__ = [
   "stream_producer_join_timeout_sec": 2.0,
   "runjson_emit": true,
   "excel_emit_cells": true,
-  "excel_max_cells_per_sheet": 500,
-  "excel_max_rows_per_table": 50,
-  "excel_max_formulas_per_sheet": 1000,
-  "excel_preview_max_rows": 50,
-  "excel_named_range_preview": 10,
+  "excel_max_cells_per_sheet": 250,
+  "excel_max_rows_per_table": 30,
+  "excel_max_formulas_per_sheet": 250,
+  "excel_named_range_preview": 8,
   "excel_emit_tables": true,
   "excel_emit_merged": true,
-  "excel_emit_grid_preview": false,
-  "excel_quote_strings": true
+  "excel_number_sigfigs": 6,
+  "excel_decimal_max_places": 4,
+  "excel_trim_trailing_zeros": true,
+  "excel_dates_drop_time_if_midnight": true,
+  "excel_time_precision": "minute",
+  "excel_value_max_chars": 160,
+  "excel_quote_strings": true,
+  "excel_include_formulas": false
 }
 
 # ===== aimodel/file_read/store/effective_settings.json =====
@@ -930,6 +1203,7 @@ __all__ = [
   "rag_max_chars_per_chunk": 1200,
   "rag_chunk_overlap_chars": 150,
   "rag_min_chars": 300,
+  "rag_total_char_budget": 2200,
   "rag_db_path": "corpus.sqlite",
   "rag_block_header": "Local knowledge:",
   "rag_block_bullet_prefix": "- ",
@@ -948,15 +1222,20 @@ __all__ = [
   "stream_producer_join_timeout_sec": 2.0,
   "runjson_emit": true,
   "excel_emit_cells": true,
-  "excel_max_cells_per_sheet": 500,
-  "excel_max_rows_per_table": 50,
-  "excel_max_formulas_per_sheet": 1000,
-  "excel_preview_max_rows": 50,
-  "excel_named_range_preview": 10,
+  "excel_max_cells_per_sheet": 250,
+  "excel_max_rows_per_table": 30,
+  "excel_max_formulas_per_sheet": 250,
+  "excel_named_range_preview": 8,
   "excel_emit_tables": true,
   "excel_emit_merged": true,
-  "excel_emit_grid_preview": false,
-  "excel_quote_strings": true
+  "excel_number_sigfigs": 6,
+  "excel_decimal_max_places": 4,
+  "excel_trim_trailing_zeros": true,
+  "excel_dates_drop_time_if_midnight": true,
+  "excel_time_precision": "minute",
+  "excel_value_max_chars": 160,
+  "excel_quote_strings": true,
+  "excel_include_formulas": false
 }
 
 # ===== aimodel/file_read/store/index.py =====
@@ -1265,13 +1544,30 @@ class DuckDuckGoProvider:
 
 # ===== aimodel/file_read/web/fetch.py =====
 
+# aimodel/file_read/web/fetch.py
 from __future__ import annotations
 import asyncio
 from typing import Tuple, List, Optional
 import httpx
-import trafilatura
+
+# Optional extractors (use whatever is installed)
+try:
+    from readability import Document  # readability-lxml
+except Exception:
+    Document = None  # type: ignore
+
+try:
+    from bs4 import BeautifulSoup  # beautifulsoup4 + lxml
+except Exception:
+    BeautifulSoup = None  # type: ignore
+
+try:
+    from selectolax.parser import HTMLParser  # selectolax
+except Exception:
+    HTMLParser = None  # type: ignore
 
 from ..core.settings import SETTINGS
+
 
 def _ua() -> str:
     return str(SETTINGS.get("web_fetch_user_agent", "LocalAI/0.1 (+clean-fetch)"))
@@ -1300,6 +1596,7 @@ def _max_parallel() -> int:
     except Exception:
         return 3
 
+
 async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
     # Stream and cap to avoid huge downloads
     out = bytearray()
@@ -1314,6 +1611,63 @@ async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
             break
     return bytes(out)
 
+
+def _extract_text_from_html(raw_html: str, url: str) -> str:
+    """
+    Best-effort HTML → text:
+      1) readability-lxml (if available): main-article extraction
+      2) selectolax (if available): fast DOM text
+      3) BeautifulSoup (if available): generic text fallback
+      4) Raw text as last resort
+    """
+    html = raw_html or ""
+
+    # 1) readability main content
+    if Document is not None:
+        try:
+            doc = Document(html)
+            summary_html = doc.summary(html_partial=True) or ""
+            if summary_html:
+                if BeautifulSoup is not None:
+                    soup = BeautifulSoup(summary_html, "lxml")
+                    txt = soup.get_text(" ", strip=True)
+                    if txt:
+                        return txt
+                # If bs4 missing, fall back to selectolax/plain below
+        except Exception:
+            pass
+
+    # 2) selectolax full text
+    if HTMLParser is not None:
+        try:
+            tree = HTMLParser(html)
+            # Remove script/style/noscript quickly if present
+            for bad in ("script", "style", "noscript"):
+                for n in tree.tags(bad):
+                    n.decompose()
+            txt = tree.body.text(separator=" ", strip=True) if tree.body else tree.text(separator=" ", strip=True)
+            if txt:
+                return txt
+        except Exception:
+            pass
+
+    # 3) BeautifulSoup full text
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            # Strip scripts/styles
+            for s in soup(["script", "style", "noscript"]):
+                s.extract()
+            txt = soup.get_text(" ", strip=True)
+            if txt:
+                return txt
+        except Exception:
+            pass
+
+    # 4) Raw (no HTML parsing available)
+    return html
+
+
 async def fetch_clean(
     url: str,
     timeout_s: Optional[float] = None,
@@ -1322,7 +1676,7 @@ async def fetch_clean(
 ) -> Tuple[str, int, str]:
     """
     Returns: (final_url, status_code, cleaned_text)
-    - cleaned_text is trafilatura-extracted text if available, else raw (capped)
+    - cleaned_text is extracted via readability/selectolax/bs4 if available; else raw
     - caps by bytes first, then by chars
     """
     timeout = _timeout() if timeout_s is None else float(timeout_s)
@@ -1340,14 +1694,15 @@ async def fetch_clean(
         enc = r.encoding or "utf-8"
         raw_text = raw_bytes.decode(enc, errors="ignore")
 
-        # Clean via trafilatura; fallback to raw if empty
-        txt = trafilatura.extract(raw_text, url=str(r.url)) or raw_text
-        txt = txt.strip().replace("\r", "")
+        # Extract/clean HTML to text (no trafilatura)
+        txt = _extract_text_from_html(raw_text, str(r.url))
+        txt = (txt or "").strip().replace("\r", "")
 
         if len(txt) > cap_chars:
             txt = txt[:cap_chars]
 
         return (str(r.url), r.status_code, txt)
+
 
 async def fetch_many(
     urls: List[str],
@@ -2490,438 +2845,4 @@ export default function ChatBubble({
             )}
           </div>
         </div>
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatComposer.tsx =====
-
-// frontend/src/file_read/components/ChatComposer.tsx
-import { useEffect, useRef, useState } from "react";
-import { SendHorizonal, Square } from "lucide-react";
-
-const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
-
-type Props = {
-  input: string;
-  setInput: (v: string) => void;
-  loading: boolean;
-  queued?: boolean;
-  onSend: (text: string) => void | Promise<void>;
-  onStop: () => void | Promise<void>;
-  onHeightChange?: (h: number) => void;
-  onRefreshChats?: () => void;
-};
-
-export default function ChatComposer({
-  input,
-  setInput,
-  loading,
-  queued = false,
-  onSend,
-  onStop,
-  onHeightChange,
-  onRefreshChats,
-}: Props) {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const taRef = useRef<HTMLTextAreaElement>(null);
-  const MAX_HEIGHT_PX = 192;
-  const [isClamped, setIsClamped] = useState(false);
-  const [draft, setDraft] = useState(input);
-
-  useEffect(() => setDraft(input), [input]);
-
-  const autogrow = () => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    const next = Math.min(ta.scrollHeight, MAX_HEIGHT_PX);
-    ta.style.height = `${next}px`;
-    setIsClamped(ta.scrollHeight > MAX_HEIGHT_PX);
-    if (wrapRef.current && onHeightChange) {
-      onHeightChange(wrapRef.current.getBoundingClientRect().height);
-    }
-  };
-
-  useEffect(() => {
-    autogrow();
-    const onResize = () => autogrow();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    autogrow();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft]);
-
-  const hasText = draft.trim().length > 0;
-
-  // 🔹 NEW: tell ChatView to scroll to bottom
-  const forceScroll = (behavior: ScrollBehavior = "auto") => {
-    window.dispatchEvent(
-      new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } })
-    );
-  };
-
-  const handleSendClick = () => {
-    const v = draft.trim();
-    if (!v || loading || queued) return; // prevent sending while queued/streaming
-
-    // Snap immediately to bottom so user sees the latest area
-    forceScroll("auto");
-
-    setDraft("");
-    setInput("");
-    void Promise.resolve(onSend(v)).finally(() => {
-      onRefreshChats?.();
-      // Settle at bottom after DOM updates
-      requestAnimationFrame(() => forceScroll("smooth"));
-    });
-  };
-
-  const handleStopClick = () => {
-    if (!loading && !queued) return;
-    void Promise.resolve(onStop()).finally(() => {
-      onRefreshChats?.(); // refresh once the stop lands
-    });
-  };
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (!loading && !queued) handleSendClick();
-    }
-  }
-
-  return (
-    <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
-      <div className="flex gap-2">
-        <textarea
-          ref={taRef}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            setInput(e.target.value);
-            autogrow();
-          }}
-          onInput={autogrow}
-          onKeyDown={onKeyDown}
-          placeholder="Ask anything…"
-          className={`flex-1 border rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring ${
-            isClamped ? "overflow-y-auto" : "overflow-hidden"
-          }`}
-          rows={1}
-          style={{ maxHeight: MAX_HEIGHT_PX }}
-        />
-
-        <div className="flex items-end gap-2">
-          {(loading || queued) ? (
-            <button
-              className="p-2 rounded-lg border hover:bg-gray-50"
-              onClick={handleStopClick}
-              title={queued ? "Cancel queued message" : "Stop generating"}
-              aria-label={queued ? "Cancel queued message" : "Stop generating"}
-            >
-              <Square size={18} />
-            </button>
-          ) : hasText ? (
-            <button
-              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
-              onClick={handleSendClick}
-              title="Send"
-              aria-label="Send"
-            >
-              <SendHorizonal size={18} />
-            </button>
-          ) : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatContainer.tsx =====
-
-import { useState, useRef, useEffect } from "react";
-import ChatView from "./ChatView/ChatView";
-import ChatComposer from "./ChatComposer";
-import type { ChatMsg } from "../types/chat";
-import type { GenMetrics, RunJson } from "../hooks/useChatStream";
-
-interface Props {
-  messages: ChatMsg[];
-  input: string;
-  setInput: (s: string) => void;
-  loading: boolean;
-  queued?: boolean;
-  send: (text?: string) => Promise<void>;
-  stop: () => Promise<void> | void;
-  runMetrics?: GenMetrics | null;
-  runJson?: RunJson | null;
-  onRefreshChats?: () => void;
-  onDeleteMessages?: (ids: string[]) => void;
-  autoFollow?: boolean;
-}
-
-export default function ChatContainer({
-  messages,
-  input,
-  setInput,
-  loading,
-  queued = false,
-  send,
-  stop,
-  runMetrics,
-  runJson,
-  onRefreshChats,
-  onDeleteMessages,
-  autoFollow = true,
-}: Props) {
-  const [composerH, setComposerH] = useState(0);
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  // Track if the user is scrolled up
-  const [pinned, setPinned] = useState(false);
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-
-    const threshold = 120;
-
-    const isNearBottom = () => {
-      return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
-    };
-
-    const onScroll = () => {
-      // pinned = true if not near bottom
-      setPinned(!isNearBottom());
-    };
-
-    el.addEventListener("scroll", onScroll, { passive: true });
-
-    // initialize
-    setPinned(!isNearBottom());
-
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
-
-  const forceScrollToBottom = (behavior: ScrollBehavior = "smooth") => {
-    const el = containerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior });
-  };
-
-  const handleSend = async (text?: string) => {
-    // Only auto-scroll if user hasn’t scrolled up
-    if (!pinned) {
-      forceScrollToBottom("auto");
-    }
-    await send(text);
-    onRefreshChats?.();
-    if (!pinned) {
-      requestAnimationFrame(() => forceScrollToBottom("smooth"));
-    }
-  };
-
-  return (
-    <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
-      <div
-        ref={containerRef}
-        data-chat-scroll
-        className="flex-1 overflow-y-auto min-w-0"
-      >
-        <ChatView
-          messages={messages}
-          loading={loading}
-          queued={queued}
-          bottomPad={composerH}
-          runMetrics={runMetrics}
-          runJson={runJson}
-          onDeleteMessages={onDeleteMessages}
-          autoFollow={autoFollow}
-        />
-      </div>
-
-      <ChatComposer
-        input={input}
-        setInput={setInput}
-        loading={loading}
-        queued={queued}
-        onSend={handleSend}
-        onStop={stop}
-        onHeightChange={setComposerH}
-        onRefreshChats={onRefreshChats}
-      />
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatItem.tsx =====
-
-// frontend/src/file_read/components/chat/ChatItem.tsx
-import ChatBubble from "./ChatBubble";
-import AssistantMetrics from "./AssistantMetrics";
-import { buildStatus } from "./ChatView/StatusLine";
-import type { ChatMsg } from "../types/chat";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-
-export default function ChatItem({
-  m,
-  idx,
-  loading,
-  lastAssistantIndex,
-  runJsonLive,
-  runMetricsLive,
-  onDelete,
-}: {
-  m: ChatMsg;
-  idx: number;
-  loading: boolean;
-  lastAssistantIndex: number;
-  runJsonLive?: RunJson | null;
-  runMetricsLive?: GenMetrics | null;
-  onDelete?: (id: string) => void;
-}) {
-  const isAssistant = m.role === "assistant";
-  const isCurrentStreamingAssistant = isAssistant && loading && idx === lastAssistantIndex;
-
-  let jsonForThis: RunJson | null = null;
-  let flatForThis: GenMetrics | null = null;
-
-  if (isAssistant) {
-    // @ts-ignore meta bag
-    const meta = m.meta as { runJson?: RunJson | null; flat?: GenMetrics | null } | undefined;
-    jsonForThis = meta?.runJson ?? null;
-    flatForThis = meta?.flat ?? null;
-
-    if (isCurrentStreamingAssistant) {
-      if (runJsonLive) jsonForThis = runJsonLive;
-      if (runMetricsLive) flatForThis = runMetricsLive;
-    }
-  }
-
-  const status = isAssistant ? buildStatus(jsonForThis, flatForThis) : "";
-  const showMetrics = isAssistant && (jsonForThis || flatForThis);
-
-  return (
-    <div>
-      <ChatBubble
-        role={m.role}
-        text={m.text}
-        showActions={m.role === "user" || (m.role === "assistant" && !isCurrentStreamingAssistant)}
-        onDelete={onDelete ? () => onDelete(m.id) : undefined}
-      />
-      {showMetrics && <AssistantMetrics status={status} runJson={jsonForThis} flat={flatForThis} />}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatSidebar/ChatSidebar.tsx =====
-
-import { useState } from "react";
-import { deleteChatsBatch } from "../../hooks/data/chatApi";
-import type { ChatRow } from "../../types/chat";
-import { useMultiSelect } from "../../hooks/useMultiSelect";
-import { useChatsPager } from "../../hooks/useChatsPager";
-import SidebarHeader from "./SidebarHeader";
-import SidebarListItem from "./SidebarListItem";
-
-const PAGE_SIZE = 10;
-
-type Props = {
-  onOpen: (id: string) => Promise<void>;
-  onNew: () => Promise<void>;
-  refreshKey?: number;
-  activeId?: string;
-  onHideSidebar?: () => void;
-  onCancelSessions?: (ids: string[]) => Promise<void>;
-};
-
-export default function ChatSidebar({
-  onOpen, onNew, refreshKey, activeId, onHideSidebar, onCancelSessions,
-}: Props) {
-  const {
-    chats, page, hasMore, total, totalPages,
-    initialLoading, loadingMore,
-    scrollRef, sentinelRef, loadMore, setChats,
-  } = useChatsPager(PAGE_SIZE, refreshKey);
-
-  const [isEditing, setIsEditing] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [newPending, setNewPending] = useState(false);
-
-  const allIds = chats.map(c => c.sessionId);
-  const { selected, setSelected, allSelected, toggleOne, toggleAll } = useMultiSelect(allIds);
-
-  async function handleNew() {
-    if (newPending) return;
-    setNewPending(true);
-    try { await onNew(); } finally { setNewPending(false); }
-  }
-
-  async function onDeleteSelected(): Promise<void> {
-    const count = selected.size;
-    if (!count || deleting) return;
-
-    const isAll = count === chats.length;
-    const ok = window.confirm(
-      isAll
-        ? `Delete ALL ${count} chats? This cannot be undone.`
-        : `Delete ${count} selected chat${count > 1 ? "s" : ""}?`
-    );
-    if (!ok) return;
-
-    const ids = [...selected];
-    try { await onCancelSessions?.(ids); await Promise.resolve(); } catch {}
-
-    const deletingActive = activeId ? selected.has(activeId) : false;
-    const fallback = chats.find(c => !selected.has(c.sessionId))?.sessionId;
-
-    setDeleting(true);
-    try {
-      const deleted = await deleteChatsBatch(ids);
-      if (!deleted.length) return;
-      setChats(prev => prev.filter(c => !deleted.includes(c.sessionId)));
-      setSelected(new Set());
-      setIsEditing(false);
-
-      if (deletingActive) {
-        if (fallback) void onOpen(fallback);
-        else void onOpen("");
-      }
-    } finally {
-      setDeleting(false);
-    }
-  }
-
-  return (
-    <aside className="w-full md:w-72 h-full border-r bg-white p-0 flex flex-col">
-      <SidebarHeader
-        isEditing={isEditing}
-        setIsEditing={(v) => { setIsEditing(v); setSelected(new Set()); }}
-        newPending={newPending}
-        onNew={handleNew}
-        onHideSidebar={onHideSidebar}
-        selectedCount={selected.size}
-        deleting={deleting}
-        onDelete={onDeleteSelected}
-      />
-
-      {/* LIST */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto p-2 overscroll-contain"
-        style={{ WebkitOverflowScrolling: "touch" }}
-      >
-        {initialLoading && (
-          <div className="px-2 py-1 text-xs text-gray-500">Loading…</div>
-        )}
-
-        <ul className="space-y-1">
-          {chats.map((c: ChatRow) => (
-            <SidebarListItem
-              key
+ 

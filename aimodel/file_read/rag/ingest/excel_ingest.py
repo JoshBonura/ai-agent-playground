@@ -1,44 +1,55 @@
+# ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
 from __future__ import annotations
+
 from typing import Tuple, List
 import io, re
 from datetime import datetime, date, time
 from ...core.settings import SETTINGS
 
-def S(key: str):
-    return SETTINGS.effective()[key]
-
 _WS_RE = re.compile(r"[ \t]+")
-
-def _squeeze_spaces(s: str) -> str:
-    return _WS_RE.sub(" ", s).strip()
+def _squeeze_spaces_inline(s: str) -> str:
+    return _WS_RE.sub(" ", (s or "")).strip()
 
 def extract_excel(data: bytes) -> Tuple[str, str]:
     from openpyxl import load_workbook
-    from openpyxl.utils import range_boundaries, get_column_letter
+    from openpyxl.utils import range_boundaries
     from openpyxl.worksheet.worksheet import Worksheet
 
-    sig = int(S("excel_number_sigfigs"))
-    maxp = int(S("excel_decimal_max_places"))
-    trim = bool(S("excel_trim_trailing_zeros"))
-    drop_midnight = bool(S("excel_dates_drop_time_if_midnight"))
-    time_prec = str(S("excel_time_precision"))
-    max_chars = int(S("excel_value_max_chars"))
-    quote_strings = bool(S("excel_quote_strings"))
+    S = SETTINGS.effective
 
-    # NEW: feature flag (defaults to True if missing to preserve old behavior)
-    try:
-        include_formulas = bool(S("excel_include_formulas"))
-    except Exception:
-        include_formulas = True
+    sig = int(S().get("excel_number_sigfigs"))
+    maxp = int(S().get("excel_decimal_max_places"))
+    trim = bool(S().get("excel_trim_trailing_zeros"))
+    drop_midnight = bool(S().get("excel_dates_drop_time_if_midnight"))
+    time_prec = str(S().get("excel_time_precision"))
+    max_chars = int(S().get("excel_value_max_chars"))
+    quote_strings = bool(S().get("excel_quote_strings"))
+
+    MAX_CELLS_PER_SHEET = int(S().get("excel_max_cells_per_sheet"))
+    MAX_NR_PREVIEW = int(S().get("excel_named_range_preview"))
+    EMIT_MERGED = bool(S().get("excel_emit_merged"))
+    EMIT_CELLS = bool(S().get("excel_emit_cells"))
+
+    INFER_MAX_ROWS = int(S().get("excel_infer_max_rows"))
+    INFER_MAX_COLS = int(S().get("excel_infer_max_cols"))
+    INFER_MIN_HEADER_FILL = float(S().get("excel_infer_min_header_fill_ratio", 0.5))
+    EMIT_KEYVALUES = bool(S().get("excel_emit_key_values"))
+    EMIT_CELL_ADDR = bool(S().get("excel_emit_cell_addresses"))
+    HEADER_NORMALIZE = bool(S().get("excel_header_normalize"))
 
     def clip(s: str) -> str:
-        return s if (max_chars <= 0 or len(s) <= max_chars) else s[:max_chars] + "…"
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + "…"
+        return s
 
     def fmt_number(v) -> str:
-        s = format(float(v), f".{sig}g") if sig > 0 else f"{float(v):.{maxp}f}"
-        if "e" in s or "E" in s:
+        try:
+            s = format(float(v), f".{sig}g") if sig > 0 else f"{float(v):.{maxp}f}"
+        except Exception:
+            s = str(v)
+        if "e" in s.lower():
             try:
-                s = f"{float(s):.{maxp}f}"
+                s = f"{float(v):.{maxp}f}"
             except Exception:
                 pass
         if trim and "." in s:
@@ -65,31 +76,31 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
         if isinstance(v, time):
             return fmt_time(v)
         s = str(v)
-        if "\n" in s:
+        if "\n" in s or "\r" in s:
             s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
-        s = clip(s)
+        s = clip(_squeeze_spaces_inline(s))
         if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
             return f"\"{s}\""
         return s
 
-    wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    # Only load the formulas workbook if we actually plan to read formulas
-    wb_form = load_workbook(io.BytesIO(data), data_only=False, read_only=True) if include_formulas else None
+    def normalize_header(h: str) -> str:
+        if not HEADER_NORMALIZE:
+            return h
+        s = (h or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or h
 
-    MAX_ROWS_PER_TABLE = int(S("excel_max_rows_per_table"))
-    MAX_FORMULAS_PER_SHEET = int(S("excel_max_formulas_per_sheet"))
-    MAX_CELLS_PER_SHEET = int(S("excel_max_cells_per_sheet"))
-    MAX_NR_PREVIEW = int(S("excel_named_range_preview"))
-    EMIT_TABLES = bool(S("excel_emit_tables"))
-    EMIT_MERGED = bool(S("excel_emit_merged"))
-    EMIT_CELLS = bool(S("excel_emit_cells"))
+    wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
 
     lines: List[str] = []
 
+    # Named ranges
     try:
-        if getattr(wb_vals, "defined_names", None):
+        dn_obj = getattr(wb_vals, "defined_names", None)
+        if dn_obj and getattr(dn_obj, "definedName", None):
             nr_out: List[str] = []
-            for dn in wb_vals.defined_names.definedName:
+            for dn in dn_obj.definedName:
                 if getattr(dn, "hidden", False):
                     continue
                 try:
@@ -103,11 +114,11 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                         ws = wb_vals[sheet_name]
                         min_c, min_r, max_c, max_r = range_boundaries(ref)
                         vals: List[str] = []
-                        ws_cell = ws.cell
+                        from openpyxl.utils import get_column_letter
                         gl = get_column_letter
                         for r in range(min_r, max_r + 1):
                             for c in range(min_c, max_c + 1):
-                                v = ws_cell(row=r, column=c).value
+                                v = ws.cell(row=r, column=c).value
                                 vv = fmt_val(v)
                                 if vv:
                                     vals.append(f"{gl(c)}{r}={vv}")
@@ -115,145 +126,146 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                                     break
                             if len(vals) >= MAX_NR_PREVIEW:
                                 break
-                        vals_str = "; ".join(vals)
-                        if vals_str:
-                            nr_out.append(f"- {dn.name}: {sheet_name}!{ref} = {vals_str}")
+                        preview = "; ".join(vals)
+                        if preview:
+                            nr_out.append(f"- {dn.name}: {sheet_name}!{ref} = {preview}")
                         else:
                             nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
                     except Exception:
                         nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
             if nr_out:
-                lines.append("## Named Ranges")
+                lines.append("# Named Ranges")
                 lines.extend(nr_out)
                 lines.append("")
     except Exception:
         pass
 
-    col_letter_cache = {}
+    def _sheet_used_range(ws: Worksheet):
+        from openpyxl.utils import range_boundaries
+        if callable(getattr(ws, "calculate_dimension", None)):
+            dim_ref = ws.calculate_dimension()
+            try:
+                min_c, min_r, max_c, max_r = range_boundaries(dim_ref)
+                return min_c, min_r, max_c, max_r
+            except Exception:
+                pass
+        return 1, 1, ws.max_column or 1, ws.max_row or 1
+
+    def _detect_key_value(ws: Worksheet, min_c, min_r, max_c, max_r) -> bool:
+        if max_c - min_c + 1 != 2:
+            return False
+        textish, valueish, rows = 0, 0, 0
+        for r in range(min_r, min(min_r + INFER_MAX_ROWS - 1, max_r) + 1):
+            a = ws.cell(row=r, column=min_c).value
+            b = ws.cell(row=r, column=min_c + 1).value
+            if a is None and b is None:
+                continue
+            rows += 1
+            if isinstance(a, str):
+                textish += 1
+            if isinstance(b, (int, float, datetime, date, time)):
+                valueish += 1
+        return rows >= 3 and textish / max(1, rows) >= 0.6 and valueish / max(1, rows) >= 0.6
+
+    def _emit_key_values(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
+        lines.append(f"# Sheet: {sheet_name}")
+        lines.append("## Key/Values")
+        for r in range(min_r, min(min_r + INFER_MAX_ROWS - 1, max_r) + 1):
+            k = fmt_val(ws.cell(row=r, column=min_c).value)
+            v = fmt_val(ws.cell(row=r, column=min_c + 1).value)
+            if not k and not v:
+                continue
+            if k:
+                lines.append(f"- {k}: {v}" if v else f"- {k}:")
+        lines.append("")
+
+    def _emit_inferred_table(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
+        lines.append(f"# Sheet: {sheet_name}")
+        lines.append("## Inferred Table")
+
+        max_c_eff = min(max_c, min_c + INFER_MAX_COLS - 1)
+        max_r_eff = min(max_r, min_r + INFER_MAX_ROWS - 1)
+
+        headers: List[str] = []
+        header_fill = 0
+        for c in range(min_c, max_c_eff + 1):
+            val = ws.cell(row=min_r, column=c).value
+            s = fmt_val("" if val is None else str(val).strip())
+            if s:
+                header_fill += 1
+            headers.append(s)
+        fill_ratio = header_fill / max(1, (max_c_eff - min_c + 1))
+
+        if fill_ratio < INFER_MIN_HEADER_FILL and (min_r + 1) <= max_r_eff:
+            headers = []
+            hdr_r = min_r + 1
+            for c in range(min_c, max_c_eff + 1):
+                val = ws.cell(row=hdr_r, column=c).value
+                s = fmt_val("" if val is None else str(val).strip())
+                headers.append(s)
+            min_r = hdr_r
+
+        norm_headers = [normalize_header(h) for h in headers]
+        if any(h for h in norm_headers):
+            lines.append("headers: " + ", ".join(h for h in norm_headers if h))
+
+        for r in range(min_r + 1, max_r_eff + 1):
+            row_cells: List[str] = []
+            for c in range(min_c, max_c_eff + 1):
+                vv = ws.cell(row=r, column=c).value
+                val_str = fmt_val(vv)
+                if val_str:
+                    row_cells.append(val_str if not EMIT_CELL_ADDR else f"{val_str}")
+            if row_cells:
+                lines.append("row: " + ", ".join(row_cells))
+        lines.append("")
 
     for sheet_name in wb_vals.sheetnames:
         ws_v: Worksheet = wb_vals[sheet_name]
-        ws_f: Worksheet | None = wb_form[sheet_name] if wb_form else None
-        lines.append(f"# Sheet: {sheet_name}")
 
-        formulas_emitted = 0
-
-        if EMIT_TABLES:
-            try:
-                tables = dict(getattr(ws_v, "tables", {}) or {})
-                if tables:
-                    lines.append("## Tables")
-                    for tname, tobj in tables.items():
-                        ref = getattr(tobj, "ref", "")
-                        lines.append(f"- Table {tname} ({ref})")
-                        try:
-                            min_c, min_r, max_c, max_r = range_boundaries(ref)
-                        except Exception:
-                            min_r = 1; min_c = 1
-                            max_r = ws_v.max_row or 1
-                            max_c = ws_v.max_column or 1
-                        headers: List[str] = []
-                        ws_v_cell = ws_v.cell
-                        ws_f_cell = ws_f.cell if ws_f else None
-                        gl = get_column_letter
-                        for c in range(min_c, max_c + 1):
-                            v = ws_v_cell(row=min_r, column=c).value
-                            headers.append(fmt_val("" if v is None else str(v).strip()))
-                        if any(h for h in headers):
-                            lines.append(f"  headers: [{', '.join(h for h in headers if h)}]")
-                        shown = 0
-                        for r in range(min_r + 1, max_r + 1):
-                            cells: List[str] = []
-                            need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
-                            for c in range(min_c, max_c + 1):
-                                cl = col_letter_cache.get(c)
-                                if cl is None:
-                                    cl = gl(c)
-                                    col_letter_cache[c] = cl
-                                addr = f"{cl}{r}"
-                                vv = ws_v_cell(row=r, column=c).value
-                                val_str = fmt_val(vv)
-                                fv = ws_f_cell(row=r, column=c).value if (ws_f_cell and need_formula) else None
-                                if include_formulas and isinstance(fv, str) and fv.startswith("=") and need_formula:
-                                    if val_str:
-                                        cells.append(f"{addr}={val_str} (formula:={fv[1:]})")
-                                    else:
-                                        cells.append(f"{addr} (formula:={fv[1:]})")
-                                    formulas_emitted += 1
-                                    need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
-                                elif val_str:
-                                    cells.append(f"{addr}={val_str}")
-                            if not cells:
-                                continue
-                            lines.append(f"  row {r}: " + ", ".join(cells))
-                            shown += 1
-                            if shown >= MAX_ROWS_PER_TABLE:
-                                lines.append("  - … (rows truncated)")
-                                break
-                    lines.append("")
-            except Exception:
-                pass
+        emitted_any = False
 
         if EMIT_MERGED:
-            try:
-                merges = getattr(ws_v, "merged_cells", None)
-                if merges and getattr(merges, "ranges", None):
-                    lines.append("## Merged Ranges")
-                    for mr in merges.ranges:
-                        ref = str(getattr(mr, "coord", getattr(mr, "bounds", mr)))
-                        lines.append(f"- {ref}")
-                    lines.append("")
-            except Exception:
-                pass
+            merges = getattr(ws_v, "merged_cells", None)
+            rngs = getattr(merges, "ranges", None) if merges else None
+            if rngs:
+                lines.append(f"# Sheet: {sheet_name}")
+                lines.append("## Merged Ranges")
+                for mr in rngs:
+                    ref = str(getattr(mr, "coord", getattr(mr, "bounds", mr)))
+                    lines.append(f"- {ref}")
+                lines.append("")
+                emitted_any = True
 
-        if EMIT_CELLS:
-            try:
-                if callable(getattr(ws_v, "calculate_dimension", None)):
-                    dim_ref = ws_v.calculate_dimension()
-                    min_c, min_r, max_c, max_r = range_boundaries(dim_ref)
-                else:
-                    min_r = 1; min_c = 1
-                    max_r = ws_v.max_row or 1
-                    max_c = ws_v.max_column or 1
-                lines.append(f"## Cells (non-empty, first {MAX_CELLS_PER_SHEET})")
-                emitted = 0
-                ws_v_cell = ws_v.cell
-                ws_f_cell = ws_f.cell if ws_f else None
-                gl = get_column_letter
-                for r in range(min_r, max_r + 1):
-                    for c in range(min_c, max_c + 1):
-                        need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
-                        vv = ws_v_cell(row=r, column=c).value
-                        fv = ws_f_cell(row=r, column=c).value if (ws_f_cell and need_formula or (ws_f_cell and include_formulas and vv is None)) else None
-                        # If formulas are off, skip formula-only cells (vv is None)
-                        if vv is None and not (include_formulas and isinstance(fv, str) and fv.startswith("=")):
-                            continue
-                        cl = col_letter_cache.get(c)
-                        if cl is None:
-                            cl = gl(c)
-                            col_letter_cache[c] = cl
-                        addr = f"{cl}{r}"
-                        val_str = fmt_val(vv)
-                        if include_formulas and isinstance(fv, str) and fv.startswith("=") and need_formula:
-                            if val_str:
-                                lines.append(f"- {addr}={val_str} (formula:={fv[1:]})")
-                            else:
-                                lines.append(f"- {addr} (formula:={fv[1:]})")
-                            formulas_emitted += 1
-                        else:
-                            if val_str:
-                                lines.append(f"- {addr}={val_str}")
-                            else:
-                                continue
-                        emitted += 1
-                        if emitted >= MAX_CELLS_PER_SHEET:
-                            lines.append("… (cells truncated)")
-                            break
+        if EMIT_CELLS and not emitted_any:
+            min_c, min_r, max_c, max_r = _sheet_used_range(ws_v)
+            lines.append(f"# Sheet: {sheet_name}")
+            lines.append("## Cells (non-empty)")
+            emitted = 0
+            for r in range(min_r, max_r + 1):
+                row_parts: List[str] = []
+                for c in range(min_c, max_c + 1):
+                    vv = ws_v.cell(row=r, column=c).value
+                    if vv is None:
+                        continue
+                    val_str = fmt_val(vv)
+                    if val_str:
+                        row_parts.append(val_str if not EMIT_CELL_ADDR else f"{val_str}")
+                if row_parts:
+                    lines.append("- " + ", ".join(row_parts))
+                    emitted += 1
                     if emitted >= MAX_CELLS_PER_SHEET:
+                        lines.append("… (cells truncated)")
                         break
-                lines.append("")
-            except Exception:
-                lines.append("")
+            lines.append("")
+            emitted_any = True
 
-    txt = _squeeze_spaces("\n".join(lines).strip())
-    return txt, "text/plain"
+        if not emitted_any:
+            min_c, min_r, max_c, max_r = _sheet_used_range(ws_v)
+            if EMIT_KEYVALUES and _detect_key_value(ws_v, min_c, min_r, max_c, max_r):
+                _emit_key_values(ws_v, sheet_name, min_c, min_r, max_c, max_r)
+            else:
+                _emit_inferred_table(ws_v, sheet_name, min_c, min_r, max_c, max_r)
+
+    text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
+    return (text + "\n" if text else ""), "text/plain"

@@ -1512,6 +1512,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 import re
+from ...core.settings import SETTINGS
 
 @dataclass
 class Chunk:
@@ -1573,8 +1574,8 @@ def chunk_text(
     text: str,
     meta: Optional[Dict[str, str]] = None,
     *,
-    max_chars: int = 1000,
-    overlap: int = 200,
+    max_chars=int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
+    overlap=int(SETTINGS.get("rag_chunk_overlap_chars", 150)),
 ) -> List[Chunk]:
     meta = meta or {}
     text = text.strip()
@@ -1640,105 +1641,146 @@ def build_metas(session_id: Optional[str], filename: str, chunks: List[Chunk], *
 # ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
 
 from __future__ import annotations
-from typing import Tuple, List, Iterable
+from typing import Tuple, List
 import io, re
+from datetime import datetime, date, time
+from ...core.settings import SETTINGS
+
+def S(key: str):
+    return SETTINGS.effective()[key]
+
+_WS_RE = re.compile(r"[ \t]+")
 
 def _squeeze_spaces(s: str) -> str:
-    return re.sub(r"[ \t]+", " ", s).strip()
-
-def _fmt_val(v) -> str:
-    if v is None:
-        return ""
-    s = str(v)
-    # Quote strings that contain spaces or punctuation so RAG keeps them intact
-    if isinstance(v, str):
-        if "\n" in v:
-            s = s.replace("\r\n", "\n").replace("\r", "\n")
-            s = s.replace("\n", "\\n")
-        if re.search(r'[^A-Za-z0-9_.-]', s):
-            return f"\"{s}\""
-    return s
+    return _WS_RE.sub(" ", s).strip()
 
 def extract_excel(data: bytes) -> Tuple[str, str]:
-    """
-    RAG-friendly extractor for .xlsx:
-    - Named Ranges with resolved addresses + sample values
-    - Structured Tables (headers + first N rows)
-    - Merged ranges
-    - Per-cell catalog of non-empty cells with A1 address, current value, and formula
-    Falls back to pandas values-only if openpyxl path fails.
-    """
+    from openpyxl import load_workbook
+    from openpyxl.utils import range_boundaries, get_column_letter
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    sig = int(S("excel_number_sigfigs"))
+    maxp = int(S("excel_decimal_max_places"))
+    trim = bool(S("excel_trim_trailing_zeros"))
+    drop_midnight = bool(S("excel_dates_drop_time_if_midnight"))
+    time_prec = str(S("excel_time_precision"))
+    max_chars = int(S("excel_value_max_chars"))
+    quote_strings = bool(S("excel_quote_strings"))
+
+    # NEW: feature flag (defaults to True if missing to preserve old behavior)
     try:
-        from openpyxl import load_workbook
-        from openpyxl.utils import range_boundaries, get_column_letter
-        from openpyxl.worksheet.worksheet import Worksheet
+        include_formulas = bool(S("excel_include_formulas"))
+    except Exception:
+        include_formulas = True
 
-        wb_vals = load_workbook(io.BytesIO(data), data_only=True,  read_only=True)
-        wb_form = load_workbook(io.BytesIO(data), data_only=False, read_only=True)
+    def clip(s: str) -> str:
+        return s if (max_chars <= 0 or len(s) <= max_chars) else s[:max_chars] + "…"
 
-        # Tunables
-        MAX_ROWS_PER_TABLE = 50
-        MAX_FORMULAS_PER_SHEET = 1000  # only applies to the "Cells" list; it's generous
-        MAX_CELLS_PER_SHEET = 500      # cap to keep chunks small
-        MAX_NR_PREVIEW = 10            # values to preview per defined name range
+    def fmt_number(v) -> str:
+        s = format(float(v), f".{sig}g") if sig > 0 else f"{float(v):.{maxp}f}"
+        if "e" in s or "E" in s:
+            try:
+                s = f"{float(s):.{maxp}f}"
+            except Exception:
+                pass
+        if trim and "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
 
-        lines: List[str] = []
+    def fmt_date(dt: datetime) -> str:
+        if drop_midnight and dt.time() == time(0, 0, 0):
+            return dt.date().isoformat()
+        return dt.strftime("%Y-%m-%d %H:%M" if time_prec == "minute" else "%Y-%m-%d %H:%M:%S")
 
-        # ===== Named ranges (workbook-level) =====
-        try:
-            if getattr(wb_vals, "defined_names", None):
-                nr_out: List[str] = []
-                for dn in wb_vals.defined_names.definedName:
-                    if getattr(dn, "hidden", False):
-                        continue
-                    # Resolve destinations (sheet, ref)
+    def fmt_time(t: time) -> str:
+        return t.strftime("%H:%M" if time_prec == "minute" else "%H:%M:%S")
+
+    def fmt_val(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return fmt_number(v)
+        if isinstance(v, datetime):
+            return fmt_date(v)
+        if isinstance(v, date):
+            return v.isoformat()
+        if isinstance(v, time):
+            return fmt_time(v)
+        s = str(v)
+        if "\n" in s:
+            s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+        s = clip(s)
+        if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
+            return f"\"{s}\""
+        return s
+
+    wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    # Only load the formulas workbook if we actually plan to read formulas
+    wb_form = load_workbook(io.BytesIO(data), data_only=False, read_only=True) if include_formulas else None
+
+    MAX_ROWS_PER_TABLE = int(S("excel_max_rows_per_table"))
+    MAX_FORMULAS_PER_SHEET = int(S("excel_max_formulas_per_sheet"))
+    MAX_CELLS_PER_SHEET = int(S("excel_max_cells_per_sheet"))
+    MAX_NR_PREVIEW = int(S("excel_named_range_preview"))
+    EMIT_TABLES = bool(S("excel_emit_tables"))
+    EMIT_MERGED = bool(S("excel_emit_merged"))
+    EMIT_CELLS = bool(S("excel_emit_cells"))
+
+    lines: List[str] = []
+
+    try:
+        if getattr(wb_vals, "defined_names", None):
+            nr_out: List[str] = []
+            for dn in wb_vals.defined_names.definedName:
+                if getattr(dn, "hidden", False):
+                    continue
+                try:
+                    dests = list(dn.destinations)
+                except Exception:
+                    dests = []
+                if not dests:
+                    continue
+                for sheet_name, ref in dests:
                     try:
-                        dests = list(dn.destinations)
-                    except Exception:
-                        dests = []
-                    if not dests:
-                        continue
-
-                    # For each destination, show address and first few values
-                    for sheet_name, ref in dests:
-                        try:
-                            ws = wb_vals[sheet_name]
-                            min_c, min_r, max_c, max_r = range_boundaries(ref)
-                            vals: List[str] = []
-                            count = 0
-                            for r in range(min_r, max_r + 1):
-                                for c in range(min_c, max_c + 1):
-                                    v = ws.cell(row=r, column=c).value
-                                    addr = f"{get_column_letter(c)}{r}"
-                                    vv = _fmt_val(v)
-                                    if vv != "":
-                                        vals.append(f"{addr}={vv}")
-                                    count += 1
-                                    if len(vals) >= MAX_NR_PREVIEW:
-                                        break
+                        ws = wb_vals[sheet_name]
+                        min_c, min_r, max_c, max_r = range_boundaries(ref)
+                        vals: List[str] = []
+                        ws_cell = ws.cell
+                        gl = get_column_letter
+                        for r in range(min_r, max_r + 1):
+                            for c in range(min_c, max_c + 1):
+                                v = ws_cell(row=r, column=c).value
+                                vv = fmt_val(v)
+                                if vv:
+                                    vals.append(f"{gl(c)}{r}={vv}")
                                 if len(vals) >= MAX_NR_PREVIEW:
                                     break
-                            vals_str = "; ".join(vals)
-                            if vals_str:
-                                nr_out.append(f"- {dn.name}: {sheet_name}!{ref} = {vals_str}")
-                            else:
-                                nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
-                        except Exception:
+                            if len(vals) >= MAX_NR_PREVIEW:
+                                break
+                        vals_str = "; ".join(vals)
+                        if vals_str:
+                            nr_out.append(f"- {dn.name}: {sheet_name}!{ref} = {vals_str}")
+                        else:
                             nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
-                if nr_out:
-                    lines.append("## Named Ranges")
-                    lines.extend(nr_out)
-                    lines.append("")
-        except Exception:
-            pass
+                    except Exception:
+                        nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
+            if nr_out:
+                lines.append("## Named Ranges")
+                lines.extend(nr_out)
+                lines.append("")
+    except Exception:
+        pass
 
-        # ===== Per-sheet details =====
-        for sheet_name in wb_vals.sheetnames:
-            ws_v: Worksheet = wb_vals[sheet_name]
-            ws_f: Worksheet = wb_form[sheet_name]
-            lines.append(f"# Sheet: {sheet_name}")
+    col_letter_cache = {}
 
-            # --- Tables
+    for sheet_name in wb_vals.sheetnames:
+        ws_v: Worksheet = wb_vals[sheet_name]
+        ws_f: Worksheet | None = wb_form[sheet_name] if wb_form else None
+        lines.append(f"# Sheet: {sheet_name}")
+
+        formulas_emitted = 0
+
+        if EMIT_TABLES:
             try:
                 tables = dict(getattr(ws_v, "tables", {}) or {})
                 if tables:
@@ -1752,32 +1794,37 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                             min_r = 1; min_c = 1
                             max_r = ws_v.max_row or 1
                             max_c = ws_v.max_column or 1
-
-                        # headers
                         headers: List[str] = []
+                        ws_v_cell = ws_v.cell
+                        ws_f_cell = ws_f.cell if ws_f else None
+                        gl = get_column_letter
                         for c in range(min_c, max_c + 1):
-                            v = ws_v.cell(row=min_r, column=c).value
-                            headers.append(_fmt_val("" if v is None else str(v).strip()))
+                            v = ws_v_cell(row=min_r, column=c).value
+                            headers.append(fmt_val("" if v is None else str(v).strip()))
                         if any(h for h in headers):
-                            lines.append(f"  headers: [{', '.join(h for h in headers if h != '')}]")
-
-                        # first N data rows (show address=value and formula if present)
+                            lines.append(f"  headers: [{', '.join(h for h in headers if h)}]")
                         shown = 0
                         for r in range(min_r + 1, max_r + 1):
                             cells: List[str] = []
+                            need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
                             for c in range(min_c, max_c + 1):
-                                addr = f"{get_column_letter(c)}{r}"
-                                vv = ws_v.cell(row=r, column=c).value
-                                fv = ws_f.cell(row=r, column=c).value
-                                val_str = _fmt_val(vv)
-                                if isinstance(fv, str) and fv.startswith("="):
-                                    if val_str != "":
+                                cl = col_letter_cache.get(c)
+                                if cl is None:
+                                    cl = gl(c)
+                                    col_letter_cache[c] = cl
+                                addr = f"{cl}{r}"
+                                vv = ws_v_cell(row=r, column=c).value
+                                val_str = fmt_val(vv)
+                                fv = ws_f_cell(row=r, column=c).value if (ws_f_cell and need_formula) else None
+                                if include_formulas and isinstance(fv, str) and fv.startswith("=") and need_formula:
+                                    if val_str:
                                         cells.append(f"{addr}={val_str} (formula:={fv[1:]})")
                                     else:
                                         cells.append(f"{addr} (formula:={fv[1:]})")
-                                else:
-                                    if val_str != "":
-                                        cells.append(f"{addr}={val_str}")
+                                    formulas_emitted += 1
+                                    need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
+                                elif val_str:
+                                    cells.append(f"{addr}={val_str}")
                             if not cells:
                                 continue
                             lines.append(f"  row {r}: " + ", ".join(cells))
@@ -1789,7 +1836,7 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
             except Exception:
                 pass
 
-            # --- Merged ranges
+        if EMIT_MERGED:
             try:
                 merges = getattr(ws_v, "merged_cells", None)
                 if merges and getattr(merges, "ranges", None):
@@ -1801,7 +1848,7 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
             except Exception:
                 pass
 
-            # --- Cells catalog (non-empty, with address, value, formula)
+        if EMIT_CELLS:
             try:
                 if callable(getattr(ws_v, "calculate_dimension", None)):
                     dim_ref = ws_v.calculate_dimension()
@@ -1810,57 +1857,48 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                     min_r = 1; min_c = 1
                     max_r = ws_v.max_row or 1
                     max_c = ws_v.max_column or 1
-
                 lines.append(f"## Cells (non-empty, first {MAX_CELLS_PER_SHEET})")
                 emitted = 0
+                ws_v_cell = ws_v.cell
+                ws_f_cell = ws_f.cell if ws_f else None
+                gl = get_column_letter
                 for r in range(min_r, max_r + 1):
                     for c in range(min_c, max_c + 1):
-                        vv = ws_v.cell(row=r, column=c).value
-                        fv = ws_f.cell(row=r, column=c).value
-                        if vv is None and not (isinstance(fv, str) and fv.startswith("=")):
+                        need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
+                        vv = ws_v_cell(row=r, column=c).value
+                        fv = ws_f_cell(row=r, column=c).value if (ws_f_cell and need_formula or (ws_f_cell and include_formulas and vv is None)) else None
+                        # If formulas are off, skip formula-only cells (vv is None)
+                        if vv is None and not (include_formulas and isinstance(fv, str) and fv.startswith("=")):
                             continue
-                        addr = f"{get_column_letter(c)}{r}"
-                        val_str = _fmt_val(vv)
-                        if isinstance(fv, str) and fv.startswith("="):
-                            if val_str != "":
+                        cl = col_letter_cache.get(c)
+                        if cl is None:
+                            cl = gl(c)
+                            col_letter_cache[c] = cl
+                        addr = f"{cl}{r}"
+                        val_str = fmt_val(vv)
+                        if include_formulas and isinstance(fv, str) and fv.startswith("=") and need_formula:
+                            if val_str:
                                 lines.append(f"- {addr}={val_str} (formula:={fv[1:]})")
                             else:
                                 lines.append(f"- {addr} (formula:={fv[1:]})")
+                            formulas_emitted += 1
                         else:
-                            if val_str != "":
+                            if val_str:
                                 lines.append(f"- {addr}={val_str}")
                             else:
                                 continue
                         emitted += 1
                         if emitted >= MAX_CELLS_PER_SHEET:
                             lines.append("… (cells truncated)")
-                            raise StopIteration  # cheap escape
-                lines.append("")
-            except StopIteration:
+                            break
+                    if emitted >= MAX_CELLS_PER_SHEET:
+                        break
                 lines.append("")
             except Exception:
-                # Keep going even if a weird worksheet trips us up
                 lines.append("")
 
-        txt = _squeeze_spaces("\n".join(lines).strip())
-        return txt, "text/plain"
-
-    except Exception:
-        # pandas fallback (values only)
-        try:
-            import pandas as pd
-            xls = pd.ExcelFile(io.BytesIO(data))
-            parts: List[str] = []
-            for sheet in xls.sheet_names:
-                df = xls.parse(sheet)
-                df = df.dropna(how="all").dropna(how="all", axis=1)
-                csv = df.to_csv(index=False, sep="\t", na_rep="")
-                csv = re.sub(r"\t{2,}", "\t", csv).replace("\t", " ")
-                parts.append(f"# Sheet: {sheet}\n{csv.strip()}")
-            txt = _squeeze_spaces("\n\n".join(parts).strip())
-            return txt, "text/plain"
-        except Exception:
-            return data.decode("utf-8", errors="ignore"), "text/plain"
+    txt = _squeeze_spaces("\n".join(lines).strip())
+    return txt, "text/plain"
 
 # ===== aimodel/file_read/rag/retrieve.py =====
 
@@ -1897,17 +1935,36 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
             break
     return out
 
-def make_rag_block(hits: List[dict], *, max_chars: int = 1200) -> str:
+def make_rag_block(hits: List[dict], *, max_chars: int = 800) -> str:
     lines = ["Local knowledge:"]
+    total_budget = int(SETTINGS.get("rag_total_char_budget", 2200))  # NEW
+    used = 0
+
     for h in hits:
         src = h.get("source") or ""
         idx = h.get("chunkIndex")
         head = f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
         body = (h.get("text") or "").strip()
+
+        # header + newline cost
+        head_cost = len(head) + 1
+        if used + head_cost >= total_budget:
+            break
+        lines.append(head)
+        used += head_cost
+
         if body:
-            lines.append(f"{head}\n  {body[:max_chars]}")
-        else:
-            lines.append(head)
+            snippet = body[:max_chars]
+            snippet_cost = len(snippet) + 1 + 2  # indent + newline
+            if used + snippet_cost > total_budget:
+                remain = max(0, total_budget - used - 3)
+                if remain > 0:
+                    lines.append("  " + snippet[:remain])
+                    used += 2 + remain
+                break
+            lines.append("  " + snippet)
+            used += snippet_cost
+
     return "\n".join(lines)
 
 def build_rag_block(query: str, session_id: str | None = None) -> str | None:
@@ -1933,11 +1990,195 @@ def build_rag_block(query: str, session_id: str | None = None) -> str | None:
         return None
 
     hits_top = _dedupe_and_sort(hits, k=k)
-    block = make_rag_block(hits_top, max_chars=int(SETTINGS.get("web_orch_per_doc_char_budget", 1200)))
+    block = make_rag_block(
+    hits_top,
+    max_chars=int(SETTINGS.get("rag_max_chars_per_chunk", 800))  # ← use RAG knob
+)
     print(f"[RAG BLOCK] chars={len(block)}")
     return block
 
 
+
+# ===== aimodel/file_read/rag/router_ai.py =====
+
+from __future__ import annotations
+from typing import Tuple, Optional, Any
+import json, re, traceback
+from ..core.settings import SETTINGS
+
+# --------- Prompt (brace-safe; only {text} is formatted) ----------
+_DECIDE_PROMPT = (
+    "You are a router deciding whether the user message should query the app's LOCAL knowledge "
+    "(uploaded files, chat/session documents) via RAG.\n"
+    "Respond with JSON only in exactly this schema:\n"
+    "{{\"need\": true|false, \"query\": \"<text or empty>\"}}\n\n"
+    "Decision principle:\n"
+    "- Set need=true if answering would materially benefit from the user's LOCAL knowledge base "
+    "(e.g., their files, prior session uploads, or internal notes).\n"
+    "- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n"
+    "- Do NOT consider the public web here.\n"
+    "- If you set need=true and you can succinctly restate the search intent for the local KB, "
+    "  put that in \"query\". Otherwise leave \"query\" empty.\n\n"
+    "Text:\n{text}\n"
+    "JSON:"
+)
+
+def _dbg(msg: str):
+    print(f"[RAG ROUTER] {msg}")
+
+def _force_json(s: str) -> dict:
+    if not s:
+        _dbg("empty LLM output")
+        return {}
+    # try direct
+    try:
+        v = json.loads(s)
+        if isinstance(v, dict):
+            _dbg(f"JSON direct OK keys={list(v.keys())}")
+            return v
+        _dbg(f"JSON direct produced non-dict type={type(v).__name__}")
+    except Exception as e:
+        _dbg(f"direct loads failed: {e} | text={s!r}")
+
+    # settings regex
+    rgx = SETTINGS.get("router_json_extract_regex")
+    cand = None
+    if isinstance(rgx, str) and rgx:
+        try:
+            m = re.search(rgx, s, re.DOTALL)
+            if m:
+                cand = m.group(0)
+                _dbg(f"regex cand via settings len={len(cand)}")
+        except Exception as e:
+            _dbg(f"settings regex error: {e}")
+
+    # fallback: first {...}
+    if not cand:
+        m2 = re.search(r"\{.*?\}", s, re.DOTALL)
+        cand = m2.group(0) if m2 else None
+        if cand:
+            _dbg(f"fallback cand len={len(cand)}")
+
+    if not cand:
+        _dbg("no JSON candidate found")
+        return {}
+
+    try:
+        v = json.loads(cand)
+        if isinstance(v, dict):
+            _dbg(f"cand loads OK keys={list(v.keys())}")
+            return v
+        _dbg(f"cand loads non-dict type={type(v).__name__}")
+    except Exception as e:
+        _dbg(f"cand loads failed: {e} | cand={cand!r}")
+    return {}
+
+def _strip_wrappers(text: str) -> str:
+    t = (text or "")
+    if SETTINGS.get("router_trim_whitespace") is True:
+        t = t.strip()
+    if SETTINGS.get("router_strip_wrappers_enabled") is not True:
+        return t
+    head = t
+    if SETTINGS.get("router_strip_split_on_blank") is True:
+        head = t.split("\n\n", 1)[0]
+    pat = SETTINGS.get("router_strip_header_regex")
+    if isinstance(pat, str) and pat:
+        try:
+            rx = re.compile(pat)
+            out = []
+            for ln in head.splitlines():
+                if rx.match(ln):
+                    break
+                out.append(ln)
+            core = " ".join(" ".join(out).split())
+            return core if core else t
+        except Exception as e:
+            _dbg(f"strip_wrappers regex error: {e}")
+            return head
+    return head
+
+def _normalize_keys(d: dict) -> dict:
+    """Make keys robust: strip quotes/spaces and lowercase."""
+    norm = {}
+    for k, v in d.items():
+        ks = str(k).strip().strip('"').strip("'").strip().lower()
+        norm[ks] = v
+    return norm
+
+def _as_bool(v) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().strip('"').strip("'").lower()
+        if s in ("true", "yes", "y", "1"):
+            return True
+        if s in ("false", "no", "n", "0"):
+            return False
+    return None
+
+def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
+    try:
+        if not user_text or not user_text.strip():
+            _dbg("SKIP empty user_text")
+            return (False, None)
+
+        core_text = _strip_wrappers(user_text.strip())
+        the_prompt = _DECIDE_PROMPT.format(text=core_text)
+        _dbg(f"INPUT core_text={core_text!r}")
+        _dbg(f"PROMPT >>>\n{the_prompt}\n<<< PROMPT")
+
+        params = {
+            "max_tokens": SETTINGS.get("router_decide_max_tokens"),
+            "temperature": SETTINGS.get("router_decide_temperature"),
+            "top_p": SETTINGS.get("router_decide_top_p"),
+            "stream": False,
+        }
+        stop_list = SETTINGS.get("router_decide_stop")
+        if isinstance(stop_list, list) and stop_list:
+            params["stop"] = stop_list
+        params = {k: v for k, v in params.items() if v is not None}
+        _dbg(f"PARAMS={params}")
+
+        raw = llm.create_chat_completion(
+            messages=[{"role": "user", "content": the_prompt}],
+            **params,
+        )
+        _dbg(f"RAW OBJ keys={list(raw.keys())}")
+        text_out = (raw.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        _dbg(f"RAW OUT str={text_out!r}")
+
+        data = _force_json(text_out) or {}
+        _dbg(f"PARSED JSON raw={data}")
+
+        data = _normalize_keys(data)
+        _dbg(f"PARSED JSON norm_keys={data}")
+
+        need_raw = data.get("need")
+        need_bool = _as_bool(need_raw) if not isinstance(need_raw, bool) else need_raw
+        if need_bool is None:
+            need_default = SETTINGS.get("rag_default_need_when_invalid")
+            need = bool(need_default) if isinstance(need_default, bool) else False
+            _dbg(f"'need' missing/invalid -> default={need}")
+        else:
+            need = bool(need_bool)
+
+        query_field = data.get("query", "")
+        try:
+            query = _strip_wrappers(str(query_field or "").strip())
+        except Exception as e:
+            _dbg(f"query strip error: {e}")
+            query = ""
+
+        if not need:
+            query = None
+        _dbg(f"DECISION need={need} query={query!r}")
+        return (need, query)
+
+    except Exception as e:
+        _dbg(f"FATAL {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return (bool(SETTINGS.get("rag_default_need_when_invalid", False)), None)
 
 # ===== aimodel/file_read/rag/schemas.py =====
 
@@ -2138,7 +2379,6 @@ starlette==0.47.2
 llama-cpp-python==0.3.4
 ddgs==9.5.4
 httpx==0.27.0
-
 # HTML parsing / readability (permissive)
 lxml==6.0.1
 readability-lxml==0.8.1
@@ -2160,6 +2400,9 @@ pdfminer.six==20240706
 
 PyPDF2==3.0.1
 pandas==2.2.2
+
+
+
 
 # ===== aimodel/file_read/runtime/__init__.py =====
 
@@ -2381,12 +2624,14 @@ def clamp_out_budget(
 
 # ===== aimodel/file_read/services/generate_flow.py =====
 
+# aimodel/file_read/services/generate_flow.py
 from __future__ import annotations
 import asyncio, time, json
 from typing import AsyncGenerator, Dict, List, Optional
 from fastapi.responses import StreamingResponse
 from datetime import datetime
 from dataclasses import asdict
+
 from ..core.settings import SETTINGS
 from ..runtime.model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
@@ -2397,14 +2642,17 @@ from .packing import build_system_text, pack_with_rollup, maybe_inject_rag_block
 from .context_window import clamp_out_budget
 
 from ..web.router_ai import decide_web_and_fetch
+from ..rag.router_ai import decide_rag  # <-- NEW: LLM JSON router for RAG
 from ..utils.streaming import RUNJSON_START, RUNJSON_END
 
 from .streaming_worker import run_stream as _run_stream
 from typing import AsyncIterator
 run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream  # type: ignore[assignment]
 
+
 def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
+
 
 def _chars_len(msgs: List[object]) -> int:
     total = 0
@@ -2424,6 +2672,7 @@ def _chars_len(msgs: List[object]) -> int:
                 pass
     return total
 
+
 def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, object], session_id: str) -> None:
     try:
         print(f"[{_now()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
@@ -2431,6 +2680,7 @@ def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, ob
         print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
     except Exception as e:
         print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+
 
 def _compose_router_text(
     recent,
@@ -2482,6 +2732,7 @@ def _compose_router_text(
         out = out[:mc].rstrip()
     return out
 
+
 async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     ensure_ready()
     llm = get_llm()
@@ -2511,19 +2762,21 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     latest_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
     lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
 
+    # ---------------------- WEB INJECT (optional) ----------------------
     t0 = time.perf_counter()
     print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
     try:
         block = None
+        router_text = _compose_router_text(
+            st.get("recent", []),
+            str(latest_user_text or ""),
+            st.get("summary", "") or "",
+            tail_turns=int(eff["router_tail_turns"]),
+            summary_chars=int(eff["router_summary_chars"]),
+            max_chars=int(eff["router_max_chars"]),
+        )
+
         if auto_web:
-            router_text = _compose_router_text(
-                st.get("recent", []),
-                str(latest_user_text or ""),
-                st.get("summary", "") or "",
-                tail_turns=int(eff["router_tail_turns"]),
-                summary_chars=int(eff["router_summary_chars"]),
-                max_chars=int(eff["router_max_chars"]),
-            )
             block = await decide_web_and_fetch(llm, router_text, k=web_k)
 
         print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
@@ -2545,6 +2798,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         dt = time.perf_counter() - t0
         print(f"[{_now()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
 
+    # ---------------------- PACK (with ephemeral web) ----------------------
     system_text = build_system_text()
 
     ephemeral_once = st.pop("_ephemeral_web", [])
@@ -2557,8 +2811,29 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         ephemeral=ephemeral_once,
     )
 
-    packed = maybe_inject_rag_block(packed, session_id=session_id)
+    # ---------------------- RAG ROUTER (LLM JSON) ----------------------
+    rag_need = False
+    rag_query: Optional[str] = None
+    try:
+        rag_need, rag_query = decide_rag(llm, router_text)
+        print(f"[{_now()}] RAG ROUTER need={rag_need} query={rag_query!r}")
+    except Exception as e:
+        print(f"[{_now()}] RAG ROUTER ERROR {type(e).__name__}: {e}")
+        rag_need = bool(SETTINGS.effective().get("rag_default_need_when_invalid", False))
+        rag_query = None
 
+    # If a web block was injected OR RAG router said no, skip RAG
+    skip_rag = bool(ephemeral_once) or (not rag_need)
+
+    # Optionally pass LLM-refined query to RAG
+    packed = maybe_inject_rag_block(
+        packed,
+        session_id=session_id,
+        skip_rag=skip_rag,
+        rag_query=rag_query,
+    )
+
+    # ---------------------- STREAM SETUP ----------------------
     packed_chars = _chars_len(packed)
     print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
 
@@ -2590,266 +2865,4 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
             def _accum_visible(chunk_bytes: bytes):
                 if not chunk_bytes:
                     return
-                s = chunk_bytes.decode("utf-8", errors="ignore")
-                if RUNJSON_START in s and RUNJSON_END in s:
-                    return
-                if s.strip() == eff["stopped_line_marker"]:
-                    return
-                out_buf.extend(chunk_bytes)
-
-            try:
-                print(f"[{_now()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
-                async for chunk in run_stream(
-                    llm=llm,
-                    messages=packed,
-                    out_budget=out_budget,
-                    stop_ev=stop_ev,
-                    request=request,
-                    temperature=temperature,
-                    top_p=top_p,
-                    input_tokens_est=input_tokens_est,
-                ):
-                    if isinstance(chunk, (bytes, bytearray)):
-                        _accum_visible(chunk)
-                    else:
-                        _accum_visible(chunk.encode("utf-8"))
-                    yield chunk
-            finally:
-                try:
-                    full_text = out_buf.decode("utf-8", errors="ignore").strip()
-                    start = full_text.find(RUNJSON_START)
-                    if start != -1:
-                        end = full_text.find(RUNJSON_END, start)
-                        if end != -1:
-                            full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
-                    if full_text:
-                        st["recent"].append({"role": "assistant", "content": full_text})
-                        print(f"[{_now()}] RECENT append assistant chars={len(full_text)}")
-                except Exception:
-                    pass
-                try:
-                    from ..store import apply_pending_for
-                    apply_pending_for(session_id)
-                except Exception:
-                    pass
-                try:
-                    from ..store import list_messages as store_list_messages
-                    from ..workers.retitle_worker import enqueue as enqueue_retitle
-                    msgs = store_list_messages(session_id)
-                    last_seq = max((int(m.id) for m in msgs), default=0)
-                    enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
-                except Exception:
-                    pass
-                print(f"[{_now()}] GEN run_stream END   session={session_id}")
-                mark_active(session_id, -1)
-
-    return StreamingResponse(
-        streamer(),
-        media_type="text/plain",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
-
-async def cancel_session(session_id: str):
-    from .cancel import cancel_event
-    cancel_event(session_id).set()
-    return {"ok": True}
-
-async def cancel_session_alias(session_id: str):
-    return await cancel_session(session_id)
-
-# ===== aimodel/file_read/services/packing.py =====
-
-# aimodel/file_read/services/packing.py
-from __future__ import annotations
-from typing import Tuple, List, Dict, Optional
-from ..rag.retrieve import build_rag_block
-from ..core.settings import SETTINGS
-from ..core.memory import build_system, pack_messages, roll_summary_if_needed
-
-
-def build_system_text() -> str:
-    eff = SETTINGS.effective()
-    base = build_system(
-        style=str(eff["pack_style"]),
-        short=bool(eff["pack_short"]),
-        bullets=bool(eff["pack_bullets"]),
-    )
-    guidance = str(eff["packing_guidance"])
-    return base + guidance
-
-
-def pack_with_rollup(
-    *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
-    ephemeral: Optional[List[Dict[str, str]]] = None,
-) -> Tuple[List[Dict[str, str]], str, int]:
-    eff = SETTINGS.effective()
-
-    packed, input_budget = pack_messages(
-        style=str(eff["pack_style"]),
-        short=bool(eff["pack_short"]),
-        bullets=bool(eff["pack_bullets"]),
-        summary=summary,
-        recent=recent,
-        max_ctx=max_ctx,
-        out_budget=out_budget,
-    )
-
-    packed, new_summary = roll_summary_if_needed(
-        packed=packed,
-        recent=recent,
-        summary=summary,
-        input_budget=input_budget,
-        system_text=system_text,
-    )
-
-    # Inject ephemeral (web findings) BEFORE the last user message, so the final turn is still user.
-    if ephemeral:
-        last_user_idx = None
-        for i in range(len(packed) - 1, -1, -1):
-            m = packed[i]
-            if isinstance(m, dict) and m.get("role") == "user":
-                last_user_idx = i
-                break
-        eph = list(ephemeral)
-        if last_user_idx is not None:
-            packed = packed[:last_user_idx] + eph + packed[last_user_idx:]
-        else:
-            packed = packed + eph
-
-    return packed, new_summary, input_budget
-
-def maybe_inject_rag_block(messages: list[dict], *, session_id: str | None) -> list[dict]:
-    if not SETTINGS.get("rag_enabled", True):
-        return messages
-    if not messages or messages[-1].get("role") != "user":
-        return messages
-
-    user_q = messages[-1].get("content") or ""
-    block = build_rag_block(user_q, session_id=session_id)
-
-    if not block:
-        print(f"[RAG INJECT] no hits (session={session_id}) q={user_q!r}")
-        return messages
-
-    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
-    injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
-    return injected
-
-# ===== aimodel/file_read/services/session_io.py =====
-
-from __future__ import annotations
-from typing import Dict, List
-from ..core.memory import get_session
-from ..store import set_summary as store_set_summary
-
-def handle_incoming(session_id: str, incoming: List[Dict[str, str]]):
-    st = get_session(session_id)
-    st.setdefault("_ephemeral_web", [])
-    for m in incoming:
-        st["recent"].append(m)
-    return st
-
-def persist_summary(session_id: str, summary: str):
-    try:
-        store_set_summary(session_id, summary)
-    except Exception:
-        pass
-
-# ===== aimodel/file_read/services/streaming_worker.py =====
-
-# aimodel/file_read/services/streaming_worker.py
-from __future__ import annotations
-import asyncio, json, time, logging
-from typing import AsyncGenerator, Optional, List
-
-from ..core.settings import SETTINGS
-from ..utils.streaming import (
-    RUNJSON_START, RUNJSON_END,
-    build_run_json, watch_disconnect,
-)
-
-log = logging.getLogger("aimodel.api.generate")
-
-async def run_stream(
-    *, llm, messages, out_budget, stop_ev, request,
-    temperature: float, top_p: float, input_tokens_est: Optional[int]
-) -> AsyncGenerator[bytes, None]:
-    q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
-    SENTINEL = object()
-
-    def produce():
-        t_start = time.perf_counter()
-        t_first: Optional[float] = None
-        t_last: Optional[float] = None
-        finish_reason: Optional[str] = None
-        err_text: Optional[str] = None
-        out_parts: List[str] = []
-
-        try:
-            try:
-                stream = llm.create_chat_completion(
-                    messages=messages,
-                    stream=True,
-                    max_tokens=out_budget,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=SETTINGS.stream_top_k,
-                    repeat_penalty=SETTINGS.stream_repeat_penalty,
-                    stop=SETTINGS.stream_stop_strings,
-                )
-            except ValueError as ve:
-                if "exceed context window" in str(ve).lower():
-                    retry_tokens = max(
-                        SETTINGS.stream_retry_min_tokens,
-                        int(out_budget * SETTINGS.stream_retry_fraction)
-                    )
-                    log.warning(
-                        "generate: context overflow, retrying with max_tokens=%d",
-                        retry_tokens
-                    )
-                    stream = llm.create_chat_completion(
-                        messages=messages,
-                        stream=True,
-                        max_tokens=retry_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=SETTINGS.stream_top_k,
-                        repeat_penalty=SETTINGS.stream_repeat_penalty,
-                        stop=SETTINGS.stream_stop_strings,
-                    )
-                else:
-                    raise
-
-            for chunk in stream:
-                if stop_ev.is_set():
-                    break
-
-                try:
-                    fr = chunk["choices"][0].get("finish_reason")
-                    if fr:
-                        finish_reason = fr
-                except Exception:
-                    pass
-
-                piece = chunk["choices"][0]["delta"].get("content", "")
-                if not piece:
-                    continue
-
-                now = time.perf_counter()
-                if t_first is None:
-                    t_first = now
-                t_last = now
-                out_parts.append(piece)
-
-                while not stop_ev.is_set():
-                    try:
-                        q.put_nowait(piece)
-                        break
-                    except asyncio.QueueFull:
-                        time.sleep(SETTINGS.stream_backpressure_sleep_sec)
-
-        except Exception as e:
-            err_text = str(e)
-            log.exception("generate: llm stream error: %s", e)
-            try:
-                q.put_nowait(f"[aimodel] 
+      

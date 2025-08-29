@@ -1,21 +1,22 @@
+# ===== aimodel/file_read/rag/ingest/__init__.py =====
 from __future__ import annotations
 from typing import Tuple
 import io, json
 
 from .excel_ingest import extract_excel
+from .csv_ingest import extract_csv
 from .common import _utf8, _strip_html, Chunk, chunk_text, build_metas
 
 __all__ = ["sniff_and_extract", "Chunk", "chunk_text", "build_metas"]
 
 def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
-    """
-    Dispatcher that returns (text, mime) for many file types.
-    Excel (.xlsx) is handled by excel_ingest.extract_excel for rich structure.
-    """
     name = (filename or "").lower()
 
-    if name.endswith(".xlsx"):
+    if name.endswith((".xlsx", ".xlsm")):
         return extract_excel(data)
+
+    if name.endswith((".csv", ".tsv")):
+        return extract_csv(data)
 
     if name.endswith(".docx"):
         try:
@@ -79,9 +80,6 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
         except Exception:
             return _utf8(data), "text/plain"
 
-    if name.endswith((".csv", ".tsv")):
-        return _utf8(data), "text/plain"
-
     if name.endswith((".htm", ".html", ".xml")):
         return _strip_html(_utf8(data)), "text/plain"
 
@@ -96,5 +94,5 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
     )):
         return _utf8(data), "text/plain"
 
-    # default
+    # Default
     return _utf8(data), "text/plain"

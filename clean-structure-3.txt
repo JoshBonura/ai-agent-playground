@@ -1,4 +1,438 @@
-={c.sessionId}
+     )}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatComposer.tsx =====
+
+// frontend/src/file_read/components/ChatComposer.tsx
+import { useEffect, useRef, useState } from "react";
+import { SendHorizonal, Square } from "lucide-react";
+
+const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
+
+type Props = {
+  input: string;
+  setInput: (v: string) => void;
+  loading: boolean;
+  queued?: boolean;
+  onSend: (text: string) => void | Promise<void>;
+  onStop: () => void | Promise<void>;
+  onHeightChange?: (h: number) => void;
+  onRefreshChats?: () => void;
+};
+
+export default function ChatComposer({
+  input,
+  setInput,
+  loading,
+  queued = false,
+  onSend,
+  onStop,
+  onHeightChange,
+  onRefreshChats,
+}: Props) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const MAX_HEIGHT_PX = 192;
+  const [isClamped, setIsClamped] = useState(false);
+  const [draft, setDraft] = useState(input);
+
+  useEffect(() => setDraft(input), [input]);
+
+  const autogrow = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const next = Math.min(ta.scrollHeight, MAX_HEIGHT_PX);
+    ta.style.height = `${next}px`;
+    setIsClamped(ta.scrollHeight > MAX_HEIGHT_PX);
+    if (wrapRef.current && onHeightChange) {
+      onHeightChange(wrapRef.current.getBoundingClientRect().height);
+    }
+  };
+
+  useEffect(() => {
+    autogrow();
+    const onResize = () => autogrow();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    autogrow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  const hasText = draft.trim().length > 0;
+
+  // 🔹 NEW: tell ChatView to scroll to bottom
+  const forceScroll = (behavior: ScrollBehavior = "auto") => {
+    window.dispatchEvent(
+      new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } })
+    );
+  };
+
+  const handleSendClick = () => {
+    const v = draft.trim();
+    if (!v || loading || queued) return; // prevent sending while queued/streaming
+
+    // Snap immediately to bottom so user sees the latest area
+    forceScroll("auto");
+
+    setDraft("");
+    setInput("");
+    void Promise.resolve(onSend(v)).finally(() => {
+      onRefreshChats?.();
+      // Settle at bottom after DOM updates
+      requestAnimationFrame(() => forceScroll("smooth"));
+    });
+  };
+
+  const handleStopClick = () => {
+    if (!loading && !queued) return;
+    void Promise.resolve(onStop()).finally(() => {
+      onRefreshChats?.(); // refresh once the stop lands
+    });
+  };
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (!loading && !queued) handleSendClick();
+    }
+  }
+
+  return (
+    <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
+      <div className="flex gap-2">
+        <textarea
+          ref={taRef}
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setInput(e.target.value);
+            autogrow();
+          }}
+          onInput={autogrow}
+          onKeyDown={onKeyDown}
+          placeholder="Ask anything…"
+          className={`flex-1 border rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring ${
+            isClamped ? "overflow-y-auto" : "overflow-hidden"
+          }`}
+          rows={1}
+          style={{ maxHeight: MAX_HEIGHT_PX }}
+        />
+
+        <div className="flex items-end gap-2">
+          {(loading || queued) ? (
+            <button
+              className="p-2 rounded-lg border hover:bg-gray-50"
+              onClick={handleStopClick}
+              title={queued ? "Cancel queued message" : "Stop generating"}
+              aria-label={queued ? "Cancel queued message" : "Stop generating"}
+            >
+              <Square size={18} />
+            </button>
+          ) : hasText ? (
+            <button
+              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
+              onClick={handleSendClick}
+              title="Send"
+              aria-label="Send"
+            >
+              <SendHorizonal size={18} />
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatContainer.tsx =====
+
+import { useState, useRef, useEffect } from "react";
+import ChatView from "./ChatView/ChatView";
+import ChatComposer from "./ChatComposer";
+import type { ChatMsg } from "../types/chat";
+import type { GenMetrics, RunJson } from "../hooks/useChatStream";
+
+interface Props {
+  messages: ChatMsg[];
+  input: string;
+  setInput: (s: string) => void;
+  loading: boolean;
+  queued?: boolean;
+  send: (text?: string) => Promise<void>;
+  stop: () => Promise<void> | void;
+  runMetrics?: GenMetrics | null;
+  runJson?: RunJson | null;
+  onRefreshChats?: () => void;
+  onDeleteMessages?: (ids: string[]) => void;
+  autoFollow?: boolean;
+}
+
+export default function ChatContainer({
+  messages,
+  input,
+  setInput,
+  loading,
+  queued = false,
+  send,
+  stop,
+  runMetrics,
+  runJson,
+  onRefreshChats,
+  onDeleteMessages,
+  autoFollow = true,
+}: Props) {
+  const [composerH, setComposerH] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Track if the user is scrolled up
+  const [pinned, setPinned] = useState(false);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const threshold = 120;
+
+    const isNearBottom = () => {
+      return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+    };
+
+    const onScroll = () => {
+      // pinned = true if not near bottom
+      setPinned(!isNearBottom());
+    };
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+
+    // initialize
+    setPinned(!isNearBottom());
+
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const forceScrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  };
+
+  const handleSend = async (text?: string) => {
+    // Only auto-scroll if user hasn’t scrolled up
+    if (!pinned) {
+      forceScrollToBottom("auto");
+    }
+    await send(text);
+    onRefreshChats?.();
+    if (!pinned) {
+      requestAnimationFrame(() => forceScrollToBottom("smooth"));
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
+      <div
+        ref={containerRef}
+        data-chat-scroll
+        className="flex-1 overflow-y-auto min-w-0"
+      >
+        <ChatView
+          messages={messages}
+          loading={loading}
+          queued={queued}
+          bottomPad={composerH}
+          runMetrics={runMetrics}
+          runJson={runJson}
+          onDeleteMessages={onDeleteMessages}
+          autoFollow={autoFollow}
+        />
+      </div>
+
+      <ChatComposer
+        input={input}
+        setInput={setInput}
+        loading={loading}
+        queued={queued}
+        onSend={handleSend}
+        onStop={stop}
+        onHeightChange={setComposerH}
+        onRefreshChats={onRefreshChats}
+      />
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatItem.tsx =====
+
+// frontend/src/file_read/components/chat/ChatItem.tsx
+import ChatBubble from "./ChatBubble";
+import AssistantMetrics from "./AssistantMetrics";
+import { buildStatus } from "./ChatView/StatusLine";
+import type { ChatMsg } from "../types/chat";
+import type { RunJson, GenMetrics } from "../shared/lib/runjson";
+
+export default function ChatItem({
+  m,
+  idx,
+  loading,
+  lastAssistantIndex,
+  runJsonLive,
+  runMetricsLive,
+  onDelete,
+}: {
+  m: ChatMsg;
+  idx: number;
+  loading: boolean;
+  lastAssistantIndex: number;
+  runJsonLive?: RunJson | null;
+  runMetricsLive?: GenMetrics | null;
+  onDelete?: (id: string) => void;
+}) {
+  const isAssistant = m.role === "assistant";
+  const isCurrentStreamingAssistant = isAssistant && loading && idx === lastAssistantIndex;
+
+  let jsonForThis: RunJson | null = null;
+  let flatForThis: GenMetrics | null = null;
+
+  if (isAssistant) {
+    // @ts-ignore meta bag
+    const meta = m.meta as { runJson?: RunJson | null; flat?: GenMetrics | null } | undefined;
+    jsonForThis = meta?.runJson ?? null;
+    flatForThis = meta?.flat ?? null;
+
+    if (isCurrentStreamingAssistant) {
+      if (runJsonLive) jsonForThis = runJsonLive;
+      if (runMetricsLive) flatForThis = runMetricsLive;
+    }
+  }
+
+  const status = isAssistant ? buildStatus(jsonForThis, flatForThis) : "";
+  const showMetrics = isAssistant && (jsonForThis || flatForThis);
+
+  return (
+    <div>
+      <ChatBubble
+        role={m.role}
+        text={m.text}
+        showActions={m.role === "user" || (m.role === "assistant" && !isCurrentStreamingAssistant)}
+        onDelete={onDelete ? () => onDelete(m.id) : undefined}
+      />
+      {showMetrics && <AssistantMetrics status={status} runJson={jsonForThis} flat={flatForThis} />}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatSidebar/ChatSidebar.tsx =====
+
+import { useState } from "react";
+import { deleteChatsBatch } from "../../hooks/data/chatApi";
+import type { ChatRow } from "../../types/chat";
+import { useMultiSelect } from "../../hooks/useMultiSelect";
+import { useChatsPager } from "../../hooks/useChatsPager";
+import SidebarHeader from "./SidebarHeader";
+import SidebarListItem from "./SidebarListItem";
+
+const PAGE_SIZE = 10;
+
+type Props = {
+  onOpen: (id: string) => Promise<void>;
+  onNew: () => Promise<void>;
+  refreshKey?: number;
+  activeId?: string;
+  onHideSidebar?: () => void;
+  onCancelSessions?: (ids: string[]) => Promise<void>;
+};
+
+export default function ChatSidebar({
+  onOpen, onNew, refreshKey, activeId, onHideSidebar, onCancelSessions,
+}: Props) {
+  const {
+    chats, page, hasMore, total, totalPages,
+    initialLoading, loadingMore,
+    scrollRef, sentinelRef, loadMore, setChats,
+  } = useChatsPager(PAGE_SIZE, refreshKey);
+
+  const [isEditing, setIsEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [newPending, setNewPending] = useState(false);
+
+  const allIds = chats.map(c => c.sessionId);
+  const { selected, setSelected, allSelected, toggleOne, toggleAll } = useMultiSelect(allIds);
+
+  async function handleNew() {
+    if (newPending) return;
+    setNewPending(true);
+    try { await onNew(); } finally { setNewPending(false); }
+  }
+
+  async function onDeleteSelected(): Promise<void> {
+    const count = selected.size;
+    if (!count || deleting) return;
+
+    const isAll = count === chats.length;
+    const ok = window.confirm(
+      isAll
+        ? `Delete ALL ${count} chats? This cannot be undone.`
+        : `Delete ${count} selected chat${count > 1 ? "s" : ""}?`
+    );
+    if (!ok) return;
+
+    const ids = [...selected];
+    try { await onCancelSessions?.(ids); await Promise.resolve(); } catch {}
+
+    const deletingActive = activeId ? selected.has(activeId) : false;
+    const fallback = chats.find(c => !selected.has(c.sessionId))?.sessionId;
+
+    setDeleting(true);
+    try {
+      const deleted = await deleteChatsBatch(ids);
+      if (!deleted.length) return;
+      setChats(prev => prev.filter(c => !deleted.includes(c.sessionId)));
+      setSelected(new Set());
+      setIsEditing(false);
+
+      if (deletingActive) {
+        if (fallback) void onOpen(fallback);
+        else void onOpen("");
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <aside className="w-full md:w-72 h-full border-r bg-white p-0 flex flex-col">
+      <SidebarHeader
+        isEditing={isEditing}
+        setIsEditing={(v) => { setIsEditing(v); setSelected(new Set()); }}
+        newPending={newPending}
+        onNew={handleNew}
+        onHideSidebar={onHideSidebar}
+        selectedCount={selected.size}
+        deleting={deleting}
+        onDelete={onDeleteSelected}
+      />
+
+      {/* LIST */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto p-2 overscroll-contain"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
+        {initialLoading && (
+          <div className="px-2 py-1 text-xs text-gray-500">Loading…</div>
+        )}
+
+        <ul className="space-y-1">
+          {chats.map((c: ChatRow) => (
+            <SidebarListItem
+              key={c.sessionId}
               c={c}
               isActive={activeId === c.sessionId}
               isEditing={isEditing}
@@ -2726,412 +3160,4 @@ export default function AgentRunner() {
   }, []);
 
   async function newChat(): Promise<void> {
-    const id = crypto.randomUUID();
-    chat.setSessionId(id);
-    try { await createChat(id, "New Chat"); } catch {}
-    localStorage.setItem(LS_KEY, id);
-    setRefreshKey((k) => k + 1);
-    chat.setInput("");
-    chat.clearMetrics?.();
-    await refreshFollow();
-  }
-
-  async function openSession(id: string): Promise<void> {
-    if (!id) return;
-    await chat.loadHistory(id);
-    localStorage.setItem(LS_KEY, id);
-    chat.setInput("");
-    chat.clearMetrics?.();
-    await refreshFollow();
-  }
-
-  // --- TWO REFRESH HELPERS ---
-
-  // 1) Follow-to-bottom refresh (normal)
-  async function refreshFollow() {
-    const sid = chat.sessionIdRef.current;
-    if (!sid) return;
-    setAutoFollow(true);
-    await chat.loadHistory(sid);
-    const el = document.getElementById("chat-scroll-container");
-    if (el) el.scrollTop = el.scrollHeight;
-  }
-
-  // 2) Preserve-scroll refresh (use for deletions, etc.)
-  async function refreshPreserve() {
-    const sid = chat.sessionIdRef.current;
-    if (!sid) return;
-    const el = document.getElementById("chat-scroll-container");
-    const prevTop = el?.scrollTop ?? 0;
-    const prevHeight = el?.scrollHeight ?? 0;
-
-    setAutoFollow(false);
-    await chat.loadHistory(sid);
-
-    requestAnimationFrame(() => {
-      if (el) {
-        const newHeight = el.scrollHeight;
-        el.scrollTop = prevTop + (newHeight - prevHeight);
-      }
-      setAutoFollow(true);
-    });
-  }
-
-  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
-  async function handleDeleteMessages(clientIds: string[]) {
-    const sid = chat.sessionIdRef.current;
-    if (!sid || !clientIds?.length) return;
-
-    const current = chat.messages;
-    const toDelete = new Set(clientIds);
-
-    const serverIds = current
-      .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
-      .map((m: any) => m.serverId as number);
-
-    const remaining = current.filter((m) => !toDelete.has(m.id));
-
-    // Optimistic local state
-    if ((chat as any).setMessagesForSession) {
-      (chat as any).setMessagesForSession(sid, () => remaining);
-    }
-
-    try {
-      if (serverIds.length) {
-        await deleteMessagesBatch(sid, serverIds);
-      }
-
-      await refreshPreserve();
-
-      setRefreshKey((k) => k + 1);
-      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
-
-      show("Message deleted");
-    } catch {
-      show("Failed to delete message");
-      await chat.loadHistory(sid);
-      setRefreshKey((k) => k + 1);
-    }
-  }
-
-  return (
-    <div className="h-screen w-full flex bg-gray-50">
-      {sidebarOpen && (
-        <div className="hidden md:flex h-full">
-          <ChatSidebar
-            onOpen={openSession}
-            onNew={newChat}
-            refreshKey={refreshKey}
-            activeId={chat.sessionIdRef.current}
-            onHideSidebar={() => setSidebarOpen(false)}
-          />
-        </div>
-      )}
-
-      <MobileDrawer
-        onOpenSession={openSession}
-        onNewChat={newChat}
-        refreshKey={refreshKey}
-        activeId={chat.sessionIdRef.current}
-        openMobileDrawer={openMobileDrawer}
-        closeMobileDrawer={closeMobileDrawer}
-      />
-      <div className="md:hidden h-14 shrink-0" />
-
-      <div className="flex-1 min-w-0 flex flex-col">
-        <DesktopHeader
-          sidebarOpen={sidebarOpen}
-          onShowSidebar={() => setSidebarOpen(true)}
-        />
-
-        {/* NEW: small settings trigger row above the chat */}
-        <div className="px-3 md:px-6 pt-2">
-          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end">
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowSettings(true)}
-              title="Open Settings"
-            >
-              Settings
-            </button>
-          </div>
-        </div>
-        <div className="px-3 md:px-6 pt-2">
-          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowKnowledge(true)}
-              title="Open Knowledge"
-            >
-              Knowledge
-            </button>
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowSettings(true)}
-              title="Open Settings"
-            >
-              Settings
-            </button>
-          </div>
-        </div>
-
-        <div className="flex-1 min-h-0">
-          <div className="h-full px-3 md:px-6">
-            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              {/* Note: add id on the scroll container wrapper for refresh helpers */}
-              <div id="chat-scroll-container" className="h-full">
-                <ChatContainer
-                  messages={chat.messages}
-                  input={chat.input}
-                  setInput={chat.setInput}
-                  loading={chat.loading}
-                  queued={chat.queued}
-                  send={chat.send}
-                  stop={chat.stop}
-                  runMetrics={chat.runMetrics}
-                  runJson={chat.runJson}
-                  onRefreshChats={() => setRefreshKey((k) => k + 1)}
-                  onDeleteMessages={handleDeleteMessages}
-                  autoFollow={autoFollow}
-                />
-              </div>
-              <Toast message={toast} />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* NEW: settings modal */}
-      {showSettings && (
-        <SettingsPanel
-          sessionId={chat.sessionIdRef.current}
-          onClose={() => setShowSettings(false)}
-        />
-      )}
-      {showKnowledge && (
-        <KnowledgePanel
-          sessionId={chat.sessionIdRef.current}
-          onClose={() => setShowKnowledge(false)}
-          toast={show}
-        />
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/pages/AgentShell.tsx =====
-
-// frontend/src/file_read/pages/AgentShell.tsx
-import DesktopHeader from "../components/DesktopHeader";
-import MobileDrawer from "../components/MobileDrawer";
-import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
-import ChatContainer from "../components/ChatContainer";
-
-export default function AgentShell({
-  sidebarOpen, setSidebarOpen,
-  openMobileDrawer, closeMobileDrawer,
-  refreshKey, activeId,
-  onOpenSession, onNewChat,
-  chatProps,
-}: {
-  sidebarOpen: boolean;
-  setSidebarOpen: (v: boolean) => void;
-  openMobileDrawer: () => void;
-  closeMobileDrawer: () => void;
-  refreshKey: number;
-  activeId?: string;
-  onOpenSession: (id: string) => Promise<void>;
-  onNewChat: () => Promise<void>;
-  chatProps: React.ComponentProps<typeof ChatContainer>;
-}) {
-  return (
-    <div className="h-screen w-full flex bg-gray-50">
-      {sidebarOpen && (
-        <div className="hidden md:flex h-full">
-          <ChatSidebar
-            onOpen={onOpenSession}
-            onNew={onNewChat}
-            refreshKey={refreshKey}
-            activeId={activeId}
-            onHideSidebar={() => setSidebarOpen(false)}
-          />
-        </div>
-      )}
-
-      <MobileDrawer
-        onOpenSession={onOpenSession}
-        onNewChat={onNewChat}
-        refreshKey={refreshKey}
-        activeId={activeId}
-        openMobileDrawer={openMobileDrawer}
-        closeMobileDrawer={closeMobileDrawer}
-      />
-      <div className="md:hidden h-14 shrink-0" />
-
-      <div className="flex-1 min-w-0 flex flex-col">
-        <DesktopHeader
-          sidebarOpen={sidebarOpen}
-          onShowSidebar={() => setSidebarOpen(true)}
-        />
-        <div className="flex-1 min-h-0">
-          <div className="h-full px-3 md:px-6">
-            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              <ChatContainer {...chatProps} />
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/pages/useInitialLoad.ts =====
-
-// frontend/src/file_read/pages/useInitialLoad.ts
-import { useEffect } from "react";
-import { listChatsPage } from "../data/chatApi";
-
-export function useInitialLoad(
-  pageSize: number,
-  onPick: (id: string) => Promise<void>,
-  keyName = "lastSessionId"
-) {
-  useEffect(() => {
-    (async () => {
-      try {
-        const ceil = new Date().toISOString();
-        const page = await listChatsPage(0, pageSize, ceil);
-        const saved = localStorage.getItem(keyName) || "";
-        const targetId =
-          (saved && page.content.find(c => c.sessionId === saved)?.sessionId) ||
-          page.content[0]?.sessionId || "";
-        if (targetId) {
-          await onPick(targetId);
-          localStorage.setItem(keyName, targetId);
-        }
-      } catch {}
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-}
-
-# ===== frontend/src/file_read/services/http.ts =====
-
-export const API_BASE = import.meta.env.VITE_API_URL || "";
-
-export async function request<T>(
-  path: string,
-  init?: RequestInit
-): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init);
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    // bubble a readable error
-    throw new Error(`HTTP ${res.status} – ${text || res.statusText}`);
-  }
-  return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
-}
-
-# ===== frontend/src/file_read/shared/lib/runjson.ts =====
-
-// src/file_read/utils/runjson.ts
-export const MET_START = "[[RUNJSON]]";
-export const MET_END = "[[/RUNJSON]]";
-
-export type GenMetrics = {
-  ttft_ms?: number | null;
-  tok_per_sec?: number | null;
-  output_tokens?: number | null;
-  input_tokens_est?: number | null;
-  total_tokens_est?: number | null;
-  stop_reason?: string | null;
-};
-
-export type RunJson = {
-  stats?: {
-    stopReason?: string | null;
-    tokensPerSecond?: number | null;
-    timeToFirstTokenSec?: number | null;
-    totalTimeSec?: number | null;
-    promptTokensCount?: number | null;
-    predictedTokensCount?: number | null;
-    totalTokensCount?: number | null;
-  };
-  [k: string]: unknown;
-};
-
-// Robustly extract the last [[RUNJSON]] ... [[/RUNJSON]] block, tolerating
-// surrounding spaces/newlines and any placement within the text.
-export function extractRunJsonFromBuffer(
-  buf: string
-): { clean: string; json?: RunJson; flat?: GenMetrics } {
-  // Use a global, dotall regex that captures the JSON payload and allows
-  // optional whitespace around the delimiters.
-  const re =
-    /(?:\s*)\[\[RUNJSON\]\]\s*([\s\S]*?)\s*\[\[\/RUNJSON\]\](?:\s*)/g;
-
-  let match: RegExpExecArray | null = null;
-  let lastMatch: RegExpExecArray | null = null;
-
-  while ((match = re.exec(buf)) !== null) {
-    lastMatch = match; // keep the last one if multiple blocks appear
-  }
-
-  if (!lastMatch) {
-    // nothing found -> leave as-is
-    return { clean: buf };
-  }
-
-  const fullSpan = lastMatch[0];
-  const payload = lastMatch[1] ?? "";
-
-  let parsed: RunJson | undefined;
-  try {
-    parsed = JSON.parse(payload) as RunJson;
-  } catch {
-    // if JSON parse fails, still strip the span from the clean text
-  }
-
-  // Remove exactly the matched span (not all occurrences).
-  const startIdx = (lastMatch.index as number);
-  const endIdx = startIdx + fullSpan.length;
-  const clean = buf.slice(0, startIdx) + buf.slice(endIdx);
-
-  // Flatten if we have stats
-  let flat: GenMetrics | undefined;
-  const s = parsed?.stats;
-  if (s) {
-    flat = {
-      ttft_ms:
-        s.timeToFirstTokenSec != null
-          ? Math.max(0, s.timeToFirstTokenSec) * 1000
-          : null,
-      tok_per_sec: s.tokensPerSecond ?? null,
-      output_tokens: s.predictedTokensCount ?? null,
-      input_tokens_est: s.promptTokensCount ?? null,
-      total_tokens_est: s.totalTokensCount ?? null,
-      stop_reason: s.stopReason ?? null,
-    };
-  }
-
-  return { clean, json: parsed, flat };
-}
-
-// For one-shot responses (e.g., title bot)
-export function stripRunJson(raw: string): {
-  text: string;
-  json?: RunJson;
-  flat?: GenMetrics;
-} {
-  const { clean, json, flat } = extractRunJsonFromBuffer(raw);
-  return { text: clean, json, flat };
-}
-
-// (kept exports for any external references)
-export { MET_START as MET_START_TAG, MET_END as MET_END_TAG };
-
-# ===== frontend/src/file_read/shared/lib/text.ts =====
-
-export function firstLineSmart(s: string, max = 48): string {
-  const one = s.replace(/\s+/g, " ").trim();
-  return one.length <= max ? one : one.slice(
+    const id = crypto.
