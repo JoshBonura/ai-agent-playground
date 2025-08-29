@@ -215,6 +215,7 @@ export default function AgentRunner() {
                   onRefreshChats={() => setRefreshKey((k) => k + 1)}
                   onDeleteMessages={handleDeleteMessages}
                   autoFollow={autoFollow}
+                  sessionId={chat.sessionIdRef.current} // ⬅️ this enables per-chat uploads
                 />
               </div>
               <Toast message={toast} />

@@ -1,4 +1,213 @@
-     )}
+tle_raw = await asyncio.to_thread(_make_title, llm, src)
+        except Exception as e:
+            logging.exception("retitle: LLM error: %s", e)
+            return
+        finally:
+            try:
+                llm.reset()
+            except Exception:
+                pass
+
+    # Optional sanitize (fully controlled by settings)
+    if bool(S("retitle_enable_sanitize")):
+        title = _sanitize_title(title_raw)
+    else:
+        title = title_raw
+
+    print(f"[retitle] FINISH session={session_id} -> {title!r}")
+
+    if not title:
+        return
+
+    # write only if changed
+    idx = load_index()
+    row = next((r for r in idx if r.get("sessionId") == session_id), None)
+    if not row:
+        return
+    if (row.get("title") or "").strip() == title:
+        return
+
+    row["title"] = title
+    row["updatedAt"] = now_iso()
+    save_index(idx)
+
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
+    """Coalesced enqueue; last-write-wins per session, with a seq watermark."""
+    if not session_id:
+        return
+    if not isinstance(messages, list):
+        messages = []
+    # infer watermark if not provided (max message id)
+    if job_seq is None:
+        try:
+            job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
+        except Exception:
+            job_seq = 0
+
+    snap = {"messages": messages, "job_seq": int(job_seq)}
+
+    async def _put():
+        async with _lock:
+            _PENDING[session_id] = snap  # overwrite older snapshot
+            if session_id not in _ENQUEUED:
+                _ENQUEUED.add(session_id)
+                try:
+                    _queue.put_nowait(session_id)
+                except Exception as e:
+                    logging.warning(f"Failed to enqueue retitle: {e}")
+
+    # enqueue can be called from sync contexts; schedule safely
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_put())
+    except RuntimeError:
+        # no running loop (unlikely here); run a temporary loop
+        asyncio.run(_put())
+
+# ===== frontend/src/file_read/App.tsx =====
+
+
+import AgentRunner from "./pages/AgentRunner";
+
+export default function App() {
+  return (
+    <main className="bg-gray-50 min-h-screen">
+      <AgentRunner />
+    </main>
+  );
+}
+
+# ===== frontend/src/file_read/components/AssistantMetrics.tsx =====
+
+// frontend/src/file_read/components/chat/AssistantMetrics.tsx
+import { Info } from "lucide-react";
+import MetricsHoverCard from "./MetricsHoverCard";
+import type { RunJson, GenMetrics } from "../shared/lib/runjson";
+
+export default function AssistantMetrics({
+  status,
+  runJson,
+  flat,
+  align = "right",
+}: { status: string; runJson?: RunJson | null; flat?: GenMetrics | null; align?: "left" | "right" }) {
+  return (
+    <div className="mt-2 flex justify-start">
+      <div className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-white border shadow-sm text-[11px] text-gray-600">
+        <Info className="w-3.5 h-3.5 opacity-70" />
+        <span className="truncate max-w-[70vw] sm:max-w-none">{status || "Run details"}</span>
+        <MetricsHoverCard
+          data={
+            runJson ??
+            (flat
+              ? {
+                  stats: {
+                    stopReason: flat.stop_reason ?? null,
+                    tokensPerSecond: flat.tok_per_sec ?? null,
+                    timeToFirstTokenSec: flat.ttft_ms != null ? Math.max(0, flat.ttft_ms) / 1000 : null,
+                    totalTimeSec: null,
+                    promptTokensCount: flat.input_tokens_est ?? null,
+                    predictedTokensCount: flat.output_tokens ?? null,
+                    totalTokensCount: flat.total_tokens_est ?? null,
+                  },
+                }
+              : null)
+          }
+          title="Run JSON"
+          align={align}
+          compact
+        />
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatBubble.tsx =====
+
+import { useState } from "react";
+import { Copy, Check, Trash2 } from "lucide-react";
+import MarkdownMessage from "./Markdown/MarkdownMessage";
+
+const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
+
+export default function ChatBubble({
+  role,
+  text,
+  showActions = true, // NEW: parent decides when to show the toolbar
+  onDelete,
+}: {
+  role: "user" | "assistant";
+  text: string;
+  showActions?: boolean;
+  onDelete?: () => void;
+}) {
+  const isUser = role === "user";
+  const content = text?.trim() ?? "";
+  if (role === "assistant" && !content) return null;
+
+  // Never show the decorative stop line in assistant bubbles
+  const display = isUser ? content : content.replace(STOP_SENTINEL_RE, "");
+
+  const [copiedMsg, setCopiedMsg] = useState(false);
+
+  const copyWholeMessage = async () => {
+    try {
+      await navigator.clipboard.writeText(display);
+      setCopiedMsg(true);
+      setTimeout(() => setCopiedMsg(false), 2000);
+    } catch {}
+  };
+
+  return (
+    <div className="mb-2">
+      {/* Bubble */}
+      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+        <div
+          className={`max-w-[80%] w-fit break-words rounded-2xl px-4 py-2 shadow-sm
+                      prose prose-base max-w-none
+            ${isUser ? "bg-black text-white prose-invert" : "bg-white border text-gray-900"}`}
+          style={{ wordBreak: "break-word" }}
+        >
+          <div className="max-w-full">
+            <MarkdownMessage text={display} />
+          </div>
+        </div>
+      </div>
+
+      {/* Under-bubble toolbar (icon-only) */}
+      {showActions && (
+        <div className={`mt-1 flex ${isUser ? "justify-end" : "justify-start"}`}>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={copyWholeMessage}
+              title={copiedMsg ? "Copied" : "Copy"}
+              aria-label={copiedMsg ? "Copied" : "Copy message"}
+              className="inline-flex items-center justify-center w-7 h-7 rounded border
+                         bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
+            >
+              {copiedMsg ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+            </button>
+
+            {/* Delete for BOTH roles when provided */}
+            {onDelete && (
+              <button
+                type="button"
+                onClick={onDelete}
+                title="Delete message"
+                aria-label="Delete message"
+                className="inline-flex items-center justify-center w-7 h-7 rounded border
+                           bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2939,225 +3148,3 @@ export function useSidebar() {
 
 # ===== frontend/src/file_read/hooks/useStream.ts =====
 
-// frontend/src/file_read/hooks/useStream.ts
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMsg } from "../types/chat";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-import { createStreamController } from "./stream/core/controller";
-
-type UseStreamDeps = {
-  // not read directly; keeps memo deps stable
-  messages: ChatMsg[];
-
-  // message state per session
-  setMessagesForSession: (
-    sid: string,
-    updater: (prev: ChatMsg[]) => ChatMsg[]
-  ) => void;
-  getMessagesForSession: (sid: string) => ChatMsg[];
-
-  // ui
-  setInput: (v: string) => void;
-
-  // session plumbing
-  sessionId: () => string;
-  ensureChatCreated: () => Promise<void>;
-  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
-
-  // per-session flags/metrics
-  setLoadingForSession: (sid: string, v: boolean) => void;
-  setQueuedForSession?: (sid: string, v: boolean) => void;
-  setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-  setMetricsFallbackForSession: (sid: string, reason: string, partialOut: string) => void;
-  resetMetricsForSession: (sid: string) => void;
-};
-
-export function useStream({
-  setMessagesForSession,
-  getMessagesForSession,
-  setInput,
-  sessionId,
-  ensureChatCreated,
-  onRetitle,
-  setLoadingForSession,
-  setQueuedForSession,
-  setMetricsForSession,
-  setMetricsFallbackForSession,
-  resetMetricsForSession,
-}: UseStreamDeps) {
-  const [loading, setLoading] = useState(false);
-  const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
-
-  // Build the controller once; it manages its own queue + aborts.
-  const controller = useMemo(() => {
-    return createStreamController({
-      // message access
-      getMessagesFor: (sid) => getMessagesForSession(sid),
-      setMessagesFor: (sid, updater) => setMessagesForSession(sid, updater),
-
-      // ui hooks
-      setInput: () => setInput(""),
-      setLoadingFor: (sid, v) => {
-        if (sid === sessionId()) setLoading(v);
-        setLoadingForSession(sid, v);
-      },
-      setQueuedFor: setQueuedForSession ?? (() => {}),
-
-      // metrics
-      setMetricsFor: (sid, json, flat) => setMetricsForSession(sid, json, flat),
-      setMetricsFallbackFor: (sid, reason, out) =>
-        setMetricsFallbackForSession(sid, reason, out),
-
-      // NEW: patch server id onto a bubble identified by clientId
-      setServerIdFor: (sid, clientId, serverId) => {
-        setMessagesForSession(sid, (prev) =>
-          prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
-        );
-      },
-
-      // session plumbing
-      getSessionId: sessionId,
-      ensureChatCreated,
-      onRetitle,
-      resetMetricsFor: (sid) => resetMetricsForSession(sid),
-    });
-    // Intentionally stable: controller owns its own lifecycle.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    controllerRef.current = controller;
-    return () => controllerRef.current?.dispose();
-  }, [controller]);
-
-  async function send(override?: string) {
-    const text = (override ?? "").trim();
-    if (!text) return;
-    await controller.send(text);
-  }
-
-  async function stop() {
-    await controller.stop();
-  }
-
-  async function cancelBySessionId(sid: string) {
-    await controller.cancelBySessionId(sid);
-  }
-
-  return { loading, send, stop, cancelBySessionId };
-}
-
-# ===== frontend/src/file_read/hooks/useTheme.ts =====
-
-// frontend/src/file_read/hooks/useTheme.ts
-import { useEffect, useState } from "react";
-
-type Theme = "light" | "dark";
-const KEY = "theme";
-
-export function useTheme() {
-  const [theme, setTheme] = useState<Theme>(() => {
-    const saved = (localStorage.getItem(KEY) as Theme) || null;
-    if (saved) return saved;
-    const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
-    return prefersDark ? "dark" : "light";
-  });
-
-  useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "dark") root.classList.add("dark");
-    else root.classList.remove("dark");
-    localStorage.setItem(KEY, theme);
-  }, [theme]);
-
-  const toggle = () => setTheme(t => (t === "dark" ? "light" : "dark"));
-  return { theme, toggle };
-}
-
-# ===== frontend/src/file_read/hooks/useToast.ts =====
-
-import { useState } from "react";
-
-export function useToast() {
-  const [toast, setToast] = useState<string | null>(null);
-  function show(msg: string, ms = 1800) {
-    setToast(msg);
-    window.clearTimeout((show as any)._t);
-    (show as any)._t = window.setTimeout(() => setToast(null), ms);
-  }
-  return { toast, show };
-}
-
-# ===== frontend/src/file_read/index.css =====
-
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-# ===== frontend/src/file_read/main.tsx =====
-
-import { StrictMode } from 'react'
-import './index.css';
-import { createRoot } from 'react-dom/client'
-import App from './App.tsx'
-
-
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-
-# ===== frontend/src/file_read/pages/AgentRunner.tsx =====
-
-// frontend/src/file_read/pages/AgentRunner.tsx
-import { useEffect, useState } from "react";
-import ChatContainer from "../components/ChatContainer";
-import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
-import { useChatStream } from "../hooks/useChatStream";
-import { useSidebar } from "../hooks/useSidebar";
-import { useToast } from "../hooks/useToast";
-import DesktopHeader from "../components/DesktopHeader";
-import MobileDrawer from "../components/MobileDrawer";
-import Toast from "../shared/ui/Toast";
-import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
-
-// NEW: settings panel
-import SettingsPanel from "../components/SettingsPanel";
-import KnowledgePanel from "../components/KnowledgePanel";
-
-const PAGE_SIZE = 30;
-const LS_KEY = "lastSessionId";
-
-export default function AgentRunner() {
-  const chat = useChatStream();
-  const [showKnowledge, setShowKnowledge] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
-  const [autoFollow, setAutoFollow] = useState(true);
-  const { toast, show } = useToast();
-  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
-
-  // NEW: settings modal
-  const [showSettings, setShowSettings] = useState(false);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const ceil = new Date().toISOString();
-        const page = await listChatsPage(0, PAGE_SIZE, ceil);
-        const saved = localStorage.getItem(LS_KEY) || "";
-        const targetId =
-          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
-          page.content[0]?.sessionId ||
-          "";
-        if (targetId) {
-          await chat.loadHistory(targetId);
-          localStorage.setItem(LS_KEY, targetId);
-        }
-      } catch {}
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function newChat(): Promise<void> {
-    const id = crypto.

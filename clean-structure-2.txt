@@ -1,4 +1,110 @@
-          s = chunk_bytes.decode("utf-8", errors="ignore")
+ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
+    lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
+
+    # ---------------------- WEB INJECT (optional) ----------------------
+    t0 = time.perf_counter()
+    print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
+    try:
+        block = None
+        router_text = _compose_router_text(
+            st.get("recent", []),
+            str(latest_user_text or ""),
+            st.get("summary", "") or "",
+            tail_turns=int(eff["router_tail_turns"]),
+            summary_chars=int(eff["router_summary_chars"]),
+            max_chars=int(eff["router_max_chars"]),
+        )
+
+        if auto_web:
+            block = await decide_web_and_fetch(llm, router_text, k=web_k)
+
+        print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
+
+        if block:
+            st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
+                {
+                    "role": "assistant",
+                    "content": eff["web_block_preamble"] + "\n\n" + block,
+                }
+            ]
+            types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
+            print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
+
+        dt = time.perf_counter() - t0
+        eph_cnt = len(st.get("_ephemeral_web") or [])
+        print(f"[{_now()}] GEN web_inject END   session={session_id} elapsed={dt:.3f}s ephemeral_blocks={eph_cnt}")
+    except Exception as e:
+        dt = time.perf_counter() - t0
+        print(f"[{_now()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
+
+    # ---------------------- PACK (with ephemeral web) ----------------------
+    system_text = build_system_text()
+
+    ephemeral_once = st.pop("_ephemeral_web", [])
+    packed, st["summary"], _ = pack_with_rollup(
+        system_text=system_text,
+        summary=st["summary"],
+        recent=st["recent"],
+        max_ctx=model_ctx,
+        out_budget=out_budget_req,
+        ephemeral=ephemeral_once,
+    )
+
+    # ---------------------- RAG ROUTER (LLM JSON) ----------------------
+    rag_need = False
+    rag_query: Optional[str] = None
+    try:
+        rag_need, rag_query = decide_rag(llm, router_text)
+        print(f"[{_now()}] RAG ROUTER need={rag_need} query={rag_query!r}")
+    except Exception as e:
+        print(f"[{_now()}] RAG ROUTER ERROR {type(e).__name__}: {e}")
+        rag_need = bool(SETTINGS.effective().get("rag_default_need_when_invalid", False))
+        rag_query = None
+
+    # If a web block was injected OR RAG router said no, skip RAG
+    skip_rag = bool(ephemeral_once) or (not rag_need)
+
+    # Optionally pass LLM-refined query to RAG
+    packed = maybe_inject_rag_block(
+        packed,
+        session_id=session_id,
+        skip_rag=skip_rag,
+        rag_query=rag_query,
+    )
+
+    # ---------------------- STREAM SETUP ----------------------
+    packed_chars = _chars_len(packed)
+    print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
+
+    _dump_full_prompt(
+        packed,
+        params={
+            "requested_out": out_budget_req,
+            "temperature": temperature,
+            "top_p": top_p,
+        },
+        session_id=session_id,
+    )
+
+    persist_summary(session_id, st["summary"])
+
+    out_budget, input_tokens_est = clamp_out_budget(
+        llm=llm, messages=packed, requested_out=out_budget_req, margin=int(eff["clamp_margin"])
+    )
+    print(f"[{_now()}] GEN clamp_out_budget  session={session_id} out_budget={out_budget} input_tokens_est={input_tokens_est}")
+
+    stop_ev = cancel_event(session_id)
+    stop_ev.clear()
+
+    async def streamer() -> AsyncGenerator[bytes, None]:
+        async with GEN_SEMAPHORE:
+            mark_active(session_id, +1)
+            out_buf = bytearray()
+
+            def _accum_visible(chunk_bytes: bytes):
+                if not chunk_bytes:
+                    return
+                s = chunk_bytes.decode("utf-8", errors="ignore")
                 if RUNJSON_START in s and RUNJSON_END in s:
                     return
                 if s.strip() == eff["stopped_line_marker"]:
@@ -941,12 +1047,9 @@ __all__ = [
   "stream_emit_stopped_line": true,
   "stream_producer_join_timeout_sec": 2.0,
   "runjson_emit": true,
-  "excel_emit_cells": true,
+  "excel_emit_cells": false,
   "excel_max_cells_per_sheet": 250,
-  "excel_max_rows_per_table": 30,
-  "excel_max_formulas_per_sheet": 250,
-  "excel_named_range_preview": 8,
-  "excel_emit_tables": true,
+  "excel_named_range_preview": 6,
   "excel_emit_merged": true,
   "excel_number_sigfigs": 6,
   "excel_decimal_max_places": 4,
@@ -955,7 +1058,29 @@ __all__ = [
   "excel_time_precision": "minute",
   "excel_value_max_chars": 160,
   "excel_quote_strings": true,
-  "excel_include_formulas": false
+  "excel_infer_max_rows": 50,
+  "excel_infer_max_cols": 26,
+  "excel_infer_min_header_fill_ratio": 0.5,
+  "excel_emit_key_values": true,
+  "excel_header_normalize": true,
+ "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
+  "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
+  "router_rag_trim_whitespace": true,
+  "router_rag_strip_wrappers_enabled": true,
+  "router_rag_strip_split_on_blank": true,
+  "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
+  "router_rag_decide_max_tokens": 300,
+  "router_rag_decide_temperature": 0.0,
+  "router_rag_decide_top_p": 1.0,
+  "router_rag_decide_stop": [
+    "\n\n"
+  ],
+  "router_rag_default_need_when_invalid": false,
+  "csv_value_max_chars": 160,
+"csv_quote_strings": true,
+"csv_header_normalize": true,
+"csv_infer_max_rows": 50,
+"csv_infer_max_cols": 26
 }
 
 # ===== aimodel/file_read/store/effective_settings.json =====
@@ -1221,12 +1346,9 @@ __all__ = [
   "stream_emit_stopped_line": true,
   "stream_producer_join_timeout_sec": 2.0,
   "runjson_emit": true,
-  "excel_emit_cells": true,
+  "excel_emit_cells": false,
   "excel_max_cells_per_sheet": 250,
-  "excel_max_rows_per_table": 30,
-  "excel_max_formulas_per_sheet": 250,
-  "excel_named_range_preview": 8,
-  "excel_emit_tables": true,
+  "excel_named_range_preview": 6,
   "excel_emit_merged": true,
   "excel_number_sigfigs": 6,
   "excel_decimal_max_places": 4,
@@ -1235,7 +1357,29 @@ __all__ = [
   "excel_time_precision": "minute",
   "excel_value_max_chars": 160,
   "excel_quote_strings": true,
-  "excel_include_formulas": false
+  "excel_infer_max_rows": 50,
+  "excel_infer_max_cols": 26,
+  "excel_infer_min_header_fill_ratio": 0.5,
+  "excel_emit_key_values": true,
+  "excel_header_normalize": true,
+  "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
+  "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
+  "router_rag_trim_whitespace": true,
+  "router_rag_strip_wrappers_enabled": true,
+  "router_rag_strip_split_on_blank": true,
+  "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
+  "router_rag_decide_max_tokens": 300,
+  "router_rag_decide_temperature": 0.0,
+  "router_rag_decide_top_p": 1.0,
+  "router_rag_decide_stop": [
+    "\n\n"
+  ],
+  "router_rag_default_need_when_invalid": false,
+  "csv_value_max_chars": 160,
+  "csv_quote_strings": true,
+  "csv_header_normalize": true,
+  "csv_infer_max_rows": 50,
+  "csv_infer_max_cols": 26
 }
 
 # ===== aimodel/file_read/store/index.py =====
@@ -2636,213 +2780,4 @@ async def _process_session(session_id: str):
     async with GEN_SEMAPHORE:
         llm = get_llm()
         try:
-            title_raw = await asyncio.to_thread(_make_title, llm, src)
-        except Exception as e:
-            logging.exception("retitle: LLM error: %s", e)
-            return
-        finally:
-            try:
-                llm.reset()
-            except Exception:
-                pass
-
-    # Optional sanitize (fully controlled by settings)
-    if bool(S("retitle_enable_sanitize")):
-        title = _sanitize_title(title_raw)
-    else:
-        title = title_raw
-
-    print(f"[retitle] FINISH session={session_id} -> {title!r}")
-
-    if not title:
-        return
-
-    # write only if changed
-    idx = load_index()
-    row = next((r for r in idx if r.get("sessionId") == session_id), None)
-    if not row:
-        return
-    if (row.get("title") or "").strip() == title:
-        return
-
-    row["title"] = title
-    row["updatedAt"] = now_iso()
-    save_index(idx)
-
-
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
-def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
-    """Coalesced enqueue; last-write-wins per session, with a seq watermark."""
-    if not session_id:
-        return
-    if not isinstance(messages, list):
-        messages = []
-    # infer watermark if not provided (max message id)
-    if job_seq is None:
-        try:
-            job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
-        except Exception:
-            job_seq = 0
-
-    snap = {"messages": messages, "job_seq": int(job_seq)}
-
-    async def _put():
-        async with _lock:
-            _PENDING[session_id] = snap  # overwrite older snapshot
-            if session_id not in _ENQUEUED:
-                _ENQUEUED.add(session_id)
-                try:
-                    _queue.put_nowait(session_id)
-                except Exception as e:
-                    logging.warning(f"Failed to enqueue retitle: {e}")
-
-    # enqueue can be called from sync contexts; schedule safely
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_put())
-    except RuntimeError:
-        # no running loop (unlikely here); run a temporary loop
-        asyncio.run(_put())
-
-# ===== frontend/src/file_read/App.tsx =====
-
-
-import AgentRunner from "./pages/AgentRunner";
-
-export default function App() {
-  return (
-    <main className="bg-gray-50 min-h-screen">
-      <AgentRunner />
-    </main>
-  );
-}
-
-# ===== frontend/src/file_read/components/AssistantMetrics.tsx =====
-
-// frontend/src/file_read/components/chat/AssistantMetrics.tsx
-import { Info } from "lucide-react";
-import MetricsHoverCard from "./MetricsHoverCard";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-
-export default function AssistantMetrics({
-  status,
-  runJson,
-  flat,
-  align = "right",
-}: { status: string; runJson?: RunJson | null; flat?: GenMetrics | null; align?: "left" | "right" }) {
-  return (
-    <div className="mt-2 flex justify-start">
-      <div className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-white border shadow-sm text-[11px] text-gray-600">
-        <Info className="w-3.5 h-3.5 opacity-70" />
-        <span className="truncate max-w-[70vw] sm:max-w-none">{status || "Run details"}</span>
-        <MetricsHoverCard
-          data={
-            runJson ??
-            (flat
-              ? {
-                  stats: {
-                    stopReason: flat.stop_reason ?? null,
-                    tokensPerSecond: flat.tok_per_sec ?? null,
-                    timeToFirstTokenSec: flat.ttft_ms != null ? Math.max(0, flat.ttft_ms) / 1000 : null,
-                    totalTimeSec: null,
-                    promptTokensCount: flat.input_tokens_est ?? null,
-                    predictedTokensCount: flat.output_tokens ?? null,
-                    totalTokensCount: flat.total_tokens_est ?? null,
-                  },
-                }
-              : null)
-          }
-          title="Run JSON"
-          align={align}
-          compact
-        />
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatBubble.tsx =====
-
-import { useState } from "react";
-import { Copy, Check, Trash2 } from "lucide-react";
-import MarkdownMessage from "./Markdown/MarkdownMessage";
-
-const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
-
-export default function ChatBubble({
-  role,
-  text,
-  showActions = true, // NEW: parent decides when to show the toolbar
-  onDelete,
-}: {
-  role: "user" | "assistant";
-  text: string;
-  showActions?: boolean;
-  onDelete?: () => void;
-}) {
-  const isUser = role === "user";
-  const content = text?.trim() ?? "";
-  if (role === "assistant" && !content) return null;
-
-  // Never show the decorative stop line in assistant bubbles
-  const display = isUser ? content : content.replace(STOP_SENTINEL_RE, "");
-
-  const [copiedMsg, setCopiedMsg] = useState(false);
-
-  const copyWholeMessage = async () => {
-    try {
-      await navigator.clipboard.writeText(display);
-      setCopiedMsg(true);
-      setTimeout(() => setCopiedMsg(false), 2000);
-    } catch {}
-  };
-
-  return (
-    <div className="mb-2">
-      {/* Bubble */}
-      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-        <div
-          className={`max-w-[80%] w-fit break-words rounded-2xl px-4 py-2 shadow-sm
-                      prose prose-base max-w-none
-            ${isUser ? "bg-black text-white prose-invert" : "bg-white border text-gray-900"}`}
-          style={{ wordBreak: "break-word" }}
-        >
-          <div className="max-w-full">
-            <MarkdownMessage text={display} />
-          </div>
-        </div>
-      </div>
-
-      {/* Under-bubble toolbar (icon-only) */}
-      {showActions && (
-        <div className={`mt-1 flex ${isUser ? "justify-end" : "justify-start"}`}>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={copyWholeMessage}
-              title={copiedMsg ? "Copied" : "Copy"}
-              aria-label={copiedMsg ? "Copied" : "Copy message"}
-              className="inline-flex items-center justify-center w-7 h-7 rounded border
-                         bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
-            >
-              {copiedMsg ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-            </button>
-
-            {/* Delete for BOTH roles when provided */}
-            {onDelete && (
-              <button
-                type="button"
-                onClick={onDelete}
-                title="Delete message"
-                aria-label="Delete message"
-                className="inline-flex items-center justify-center w-7 h-7 rounded border
-                           bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            )}
-          </div>
-        </div>
- 
+            ti

@@ -1,4 +1,225 @@
-randomUUID();
+// frontend/src/file_read/hooks/useStream.ts
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ChatMsg } from "../types/chat";
+import type { RunJson, GenMetrics } from "../shared/lib/runjson";
+import { createStreamController } from "./stream/core/controller";
+
+type UseStreamDeps = {
+  // not read directly; keeps memo deps stable
+  messages: ChatMsg[];
+
+  // message state per session
+  setMessagesForSession: (
+    sid: string,
+    updater: (prev: ChatMsg[]) => ChatMsg[]
+  ) => void;
+  getMessagesForSession: (sid: string) => ChatMsg[];
+
+  // ui
+  setInput: (v: string) => void;
+
+  // session plumbing
+  sessionId: () => string;
+  ensureChatCreated: () => Promise<void>;
+  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
+
+  // per-session flags/metrics
+  setLoadingForSession: (sid: string, v: boolean) => void;
+  setQueuedForSession?: (sid: string, v: boolean) => void;
+  setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMetricsFallbackForSession: (sid: string, reason: string, partialOut: string) => void;
+  resetMetricsForSession: (sid: string) => void;
+};
+
+export function useStream({
+  setMessagesForSession,
+  getMessagesForSession,
+  setInput,
+  sessionId,
+  ensureChatCreated,
+  onRetitle,
+  setLoadingForSession,
+  setQueuedForSession,
+  setMetricsForSession,
+  setMetricsFallbackForSession,
+  resetMetricsForSession,
+}: UseStreamDeps) {
+  const [loading, setLoading] = useState(false);
+  const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
+
+  // Build the controller once; it manages its own queue + aborts.
+  const controller = useMemo(() => {
+    return createStreamController({
+      // message access
+      getMessagesFor: (sid) => getMessagesForSession(sid),
+      setMessagesFor: (sid, updater) => setMessagesForSession(sid, updater),
+
+      // ui hooks
+      setInput: () => setInput(""),
+      setLoadingFor: (sid, v) => {
+        if (sid === sessionId()) setLoading(v);
+        setLoadingForSession(sid, v);
+      },
+      setQueuedFor: setQueuedForSession ?? (() => {}),
+
+      // metrics
+      setMetricsFor: (sid, json, flat) => setMetricsForSession(sid, json, flat),
+      setMetricsFallbackFor: (sid, reason, out) =>
+        setMetricsFallbackForSession(sid, reason, out),
+
+      // NEW: patch server id onto a bubble identified by clientId
+      setServerIdFor: (sid, clientId, serverId) => {
+        setMessagesForSession(sid, (prev) =>
+          prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
+        );
+      },
+
+      // session plumbing
+      getSessionId: sessionId,
+      ensureChatCreated,
+      onRetitle,
+      resetMetricsFor: (sid) => resetMetricsForSession(sid),
+    });
+    // Intentionally stable: controller owns its own lifecycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    controllerRef.current = controller;
+    return () => controllerRef.current?.dispose();
+  }, [controller]);
+
+  async function send(override?: string) {
+    const text = (override ?? "").trim();
+    if (!text) return;
+    await controller.send(text);
+  }
+
+  async function stop() {
+    await controller.stop();
+  }
+
+  async function cancelBySessionId(sid: string) {
+    await controller.cancelBySessionId(sid);
+  }
+
+  return { loading, send, stop, cancelBySessionId };
+}
+
+# ===== frontend/src/file_read/hooks/useTheme.ts =====
+
+// frontend/src/file_read/hooks/useTheme.ts
+import { useEffect, useState } from "react";
+
+type Theme = "light" | "dark";
+const KEY = "theme";
+
+export function useTheme() {
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = (localStorage.getItem(KEY) as Theme) || null;
+    if (saved) return saved;
+    const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") root.classList.add("dark");
+    else root.classList.remove("dark");
+    localStorage.setItem(KEY, theme);
+  }, [theme]);
+
+  const toggle = () => setTheme(t => (t === "dark" ? "light" : "dark"));
+  return { theme, toggle };
+}
+
+# ===== frontend/src/file_read/hooks/useToast.ts =====
+
+import { useState } from "react";
+
+export function useToast() {
+  const [toast, setToast] = useState<string | null>(null);
+  function show(msg: string, ms = 1800) {
+    setToast(msg);
+    window.clearTimeout((show as any)._t);
+    (show as any)._t = window.setTimeout(() => setToast(null), ms);
+  }
+  return { toast, show };
+}
+
+# ===== frontend/src/file_read/index.css =====
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+# ===== frontend/src/file_read/main.tsx =====
+
+import { StrictMode } from 'react'
+import './index.css';
+import { createRoot } from 'react-dom/client'
+import App from './App.tsx'
+
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+# ===== frontend/src/file_read/pages/AgentRunner.tsx =====
+
+// frontend/src/file_read/pages/AgentRunner.tsx
+import { useEffect, useState } from "react";
+import ChatContainer from "../components/ChatContainer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
+import { useChatStream } from "../hooks/useChatStream";
+import { useSidebar } from "../hooks/useSidebar";
+import { useToast } from "../hooks/useToast";
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import Toast from "../shared/ui/Toast";
+import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
+
+// NEW: settings panel
+import SettingsPanel from "../components/SettingsPanel";
+import KnowledgePanel from "../components/KnowledgePanel";
+
+const PAGE_SIZE = 30;
+const LS_KEY = "lastSessionId";
+
+export default function AgentRunner() {
+  const chat = useChatStream();
+  const [showKnowledge, setShowKnowledge] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [autoFollow, setAutoFollow] = useState(true);
+  const { toast, show } = useToast();
+  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
+
+  // NEW: settings modal
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const ceil = new Date().toISOString();
+        const page = await listChatsPage(0, PAGE_SIZE, ceil);
+        const saved = localStorage.getItem(LS_KEY) || "";
+        const targetId =
+          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
+          page.content[0]?.sessionId ||
+          "";
+        if (targetId) {
+          await chat.loadHistory(targetId);
+          localStorage.setItem(LS_KEY, targetId);
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function newChat(): Promise<void> {
+    const id = crypto.randomUUID();
     chat.setSessionId(id);
     try { await createChat(id, "New Chat"); } catch {}
     localStorage.setItem(LS_KEY, id);

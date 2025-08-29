@@ -1,11 +1,11 @@
 # aimodel/file_read/api/rag.py
 from __future__ import annotations
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from typing import Optional, List
+from typing import Optional, List, Dict
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from threading import RLock
-
+from ..rag.uploads import list_sources as rag_list_sources, hard_delete_source
 from ..rag.schemas import SearchReq, SearchHit
 from ..rag.ingest import sniff_and_extract, chunk_text, build_metas
 from ..rag.store import add_vectors, search_vectors
@@ -74,10 +74,7 @@ async def search(req: SearchReq):
 
 @router.get("/list")
 async def list_items(sessionId: Optional[str] = None, k: int = 20):
-    """
-    Debug: show a lightweight list of stored chunks for a session (or global if sessionId is None).
-    Returns id/source/score and a short text preview so you can verify ingestion.
-    """
+
     qv = np.array(_embed(["list"])[0], dtype="float32")
     hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
 
@@ -116,3 +113,24 @@ async def dump_items(sessionId: Optional[str] = None, k: int = 50):
         })
     print(f"[RAG DUMP] sessionId={sessionId} k={k} -> {len(chunks)} items")
     return {"chunks": chunks}
+
+@router.get("/uploads")
+async def api_list_uploads(sessionId: Optional[str] = None, scope: str = "all"):
+    include_global = scope != "session"
+    return {"uploads": rag_list_sources(sessionId, include_global=include_global)}
+
+@router.post("/uploads/delete-hard")
+async def api_delete_upload_hard(body: dict[str, str]):
+    source = (body.get("source") or "").strip()
+    session_id = (body.get("sessionId") or None)
+    if not source:
+        return {"error": "source required"}
+
+    # use the same model as ingest/search
+    model = _get_st_model()  # you already have this in rag.py
+    def _embed(texts: List[str]):
+        arr = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        return arr.astype("float32")
+
+    out = hard_delete_source(source, session_id=session_id, embedder=_embed)
+    return out

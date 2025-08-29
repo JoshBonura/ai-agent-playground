@@ -1,6 +1,11 @@
-// frontend/src/file_read/components/KnowledgePanel.tsx
-import { useState } from "react";
-import { uploadRag, searchRag } from "../data/ragApi";
+import { useState, useEffect } from "react";
+import {
+  uploadRag,
+  searchRag,
+  listUploads,
+  deleteUploadHard,
+  type UploadRow,
+} from "../data/ragApi";
 
 export default function KnowledgePanel({
   sessionId,
@@ -17,32 +22,55 @@ export default function KnowledgePanel({
   const [hits, setHits] = useState<{ text: string; source?: string; score: number }[]>([]);
   const [searching, setSearching] = useState(false);
 
-async function doUpload() {
-  console.log("[KnowledgePanel] doUpload clicked", files);
+  const [scope, setScope] = useState<"all" | "session">("all");
+  const [uploads, setUploads] = useState<UploadRow[]>([]);
+  const [loadingUploads, setLoadingUploads] = useState(false);
 
-  if (!files || !files.length) {
-    console.warn("[KnowledgePanel] no files selected");
-    return;
-  }
+  useEffect(() => {
+    void refreshUploads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, sessionId]);
 
-  setBusy(true);
-  try {
-    let total = 0;
-    for (const f of Array.from(files)) {
-      console.log("[KnowledgePanel] uploading", f.name, f.size);
-      const out = await uploadRag(f, undefined);
-      console.log("[KnowledgePanel] result", out);
-      total += out.added || 0;
+  async function refreshUploads() {
+    setLoadingUploads(true);
+    try {
+      const out = await listUploads(sessionId, scope);
+      setUploads(out.uploads || []);
+    } catch (e: any) {
+      toast?.(e?.message || "Failed to load uploads");
+    } finally {
+      setLoadingUploads(false);
     }
-    toast?.(`Added ${total} chunks`);
-    setFiles(null);
-  } catch (e: any) {
-    console.error("[KnowledgePanel] upload error", e);
-    toast?.(e?.message || "Upload failed");
-  } finally {
-    setBusy(false);
   }
-}
+
+  async function handleDeleteHard(source: string, ns?: string | null) {
+    try {
+      const res = await deleteUploadHard(source, ns ?? undefined);
+      toast?.(`Removed ${res.removed} chunk${res.removed === 1 ? "" : "s"}. Remaining: ${res.remaining}`);
+      await refreshUploads();
+    } catch (e: any) {
+      toast?.(e?.message || "Delete failed");
+    }
+  }
+
+  async function doUpload() {
+    if (!files || !files.length) return;
+    setBusy(true);
+    try {
+      let total = 0;
+      for (const f of Array.from(files)) {
+        const out = await uploadRag(f, undefined);
+        total += (out as any)?.added || 0;
+      }
+      toast?.(`Added ${total} chunk${total === 1 ? "" : "s"}`);
+      setFiles(null);
+      await refreshUploads();
+    } catch (e: any) {
+      toast?.(e?.message || "Upload failed");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function doSearch() {
     const q = query.trim();
@@ -60,7 +88,7 @@ async function doUpload() {
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
-      <div className="w-full max-w-3xl rounded-2xl bg-white shadow-xl border overflow-hidden">
+      <div className="w-full max-w-5xl rounded-2xl bg-white shadow-xl border overflow-hidden">
         <div className="px-4 py-3 border-b flex items-center gap-2">
           <div className="font-semibold">Knowledge</div>
           <div className="ml-auto flex items-center gap-2">
@@ -74,12 +102,7 @@ async function doUpload() {
           {/* Upload */}
           <div>
             <div className="font-medium mb-2">Upload documents</div>
-            <input
-              type="file"
-              multiple
-              className="block w-full text-sm"
-              onChange={(e) => setFiles(e.target.files)}
-            />
+            <input type="file" multiple className="block w-full text-sm" onChange={(e) => setFiles(e.target.files)} />
             <button
               className={`mt-2 text-sm px-3 py-1.5 rounded ${busy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"}`}
               disabled={busy || !files || files.length === 0}
@@ -88,7 +111,52 @@ async function doUpload() {
               {busy ? "Uploading…" : "Upload"}
             </button>
             <div className="text-[11px] text-gray-500 mt-2">
-              Tip: CSV, TXT, MD, PDF (extracted as text) — per-chat or global depending on active session.
+              Tip: CSV, TXT, MD, PDF (text extracted). Uploads can be global or per chat.
+            </div>
+
+            <div className="mt-6">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="font-medium">Your uploads</div>
+                <select
+                  className="ml-auto border rounded px-2 py-1 text-xs"
+                  value={scope}
+                  onChange={(e) => setScope(e.target.value as "all" | "session")}
+                  title="Scope"
+                >
+                  <option value="all">All (global + this chat)</option>
+                  <option value="session">This chat only</option>
+                </select>
+                <button
+                  className="text-xs px-2 py-1 rounded border hover:bg-gray-50"
+                  onClick={refreshUploads}
+                  disabled={loadingUploads}
+                >
+                  {loadingUploads ? "Refreshing…" : "Refresh"}
+                </button>
+              </div>
+
+              <ul className="space-y-2 max-h-64 overflow-auto">
+                {uploads.length === 0 && (
+                  <li className="text-xs text-gray-500">No uploads yet.</li>
+                )}
+                {uploads.map((u, i) => (
+                  <li key={`${u.source}-${u.sessionId ?? "global"}-${i}`} className="p-2 border rounded bg-gray-50">
+                    <div className="flex items-center gap-2">
+                      <div className="font-mono text-xs break-all">{u.source}</div>
+                      <span className="text-[11px] text-gray-500">
+                        {u.sessionId ? "session" : "global"} • {u.chunks} chunk{u.chunks === 1 ? "" : "s"}
+                      </span>
+                      <button
+                        className="ml-auto text-xs px-2 py-1 rounded border hover:bg-gray-100"
+                        title="Delete (hard delete by Source)"
+                        onClick={() => handleDeleteHard(u.source, u.sessionId ?? undefined)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
             </div>
           </div>
 
@@ -115,20 +183,18 @@ async function doUpload() {
               {hits.map((h, i) => (
                 <li key={i} className="p-2 border rounded bg-gray-50">
                   <div className="text-[11px] text-gray-500 mb-1">
-                    {h.source || "uploaded"} • score {h.score.toFixed(3)}
+                    {h.source || "uploaded"} • score {Number.isFinite(h.score) ? h.score.toFixed(3) : "—"}
                   </div>
                   <div className="text-sm whitespace-pre-wrap">{h.text}</div>
                 </li>
               ))}
-              {!hits.length && (
-                <li className="text-xs text-gray-500">No results yet.</li>
-              )}
+              {!hits.length && <li className="text-xs text-gray-500">No results yet.</li>}
             </ul>
           </div>
         </div>
 
         <div className="px-4 py-3 border-t text-[11px] text-gray-500">
-          When you chat, top results are injected automatically as “Local knowledge”.
+          “Delete” performs a hard delete: removes chunks for that Source and rebuilds the index.
         </div>
       </div>
     </div>

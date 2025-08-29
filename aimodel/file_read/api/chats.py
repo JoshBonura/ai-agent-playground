@@ -81,7 +81,7 @@ async def api_list_messages(session_id: str):
     rows = store_list_messages(session_id)
     return [asdict(r) for r in rows]
 
-# ✅ Single append route; triggers retitle only after assistant turn is persisted
+
 @router.post("/api/chats/{session_id}/messages")
 async def api_append_message(session_id: str, body: Dict[str, str]):
     role = (body.get("role") or "user").strip()
@@ -90,7 +90,6 @@ async def api_append_message(session_id: str, body: Dict[str, str]):
     row = store_append(session_id, role, content)
 
     if role == "assistant":
-        # Retitle should *not* see RUNJSON blobs
         try:
             msgs = store_list_messages(session_id)
             last_seq = max((int(m.id) for m in msgs), default=0)

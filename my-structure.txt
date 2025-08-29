@@ -283,6 +283,7 @@ ai-agent-playground/
         ingest/
           __init__.py
           common.py
+          csv_ingest.py
           excel_ingest.py
       runtime/
         __init__.py
@@ -304,22 +305,13 @@ ai-agent-playground/
         override_settings.json
         rag/
           by_session/
-            5d04ff6e-f4fd-4587-ba96-6971af4df6ff/
-            5e3d6d8e-592f-40bf-9533-4995d02a6956/
-            6d3f1cb1-7a1a-43f8-9a14-2ffaa8428237/
-            77920298-4be5-4e44-aad8-d94aee131691/
-            8be84e02-6db7-4d3b-9f14-7cbd70f4ad7d/
-            8d4666bb-246b-4681-9063-073c085571f8/
-            8d8dba9c-f492-4586-93d9-01d287d250b8/
-            9e454785-06a4-4caf-bf81-0f91f98dcd6d/
-            ac9c3945-ffd2-4ddf-86d0-1133b2f20c9c/
-            b5eea9ed-e819-4d6a-bec1-cc67452a9342/
-            d8a5541e-386b-4cdd-ad87-bd8da4e3b11d/
-            e9aa157c-e1b5-4847-ba6f-538b2990cc29/
-            edbfb178-2502-4a56-b13f-231f64b4e333/
-            fe77c05c-0264-4818-baaf-7c0f71e54ab9/
+            13c07b0a-87ff-43c7-9dbe-1838e919b197/
+              index.faiss
+              meta.jsonl
+            eca9b34b-1369-47d2-9a4c-1f6de9dcf4ea/
+              index.faiss
+              meta.jsonl
           global/
-            index.faiss
             meta.jsonl
       utils/
         streaming.py
