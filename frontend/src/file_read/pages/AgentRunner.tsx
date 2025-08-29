@@ -12,12 +12,14 @@ import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/ch
 
 // NEW: settings panel
 import SettingsPanel from "../components/SettingsPanel";
+import KnowledgePanel from "../components/KnowledgePanel";
 
 const PAGE_SIZE = 30;
 const LS_KEY = "lastSessionId";
 
 export default function AgentRunner() {
   const chat = useChatStream();
+  const [showKnowledge, setShowKnowledge] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [autoFollow, setAutoFollow] = useState(true);
   const { toast, show } = useToast();
@@ -176,6 +178,24 @@ export default function AgentRunner() {
             </button>
           </div>
         </div>
+        <div className="px-3 md:px-6 pt-2">
+          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
+            <button
+              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
+              onClick={() => setShowKnowledge(true)}
+              title="Open Knowledge"
+            >
+              Knowledge
+            </button>
+            <button
+              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
+              onClick={() => setShowSettings(true)}
+              title="Open Settings"
+            >
+              Settings
+            </button>
+          </div>
+        </div>
 
         <div className="flex-1 min-h-0">
           <div className="h-full px-3 md:px-6">
@@ -208,6 +228,13 @@ export default function AgentRunner() {
         <SettingsPanel
           sessionId={chat.sessionIdRef.current}
           onClose={() => setShowSettings(false)}
+        />
+      )}
+      {showKnowledge && (
+        <KnowledgePanel
+          sessionId={chat.sessionIdRef.current}
+          onClose={() => setShowKnowledge(false)}
+          toast={show}
         />
       )}
     </div>

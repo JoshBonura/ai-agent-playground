@@ -476,15 +476,21 @@ async def api_list_messages(session_id: str):
 @router.post("/api/chats/{session_id}/messages")
 async def api_append_message(session_id: str, body: Dict[str, str]):
     role = (body.get("role") or "user").strip()
-    content = strip_runjson((body.get("content") or "").rstrip())
+    # 🔴 was: content = strip_runjson(...)
+    content = (body.get("content") or "").rstrip()
     row = store_append(session_id, role, content)
 
     if role == "assistant":
+        # Retitle should *not* see RUNJSON blobs
         try:
             msgs = store_list_messages(session_id)
             last_seq = max((int(m.id) for m in msgs), default=0)
-            enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
-            # print(f"[retitle] ENQUEUE session={session_id} job_seq={last_seq} msgs={len(msgs)}")
+            msgs_clean = []
+            for m in msgs:
+                dm = asdict(m)
+                dm["content"] = strip_runjson(dm.get("content") or "")
+                msgs_clean.append(dm)
+            enqueue_retitle(session_id, msgs_clean, job_seq=last_seq)
         except Exception:
             pass
 
@@ -590,6 +596,127 @@ async def api_update_settings(patch: Dict[str, object]):
     s = write_settings(patch)
     return s
 
+# ===== aimodel/file_read/api/rag.py =====
+
+# aimodel/file_read/api/rag.py
+from __future__ import annotations
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from typing import Optional, List
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from threading import RLock
+
+from ..rag.schemas import SearchReq, SearchHit
+from ..rag.ingest import sniff_and_extract, chunk_text, build_metas
+from ..rag.store import add_vectors, search_vectors
+
+router = APIRouter(prefix="/api/rag", tags=["rag"])
+
+# ---- embedding model (sync, cached) ----
+_st_model: SentenceTransformer | None = None
+_st_lock = RLock()
+
+def _get_st_model() -> SentenceTransformer:
+    global _st_model
+    if _st_model is None:
+        with _st_lock:
+            if _st_model is None:
+                print("[RAG EMBED] loading e5-small-v2… (one-time)")
+                _st_model = SentenceTransformer("intfloat/e5-small-v2")
+                print("[RAG EMBED] model ready")
+    return _st_model
+
+def _embed(texts: List[str]) -> np.ndarray:
+    model = _get_st_model()
+    arr = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+    return arr.astype("float32")
+
+@router.post("/upload")
+async def upload_doc(sessionId: Optional[str] = Form(default=None), file: UploadFile = File(...)):
+    print(f"[RAG UPLOAD] sessionId={sessionId}, filename={file.filename}, content_type={file.content_type}")
+
+    data = await file.read()
+    print(f"[RAG UPLOAD] file size={len(data)} bytes")
+
+    text, mime = sniff_and_extract(file.filename, data)
+    print(f"[RAG UPLOAD] extracted mime={mime}, text_len={len(text)}")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Empty/unsupported file")
+
+    chunks = chunk_text(text, {"mime": mime})
+    print(f"[RAG UPLOAD] chunk_count={len(chunks)}")
+
+    metas = build_metas(sessionId, file.filename, chunks, size=len(data))
+    embeds = _embed([c.text for c in chunks])
+    print(f"[RAG UPLOAD] embed_shape={embeds.shape}")
+
+    add_vectors(sessionId, embeds, metas, dim=embeds.shape[1])
+    return {"ok": True, "added": len(chunks)}
+
+@router.post("/search")
+async def search(req: SearchReq):
+    q = req.query.strip()
+    if not q:
+        return {"hits": []}
+    qv = np.array(_embed([q])[0], dtype="float32")
+    chat_hits = search_vectors(req.sessionId, qv, req.kChat, dim=qv.shape[0])
+    global_hits = search_vectors(None, qv, req.kGlobal, dim=qv.shape[0])
+    from ..rag.search import merge_chat_first
+    fused = merge_chat_first(chat_hits, global_hits, alpha=req.hybrid_alpha)
+    out: List[SearchHit] = []
+    for r in fused:
+        out.append(SearchHit(
+            id=r["id"], text=r["text"], score=float(r["score"]),
+            source=r.get("source"), title=r.get("title"), sessionId=r.get("sessionId")
+        ))
+    return {"hits": [h.model_dump() for h in out]}
+
+@router.get("/list")
+async def list_items(sessionId: Optional[str] = None, k: int = 20):
+    """
+    Debug: show a lightweight list of stored chunks for a session (or global if sessionId is None).
+    Returns id/source/score and a short text preview so you can verify ingestion.
+    """
+    qv = np.array(_embed(["list"])[0], dtype="float32")
+    hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
+
+    items = []
+    for h in hits:
+        txt = (h.get("text") or "")
+        items.append({
+            "id": h.get("id"),
+            "sessionId": h.get("sessionId"),
+            "source": h.get("source"),
+            "title": h.get("title"),
+            "score": float(h.get("score", 0.0)),
+            "text": txt,
+        })
+    print(f"[RAG LIST] sessionId={sessionId} k={k} -> {len(items)} items")
+    return {"items": items}
+
+@router.get("/dump")
+async def dump_items(sessionId: Optional[str] = None, k: int = 50):
+    """
+    Debug: return full texts of top-k chunks (be careful: can be large).
+    Useful to confirm exact strings that were indexed.
+    """
+    qv = np.array(_embed(["dump"])[0], dtype="float32")
+    hits = search_vectors(sessionId, qv, k=k, dim=qv.shape[0])
+
+    chunks = []
+    for h in hits:
+        chunks.append({
+            "id": h.get("id"),
+            "sessionId": h.get("sessionId"),
+            "source": h.get("source"),
+            "title": h.get("title"),
+            "score": float(h.get("score", 0.0)),
+            "text": h.get("text") or "",
+        })
+    print(f"[RAG DUMP] sessionId={sessionId} k={k} -> {len(chunks)} items")
+    return {"chunks": chunks}
+
 # ===== aimodel/file_read/api/settings.py =====
 
 from fastapi import APIRouter, Query, Body
@@ -639,11 +766,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .adaptive.config.paths import bootstrap
 from .workers.retitle_worker import start_worker
-
 from .api.models import router as models_router
 from .api.chats import router as chats_router
 from .runtime.model_runtime import load_model
 from .api.generate_router import router as generate_router
+from .api.rag import router as rag_router
 from .services.cancel import is_active
 from .api import settings as settings_router
 bootstrap()
@@ -661,6 +788,7 @@ app.include_router(models_router)
 app.include_router(chats_router)
 app.include_router(generate_router)
 app.include_router(settings_router.router)
+app.include_router(rag_router)
 
 @app.on_event("startup")
 async def _startup():
@@ -1275,6 +1403,732 @@ def extract_style_and_prefs(user_text: str) -> Tuple[Optional[str], bool, bool]:
         )
     return style_inst, False, False
 
+# ===== aimodel/file_read/rag/ingest/__init__.py =====
+
+from __future__ import annotations
+from typing import Tuple
+import io, json
+
+from .excel_ingest import extract_excel
+from .common import _utf8, _strip_html, Chunk, chunk_text, build_metas
+
+__all__ = ["sniff_and_extract", "Chunk", "chunk_text", "build_metas"]
+
+def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
+    """
+    Dispatcher that returns (text, mime) for many file types.
+    Excel (.xlsx) is handled by excel_ingest.extract_excel for rich structure.
+    """
+    name = (filename or "").lower()
+
+    if name.endswith(".xlsx"):
+        return extract_excel(data)
+
+    if name.endswith(".docx"):
+        try:
+            from docx import Document  # python-docx
+            doc = Document(io.BytesIO(data))
+            paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+            return "\n".join(paras).strip(), "text/plain"
+        except Exception:
+            return _utf8(data), "text/plain"
+
+    if name.endswith(".pdf"):
+        try:
+            from pdfminer.high_level import extract_text
+            txt = extract_text(io.BytesIO(data)) or ""
+            return txt.strip(), "text/plain"
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader
+                r = PdfReader(io.BytesIO(data))
+                pages = [(p.extract_text() or "").strip() for p in r.pages]
+                return "\n\n".join([p for p in pages if p]).strip(), "text/plain"
+            except Exception:
+                return _utf8(data), "text/plain"
+
+    if name.endswith(".json"):
+        try:
+            return json.dumps(json.loads(_utf8(data)), ensure_ascii=False, indent=2), "text/plain"
+        except Exception:
+            return _utf8(data), "text/plain"
+
+    if name.endswith((".jsonl", ".jsonlines")):
+        lines = _utf8(data).splitlines()
+        out = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.dumps(json.loads(ln), ensure_ascii=False, indent=2))
+            except Exception:
+                out.append(ln)
+        return "\n".join(out).strip(), "text/plain"
+
+    if name.endswith((".yaml", ".yml")):
+        try:
+            import yaml
+            obj = yaml.safe_load(_utf8(data))
+            return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
+        except Exception:
+            return _utf8(data), "text/plain"
+
+    if name.endswith(".toml"):
+        try:
+            try:
+                import tomllib
+                obj = tomllib.loads(_utf8(data))
+            except Exception:
+                import toml
+                obj = toml.loads(_utf8(data))
+            return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
+        except Exception:
+            return _utf8(data), "text/plain"
+
+    if name.endswith((".csv", ".tsv")):
+        return _utf8(data), "text/plain"
+
+    if name.endswith((".htm", ".html", ".xml")):
+        return _strip_html(_utf8(data)), "text/plain"
+
+    # plaintext / code-ish
+    if name.endswith((
+        ".txt", ".log", ".md",
+        ".c", ".cpp", ".h", ".hpp",
+        ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".sh", ".ps1",
+        ".rs", ".java", ".go", ".rb", ".php",
+        ".swift", ".kt", ".scala", ".lua", ".perl",
+    )):
+        return _utf8(data), "text/plain"
+
+    # default
+    return _utf8(data), "text/plain"
+
+# ===== aimodel/file_read/rag/ingest/common.py =====
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import re
+
+@dataclass
+class Chunk:
+    text: str
+    meta: Dict[str, str]
+
+def _utf8(data: bytes) -> str:
+    return data.decode("utf-8", errors="ignore")
+
+def _strip_html(txt: str) -> str:
+    txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", txt)
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?is)</p>", "\n\n", txt)
+    txt = re.sub(r"(?is)<.*?>", " ", txt)
+    txt = re.sub(r"[ \t]+", " ", txt)
+    return txt.strip()
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
+
+def _split_paragraphs(text: str) -> List[str]:
+    paras = [p.strip() for p in _PARA_SPLIT_RE.split(text)]
+    return [p for p in paras if p]
+
+def _split_hard(text: str, max_len: int) -> List[str]:
+    approx = re.split(r"(?<=[\.\!\?\;])\s+", text)
+    out: List[str] = []
+    buf = ""
+    for s in approx:
+        if not s:
+            continue
+        if len(buf) + 1 + len(s) <= max_len:
+            buf = s if not buf else (buf + " " + s)
+        else:
+            if buf:
+                out.append(buf)
+            if len(s) <= max_len:
+                out.append(s)
+            else:
+                words = _WHITESPACE_RE.split(s)
+                cur = ""
+                for w in words:
+                    if not w:
+                        continue
+                    if len(cur) + 1 + len(w) <= max_len:
+                        cur = w if not cur else (cur + " " + w)
+                    else:
+                        if cur:
+                            out.append(cur)
+                        cur = w
+                if cur:
+                    out.append(cur)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+def chunk_text(
+    text: str,
+    meta: Optional[Dict[str, str]] = None,
+    *,
+    max_chars: int = 1000,
+    overlap: int = 200,
+) -> List[Chunk]:
+    meta = meta or {}
+    text = text.strip()
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [Chunk(text=text, meta=meta.copy())]
+
+    paragraphs = _split_paragraphs(text) or [text]
+
+    normalized: List[str] = []
+    for p in paragraphs:
+        if len(p) <= max_chars:
+            normalized.append(p)
+        else:
+            normalized.extend(_split_hard(p, max_chars))
+
+    chunks: List[Chunk] = []
+    cur: List[str] = []
+    cur_len = 0
+
+    for piece in normalized:
+        plen = len(piece)
+        if cur_len == 0:
+            cur, cur_len = [piece], plen
+            continue
+        if cur_len + 1 + plen <= max_chars:
+            cur.append(piece)
+            cur_len += 1 + plen
+        else:
+            joined = "\n".join(cur).strip()
+            if joined:
+                chunks.append(Chunk(text=joined, meta=meta.copy()))
+            if overlap > 0 and joined:
+                tail = joined[-overlap:]
+                cur, cur_len = [tail, piece], len(tail) + 1 + plen
+            else:
+                cur, cur_len = [piece], plen
+
+    if cur_len:
+        joined = "\n".join(cur).strip()
+        if joined:
+            chunks.append(Chunk(text=joined, meta=meta.copy()))
+
+    return chunks
+
+def build_metas(session_id: Optional[str], filename: str, chunks: List[Chunk], *, size: int = 0) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for i, c in enumerate(chunks):
+        out.append({
+            "id": f"{filename}:{i}",
+            "sessionId": session_id or "",
+            "source": filename,
+            "title": filename,
+            "mime": "text/plain",
+            "size": str(size),
+            "chunkIndex": str(i),
+            "text": c.text,  # stored for RAG block display
+        })
+    return out
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
+
+from __future__ import annotations
+from typing import Tuple, List, Iterable
+import io, re
+
+def _squeeze_spaces(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+def _fmt_val(v) -> str:
+    if v is None:
+        return ""
+    s = str(v)
+    # Quote strings that contain spaces or punctuation so RAG keeps them intact
+    if isinstance(v, str):
+        if "\n" in v:
+            s = s.replace("\r\n", "\n").replace("\r", "\n")
+            s = s.replace("\n", "\\n")
+        if re.search(r'[^A-Za-z0-9_.-]', s):
+            return f"\"{s}\""
+    return s
+
+def extract_excel(data: bytes) -> Tuple[str, str]:
+    """
+    RAG-friendly extractor for .xlsx:
+    - Named Ranges with resolved addresses + sample values
+    - Structured Tables (headers + first N rows)
+    - Merged ranges
+    - Per-cell catalog of non-empty cells with A1 address, current value, and formula
+    Falls back to pandas values-only if openpyxl path fails.
+    """
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import range_boundaries, get_column_letter
+        from openpyxl.worksheet.worksheet import Worksheet
+
+        wb_vals = load_workbook(io.BytesIO(data), data_only=True,  read_only=True)
+        wb_form = load_workbook(io.BytesIO(data), data_only=False, read_only=True)
+
+        # Tunables
+        MAX_ROWS_PER_TABLE = 50
+        MAX_FORMULAS_PER_SHEET = 1000  # only applies to the "Cells" list; it's generous
+        MAX_CELLS_PER_SHEET = 500      # cap to keep chunks small
+        MAX_NR_PREVIEW = 10            # values to preview per defined name range
+
+        lines: List[str] = []
+
+        # ===== Named ranges (workbook-level) =====
+        try:
+            if getattr(wb_vals, "defined_names", None):
+                nr_out: List[str] = []
+                for dn in wb_vals.defined_names.definedName:
+                    if getattr(dn, "hidden", False):
+                        continue
+                    # Resolve destinations (sheet, ref)
+                    try:
+                        dests = list(dn.destinations)
+                    except Exception:
+                        dests = []
+                    if not dests:
+                        continue
+
+                    # For each destination, show address and first few values
+                    for sheet_name, ref in dests:
+                        try:
+                            ws = wb_vals[sheet_name]
+                            min_c, min_r, max_c, max_r = range_boundaries(ref)
+                            vals: List[str] = []
+                            count = 0
+                            for r in range(min_r, max_r + 1):
+                                for c in range(min_c, max_c + 1):
+                                    v = ws.cell(row=r, column=c).value
+                                    addr = f"{get_column_letter(c)}{r}"
+                                    vv = _fmt_val(v)
+                                    if vv != "":
+                                        vals.append(f"{addr}={vv}")
+                                    count += 1
+                                    if len(vals) >= MAX_NR_PREVIEW:
+                                        break
+                                if len(vals) >= MAX_NR_PREVIEW:
+                                    break
+                            vals_str = "; ".join(vals)
+                            if vals_str:
+                                nr_out.append(f"- {dn.name}: {sheet_name}!{ref} = {vals_str}")
+                            else:
+                                nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
+                        except Exception:
+                            nr_out.append(f"- {dn.name}: {sheet_name}!{ref}")
+                if nr_out:
+                    lines.append("## Named Ranges")
+                    lines.extend(nr_out)
+                    lines.append("")
+        except Exception:
+            pass
+
+        # ===== Per-sheet details =====
+        for sheet_name in wb_vals.sheetnames:
+            ws_v: Worksheet = wb_vals[sheet_name]
+            ws_f: Worksheet = wb_form[sheet_name]
+            lines.append(f"# Sheet: {sheet_name}")
+
+            # --- Tables
+            try:
+                tables = dict(getattr(ws_v, "tables", {}) or {})
+                if tables:
+                    lines.append("## Tables")
+                    for tname, tobj in tables.items():
+                        ref = getattr(tobj, "ref", "")
+                        lines.append(f"- Table {tname} ({ref})")
+                        try:
+                            min_c, min_r, max_c, max_r = range_boundaries(ref)
+                        except Exception:
+                            min_r = 1; min_c = 1
+                            max_r = ws_v.max_row or 1
+                            max_c = ws_v.max_column or 1
+
+                        # headers
+                        headers: List[str] = []
+                        for c in range(min_c, max_c + 1):
+                            v = ws_v.cell(row=min_r, column=c).value
+                            headers.append(_fmt_val("" if v is None else str(v).strip()))
+                        if any(h for h in headers):
+                            lines.append(f"  headers: [{', '.join(h for h in headers if h != '')}]")
+
+                        # first N data rows (show address=value and formula if present)
+                        shown = 0
+                        for r in range(min_r + 1, max_r + 1):
+                            cells: List[str] = []
+                            for c in range(min_c, max_c + 1):
+                                addr = f"{get_column_letter(c)}{r}"
+                                vv = ws_v.cell(row=r, column=c).value
+                                fv = ws_f.cell(row=r, column=c).value
+                                val_str = _fmt_val(vv)
+                                if isinstance(fv, str) and fv.startswith("="):
+                                    if val_str != "":
+                                        cells.append(f"{addr}={val_str} (formula:={fv[1:]})")
+                                    else:
+                                        cells.append(f"{addr} (formula:={fv[1:]})")
+                                else:
+                                    if val_str != "":
+                                        cells.append(f"{addr}={val_str}")
+                            if not cells:
+                                continue
+                            lines.append(f"  row {r}: " + ", ".join(cells))
+                            shown += 1
+                            if shown >= MAX_ROWS_PER_TABLE:
+                                lines.append("  - … (rows truncated)")
+                                break
+                    lines.append("")
+            except Exception:
+                pass
+
+            # --- Merged ranges
+            try:
+                merges = getattr(ws_v, "merged_cells", None)
+                if merges and getattr(merges, "ranges", None):
+                    lines.append("## Merged Ranges")
+                    for mr in merges.ranges:
+                        ref = str(getattr(mr, "coord", getattr(mr, "bounds", mr)))
+                        lines.append(f"- {ref}")
+                    lines.append("")
+            except Exception:
+                pass
+
+            # --- Cells catalog (non-empty, with address, value, formula)
+            try:
+                if callable(getattr(ws_v, "calculate_dimension", None)):
+                    dim_ref = ws_v.calculate_dimension()
+                    min_c, min_r, max_c, max_r = range_boundaries(dim_ref)
+                else:
+                    min_r = 1; min_c = 1
+                    max_r = ws_v.max_row or 1
+                    max_c = ws_v.max_column or 1
+
+                lines.append(f"## Cells (non-empty, first {MAX_CELLS_PER_SHEET})")
+                emitted = 0
+                for r in range(min_r, max_r + 1):
+                    for c in range(min_c, max_c + 1):
+                        vv = ws_v.cell(row=r, column=c).value
+                        fv = ws_f.cell(row=r, column=c).value
+                        if vv is None and not (isinstance(fv, str) and fv.startswith("=")):
+                            continue
+                        addr = f"{get_column_letter(c)}{r}"
+                        val_str = _fmt_val(vv)
+                        if isinstance(fv, str) and fv.startswith("="):
+                            if val_str != "":
+                                lines.append(f"- {addr}={val_str} (formula:={fv[1:]})")
+                            else:
+                                lines.append(f"- {addr} (formula:={fv[1:]})")
+                        else:
+                            if val_str != "":
+                                lines.append(f"- {addr}={val_str}")
+                            else:
+                                continue
+                        emitted += 1
+                        if emitted >= MAX_CELLS_PER_SHEET:
+                            lines.append("… (cells truncated)")
+                            raise StopIteration  # cheap escape
+                lines.append("")
+            except StopIteration:
+                lines.append("")
+            except Exception:
+                # Keep going even if a weird worksheet trips us up
+                lines.append("")
+
+        txt = _squeeze_spaces("\n".join(lines).strip())
+        return txt, "text/plain"
+
+    except Exception:
+        # pandas fallback (values only)
+        try:
+            import pandas as pd
+            xls = pd.ExcelFile(io.BytesIO(data))
+            parts: List[str] = []
+            for sheet in xls.sheet_names:
+                df = xls.parse(sheet)
+                df = df.dropna(how="all").dropna(how="all", axis=1)
+                csv = df.to_csv(index=False, sep="\t", na_rep="")
+                csv = re.sub(r"\t{2,}", "\t", csv).replace("\t", " ")
+                parts.append(f"# Sheet: {sheet}\n{csv.strip()}")
+            txt = _squeeze_spaces("\n\n".join(parts).strip())
+            return txt, "text/plain"
+        except Exception:
+            return data.decode("utf-8", errors="ignore"), "text/plain"
+
+# ===== aimodel/file_read/rag/retrieve.py =====
+
+from __future__ import annotations
+from typing import List, Optional, Tuple
+from ..core.settings import SETTINGS
+from .store import search_vectors
+
+def _embed_query(q: str) -> List[float]:
+    q = (q or "").strip()
+    if not q:
+        return []
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("intfloat/e5-small-v2")
+        arr = model.encode([q], normalize_embeddings=True, convert_to_numpy=True)
+        return arr[0].tolist()
+    except Exception as e:
+        print(f"[RAG] embedding backend failed: {e}")
+        return []
+
+def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
+    # sort by score desc, then stable de-dupe by (source, chunkIndex)
+    hits_sorted = sorted(hits, key=lambda h: float(h.get("score", 0.0)), reverse=True)
+    seen: set[Tuple[str, str]] = set()
+    out: List[dict] = []
+    for h in hits_sorted:
+        key = (str(h.get("source") or ""), str(h.get("chunkIndex") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+        if len(out) >= k:
+            break
+    return out
+
+def make_rag_block(hits: List[dict], *, max_chars: int = 1200) -> str:
+    lines = ["Local knowledge:"]
+    for h in hits:
+        src = h.get("source") or ""
+        idx = h.get("chunkIndex")
+        head = f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
+        body = (h.get("text") or "").strip()
+        if body:
+            lines.append(f"{head}\n  {body[:max_chars]}")
+        else:
+            lines.append(head)
+    return "\n".join(lines)
+
+def build_rag_block(query: str, session_id: str | None = None) -> str | None:
+    if not bool(SETTINGS.get("rag_enabled", True)):
+        return None
+    k = int(SETTINGS.get("rag_top_k", 4))
+
+    q = (query or "").strip()
+    print(f"[RAG SEARCH] q={q!r} session={session_id} k={k}")
+    qvec = _embed_query(q)
+    if not qvec:
+        print("[RAG SEARCH] no qvec")
+        return None
+
+    # Pull hits from session scope and global scope
+    d = len(qvec)
+    hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
+    hits_glob = search_vectors(None,       qvec, k, dim=d) or []
+    hits = hits_chat + hits_glob
+
+    print(f"[RAG SEARCH] hits={len(hits)}")
+    if not hits:
+        return None
+
+    hits_top = _dedupe_and_sort(hits, k=k)
+    block = make_rag_block(hits_top, max_chars=int(SETTINGS.get("web_orch_per_doc_char_budget", 1200)))
+    print(f"[RAG BLOCK] chars={len(block)}")
+    return block
+
+
+
+# ===== aimodel/file_read/rag/schemas.py =====
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal, Dict
+
+class SearchReq(BaseModel):
+    query: str
+    sessionId: Optional[str] = None
+    kChat: int = 6
+    kGlobal: int = 4
+    hybrid_alpha: float = 0.5  # 0..1, higher = semantic weight
+
+class ItemRow(BaseModel):
+    id: str
+    sessionId: Optional[str]
+    source: str
+    title: Optional[str]
+    mime: Optional[str]
+    size: Optional[int]
+    createdAt: str
+    meta: Dict[str, str] = Field(default_factory=dict)
+
+class SearchHit(BaseModel):
+    id: str
+    text: str
+    score: float
+    source: Optional[str] = None   # <-- safer
+    title: Optional[str] = None
+    sessionId: Optional[str] = None
+    url: Optional[str] = None
+
+# ===== aimodel/file_read/rag/search.py =====
+
+from __future__ import annotations
+from typing import List, Dict, Optional
+import numpy as np
+from .store import search_vectors
+
+def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]:
+    # results = [list_from_chat, list_from_global]
+    scores: Dict[str, float] = {}
+    lookup: Dict[str, Dict] = {}
+    for lst in results:
+        for rank, r in enumerate(lst, start=1):
+            rid = r["id"]
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank)
+            lookup[rid] = r
+    fused = [{"score": s, **lookup[rid]} for rid, s in scores.items()]
+    fused.sort(key=lambda x: x["score"], reverse=True)
+    return fused
+
+def merge_chat_first(chat_hits: List[Dict], global_hits: List[Dict], alpha: float = 0.5) -> List[Dict]:
+    # alpha weights semantic scores; RRF stabilizes positions
+    fused = reciprocal_rank_fusion([chat_hits, global_hits])
+    return fused
+
+# ===== aimodel/file_read/rag/store.py =====
+
+from __future__ import annotations
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+import faiss, json, os, time, hashlib
+import numpy as np
+
+BASE = Path(__file__).resolve().parents[1] / "store" / "rag"
+
+def _ns_dir(session_id: Optional[str]) -> Path:
+    if session_id:
+        return BASE / "by_session" / session_id
+    return BASE / "global"
+
+def _paths(session_id: Optional[str]) -> Tuple[Path, Path]:
+    d = _ns_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "index.faiss", d / "meta.jsonl"
+
+def _norm(x: np.ndarray) -> np.ndarray:
+    x = x.astype("float32")
+    faiss.normalize_L2(x)
+    return x
+
+def _load_index(dim: int, p: Path) -> faiss.Index:
+    if p.exists():
+        return faiss.read_index(str(p))
+    return faiss.IndexFlatIP(dim)
+
+def _save_index(idx: faiss.Index, p: Path) -> None:
+    faiss.write_index(idx, str(p))
+
+def add_vectors(session_id: Optional[str], embeds: np.ndarray, metas: List[Dict], dim: int):
+    idx_path, meta_path = _paths(session_id)
+    idx = _load_index(dim, idx_path)
+
+    # ensure index type
+    if not isinstance(idx, faiss.IndexFlatIP):
+        idx = faiss.IndexFlatIP(dim) if idx.ntotal == 0 else idx
+
+    # normalize vectors
+    embeds = _norm(embeds)
+
+    # ✅ read existing ids to avoid duplicates
+    existing_ids = set()
+    if meta_path.exists():
+        with meta_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    j = json.loads(line)
+                    existing_ids.add(j["id"])
+                except:
+                    pass
+
+    start = idx.ntotal
+    new_embeds = []
+    new_metas = []
+
+    for i, m in enumerate(metas):
+        if m["id"] in existing_ids:
+            continue
+        m["row"] = start + len(new_embeds)
+        new_embeds.append(embeds[i])
+        new_metas.append(m)
+
+    if new_embeds:
+        idx.add(np.vstack(new_embeds))
+        _save_index(idx, idx_path)
+        with meta_path.open("a", encoding="utf-8") as f:
+            for m in new_metas:
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+def search_vectors(session_id: Optional[str], query_vec: np.ndarray, topk: int, dim: int) -> List[Dict]:
+    idx_path, meta_path = _paths(session_id)
+    if not idx_path.exists() or not meta_path.exists():
+        return []
+
+    idx = _load_index(dim, idx_path)
+
+    # ✅ ensure numpy array for reshape
+    query_vec = np.asarray(query_vec, dtype="float32")
+    q = _norm(query_vec.reshape(1, -1))
+
+    D, I = idx.search(q, topk)
+    out: List[Dict] = []
+    rows: Dict[int, Dict] = {}
+    with meta_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                j = json.loads(line)
+                rows[int(j["row"])] = j
+            except:
+                pass
+    for score, row in zip(D[0].tolist(), I[0].tolist()):
+        if row < 0:
+            continue
+        m = rows.get(row)
+        if not m:
+            continue
+        m = dict(m)
+        m["score"] = float(score)
+        out.append(m)
+    return out
+
+def search_similar(qvec: List[float] | np.ndarray, *, k: int = 5, session_id: Optional[str] = None) -> List[Dict]:
+    """
+    Compatibility wrapper used by retrieve.py.
+    qvec: a single embedding vector (list or np.ndarray)
+    """
+    arr = np.asarray(qvec, dtype="float32")
+    dim = int(arr.shape[-1])
+    return search_vectors(session_id, arr, k, dim)
+
+def add_texts(
+    texts: List[str],
+    metas: List[Dict],
+    *,
+    session_id: Optional[str],
+    embed_fn,  # callable: List[str] -> np.ndarray[float32]
+) -> int:
+    if not texts:
+        return 0
+    vecs = embed_fn(texts)  # should return (n, d) float32
+    if not isinstance(vecs, np.ndarray):
+        vecs = np.asarray(vecs, dtype="float32")
+    dim = int(vecs.shape[-1])
+    add_vectors(session_id, vecs, metas, dim)
+    return len(texts)
+
+# ===== aimodel/file_read/rag/worker.py =====
+
+
+
 # ===== aimodel/file_read/requirements.txt =====
 
 fastapi==0.116.1
@@ -1284,8 +2138,28 @@ starlette==0.47.2
 llama-cpp-python==0.3.4
 ddgs==9.5.4
 httpx==0.27.0
-trafilatura==1.9.0
-lxml[html_clean]>=5.3
+
+# HTML parsing / readability (permissive)
+lxml==6.0.1
+readability-lxml==0.8.1
+selectolax==0.3.21
+beautifulsoup4==4.12.3
+
+# RAG
+faiss-cpu==1.8.0.post1
+numpy==1.26.4
+sentence-transformers==3.0.1
+tzlocal==5.2
+openpyxl==3.1.5 
+python-multipart==0.0.20
+
+python-docx==1.1.2
+PyYAML==6.0.2
+toml==0.10.2
+pdfminer.six==20240706
+
+PyPDF2==3.0.1
+pandas==2.2.2
 
 # ===== aimodel/file_read/runtime/__init__.py =====
 
@@ -1513,14 +2387,13 @@ from typing import AsyncGenerator, Dict, List, Optional
 from fastapi.responses import StreamingResponse
 from datetime import datetime
 from dataclasses import asdict
-
 from ..core.settings import SETTINGS
 from ..runtime.model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
 
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
 from .session_io import handle_incoming, persist_summary
-from .packing import build_system_text, pack_with_rollup
+from .packing import build_system_text, pack_with_rollup, maybe_inject_rag_block
 from .context_window import clamp_out_budget
 
 from ..web.router_ai import decide_web_and_fetch
@@ -1684,6 +2557,8 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         ephemeral=ephemeral_once,
     )
 
+    packed = maybe_inject_rag_block(packed, session_id=session_id)
+
     packed_chars = _chars_len(packed)
     print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
 
@@ -1787,7 +2662,7 @@ async def cancel_session_alias(session_id: str):
 # aimodel/file_read/services/packing.py
 from __future__ import annotations
 from typing import Tuple, List, Dict, Optional
-
+from ..rag.retrieve import build_rag_block
 from ..core.settings import SETTINGS
 from ..core.memory import build_system, pack_messages, roll_summary_if_needed
 
@@ -1842,6 +2717,23 @@ def pack_with_rollup(
             packed = packed + eph
 
     return packed, new_summary, input_budget
+
+def maybe_inject_rag_block(messages: list[dict], *, session_id: str | None) -> list[dict]:
+    if not SETTINGS.get("rag_enabled", True):
+        return messages
+    if not messages or messages[-1].get("role") != "user":
+        return messages
+
+    user_q = messages[-1].get("content") or ""
+    block = build_rag_block(user_q, session_id=session_id)
+
+    if not block:
+        print(f"[RAG INJECT] no hits (session={session_id}) q={user_q!r}")
+        return messages
+
+    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
+    injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
+    return injected
 
 # ===== aimodel/file_read/services/session_io.py =====
 
@@ -1960,919 +2852,4 @@ async def run_stream(
             err_text = str(e)
             log.exception("generate: llm stream error: %s", e)
             try:
-                q.put_nowait(f"[aimodel] error: {e}")
-            except Exception:
-                pass
-        finally:
-            try:
-                llm.reset()
-            except Exception:
-                pass
-
-            try:
-                out_text = "".join(out_parts)
-                run_json = build_run_json(
-                    request_cfg={
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "max_tokens": out_budget
-                    },
-                    out_text=out_text,
-                    t_start=t_start,
-                    t_first=t_first,
-                    t_last=t_last,
-                    stop_set=stop_ev.is_set(),
-                    finish_reason=finish_reason,
-                    input_tokens_est=input_tokens_est,
-                )
-                if SETTINGS.runjson_emit:
-                    q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
-            except Exception:
-                pass
-
-            try:
-                q.put_nowait(SENTINEL)
-            except Exception:
-                pass
-
-    disconnect_task = asyncio.create_task(watch_disconnect(request, stop_ev))
-    producer = asyncio.create_task(asyncio.to_thread(produce))
-
-    try:
-        while True:
-            item = await q.get()
-            if item is SENTINEL:
-                break
-            if stop_ev.is_set():
-                break
-            yield (item if isinstance(item, bytes) else item.encode("utf-8"))
-        if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
-            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")
-    finally:
-        stop_ev.set()
-        disconnect_task.cancel()
-        try:
-            await asyncio.wait_for(producer, timeout=SETTINGS.stream_producer_join_timeout_sec)
-        except Exception:
-            pass
-
-# ===== aimodel/file_read/store/__init__.py =====
-
-from .chats import (
-    ChatMessageRow,
-    upsert_on_first_message, update_last, append_message,
-    delete_message, delete_messages_batch, list_messages,
-    list_paged, delete_batch,
-    merge_chat, merge_chat_new, edit_message, set_summary, get_summary,  # ← add these
-)
-from .index import ChatMeta
-
-__all__ = [
-    # chats
-    "ChatMessageRow",
-    "upsert_on_first_message", "update_last", "append_message",
-    "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch",
-    "merge_chat", "merge_chat_new", "edit_message",  # ← add these
-    # index
-    "ChatMeta",
-    # pending
-    "set_summary", "get_summary"
-]
-
-# ===== aimodel/file_read/store/base.py =====
-
-from __future__ import annotations
-import json, os, shutil, tempfile, threading
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List
-from ..adaptive.config.paths import app_data_dir
-
-# -------- Directories & Paths --------
-APP_DIR = app_data_dir()
-CHATS_DIR = APP_DIR / "chats"
-INDEX_PATH = APP_DIR / "index.json"
-PENDING_PATH = APP_DIR / "pending.json"              # NEW
-OLD_PENDING_DELETES = APP_DIR / "pending_deletes.json"  # NEW
-
-# -------- Lock for safe writes --------
-_lock = threading.RLock()
-
-# -------- Helpers --------
-def now_iso() -> str:
-    """UTC timestamp in ISO 8601 format."""
-    return datetime.now(timezone.utc).isoformat()
-
-def atomic_write(path: Path, data: Dict[str, Any] | List[Any]):
-    """Safely write JSON to a temp file then move into place."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=path.name, dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        shutil.move(tmp_path, path)
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-
-def ensure_dirs():
-    """Ensure app/chats directories exist and index.json is initialized."""
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CHATS_DIR.mkdir(parents=True, exist_ok=True)
-    if not INDEX_PATH.exists():
-        atomic_write(INDEX_PATH, [])
-
-def chat_path(session_id: str) -> Path:
-    """Return path to chat file for a session ID."""
-    return CHATS_DIR / f"{session_id}.json"
-
-# -------- Exports --------
-__all__ = [
-    "APP_DIR",
-    "CHATS_DIR",
-    "INDEX_PATH",
-    "PENDING_PATH",          # NEW
-    "OLD_PENDING_DELETES",   # NEW
-    "_lock",
-    "now_iso",
-    "atomic_write",
-    "ensure_dirs",
-    "chat_path",
-]
-
-# ===== aimodel/file_read/store/chats.py =====
-
-# aimodel/file_read/store/chats.py
-from __future__ import annotations
-import json
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-from ..core.settings import SETTINGS
-from .base import chat_path, atomic_write, now_iso
-from .index import load_index, save_index, refresh_index_after_change, ChatMeta
-
-
-def _load_chat(session_id: str) -> Dict:
-    p = chat_path(session_id)
-    if not p.exists():
-        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}  # add summary
-    with p.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-        if "summary" not in data:
-            data["summary"] = ""  # backfill older files
-        return data
-
-
-@dataclass
-class ChatMessageRow:
-    id: int
-    sessionId: str
-    role: str
-    content: str
-    createdAt: str
-
-
-def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
-    idx = load_index()
-    existing = next((r for r in idx if r["sessionId"] == session_id), None)
-    now = now_iso()
-    if existing:
-        if title and title.strip():
-            existing["title"] = title.strip()
-        existing["updatedAt"] = now
-        save_index(idx)
-        existing.setdefault("lastMessage", None)
-        return ChatMeta(**existing)
-
-    next_id = (max((r["id"] for r in idx), default=0) + 1) if idx else 1
-    row = {
-        "id": next_id,
-        "sessionId": session_id,
-        "title": (title.strip() or SETTINGS["chat_default_title"]),
-        "lastMessage": None,
-        "createdAt": now,
-        "updatedAt": now,
-    }
-    idx.append(row)
-    save_index(idx)
-    _save_chat(session_id, {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""})
-    return ChatMeta(**row)
-
-
-def update_last(session_id: str, last_message: Optional[str], maybe_title: Optional[str]) -> ChatMeta:
-    idx = load_index()
-    row = next((r for r in idx if r["sessionId"] == session_id), None)
-    if not row:
-        raise ValueError(f"Unknown sessionId: {session_id}")
-    if last_message is not None:
-        row["lastMessage"] = last_message
-    if maybe_title and maybe_title.strip():
-        row["title"] = maybe_title.strip()
-    row["updatedAt"] = now_iso()
-    save_index(idx)
-    row.setdefault("lastMessage", None)
-    return ChatMeta(**row)
-
-
-def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
-    data = _load_chat(session_id)
-    seq = int(data.get("seq", 0)) + 1
-    msg = {
-        "id": seq,
-        "sessionId": session_id,
-        "role": role,
-        "content": content,
-        "createdAt": now_iso(),
-    }
-    data["messages"].append(msg)
-    data["seq"] = seq
-    _save_chat(session_id, data)
-
-    idx = load_index()
-    row = next((r for r in idx if r["sessionId"] == session_id), None)
-    if row:
-        row["updatedAt"] = msg["createdAt"]
-        if role == "assistant":
-            row["lastMessage"] = content
-        save_index(idx)
-
-    # pending ops are applied by pending.apply_pending_for() from the router after appends
-    return ChatMessageRow(**msg)
-
-
-def delete_message(session_id: str, message_id: int) -> int:
-    data = _load_chat(session_id)
-    msgs = data.get("messages", [])
-    before = len(msgs)
-    msgs = [m for m in msgs if int(m.get("id", -1)) != int(message_id)]
-    if len(msgs) == before:
-        return 0
-    data["messages"] = msgs
-    _save_chat(session_id, data)
-    refresh_index_after_change(session_id, msgs)
-    return 1
-
-
-def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
-    wanted = {int(i) for i in (message_ids or [])}
-    if not wanted:
-        return []
-    data = _load_chat(session_id)
-    msgs = data.get("messages", [])
-    keep, deleted = [], []
-    for m in msgs:
-        mid = int(m.get("id", -1))
-        if mid in wanted:
-            deleted.append(mid)
-        else:
-            keep.append(m)
-    if not deleted:
-        return []
-    data["messages"] = keep
-    _save_chat(session_id, data)
-    refresh_index_after_change(session_id, keep)
-    return deleted
-
-
-def list_messages(session_id: str) -> List[ChatMessageRow]:
-    data = _load_chat(session_id)
-    return [ChatMessageRow(**m) for m in data.get("messages", [])]
-
-
-def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[ChatMeta], int, int, bool]:
-    rows = load_index()
-    rows.sort(key=lambda r: r["updatedAt"], reverse=True)
-    if ceiling_iso:
-        rows = [r for r in rows if r["updatedAt"] <= ceiling_iso]
-
-    total = len(rows)
-    min_size = int(SETTINGS["chat_page_min_size"])
-    max_size = int(SETTINGS["chat_page_max_size"])
-    size = max(min_size, min(max_size, int(size)))
-    page = max(0, int(page))
-
-    start = page * size
-    end = start + size
-
-    page_rows = rows[start:end]
-    total_pages = (total + size - 1) // size if total else 1
-    last_flag = end >= total
-
-    metas = []
-    for r in page_rows:
-        r.setdefault("lastMessage", None)
-        metas.append(ChatMeta(**r))
-    return metas, total, total_pages, last_flag
-
-
-def delete_batch(session_ids: List[str]) -> List[str]:
-    for sid in session_ids:
-        try:
-            chat_path(sid).unlink(missing_ok=True)
-        except Exception:
-            pass
-    idx = load_index()
-    keep = [r for r in idx if r["sessionId"] not in set(session_ids)]
-    save_index(keep)
-    return session_ids
-
-
-def merge_chat(source_id: str, target_id: str):
-    source_msgs = list_messages(source_id)
-    target_msgs = list_messages(target_id)
-
-    # Insert source first, then re-add target to preserve order
-    merged = []
-    for m in source_msgs:
-        row = append_message(target_id, m.role, m.content)
-        merged.append(row)
-
-    for m in target_msgs:
-        row = append_message(target_id, m.role, m.content)
-        merged.append(row)
-
-    return merged
-
-
-def _save_chat(session_id: str, data: Dict):
-    atomic_write(chat_path(session_id), data)
-
-
-def set_summary(session_id: str, new_summary: str) -> None:
-    data = _load_chat(session_id)
-    data["summary"] = new_summary or ""
-    _save_chat(session_id, data)
-
-
-def get_summary(session_id: str) -> str:
-    data = _load_chat(session_id)
-    return str(data.get("summary") or "")
-
-
-def merge_chat_new(source_id: str, target_id: Optional[str] = None):
-    from uuid import uuid4
-    new_id = str(uuid4())
-    upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
-
-    merged = []
-
-    # source first
-    for m in list_messages(source_id):
-        row = append_message(new_id, m.role, m.content)
-        merged.append(row)
-
-    # then target (if exists)
-    if target_id:
-        for m in list_messages(target_id):
-            row = append_message(new_id, m.role, m.content)
-            merged.append(row)
-
-    return new_id, merged
-
-
-def edit_message(session_id: str, message_id: int, new_content: str) -> Optional[ChatMessageRow]:
-    data = _load_chat(session_id)
-    msgs = data.get("messages", [])
-    updated = None
-
-    for m in msgs:
-        if int(m.get("id", -1)) == int(message_id):
-            m["content"] = new_content
-            m["updatedAt"] = now_iso()
-            updated = m
-            break
-
-    if not updated:
-        return None
-
-    _save_chat(session_id, data)
-
-    # refresh index if last message changed
-    refresh_index_after_change(session_id, msgs)
-
-    return ChatMessageRow(**updated)
-
-
-# expose internals for pending ops
-__all__ = [
-    "ChatMessageRow",
-    "upsert_on_first_message", "update_last", "append_message",
-    "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch", "merge_chat", "merge_chat_new",
-    "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary",
-]
-
-# ===== aimodel/file_read/store/default_settings.json =====
-
-{
-  "__comment_general": "=== Tokenization & Prompt Overhead ===",
-  "chars_per_token": 4,
-  "prompt_per_message_overhead": 4,
-  "__comment_memory": "=== Session / Memory Settings ===",
-  "recent_maxlen": 50,
-  "__comment_summary": "=== Summarization & Compression ===",
-  "heuristic_max_bullets": 5,
-  "heuristic_max_words": 12,
-  "bullet_prefix": "- ",
-  "use_fast_summary": true,
-  "llm_summary_max_tokens": 60,
-  "llm_summary_temperature": 0,
-  "llm_summary_top_p": 1,
-  "llm_summary_stop": [
-    "\n\n",
-    "\n\n- ",
-    "\n\n\n"
-  ],
-  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
-  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
-  "summary_user_suffix": "\n\nOutput:\n- ",
-  "summary_max_chars": 1200,
-  "summary_header_prefix": "Conversation summary so far:\n",
-  "final_shrink_summary_keep_ratio": 0.5,
-  "final_shrink_summary_min_chars": 200,
-  "__comment_system_directives": "=== System Directives for Model Output ===",
-  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
-  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
-  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
-  "__comment_context": "=== Context Window & Budgets ===",
-  "model_ctx": 2048,
-  "out_budget": 512,
-  "reserved_system_tokens": 256,
-  "min_input_budget": 512,
-  "skip_overage_lt": 128,
-  "max_peel_per_turn": 1,
-  "peel_min": 4,
-  "peel_frac": 0.33,
-  "peel_max": 12,
-  "__comment_generation_defaults": "=== Generation Defaults ===",
-  "default_temperature": 0.7,
-  "default_top_p": 0.95,
-  "default_max_tokens": 512,
-  "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": true,
-  "default_web_k": 3,
-  "web_k_min": 1,
-  "web_k_max": 8,
-  "router_tail_turns": 0,
-  "router_summary_chars": 0,
-  "router_max_chars": 1400,
-  "router_context_label": "Context:",
-  "router_summary_label": "Summary:",
-  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
-  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
-  "pack_style": "",
-  "pack_short": false,
-  "pack_bullets": false,
-  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
-  "__comment_misc": "=== Miscellaneous ===",
-  "empty_messages_response": "No messages provided.",
-  "clamp_margin": 32,
-  "default_session_id": "default",
-  "stopped_line_marker": "⏹ stopped",
-  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
-  "gen_semaphore_permits": 1,
-  "nctx_fallback": 4096,
-  "token_estimate_fallback": 1024,
-  "min_out_tokens": 16,
-  "__comment_store": "=== Chat storage ===",
-  "chat_default_title": "New Chat",
-  "chat_merged_title": "Merged Chat",
-  "chat_page_min_size": 1,
-  "chat_page_max_size": 100,
-    "__comment_web_search_provider": "=== DuckDuckGo provider ===",
-  "web_search_cache_ttl_sec": 300,
-  "web_search_cache_superset_k": 10,
-  "web_search_region": "us-en",
-  "web_search_safesearch": "moderate",
-  "web_search_debug_logging": false,
-  "__comment_streaming": "=== Streaming worker tuning ===",
-  "stream_queue_maxsize": 64,
-  "stream_backpressure_sleep_sec": 0.005,
-  "stream_top_k": 40,
-  "stream_repeat_penalty": 1.25,
-  "stream_retry_min_tokens": 64,
-  "stream_retry_fraction": 0.5,
-  "stream_stop_strings": [
-    "\n⏹ stopped\n"
-  ],
-  "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2.0,
-  "runjson_emit": true
-}
-
-# ===== aimodel/file_read/store/effective_settings.json =====
-
-{
-  "__comment_general": "=== Tokenization & Prompt Overhead ===",
-  "chars_per_token": 4,
-  "prompt_per_message_overhead": 4,
-  "__comment_memory": "=== Session / Memory Settings ===",
-  "recent_maxlen": 50,
-  "__comment_summary": "=== Summarization & Compression ===",
-  "heuristic_max_bullets": 5,
-  "heuristic_max_words": 12,
-  "bullet_prefix": "- ",
-  "use_fast_summary": true,
-  "llm_summary_max_tokens": 60,
-  "llm_summary_temperature": 0,
-  "llm_summary_top_p": 1,
-  "llm_summary_stop": [
-    "\n\n",
-    "\n\n- ",
-    "\n\n\n"
-  ],
-  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
-  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
-  "summary_user_suffix": "\n\nOutput:\n- ",
-  "summary_max_chars": 1200,
-  "summary_header_prefix": "Conversation summary so far:\n",
-  "final_shrink_summary_keep_ratio": 0.5,
-  "final_shrink_summary_min_chars": 200,
-  "__comment_system_directives": "=== System Directives for Model Output ===",
-  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
-  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
-  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
-  "__comment_context": "=== Context Window & Budgets ===",
-  "model_ctx": 2048,
-  "out_budget": 512,
-  "reserved_system_tokens": 256,
-  "min_input_budget": 512,
-  "skip_overage_lt": 128,
-  "max_peel_per_turn": 1,
-  "peel_min": 4,
-  "peel_frac": 0.33,
-  "peel_max": 12,
-  "__comment_generation_defaults": "=== Generation Defaults ===",
-  "default_temperature": 0.7,
-  "default_top_p": 0.95,
-  "default_max_tokens": 512,
-  "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": true,
-  "default_web_k": 3,
-  "web_k_min": 1,
-  "web_k_max": 8,
-  "router_tail_turns": 0,
-  "router_summary_chars": 0,
-  "router_max_chars": 1400,
-  "router_context_label": "Context:",
-  "router_summary_label": "Summary:",
-  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
-  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
-  "pack_style": "",
-  "pack_short": false,
-  "pack_bullets": false,
-  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
-  "__comment_misc": "=== Miscellaneous ===",
-  "empty_messages_response": "No messages provided.",
-  "clamp_margin": 32,
-  "default_session_id": "default",
-  "stopped_line_marker": "⏹ stopped",
-  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
-  "gen_semaphore_permits": 1,
-  "nctx_fallback": 4096,
-  "token_estimate_fallback": 1024,
-  "min_out_tokens": 16,
-  "__comment_store": "=== Chat storage ===",
-  "chat_default_title": "New Chat",
-  "chat_merged_title": "Merged Chat",
-  "chat_page_min_size": 1,
-  "chat_page_max_size": 100,
-  "__comment_web_search_provider": "=== DuckDuckGo provider ===",
-  "web_search_cache_ttl_sec": 300,
-  "web_search_cache_superset_k": 10,
-  "web_search_region": "us-en",
-  "web_search_safesearch": "moderate",
-  "web_search_debug_logging": false,
-  "__comment_streaming": "=== Streaming worker tuning ===",
-  "stream_queue_maxsize": 64,
-  "stream_backpressure_sleep_sec": 0.005,
-  "stream_top_k": 40,
-  "stream_repeat_penalty": 1.25,
-  "stream_retry_min_tokens": 64,
-  "stream_retry_fraction": 0.5,
-  "stream_stop_strings": [
-    "\n⏹ stopped\n"
-  ],
-  "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2.0,
-  "runjson_emit": true
-}
-
-# ===== aimodel/file_read/store/index.py =====
-
-from __future__ import annotations
-import json
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from .base import INDEX_PATH, atomic_write, ensure_dirs, now_iso
-
-def load_index() -> List[Dict]:
-    ensure_dirs()
-    try:
-        with INDEX_PATH.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def save_index(rows: List[Dict]):
-    atomic_write(INDEX_PATH, rows)
-
-@dataclass
-class ChatMeta:
-    id: int
-    sessionId: str
-    title: str
-    lastMessage: Optional[str]
-    createdAt: str
-    updatedAt: str
-
-def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
-    idx = load_index()
-    row = next((r for r in idx if r["sessionId"] == session_id), None)
-    if not row:
-        return
-    row["updatedAt"] = now_iso()
-    last_asst = None
-    for m in reversed(messages):
-        if m.get("role") == "assistant":
-            last_asst = m.get("content") or None
-            break
-    row["lastMessage"] = last_asst
-    save_index(idx)
-
-# ===== aimodel/file_read/store/override_settings.json =====
-
-{
-  "__comment_general": "=== Tokenization & Prompt Overhead ===",
-  "chars_per_token": 4,
-  "prompt_per_message_overhead": 4,
-  "__comment_memory": "=== Session / Memory Settings ===",
-  "recent_maxlen": 50,
-  "__comment_summary": "=== Summarization & Compression ===",
-  "heuristic_max_bullets": 5,
-  "heuristic_max_words": 12,
-  "bullet_prefix": "- ",
-  "use_fast_summary": true,
-  "llm_summary_max_tokens": 60,
-  "llm_summary_temperature": 0,
-  "llm_summary_top_p": 1,
-  "llm_summary_stop": [
-    "\n\n",
-    "\n\n- ",
-    "\n\n\n"
-  ],
-  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
-  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
-  "summary_user_suffix": "\n\nOutput:\n- ",
-  "summary_max_chars": 1200,
-  "summary_header_prefix": "Conversation summary so far:\n",
-  "final_shrink_summary_keep_ratio": 0.5,
-  "final_shrink_summary_min_chars": 200,
-  "__comment_system_directives": "=== System Directives for Model Output ===",
-  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
-  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
-  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
-  "__comment_context": "=== Context Window & Budgets ===",
-  "model_ctx": 2048,
-  "out_budget": 512,
-  "reserved_system_tokens": 256,
-  "min_input_budget": 512,
-  "skip_overage_lt": 128,
-  "max_peel_per_turn": 1,
-  "peel_min": 4,
-  "peel_frac": 0.33,
-  "peel_max": 12,
-  "__comment_generation_defaults": "=== Generation Defaults ===",
-  "default_temperature": 0.7,
-  "default_top_p": 0.95,
-  "default_max_tokens": 512,
-  "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": true,
-  "default_web_k": 3,
-  "web_k_min": 1,
-  "web_k_max": 8,
-  "router_tail_turns": 0,
-  "router_summary_chars": 0,
-  "router_max_chars": 1400,
-  "router_context_label": "Context:",
-  "router_summary_label": "Summary:",
-  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
-  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
-  "pack_style": "",
-  "pack_short": false,
-  "pack_bullets": false,
-  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
-  "__comment_misc": "=== Miscellaneous ===",
-  "empty_messages_response": "No messages provided.",
-  "clamp_margin": 32,
-  "default_session_id": "default",
-  "stopped_line_marker": "⏹ stopped",
-  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
-  "gen_semaphore_permits": 1,
-  "nctx_fallback": 4096,
-  "token_estimate_fallback": 1024,
-  "min_out_tokens": 16,
-  "__comment_store": "=== Chat storage ===",
-  "chat_default_title": "New Chat",
-  "chat_merged_title": "Merged Chat",
-  "chat_page_min_size": 1,
-  "chat_page_max_size": 100,
-    "__comment_web_search_provider": "=== DuckDuckGo provider ===",
-  "web_search_cache_ttl_sec": 300,
-  "web_search_cache_superset_k": 10,
-  "web_search_region": "us-en",
-  "web_search_safesearch": "moderate",
-  "web_search_debug_logging": false,
-  "__comment_streaming": "=== Streaming worker tuning ===",
-  "stream_queue_maxsize": 64,
-  "stream_backpressure_sleep_sec": 0.005,
-  "stream_top_k": 40,
-  "stream_repeat_penalty": 1.25,
-  "stream_retry_min_tokens": 64,
-  "stream_retry_fraction": 0.5,
-  "stream_stop_strings": [
-    "\n⏹ stopped\n"
-  ],
-  "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2.0,
-  "runjson_emit": true
-}
-
-# ===== aimodel/file_read/utils/streaming.py =====
-
-from __future__ import annotations
-import asyncio
-import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-from ..runtime.model_runtime import current_model_info, get_llm
-
-# Markers MUST match the frontend parser
-RUNJSON_START = "\n[[RUNJSON]]\n"
-RUNJSON_END = "\n[[/RUNJSON]]\n"
-
-# llama.cpp common stop strings
-STOP_STRINGS = ["</s>", "User:", "\nUser:"]
-
-# ---------- token + model helpers ----------
-
-def strip_runjson(s: str) -> str:
-    if not isinstance(s, str) or not s:
-        return s
-    out, i = [], 0
-    while True:
-        start = s.find(RUNJSON_START, i)
-        if start == -1:
-            out.append(s[i:])
-            break
-        out.append(s[i:start])
-        end = s.find(RUNJSON_END, start)
-        if end == -1:
-            break  # unmatched start → drop tail
-        i = end + len(RUNJSON_END)
-    return "".join(out).strip()
-
-def safe_token_count_text(llm: Any, text: str) -> int:
-    try:
-        return len(llm.tokenize(text.encode("utf-8")))
-    except Exception:
-        try:
-            return len(llm.tokenize(text, special=True))  # type: ignore[arg-type]
-        except Exception:
-            return max(1, len(text) // 4)
-
-def safe_token_count_messages(llm: Any, msgs: List[Dict[str, str]]) -> int:
-    return sum(safe_token_count_text(llm, (m.get("content") or "")) for m in msgs)
-
-def model_ident_and_cfg() -> Tuple[str, Dict[str, object]]:
-    info = current_model_info() or {}
-    cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
-    model_path = cfg.get("modelPath") or ""
-    ident = Path(model_path).name or "local-gguf"
-    return ident, cfg
-
-def derive_stop_reason(stop_set: bool, finish_reason: Optional[str], err_text: Optional[str]) -> str:
-    if stop_set:
-        return "user_cancel"
-    if finish_reason:
-        return "eosFound" if finish_reason == "stop" else f"finish:{finish_reason}"
-    if err_text:
-        return "error"
-    return "end_of_stream"
-
-def build_run_json(
-    *,
-    request_cfg: Dict[str, object],   # temperature, top_p, max_tokens
-    out_text: str,
-    t_start: float,
-    t_first: Optional[float],
-    t_last: Optional[float],
-    stop_set: bool,
-    finish_reason: Optional[str],
-    input_tokens_est: Optional[int],
-) -> Dict[str, object]:
-    llm = get_llm()
-    out_tokens = safe_token_count_text(llm, out_text)
-    t_end = time.perf_counter()
-    ttft_ms = ((t_first or t_end) - t_start) * 1000.0
-    gen_secs = (t_last - t_first) if (t_first is not None and t_last is not None) else 0.0
-    tok_per_sec = (out_tokens / gen_secs) if gen_secs > 0 else None
-
-    stop_reason_final = derive_stop_reason(stop_set, finish_reason, None)
-    ident, cfg = model_ident_and_cfg()
-
-    total_tokens = (input_tokens_est or 0) + out_tokens if input_tokens_est is not None else None
-
-    return {
-        "indexedModelIdentifier": ident,
-        "identifier": ident,
-        "loadModelConfig": {
-            "fields": [
-                {"key": "llm.load.llama.cpuThreadPoolSize", "value": int(cfg.get("nThreads") or 0)},
-                {"key": "llm.load.contextLength", "value": int(cfg.get("nCtx") or 4096)},
-                {"key": "llm.load.llama.acceleration.offloadRatio", "value": 1 if int(cfg.get("nGpuLayers") or 0) > 0 else 0},
-                {"key": "llm.load.llama.nBatch", "value": int(cfg.get("nBatch") or 0)},
-                {"key": "llm.load.ropeFreqBase", "value": cfg.get("ropeFreqBase")},
-                {"key": "llm.load.ropeFreqScale", "value": cfg.get("ropeFreqScale")},
-            ]
-        },
-        "predictionConfig": {
-            "fields": [
-                {"key": "llm.prediction.temperature", "value": request_cfg.get("temperature", 0.6)},
-                {"key": "llm.prediction.topKSampling", "value": 40},
-                {"key": "llm.prediction.topPSampling", "value": {"checked": True, "value": request_cfg.get("top_p", 0.9)}},
-                {"key": "llm.prediction.repeatPenalty", "value": {"checked": True, "value": 1.25}},
-                {"key": "llm.prediction.maxTokens", "value": request_cfg.get("max_tokens", 512)},
-                {"key": "llm.prediction.stopStrings", "value": STOP_STRINGS},
-                {"key": "llm.prediction.llama.cpuThreads", "value": int(cfg.get("nThreads") or 0)},
-                {"key": "llm.prediction.contextPrefill", "value": []},
-                {"key": "llm.prediction.tools", "value": {"type": "none"}},
-                {"key": "llm.prediction.promptTemplate", "value": {"type": "none"}},
-            ]
-        },
-        "stats": {
-            "stopReason": stop_reason_final,
-            "tokensPerSecond": tok_per_sec,
-            "numGpuLayers": int(cfg.get("nGpuLayers") or 0),
-            "timeToFirstTokenSec": round((ttft_ms or 0) / 1000.0, 3),
-            "totalTimeSec": round(t_end - t_start, 3),
-            "promptTokensCount": input_tokens_est,
-            "predictedTokensCount": out_tokens,
-            "totalTokensCount": total_tokens,
-        },
-    }
-
-# ---------- connection helper ----------
-
-async def watch_disconnect(request, stop_ev):
-    if await request.is_disconnected():
-        stop_ev.set()
-        return
-    while not stop_ev.is_set():
-        await asyncio.sleep(0.2)
-        if await request.is_disconnected():
-            stop_ev.set()
-            break
-
-# ===== aimodel/file_read/web/__init__.py =====
-
-
-
-# ===== aimodel/file_read/web/duckduckgo.py =====
-
-# aimodel/file_read/web/duckduckgo.py
-from __future__ import annotations
-from typing import List, Optional, Tuple
-import asyncio, time
-from urllib.parse import urlparse
-
-# Prefer new package; fallback for compatibility
-try:
-    from ddgs import DDGS  # type: ignore
-except Exception:
-    try:
-        from duckduckgo_search import DDGS  # type: ignore
-    except Exception:
-        DDGS = None  # no provider
-
-from .provider import SearchHit
-
-# -------- simple in-memory cache (store superset = 10) -----------------------
-_CACHE: dict[str, Tuple[float, List[SearchHit]]] = {}
-CACHE_TTL_SEC = 300  # 5 minutes
-CACHE_SUPERSET_K = 10
-
-def _cache_key(query: str) -> str:
-    return (query or "").strip().lower()
-
-def _cache_get(query: str) -> Optional[List[SearchHit]]:
-    key = _cache_key(query)
-    v = _CA
+                q.put_nowait(f"[aimodel] 

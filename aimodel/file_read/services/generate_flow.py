@@ -1,3 +1,4 @@
+# aimodel/file_read/services/generate_flow.py
 from __future__ import annotations
 import asyncio, time, json
 from typing import AsyncGenerator, Dict, List, Optional
@@ -11,18 +12,21 @@ from ..core.schemas import ChatBody
 
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
 from .session_io import handle_incoming, persist_summary
-from .packing import build_system_text, pack_with_rollup
+from .packing import build_system_text, pack_with_rollup, maybe_inject_rag_block
 from .context_window import clamp_out_budget
 
 from ..web.router_ai import decide_web_and_fetch
+from ..rag.router_ai import decide_rag  # <-- NEW: LLM JSON router for RAG
 from ..utils.streaming import RUNJSON_START, RUNJSON_END
 
 from .streaming_worker import run_stream as _run_stream
 from typing import AsyncIterator
 run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream  # type: ignore[assignment]
 
+
 def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
+
 
 def _chars_len(msgs: List[object]) -> int:
     total = 0
@@ -42,6 +46,7 @@ def _chars_len(msgs: List[object]) -> int:
                 pass
     return total
 
+
 def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, object], session_id: str) -> None:
     try:
         print(f"[{_now()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
@@ -49,6 +54,7 @@ def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, ob
         print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
     except Exception as e:
         print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+
 
 def _compose_router_text(
     recent,
@@ -100,6 +106,7 @@ def _compose_router_text(
         out = out[:mc].rstrip()
     return out
 
+
 async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     ensure_ready()
     llm = get_llm()
@@ -129,19 +136,21 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     latest_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
     lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
 
+    # ---------------------- WEB INJECT (optional) ----------------------
     t0 = time.perf_counter()
     print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
     try:
         block = None
+        router_text = _compose_router_text(
+            st.get("recent", []),
+            str(latest_user_text or ""),
+            st.get("summary", "") or "",
+            tail_turns=int(eff["router_tail_turns"]),
+            summary_chars=int(eff["router_summary_chars"]),
+            max_chars=int(eff["router_max_chars"]),
+        )
+
         if auto_web:
-            router_text = _compose_router_text(
-                st.get("recent", []),
-                str(latest_user_text or ""),
-                st.get("summary", "") or "",
-                tail_turns=int(eff["router_tail_turns"]),
-                summary_chars=int(eff["router_summary_chars"]),
-                max_chars=int(eff["router_max_chars"]),
-            )
             block = await decide_web_and_fetch(llm, router_text, k=web_k)
 
         print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
@@ -163,6 +172,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         dt = time.perf_counter() - t0
         print(f"[{_now()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
 
+    # ---------------------- PACK (with ephemeral web) ----------------------
     system_text = build_system_text()
 
     ephemeral_once = st.pop("_ephemeral_web", [])
@@ -175,6 +185,29 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         ephemeral=ephemeral_once,
     )
 
+    # ---------------------- RAG ROUTER (LLM JSON) ----------------------
+    rag_need = False
+    rag_query: Optional[str] = None
+    try:
+        rag_need, rag_query = decide_rag(llm, router_text)
+        print(f"[{_now()}] RAG ROUTER need={rag_need} query={rag_query!r}")
+    except Exception as e:
+        print(f"[{_now()}] RAG ROUTER ERROR {type(e).__name__}: {e}")
+        rag_need = bool(SETTINGS.effective().get("rag_default_need_when_invalid", False))
+        rag_query = None
+
+    # If a web block was injected OR RAG router said no, skip RAG
+    skip_rag = bool(ephemeral_once) or (not rag_need)
+
+    # Optionally pass LLM-refined query to RAG
+    packed = maybe_inject_rag_block(
+        packed,
+        session_id=session_id,
+        skip_rag=skip_rag,
+        rag_query=rag_query,
+    )
+
+    # ---------------------- STREAM SETUP ----------------------
     packed_chars = _chars_len(packed)
     print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
 
@@ -265,10 +298,12 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
+
 async def cancel_session(session_id: str):
     from .cancel import cancel_event
     cancel_event(session_id).set()
     return {"ok": True}
+
 
 async def cancel_session_alias(session_id: str):
     return await cancel_session(session_id)

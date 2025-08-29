@@ -1,0 +1,179 @@
+0, max - 1).trimEnd() + "…";
+}
+
+# ===== frontend/src/file_read/shared/ui/Button.tsx =====
+
+interface Props {
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}
+
+export default function Button({ onClick, disabled, children }: Props) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 ${
+        disabled ? "opacity-50 cursor-not-allowed" : ""
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/CodeCopyButton.tsx =====
+
+// frontend/src/file_read/components/CodeCopyButton.tsx
+import { Copy, Check } from "lucide-react";
+import { useState } from "react";
+
+export default function CodeCopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  async function onCopy() {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+  }
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      title={copied ? "Copied!" : "Copy"}
+      className="inline-flex items-center justify-center w-7 h-7 rounded bg-gray-200 text-gray-600 hover:bg-gray-300 transition"
+    >
+      {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+    </button>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/Spinner.tsx =====
+
+export default function Spinner() {
+  return (
+    <div className="flex justify-center py-6">
+      <div className="h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/Toast.tsx =====
+
+export default function Toast({ message }: { message: string | null }) {
+  if (!message) return null;
+  return (
+    <div className="pointer-events-none fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
+      <div className="px-3 py-2 rounded-lg bg-black text-white text-xs shadow-lg">
+        {message}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/shared/ui/TypingIndicator.tsx =====
+
+// components/TypingIndicator.tsx
+export default function TypingIndicator() {
+  return (
+    <div className="flex items-start gap-2">
+      {/* Optional avatar spot */}
+      <div className="h-8 w-8 rounded-full bg-gray-200 shrink-0" />
+      <div className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600">
+        <span className="inline-flex gap-1">
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.2s]" />
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.1s]" />
+          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/types/chat.ts =====
+
+export type Role = "user" | "assistant";
+
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export type ChatMsg = {
+  /** Stable UI id that never changes. Always a UUID you assign client-side. */
+  id: string; // == clientId
+  /** Database id if persisted. Null until the backend saves it. */
+  serverId: number | null;
+
+  role: Role;
+  text: string;
+
+  // Per-message telemetry (assistant only is typical)
+  meta?: {
+    runJson?: RunJson | null;
+    flat?: GenMetrics | null;
+  };
+};
+
+export type ChatRow = {
+  id: number;
+  sessionId: string;
+  title: string;
+  lastMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ChatMessageRow = {
+  id: number;              // server id
+  sessionId: string;
+  role: Role;
+  content: string;
+  createdAt: string;
+};
+
+# ===== frontend/src/file_read/utils/metricsCache.ts =====
+
+// Cache per-assistant-message metrics in localStorage so they persist across navigation/reload.
+const KEY = "msgMetrics:v1";
+
+type Stored = Record<string, { runJson?: any | null; flat?: any | null }>;
+
+function loadAll(): Stored {
+  try {
+    const raw = localStorage.getItem(KEY);
+    return raw ? (JSON.parse(raw) as Stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAll(obj: Stored) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(obj));
+  } catch {
+    /* ignore quota errors */
+  }
+}
+
+export function setMsgMetrics(messageId: string, data: { runJson?: any | null; flat?: any | null }) {
+  const all = loadAll();
+  const cur = all[messageId] || {};
+  all[messageId] = {
+    runJson: data.runJson ?? cur.runJson ?? null,
+    flat: data.flat ?? cur.flat ?? null,
+  };
+  saveAll(all);
+}
+
+export function getMsgMetrics(messageId: string) {
+  const all = loadAll();
+  return all[messageId] || null;
+}
+
+export function clearMsgMetrics(messageId: string) {
+  const all = loadAll();
+  if (all[messageId]) {
+    delete all[messageId];
+    saveAll(all);
+  }
+}
+
+# ===== frontend/src/file_read/vite-env.d.ts =====
+
+/// <reference types="vite/client" />

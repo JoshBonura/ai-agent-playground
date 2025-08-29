@@ -5,11 +5,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .adaptive.config.paths import bootstrap
 from .workers.retitle_worker import start_worker
-
 from .api.models import router as models_router
 from .api.chats import router as chats_router
 from .runtime.model_runtime import load_model
 from .api.generate_router import router as generate_router
+from .api.rag import router as rag_router
 from .services.cancel import is_active
 from .api import settings as settings_router
 bootstrap()
@@ -27,6 +27,7 @@ app.include_router(models_router)
 app.include_router(chats_router)
 app.include_router(generate_router)
 app.include_router(settings_router.router)
+app.include_router(rag_router)
 
 @app.on_event("startup")
 async def _startup():

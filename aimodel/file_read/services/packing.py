@@ -1,7 +1,7 @@
 # aimodel/file_read/services/packing.py
 from __future__ import annotations
 from typing import Tuple, List, Dict, Optional
-
+from ..rag.retrieve import build_rag_block
 from ..core.settings import SETTINGS
 from ..core.memory import build_system, pack_messages, roll_summary_if_needed
 
@@ -56,3 +56,23 @@ def pack_with_rollup(
             packed = packed + eph
 
     return packed, new_summary, input_budget
+
+def maybe_inject_rag_block(messages: list[dict], *, session_id: str | None,
+                           skip_rag: bool = False, rag_query: str | None = None) -> list[dict]:
+    if skip_rag:
+        return messages
+    if not SETTINGS.get("rag_enabled", True):
+        return messages
+    if not messages or messages[-1].get("role") != "user":
+        return messages
+
+    user_q = rag_query or (messages[-1].get("content") or "")
+    block = build_rag_block(user_q, session_id=session_id)
+
+    if not block:
+        print(f"[RAG INJECT] no hits (session={session_id}) q={(user_q or '')!r}")
+        return messages
+
+    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
+    injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
+    return injected
