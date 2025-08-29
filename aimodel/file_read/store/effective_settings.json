@@ -272,5 +272,6 @@
   "excel_dates_drop_time_if_midnight": true,
   "excel_time_precision": "minute",
   "excel_value_max_chars": 160,
-  "excel_quote_strings": true
+  "excel_quote_strings": true,
+  "excel_include_formulas": false
 }

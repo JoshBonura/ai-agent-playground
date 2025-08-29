@@ -25,6 +25,12 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
     max_chars = int(S("excel_value_max_chars"))
     quote_strings = bool(S("excel_quote_strings"))
 
+    # NEW: feature flag (defaults to True if missing to preserve old behavior)
+    try:
+        include_formulas = bool(S("excel_include_formulas"))
+    except Exception:
+        include_formulas = True
+
     def clip(s: str) -> str:
         return s if (max_chars <= 0 or len(s) <= max_chars) else s[:max_chars] + "…"
 
@@ -67,7 +73,8 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
         return s
 
     wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    wb_form = load_workbook(io.BytesIO(data), data_only=False, read_only=True)
+    # Only load the formulas workbook if we actually plan to read formulas
+    wb_form = load_workbook(io.BytesIO(data), data_only=False, read_only=True) if include_formulas else None
 
     MAX_ROWS_PER_TABLE = int(S("excel_max_rows_per_table"))
     MAX_FORMULAS_PER_SHEET = int(S("excel_max_formulas_per_sheet"))
@@ -126,7 +133,7 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
 
     for sheet_name in wb_vals.sheetnames:
         ws_v: Worksheet = wb_vals[sheet_name]
-        ws_f: Worksheet = wb_form[sheet_name]
+        ws_f: Worksheet | None = wb_form[sheet_name] if wb_form else None
         lines.append(f"# Sheet: {sheet_name}")
 
         formulas_emitted = 0
@@ -147,7 +154,7 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                             max_c = ws_v.max_column or 1
                         headers: List[str] = []
                         ws_v_cell = ws_v.cell
-                        ws_f_cell = ws_f.cell
+                        ws_f_cell = ws_f.cell if ws_f else None
                         gl = get_column_letter
                         for c in range(min_c, max_c + 1):
                             v = ws_v_cell(row=min_r, column=c).value
@@ -157,7 +164,7 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                         shown = 0
                         for r in range(min_r + 1, max_r + 1):
                             cells: List[str] = []
-                            need_formula = formulas_emitted < MAX_FORMULAS_PER_SHEET
+                            need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
                             for c in range(min_c, max_c + 1):
                                 cl = col_letter_cache.get(c)
                                 if cl is None:
@@ -166,14 +173,14 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                                 addr = f"{cl}{r}"
                                 vv = ws_v_cell(row=r, column=c).value
                                 val_str = fmt_val(vv)
-                                fv = ws_f_cell(row=r, column=c).value if need_formula else None
-                                if isinstance(fv, str) and fv.startswith("=") and need_formula:
+                                fv = ws_f_cell(row=r, column=c).value if (ws_f_cell and need_formula) else None
+                                if include_formulas and isinstance(fv, str) and fv.startswith("=") and need_formula:
                                     if val_str:
                                         cells.append(f"{addr}={val_str} (formula:={fv[1:]})")
                                     else:
                                         cells.append(f"{addr} (formula:={fv[1:]})")
                                     formulas_emitted += 1
-                                    need_formula = formulas_emitted < MAX_FORMULAS_PER_SHEET
+                                    need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
                                 elif val_str:
                                     cells.append(f"{addr}={val_str}")
                             if not cells:
@@ -211,14 +218,15 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                 lines.append(f"## Cells (non-empty, first {MAX_CELLS_PER_SHEET})")
                 emitted = 0
                 ws_v_cell = ws_v.cell
-                ws_f_cell = ws_f.cell
+                ws_f_cell = ws_f.cell if ws_f else None
                 gl = get_column_letter
                 for r in range(min_r, max_r + 1):
                     for c in range(min_c, max_c + 1):
-                        need_formula = formulas_emitted < MAX_FORMULAS_PER_SHEET
+                        need_formula = include_formulas and (formulas_emitted < MAX_FORMULAS_PER_SHEET)
                         vv = ws_v_cell(row=r, column=c).value
-                        fv = ws_f_cell(row=r, column=c).value if need_formula or vv is None else None
-                        if vv is None and not (isinstance(fv, str) and fv and fv.startswith("=")):
+                        fv = ws_f_cell(row=r, column=c).value if (ws_f_cell and need_formula or (ws_f_cell and include_formulas and vv is None)) else None
+                        # If formulas are off, skip formula-only cells (vv is None)
+                        if vv is None and not (include_formulas and isinstance(fv, str) and fv.startswith("=")):
                             continue
                         cl = col_letter_cache.get(c)
                         if cl is None:
@@ -226,7 +234,7 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                             col_letter_cache[c] = cl
                         addr = f"{cl}{r}"
                         val_str = fmt_val(vv)
-                        if isinstance(fv, str) and fv.startswith("=") and need_formula:
+                        if include_formulas and isinstance(fv, str) and fv.startswith("=") and need_formula:
                             if val_str:
                                 lines.append(f"- {addr}={val_str} (formula:={fv[1:]})")
                             else:
