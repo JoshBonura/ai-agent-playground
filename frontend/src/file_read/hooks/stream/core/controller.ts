@@ -1,4 +1,4 @@
-import { appendMessage } from "../../data/chatApi";
+import { appendMessage } from "../../../data/chatApi";
 import type { StreamController, StreamCoreOpts } from "./types";
 import { createScheduler, type QueueItem } from "./queue";
 import { createCanceller } from "./cancel";

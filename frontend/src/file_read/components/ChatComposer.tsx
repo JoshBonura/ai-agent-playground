@@ -1,8 +1,8 @@
 // frontend/src/file_read/components/ChatComposer.tsx
 import { useEffect, useRef, useState } from "react";
-import { SendHorizonal, Square, Paperclip, X, Check } from "lucide-react";
-import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
-
+import ComposerActions from "./Composer/ComposerActions";
+import AttachmentChip from "./Composer/AttachmentChip";
+import { useAttachmentUploads } from "../hooks/useAttachmentUploads";
 import type { Attachment } from "../types/chat";
 
 const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
@@ -12,19 +12,11 @@ type Props = {
   setInput: (v: string) => void;
   loading: boolean;
   queued?: boolean;
-  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;  // ✅ updated
+  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
   onStop: () => void | Promise<void>;
   onHeightChange?: (h: number) => void;
   onRefreshChats?: () => void;
   sessionId?: string;
-};
-
-type Att = {
-  id: string;               // unique per pick
-  name: string;             // file.name (used as source)
-  pct: number;              // 0..100
-  status: "uploading" | "ready" | "error";
-  abort?: AbortController;  // to cancel in-flight
 };
 
 export default function ChatComposer({
@@ -46,8 +38,8 @@ export default function ChatComposer({
   const [isClamped, setIsClamped] = useState(false);
   const [draft, setDraft] = useState(input);
 
-  // local attachment list
-  const [atts, setAtts] = useState<Att[]>([]);
+  const { atts, addFiles, removeAtt, anyUploading, anyReady, attachmentsForPost, reset } =
+    useAttachmentUploads(sessionId, onRefreshChats);
 
   useEffect(() => setDraft(input), [input]);
 
@@ -68,55 +60,35 @@ export default function ChatComposer({
     const onResize = () => autogrow();
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { autogrow(); }, [draft, atts.length]); // reflow when chips change
+  useEffect(() => { autogrow(); }, [draft, atts.length]);
 
   const hasText = draft.trim().length > 0;
-  const anyUploading = atts.some(a => a.status === "uploading");
-  const anyReady = atts.some(a => a.status === "ready");
 
   const forceScroll = (behavior: ScrollBehavior = "auto") => {
     window.dispatchEvent(new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } }));
   };
 
-  // ⬇️ NEW: build attachments payload for POST
-  function attachmentsForPost() {
-    if (!sessionId) return [];
-    return atts
-      .filter(a => a.status === "ready")
-      .map(a => ({
-        name: a.name,
-        source: a.name,   // RAG uses filename as source
-        sessionId,
-        // optionally: size, mime, chunks if you track them
-      }));
-  }
+  const handleSendClick = async () => {
+    const v = draft.trim();
+    if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
+    forceScroll("auto");
+    setDraft("");
+    setInput("");
+    reset();
+    try {
+      await onSend(v, attachmentsForPost());
+    } finally {
+      onRefreshChats?.();
+      requestAnimationFrame(() => forceScroll("smooth"));
+    }
+  };
 
-const handleSendClick = async () => {
-  const v = draft.trim();
-  if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
-
-  forceScroll("auto");
-
-  setDraft("");
-  setInput("");
-  setAtts([]);
-
-  try {
-    await onSend(v, attachmentsForPost());
-  } finally {
-    onRefreshChats?.();
-    requestAnimationFrame(() => forceScroll("smooth"));
-  }
-};
-
-// ✅ moved out of handleSendClick
-const handleStopClick = () => {
-  if (!loading && !queued) return;
-  void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
-};
+  const handleStopClick = () => {
+    if (!loading && !queued) return;
+    void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
+  };
 
   const pickFile = () => fileRef.current?.click();
 
@@ -124,53 +96,9 @@ const handleStopClick = () => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     if (!sessionId) { e.target.value = ""; return; }
-
-    const picked = Array.from(files);
-    // create local chip entries
-    const news: Att[] = picked.map((f, i) => ({
-      id: `${Date.now()}-${i}-${f.name}`,
-      name: f.name,
-      pct: 0,
-      status: "uploading",
-      abort: new AbortController(),
-    }));
-    setAtts(prev => [...prev, ...news]);
-
-    // kick uploads
-    news.forEach((att, idx) => {
-      const f = picked[idx];
-      uploadRagWithProgress(
-        f,
-        sessionId,
-        (pct) => setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct } : a)),
-        att.abort?.signal
-      ).then(() => {
-        setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct: 100, status: "ready", abort: undefined } : a));
-        onRefreshChats?.();
-      }).catch(() => {
-        setAtts(prev => prev.map(a => a.id === att.id ? { ...a, status: "error", abort: undefined } : a));
-      });
-    });
-
-    e.target.value = ""; // allow re-pick
+    await addFiles(files);
+    e.target.value = "";
   };
-
-const removeAtt = async (att: Att) => {
-  // 1) Cancel in-flight upload immediately
-  if (att.status === "uploading" && att.abort) {
-    att.abort.abort();
-  }
-
-  // 2) Always ask backend to purge any partial/queued ingest
-  if (sessionId) {
-    try { await deleteUploadHard(att.name, sessionId); } catch {}
-  }
-
-  // 3) Remove chip right away (UI feels instant)
-  setAtts(prev => prev.filter(a => a.id !== att.id));
-
-  onRefreshChats?.();
-};
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -180,49 +108,20 @@ const removeAtt = async (att: Att) => {
   }
 
   const disableActions = loading || queued || anyUploading;
-  const showSend = hasText || anyReady; // allow send even with empty text if file ready
+  const showSend = hasText || anyReady;
 
   return (
     <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
-      {/* Attachment chips */}
       {atts.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-2">
           {atts.map((a) => (
-            <div key={a.id} className="min-w-[160px] max-w-[280px] border rounded-lg px-2 py-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="truncate text-sm" title={a.name}>{a.name}</div>
-                <button
-                  className="p-1 rounded hover:bg-gray-100"
-                  aria-label="Remove file"
-                  onClick={() => removeAtt(a)}
-                >
-                  <X size={14} />
-                </button>
-              </div>
-              <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
-                <div
-                  className={`h-1.5 rounded ${a.status === "error" ? "bg-red-500" : "bg-black"}`}
-                  style={{ width: `${a.pct}%` }}
-                />
-              </div>
-              <div className="mt-1 text-xs text-gray-500 flex items-center gap-1">
-                {a.status === "uploading" && <span>Uploading… {a.pct}%</span>}
-                {a.status === "ready" && <><Check size={14} /> Ready</>}
-                {a.status === "error" && <span>Error</span>}
-              </div>
-            </div>
+            <AttachmentChip key={a.id} a={a} onRemove={removeAtt} />
           ))}
         </div>
       )}
 
       <div className="flex gap-2">
-        <input
-          ref={fileRef}
-          type="file"
-          multiple
-          className="hidden"
-          onChange={onFilePicked}
-        />
+        <input ref={fileRef} type="file" multiple className="hidden" onChange={onFilePicked} />
 
         <textarea
           ref={taRef}
@@ -236,41 +135,17 @@ const removeAtt = async (att: Att) => {
           }`}
           rows={1}
           style={{ maxHeight: MAX_HEIGHT_PX }}
-          disabled={queued} // typing allowed during upload if you prefer, keep as-is
+          disabled={queued}
         />
 
-        <div className="flex items-end gap-2">
-          <button
-            className={`p-2 rounded-lg border hover:bg-gray-50 ${disableActions || !sessionId ? "opacity-60 cursor-not-allowed" : ""}`}
-            onClick={pickFile}
-            title="Upload to this chat"
-            aria-label="Upload to this chat"
-            disabled={disableActions || !sessionId}
-          >
-            <Paperclip size={18} />
-          </button>
-
-          {(loading || queued) ? (
-            <button
-              className="p-2 rounded-lg border hover:bg-gray-50"
-              onClick={handleStopClick}
-              title={queued ? "Cancel queued message" : "Stop generating"}
-              aria-label={queued ? "Cancel queued message" : "Stop generating"}
-            >
-              <Square size={18} />
-            </button>
-          ) : showSend ? (
-            <button
-              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px disabled:opacity-60"
-              onClick={handleSendClick}
-              title="Send"
-              aria-label="Send"
-              disabled={disableActions}
-            >
-              <SendHorizonal size={18} />
-            </button>
-          ) : null}
-        </div>
+        <ComposerActions
+          disabledUpload={disableActions || !sessionId}
+          onPickFile={pickFile}
+          showStop={loading || queued}
+          onStop={handleStopClick}
+          showSend={showSend}
+          onSend={handleSendClick}
+        />
       </div>
     </div>
   );

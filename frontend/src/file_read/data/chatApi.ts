@@ -1,5 +1,5 @@
-import type { Attachment, ChatRow, ChatMessageRow} from "../../types/chat";
-import { request } from "../../services/http";
+import type { Attachment, ChatRow, ChatMessageRow} from "../types/chat";
+import { request } from "../services/http";
 
 // Spring Page<T> type
 export type PageResp<T> = {

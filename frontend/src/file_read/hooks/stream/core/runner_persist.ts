@@ -1,4 +1,4 @@
-import { appendMessage, updateChatLast } from "../../data/chatApi";
+import { appendMessage, updateChatLast } from "../../../data/chatApi";
 import type { RunJson } from "../../../shared/lib/runjson";
 import { MET_START, MET_END } from "../../../shared/lib/runjson";
 

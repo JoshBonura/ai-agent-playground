@@ -1,114 +1,6 @@
- 0; i--) {
-        if (q[i].sid === sid) q.splice(i, 1);
-      }
-    },
-    getActiveSid: () => active?.sid ?? null,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
-
-// frontend/src/file_read/hooks/stream/core/runner.ts
-import { postStream } from "./network";
-import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
-import type { ChatMsg } from "../../../types/chat";
-import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
-import { readStreamLoop } from "./runner_stream";
-import {
-  pinLiveMetricsToSession,
-  pinLiveMetricsToBubble,
-  pinFallbackToSessionAndBubble,
-} from "./runner_metrics";
-import { persistAssistantTurn } from "./runner_persist";
-import type { QueueItem } from "./queue";
-
-export type RunnerDeps = {
-  opts: {
-    ensureChatCreated: () => Promise<void>;
-    getSessionId: () => string;
-    getMessagesFor: (sid: string) => ChatMsg[];
-    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
-    setInput: (v: string) => void;
-    setLoadingFor: (sid: string, v: boolean) => void;
-    setQueuedFor: (sid: string, v: boolean) => void;
-    resetMetricsFor: (sid: string) => void;
-    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
-    onRetitle: (sid: string, finalText: string) => Promise<void>;
-    /** patch serverId by clientId */
-    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
-  };
-  getCancelForSid: () => string | null;
-  clearCancelIf: (sid: string) => void;
-  setController: (c: AbortController | null) => void;
-  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
-};
-
-export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
-  const { sid, prompt, asstId, attachments } = job;
-  const { opts } = d;
-  const wasCanceled = () => d.getCancelForSid() === sid;
-
-  opts.resetMetricsFor(sid);
-  opts.setLoadingFor(sid, true);
-
-  // Ensure assistant placeholder exists even for attachments-only turns
-  ensureAssistantPlaceholder(
-    { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
-    sid,
-    asstId
-  );
-
-  // Build short history and PRESERVE attachments for prior messages
-  const MAX_HISTORY = 10;
-  const history = opts
-    .getMessagesFor(sid)
-    .slice(-MAX_HISTORY)
-    .map((m) => ({
-      role: m.role,
-      content: m.text || "",
-      attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
-    }))
-    // keep entries that have text OR attachments (so attachments-only past turns aren't dropped)
-    .filter(
-      (m) =>
-        (m.content && m.content.trim().length > 0) ||
-        (m.attachments && m.attachments.length > 0)
-    );
-
-  // Current user turn (may be text, attachments, or both)
-  const userTurn = {
-    role: "user" as const,
-    content: prompt,
-    attachments: attachments && attachments.length ? attachments : undefined,
-  };
-
-  // 🔎 helpful debug
-  console.log("[runner] postStream payload", {
-    sid,
-    historyCount: history.length,
-    lastHistHasAtts:
-      history.length > 0 && !!history[history.length - 1]?.attachments?.length,
-    promptLen: (prompt || "").length,
-    hasAttachments: !!(attachments && attachments.length),
-  });
-
-  const controller = new AbortController();
-  d.setController(controller);
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-
-  try {
-    // Send to backend; IMPORTANT: do not strip attachments in network.ts
-    reader = await postStream(
-      { sessionId: sid, messages: [...history, userTurn] },
-      controller.signal
-    );
-    d.setReader(reader);
-
-    const { finalText, gotMetrics, lastRunJson } = await readStreamLoop(reader, {
+it readStreamLoop(reader, {
       wasCanceled,
       onDelta: (delta) => {
-        // append assistant delta inline
         opts.setMessagesFor(sid, (prev) => {
           const idx = prev.findIndex((m) => m.id === asstId);
           if (idx === -1) return prev;
@@ -139,21 +31,42 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
       if (newServerId != null) {
         opts.setServerIdFor(sid, asstId, newServerId);
       }
+
+      try { await opts.onRetitle(sid, finalText); } catch {}
       try {
-        await opts.onRetitle(sid, finalText);
-      } catch {}
-      try {
-       window.dispatchEvent(
+        window.dispatchEvent(
           new CustomEvent("chats:refresh", {
             detail: {
               sessionId: sid,
               lastMessage: finalText,
-              // title: <if you retitle>,   // keep if/when you re-enable title bot
               updatedAt: new Date().toISOString(),
             },
           })
         );
       } catch {}
+
+      const pokeForTitle = (delayMs: number) => {
+        window.setTimeout(async () => {
+          try {
+            const ceil = new Date().toISOString();
+            const page = await listChatsPage(0, 30, ceil);
+            const row = page.content.find((r: any) => r.sessionId === sid);
+            if (row?.title) {
+              window.dispatchEvent(
+                new CustomEvent("chats:refresh", {
+                  detail: {
+                    sessionId: sid,
+                    title: row.title,
+                    updatedAt: row.updatedAt,
+                  },
+                })
+              );
+            }
+          } catch {}
+        }, delayMs);
+      };
+      pokeForTitle(1000);
+      pokeForTitle(3000);
     }
   } catch (e: any) {
     const localAbort =
@@ -256,7 +169,7 @@ export function pinFallbackToSessionAndBubble(
 
 # ===== frontend/src/file_read/hooks/stream/core/runner_persist.ts =====
 
-import { appendMessage, updateChatLast } from "../../data/chatApi";
+import { appendMessage, updateChatLast } from "../../../data/chatApi";
 import type { RunJson } from "../../../shared/lib/runjson";
 import { MET_START, MET_END } from "../../../shared/lib/runjson";
 
@@ -422,50 +335,181 @@ export function snapshotPendingAssistant(msgs: ChatMsg[]): string {
   return last.role === "assistant" ? last.text : "";
 }
 
-# ===== frontend/src/file_read/hooks/useAutoScroll.ts =====
+# ===== frontend/src/file_read/hooks/useAttachmentUploads.ts =====
 
-// frontend/src/file_read/hooks/useAutoScroll.ts
-import { useEffect } from "react";
+import { useState } from "react";
+import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
 
-type AnyRef<T extends HTMLElement> = { current: T | null };
+export type Att = {
+  id: string;
+  name: string;
+  pct: number;
+  status: "uploading" | "ready" | "error";
+  abort?: AbortController;
+};
 
-/**
- * Auto-scrolls to bottom when the user is already near the bottom.
- * Supports BOTH:
- *   1) useAutoScroll(ref, [dep1, dep2],)          // old style
- *   2) useAutoScroll(ref, thresholdPx, dep1, dep2) // new style with threshold
- */
-export function useAutoScroll<T extends HTMLElement>(
-  ref: AnyRef<T>,
-  depsOrThreshold: any[] | number = [],
-  ...restDeps: any[]
-) {
-  const thresholdPx =
-    typeof depsOrThreshold === "number" ? depsOrThreshold : 24;
-  const deps = Array.isArray(depsOrThreshold) ? depsOrThreshold : restDeps;
+export function useAttachmentUploads(sessionId?: string, onRefreshChats?: () => void) {
+  const [atts, setAtts] = useState<Att[]>([]);
+
+  const anyUploading = atts.some(a => a.status === "uploading");
+  const anyReady = atts.some(a => a.status === "ready");
+
+  async function addFiles(files: FileList | File[]) {
+    if (!files || !sessionId) return;
+    const picked = Array.from(files);
+    const news: Att[] = picked.map((f, i) => ({
+      id: `${Date.now()}-${i}-${f.name}`,
+      name: f.name,
+      pct: 0,
+      status: "uploading",
+      abort: new AbortController(),
+    }));
+    setAtts(prev => [...prev, ...news]);
+
+    news.forEach((att, idx) => {
+      const f = picked[idx];
+      uploadRagWithProgress(
+        f,
+        sessionId,
+        (pct) => setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct } : a)),
+        att.abort?.signal
+      )
+        .then(() => {
+          setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct: 100, status: "ready", abort: undefined } : a));
+          onRefreshChats?.();
+        })
+        .catch(() => {
+          setAtts(prev => prev.map(a => a.id === att.id ? { ...a, status: "error", abort: undefined } : a));
+        });
+    });
+  }
+
+  async function removeAtt(att: Att) {
+    if (att.status === "uploading" && att.abort) {
+      try { att.abort.abort(); } catch {}
+    }
+    if (sessionId) {
+      try { await deleteUploadHard(att.name, sessionId); } catch {}
+    }
+    setAtts(prev => prev.filter(a => a.id !== att.id));
+    onRefreshChats?.();
+  }
+
+  function attachmentsForPost(): Array<{ name: string; source: string; sessionId: string }> {
+    if (!sessionId) return [];
+    return atts
+      .filter(a => a.status === "ready")
+      .map(a => ({ name: a.name, source: a.name, sessionId }));
+  }
+
+  function reset() {
+    setAtts([]);
+  }
+
+  return { atts, addFiles, removeAtt, anyUploading, anyReady, attachmentsForPost, reset };
+}
+
+# ===== frontend/src/file_read/hooks/useChatAutoFollow.ts =====
+
+import { useEffect, useMemo, useRef } from "react";
+import type { ChatMsg } from "../types/chat";
+
+const SCROLL_THRESHOLD_VH = 0.75;
+const MIN_THRESHOLD_PX = 24;
+const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
+
+export function useChatAutofollow({
+  messages,
+  loading,
+  autoFollow = true,
+  bottomPad = 0,
+}: {
+  messages: ChatMsg[];
+  loading: boolean;
+  autoFollow?: boolean;
+  bottomPad?: number;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const prevLoadingRef = useRef<boolean>(loading);
+  const prevAsstLenRef = useRef<number>(0);
+  const didInitialAutoscrollRef = useRef(false);
+
+  function getScrollEl(): HTMLElement | null {
+    const el = listRef.current;
+    if (!el) return null;
+    return el.closest<HTMLElement>("[data-chat-scroll]") ?? el;
+  }
+
+  function isNearBottom(ratio = SCROLL_THRESHOLD_VH): boolean {
+    const el = getScrollEl();
+    if (!el) return true;
+    const threshold = Math.max(MIN_THRESHOLD_PX, el.clientHeight * ratio);
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return dist <= threshold;
+  }
+
+  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    bottomRef.current?.scrollIntoView({ behavior, block: "end" });
+  };
 
   useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
+    if (didInitialAutoscrollRef.current) return;
+    if (messages.length === 0) return;
+    didInitialAutoscrollRef.current = true;
+    scrollToBottom("auto");
+    requestAnimationFrame(() => scrollToBottom("auto"));
+  }, [messages.length]);
 
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const atBottom = distanceFromBottom <= thresholdPx;
+  useEffect(() => {
+    const handler = (evt: Event) => {
+      const behavior =
+        (evt as CustomEvent<{ behavior?: ScrollBehavior }>).detail?.behavior ?? "smooth";
+      bottomRef.current?.scrollIntoView({ behavior, block: "end" });
+    };
+    window.addEventListener(FORCE_SCROLL_EVT, handler as EventListener);
+    return () => window.removeEventListener(FORCE_SCROLL_EVT, handler as EventListener);
+  }, []);
 
-    if (atBottom) {
-      // wait a tick so layout paints, then scroll
-      requestAnimationFrame(() => {
-        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-      });
+  const lastAssistantIndex = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return i;
     }
-    // include threshold so changing it retriggers
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thresholdPx, ...deps]);
+    return -1;
+  }, [messages]);
+
+  const asstText = lastAssistantIndex >= 0 ? (messages[lastAssistantIndex]?.text ?? "") : "";
+
+  useEffect(() => {
+    if (lastAssistantIndex < 0) return;
+    const len = asstText.length;
+    const prev = prevAsstLenRef.current || 0;
+    prevAsstLenRef.current = len;
+    if (!autoFollow) return;
+    if (len > prev && isNearBottom()) scrollToBottom("auto");
+  }, [lastAssistantIndex, asstText, autoFollow]);
+
+  useEffect(() => {
+    const prev = prevLoadingRef.current;
+    const cur = loading;
+    prevLoadingRef.current = cur;
+    if (prev && !cur && autoFollow && isNearBottom()) scrollToBottom("smooth");
+  }, [loading, autoFollow]);
+
+  useEffect(() => {
+    if (autoFollow && isNearBottom()) {
+      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }
+  }, [bottomPad, autoFollow]);
+
+  return { listRef, bottomRef, lastAssistantIndex };
 }
 
 # ===== frontend/src/file_read/hooks/useChatsPager.ts =====
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { listChatsPage } from "../hooks/data/chatApi";
+import { listChatsPage } from "../data/chatApi";
 import type { ChatRow } from "../types/chat";
 
 export function useChatsPager(pageSize = 10, refreshKey?: number) {
@@ -528,46 +572,58 @@ export function useChatsPager(pageSize = 10, refreshKey?: number) {
     await loadFirst();
   }
 
-  // external refreshes
-  useEffect(() => { void refreshFirst(); /* eslint-disable-next-line */ }, [refreshKey]);
+  // Only react to refreshKey after mount.
+  const didMountRef = useRef(false);
+  useEffect(() => {
+    if (!didMountRef.current) { didMountRef.current = true; return; }
+    if (typeof refreshKey !== "undefined") void refreshFirst();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
+
+  // Surgical sidebar updates + inject if missing.
 useEffect(() => {
-  const handler = (evt: Event) => {
-    const detail = (evt as CustomEvent<any>).detail;
+const handler = (evt: Event) => {
+  const detail = (evt as CustomEvent<any>).detail;
+  if (!detail?.sessionId) return;
 
-    // Surgical path: update one row + move it to top
-    if (detail?.sessionId) {
-      const sid = String(detail.sessionId);
-      setChats(prev => {
-        const ix = prev.findIndex(c => c.sessionId === sid);
-        if (ix === -1) {
-          // Not on the current page; avoid a full reload to prevent flashing.
-          // (Server ordering will catch up on the next natural refresh.)
-          return prev;
-        }
-        const cur = prev[ix];
-        const patched = {
-          ...cur,
-          lastMessage: detail.lastMessage ?? cur.lastMessage,
-          title: detail.title ?? cur.title,
-          updatedAt: detail.updatedAt ?? new Date().toISOString(),
-        } as ChatRow;
+  const sid = String(detail.sessionId);
+  setChats(prev => {
+    const ix = prev.findIndex(c => c.sessionId === sid);
+    const shouldMoveToTop = typeof detail.lastMessage === "string";
 
-        const rest = prev.filter((_, i) => i !== ix);
-        return [patched, ...rest]; // move to top
-      });
-      return;
+    if (ix === -1) {
+      // Inject only for new activity; skip for title-only patches
+      if (!shouldMoveToTop) return prev;
+      const injected: ChatRow = {
+        sessionId: sid,
+        id: -1, // placeholder if needed by your UI
+        title: detail.title ?? "New Chat",
+        lastMessage: detail.lastMessage ?? "",
+        createdAt: new Date().toISOString(),
+        updatedAt: detail.updatedAt ?? new Date().toISOString(),
+      };
+      return [injected, ...prev];
     }
 
-    // Fallback: if no detail, do the old full refresh
-    void refreshFirst();
-  };
+    const cur = prev[ix];
+    const patched: ChatRow = {
+      ...cur,
+      lastMessage: detail.lastMessage ?? cur.lastMessage,
+      title: detail.title ?? cur.title,
+      updatedAt: detail.updatedAt ?? cur.updatedAt,
+    };
+
+    const rest = prev.filter((_, i) => i !== ix);
+    return shouldMoveToTop ? [patched, ...rest] : [...prev.slice(0, ix), patched, ...prev.slice(ix + 1)];
+  });
+};
 
   window.addEventListener("chats:refresh", handler as EventListener);
   return () => window.removeEventListener("chats:refresh", handler as EventListener);
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, []);
 
-  // infinite scroll
+  // Infinite scroll
   useEffect(() => {
     const rootEl = scrollRef.current, sentinel = sentinelRef.current;
     if (!rootEl || !sentinel) return;
@@ -585,12 +641,9 @@ useEffect(() => {
   }, [chats.length, page, hasMore, ceiling]);
 
   return {
-    // state
     chats, page, hasMore, total, totalPages,
     initialLoading, loadingMore,
-    // refs
     scrollRef, sentinelRef,
-    // actions
     loadMore, refreshFirst, setChats,
   };
 }
@@ -723,18 +776,6 @@ export function useChatStream() {
   };
 }
 
-# ===== frontend/src/file_read/hooks/useLockBodyScroll.ts =====
-
-import { useEffect } from "react";
-
-export function useLockBodyScroll(lock: boolean) {
-  useEffect(() => {
-    const { overflow } = document.body.style;
-    if (lock) document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = overflow; };
-  }, [lock]);
-}
-
 # ===== frontend/src/file_read/hooks/useMetrics.ts =====
 
 import { useState } from "react";
@@ -826,7 +867,7 @@ export function useMultiSelect(allIds: string[]) {
 
 // frontend/src/file_read/hooks/useRetitle.ts
 import { API_BASE } from "../services/http";
-import { listMessages, updateChatLast } from "../hooks/data/chatApi";
+import { listMessages, updateChatLast } from "../data/chatApi";
 import { stripRunJson } from "../shared/lib/runjson";
 
 const TITLE_MAX_WORDS = 6;
@@ -935,7 +976,7 @@ export function useRunState() {
 // frontend/src/file_read/hooks/useSession.ts
 import { useRef } from "react";
 import type { ChatMsg, ChatMessageRow } from "../types/chat";
-import { createChat, listMessages } from "../hooks/data/chatApi";
+import { createChat, listMessages } from "../data/chatApi";
 import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
 
 function rowToMsg(r: ChatMessageRow): ChatMsg {
@@ -1287,33 +1328,6 @@ export function useStream({
   return { loading, send, stop, cancelBySessionId };
 }
 
-# ===== frontend/src/file_read/hooks/useTheme.ts =====
-
-// frontend/src/file_read/hooks/useTheme.ts
-import { useEffect, useState } from "react";
-
-type Theme = "light" | "dark";
-const KEY = "theme";
-
-export function useTheme() {
-  const [theme, setTheme] = useState<Theme>(() => {
-    const saved = (localStorage.getItem(KEY) as Theme) || null;
-    if (saved) return saved;
-    const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
-    return prefersDark ? "dark" : "light";
-  });
-
-  useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "dark") root.classList.add("dark");
-    else root.classList.remove("dark");
-    localStorage.setItem(KEY, theme);
-  }, [theme]);
-
-  const toggle = () => setTheme(t => (t === "dark" ? "light" : "dark"));
-  return { theme, toggle };
-}
-
 # ===== frontend/src/file_read/hooks/useToast.ts =====
 
 import { useState } from "react";
@@ -1350,8 +1364,7 @@ createRoot(document.getElementById('root')!).render(
 
 # ===== frontend/src/file_read/pages/AgentRunner.tsx =====
 
-// frontend/src/file_read/pages/AgentRunner.tsx
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import ChatContainer from "../components/ChatContainer";
 import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
 import { useChatStream } from "../hooks/useChatStream";
@@ -1360,13 +1373,12 @@ import { useToast } from "../hooks/useToast";
 import DesktopHeader from "../components/DesktopHeader";
 import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
-import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
+import { createChat, deleteMessagesBatch } from "../data/chatApi";
 
 // NEW: settings panel
 import SettingsPanel from "../components/SettingsPanel";
 import KnowledgePanel from "../components/KnowledgePanel";
 
-const PAGE_SIZE = 30;
 const LS_KEY = "lastSessionId";
 
 export default function AgentRunner() {
@@ -1380,24 +1392,7 @@ export default function AgentRunner() {
   // NEW: settings modal
   const [showSettings, setShowSettings] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const ceil = new Date().toISOString();
-        const page = await listChatsPage(0, PAGE_SIZE, ceil);
-        const saved = localStorage.getItem(LS_KEY) || "";
-        const targetId =
-          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
-          page.content[0]?.sessionId ||
-          "";
-        if (targetId) {
-          await chat.loadHistory(targetId);
-          localStorage.setItem(LS_KEY, targetId);
-        }
-      } catch {}
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // ⛔ Removed the mount-time bootstrap that fetched chats and loaded history.
 
   async function newChat(): Promise<void> {
     const id = crypto.randomUUID();
@@ -1552,10 +1547,10 @@ export default function AgentRunner() {
                   stop={chat.stop}
                   runMetrics={chat.runMetrics}
                   runJson={chat.runJson}
-                  onRefreshChats={() => {}}  
+                  onRefreshChats={() => {}}
                   onDeleteMessages={handleDeleteMessages}
                   autoFollow={autoFollow}
-                  sessionId={chat.sessionIdRef.current} // ⬅️ this enables per-chat uploads
+                  sessionId={chat.sessionIdRef.current} // enables per-chat uploads
                 />
               </div>
               <Toast message={toast} />
@@ -1580,102 +1575,6 @@ export default function AgentRunner() {
       )}
     </div>
   );
-}
-
-# ===== frontend/src/file_read/pages/AgentShell.tsx =====
-
-// frontend/src/file_read/pages/AgentShell.tsx
-import DesktopHeader from "../components/DesktopHeader";
-import MobileDrawer from "../components/MobileDrawer";
-import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
-import ChatContainer from "../components/ChatContainer";
-
-export default function AgentShell({
-  sidebarOpen, setSidebarOpen,
-  openMobileDrawer, closeMobileDrawer,
-  refreshKey, activeId,
-  onOpenSession, onNewChat,
-  chatProps,
-}: {
-  sidebarOpen: boolean;
-  setSidebarOpen: (v: boolean) => void;
-  openMobileDrawer: () => void;
-  closeMobileDrawer: () => void;
-  refreshKey: number;
-  activeId?: string;
-  onOpenSession: (id: string) => Promise<void>;
-  onNewChat: () => Promise<void>;
-  chatProps: React.ComponentProps<typeof ChatContainer>;
-}) {
-  return (
-    <div className="h-screen w-full flex bg-gray-50">
-      {sidebarOpen && (
-        <div className="hidden md:flex h-full">
-          <ChatSidebar
-            onOpen={onOpenSession}
-            onNew={onNewChat}
-            refreshKey={refreshKey}
-            activeId={activeId}
-            onHideSidebar={() => setSidebarOpen(false)}
-          />
-        </div>
-      )}
-
-      <MobileDrawer
-        onOpenSession={onOpenSession}
-        onNewChat={onNewChat}
-        refreshKey={refreshKey}
-        activeId={activeId}
-        openMobileDrawer={openMobileDrawer}
-        closeMobileDrawer={closeMobileDrawer}
-      />
-      <div className="md:hidden h-14 shrink-0" />
-
-      <div className="flex-1 min-w-0 flex flex-col">
-        <DesktopHeader
-          sidebarOpen={sidebarOpen}
-          onShowSidebar={() => setSidebarOpen(true)}
-        />
-        <div className="flex-1 min-h-0">
-          <div className="h-full px-3 md:px-6">
-            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              <ChatContainer {...chatProps} />
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/pages/useInitialLoad.ts =====
-
-// frontend/src/file_read/pages/useInitialLoad.ts
-import { useEffect } from "react";
-import { listChatsPage } from "../data/chatApi";
-
-export function useInitialLoad(
-  pageSize: number,
-  onPick: (id: string) => Promise<void>,
-  keyName = "lastSessionId"
-) {
-  useEffect(() => {
-    (async () => {
-      try {
-        const ceil = new Date().toISOString();
-        const page = await listChatsPage(0, pageSize, ceil);
-        const saved = localStorage.getItem(keyName) || "";
-        const targetId =
-          (saved && page.content.find(c => c.sessionId === saved)?.sessionId) ||
-          page.content[0]?.sessionId || "";
-        if (targetId) {
-          await onPick(targetId);
-          localStorage.setItem(keyName, targetId);
-        }
-      } catch {}
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 }
 
 # ===== frontend/src/file_read/services/http.ts =====
@@ -1803,28 +1702,6 @@ export function firstLineSmart(s: string, max = 48): string {
   return one.length <= max ? one : one.slice(0, max - 1).trimEnd() + "…";
 }
 
-# ===== frontend/src/file_read/shared/ui/Button.tsx =====
-
-interface Props {
-  onClick: () => void;
-  disabled?: boolean;
-  children: React.ReactNode;
-}
-
-export default function Button({ onClick, disabled, children }: Props) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 ${
-        disabled ? "opacity-50 cursor-not-allowed" : ""
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
 # ===== frontend/src/file_read/shared/ui/CodeCopyButton.tsx =====
 
 // frontend/src/file_read/components/CodeCopyButton.tsx
@@ -1845,16 +1722,6 @@ export default function CodeCopyButton({ text }: { text: string }) {
     >
       {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
     </button>
-  );
-}
-
-# ===== frontend/src/file_read/shared/ui/Spinner.tsx =====
-
-export default function Spinner() {
-  return (
-    <div className="flex justify-center py-6">
-      <div className="h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-    </div>
   );
 }
 
@@ -1934,71 +1801,6 @@ export type ChatMessageRow = {
   createdAt: string;
   attachments?: Attachment[]; // ✅ this must exist
 };
-
-# ===== frontend/src/file_read/utils/metricsCache.ts =====
-
-// Cache per-assistant-message metrics in localStorage so they persist across navigation/reload.
-const KEY = "msgMetrics:v1";
-
-type Stored = Record<string, { runJson?: any | null; flat?: any | null }>;
-
-function loadAll(): Stored {
-  try {
-    const raw = localStorage.getItem(KEY);
-    return raw ? (JSON.parse(raw) as Stored) : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveAll(obj: Stored) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(obj));
-  } catch {
-    /* ignore quota errors */
-  }
-}
-
-export function setMsgMetrics(messageId: string, data: { runJson?: any | null; flat?: any | null }) {
-  const all = loadAll();
-  const cur = all[messageId] || {};
-  all[messageId] = {
-    runJson: data.runJson ?? cur.runJson ?? null,
-    flat: data.flat ?? cur.flat ?? null,
-  };
-  saveAll(all);
-}
-
-export function getMsgMetrics(messageId: string) {
-  const all = loadAll();
-  return all[messageId] || null;
-}
-
-export function clearMsgMetrics(messageId: string) {
-  const all = loadAll();
-  if (all[messageId]) {
-    delete all[messageId];
-    saveAll(all);
-  }
-}
-
-# ===== frontend/src/file_read/utils/parseRunjson.ts =====
-
-// frontend/src/file_read/utils/parseRunjson.ts
-export function parseRunJson(content: string): { meta?: any; text: string } {
-  const START = "\n[[RUNJSON]]\n";
-  const END = "\n[[/RUNJSON]]\n";
-  if (!content) return { text: "" };
-  const s = content.indexOf(START);
-  if (s === -1) return { text: content };
-  const e = content.indexOf(END, s + START.length);
-  if (e === -1) return { text: content };
-
-  let meta: any | undefined;
-  try { meta = JSON.parse(content.slice(s + START.length, e).trim()); } catch {}
-  const text = (content.slice(0, s) + content.slice(e + END.length)).trim();
-  return { meta, text };
-}
 
 # ===== frontend/src/file_read/vite-env.d.ts =====
 

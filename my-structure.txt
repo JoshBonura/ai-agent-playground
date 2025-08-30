@@ -331,6 +331,9 @@ ai-agent-playground/
               index.faiss
               meta.jsonl
             7a346381-f150-43e6-89a0-0ce5e77f194d/
+            93e5b230-292a-4424-9df0-bfbd329e8096/
+              index.faiss
+              meta.jsonl
             9532ad7e-f36d-4256-9ef5-4dc179867ba0/
               index.faiss
               meta.jsonl
@@ -353,6 +356,9 @@ ai-agent-playground/
               index.faiss
               meta.jsonl
             dfaeec5f-2ea5-449d-af23-8ce6f49e720a/
+              index.faiss
+              meta.jsonl
+            e7caf595-4368-471f-9e73-6020138b09ea/
               index.faiss
               meta.jsonl
             ea6e9007-53e1-4415-bfd4-20406a0e3977/
@@ -724,33 +730,34 @@ ai-agent-playground/
           ChatView/
             ChatView.tsx
             StatusLine.ts
+          Composer/
+            AttachmentChip.tsx
+            ComposerActions.tsx
+            ProgressBar.tsx
           Markdown/
             MarkdownMessage.tsx
         data/
+          chatApi.ts
           ragApi.ts
           settingsApi.ts
         features/
           chat/
         hooks/
-          useAutoScroll.ts
+          useAttachmentUploads.ts
+          useChatAutoFollow.ts
           useChatState.ts
           useChatStream.ts
           useChatsPager.ts
-          useLockBodyScroll.ts
           useMetrics.ts
           useMultiSelect.ts
           useRetitle.ts
-          useRunMetrics.ts
           useRunState.ts
           useSession.ts
           useSettings.ts
           useSidebar.ts
           useStream.ts
-          useTheme.ts
           useToast.ts
           data/
-            aiApi.ts
-            chatApi.ts
           stream/
             core/
               buffer.ts
@@ -767,8 +774,6 @@ ai-agent-playground/
               updater.ts
         pages/
           AgentRunner.tsx
-          AgentShell.tsx
-          useInitialLoad.ts
         services/
           http.ts
         shared/
@@ -776,13 +781,8 @@ ai-agent-playground/
             runjson.ts
             text.ts
           ui/
-            Button.tsx
             CodeCopyButton.tsx
-            Spinner.tsx
             Toast.tsx
             TypingIndicator.tsx
         types/
           chat.ts
-        utils/
-          metricsCache.ts
-          parseRunjson.ts

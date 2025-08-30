@@ -11,7 +11,8 @@ import {
 } from "./runner_metrics";
 import { persistAssistantTurn } from "./runner_persist";
 import type { QueueItem } from "./queue";
-import { listChatsPage } from "../../data/chatApi";
+import { listChatsPage } from "../../../data/chatApi";
+
 
 export type RunnerDeps = {
   opts: {

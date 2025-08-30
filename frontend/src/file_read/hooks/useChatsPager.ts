@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { listChatsPage } from "../hooks/data/chatApi";
+import { listChatsPage } from "../data/chatApi";
 import type { ChatRow } from "../types/chat";
 
 export function useChatsPager(pageSize = 10, refreshKey?: number) {

@@ -7,7 +7,7 @@ import { useToast } from "../hooks/useToast";
 import DesktopHeader from "../components/DesktopHeader";
 import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
-import { createChat, deleteMessagesBatch } from "../hooks/data/chatApi";
+import { createChat, deleteMessagesBatch } from "../data/chatApi";
 
 // NEW: settings panel
 import SettingsPanel from "../components/SettingsPanel";

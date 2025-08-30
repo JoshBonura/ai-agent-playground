@@ -91,6 +91,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     ensure_ready()
     llm = get_llm()
 
+    t_request_start = time.perf_counter()
     # ---- effective settings (no fallbacks) ----
     eff0 = SETTINGS.effective()
     session_id = data.sessionId or eff0["default_session_id"]
@@ -309,6 +310,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                     temperature=temperature,
                     top_p=top_p,
                     input_tokens_est=input_tokens_est,
+                    t0_request=t_request_start
                 ):
                     if isinstance(chunk, (bytes, bytearray)):
                         _accum_visible(chunk)
@@ -579,13 +581,13 @@ log = logging.getLogger("aimodel.api.generate")
 
 async def run_stream(
     *, llm, messages, out_budget, stop_ev, request,
-    temperature: float, top_p: float, input_tokens_est: Optional[int]
+    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None,
 ) -> AsyncGenerator[bytes, None]:
     q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
 
     def produce():
-        t_start = time.perf_counter()
+        t_start = t0_request or time.perf_counter()
         t_first: Optional[float] = None
         t_last: Optional[float] = None
         finish_reason: Optional[str] = None
@@ -2794,7 +2796,4 @@ async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s
     top_hits = _dedupe_by_host(scored, cfg_k)
     for i, h in enumerate(top_hits, 1):
         # reuse computed scores when printing
-        s = next((sc for sc, hh in scored if hh is h), 0)
-        print(f"[orchestrator] PICK {i}/{cfg_k} score={s} host={_host(h.url)} title={(h.title or '')[:80]!r}")
-
-    #
+        s = next((sc for sc, hh in

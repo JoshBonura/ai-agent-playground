@@ -1,6 +1,6 @@
 // frontend/src/file_read/hooks/useRetitle.ts
 import { API_BASE } from "../services/http";
-import { listMessages, updateChatLast } from "../hooks/data/chatApi";
+import { listMessages, updateChatLast } from "../data/chatApi";
 import { stripRunJson } from "../shared/lib/runjson";
 
 const TITLE_MAX_WORDS = 6;

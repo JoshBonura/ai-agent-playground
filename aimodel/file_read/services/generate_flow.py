@@ -32,6 +32,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
     ensure_ready()
     llm = get_llm()
 
+    t_request_start = time.perf_counter()
     # ---- effective settings (no fallbacks) ----
     eff0 = SETTINGS.effective()
     session_id = data.sessionId or eff0["default_session_id"]
@@ -250,6 +251,7 @@ async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
                     temperature=temperature,
                     top_p=top_p,
                     input_tokens_est=input_tokens_est,
+                    t0_request=t_request_start
                 ):
                     if isinstance(chunk, (bytes, bytearray)):
                         _accum_visible(chunk)

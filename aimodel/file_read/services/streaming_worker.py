@@ -13,13 +13,13 @@ log = logging.getLogger("aimodel.api.generate")
 
 async def run_stream(
     *, llm, messages, out_budget, stop_ev, request,
-    temperature: float, top_p: float, input_tokens_est: Optional[int]
+    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None,
 ) -> AsyncGenerator[bytes, None]:
     q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
 
     def produce():
-        t_start = time.perf_counter()
+        t_start = t0_request or time.perf_counter()
         t_first: Optional[float] = None
         t_last: Optional[float] = None
         finish_reason: Optional[str] = None

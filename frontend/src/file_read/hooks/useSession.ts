@@ -1,7 +1,7 @@
 // frontend/src/file_read/hooks/useSession.ts
 import { useRef } from "react";
 import type { ChatMsg, ChatMessageRow } from "../types/chat";
-import { createChat, listMessages } from "../hooks/data/chatApi";
+import { createChat, listMessages } from "../data/chatApi";
 import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
 
 function rowToMsg(r: ChatMessageRow): ChatMsg {

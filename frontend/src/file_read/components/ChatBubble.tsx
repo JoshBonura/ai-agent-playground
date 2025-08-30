@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Copy, Check, Trash2 } from "lucide-react";
 import MarkdownMessage from "./Markdown/MarkdownMessage";
-import { parseRunJson } from "../utils/parseRunjson";
+import { stripRunJson } from "../shared/lib/runjson";
 import type { Attachment } from "../types/chat";   // ✅ import Attachment type
 
 const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
@@ -21,7 +21,7 @@ export default function ChatBubble({
 }) {
   const isUser = role === "user";
   const raw = text ?? "";
-  const { text: stripped } = parseRunJson(raw);
+  const { text: stripped } = stripRunJson(raw);
   let content = stripped.trim();
 
   if (!isUser) content = content.replace(STOP_SENTINEL_RE, "");

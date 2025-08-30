@@ -1,4 +1,7 @@
- --- FETCH ROUND 1 (static) ---
+ scored if hh is h), 0)
+        print(f"[orchestrator] PICK {i}/{cfg_k} score={s} host={_host(h.url)} title={(h.title or '')[:80]!r}")
+
+    # --- FETCH ROUND 1 (static) ---
     urls = [h.url for h in top_hits]
     meta = [(h.title or h.url, h.url) for h in top_hits]
     print(f"[orchestrator] FETCH[1] start urls={[ _host(u) for u in urls ]}")
@@ -762,7 +765,7 @@ export default function AssistantMetrics({
 import { useState } from "react";
 import { Copy, Check, Trash2 } from "lucide-react";
 import MarkdownMessage from "./Markdown/MarkdownMessage";
-import { parseRunJson } from "../utils/parseRunjson";
+import { stripRunJson } from "../shared/lib/runjson";
 import type { Attachment } from "../types/chat";   // ✅ import Attachment type
 
 const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
@@ -782,7 +785,7 @@ export default function ChatBubble({
 }) {
   const isUser = role === "user";
   const raw = text ?? "";
-  const { text: stripped } = parseRunJson(raw);
+  const { text: stripped } = stripRunJson(raw);
   let content = stripped.trim();
 
   if (!isUser) content = content.replace(STOP_SENTINEL_RE, "");
@@ -874,9 +877,9 @@ export default function ChatBubble({
 
 // frontend/src/file_read/components/ChatComposer.tsx
 import { useEffect, useRef, useState } from "react";
-import { SendHorizonal, Square, Paperclip, X, Check } from "lucide-react";
-import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
-
+import ComposerActions from "./Composer/ComposerActions";
+import AttachmentChip from "./Composer/AttachmentChip";
+import { useAttachmentUploads } from "../hooks/useAttachmentUploads";
 import type { Attachment } from "../types/chat";
 
 const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
@@ -886,19 +889,11 @@ type Props = {
   setInput: (v: string) => void;
   loading: boolean;
   queued?: boolean;
-  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;  // ✅ updated
+  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
   onStop: () => void | Promise<void>;
   onHeightChange?: (h: number) => void;
   onRefreshChats?: () => void;
   sessionId?: string;
-};
-
-type Att = {
-  id: string;               // unique per pick
-  name: string;             // file.name (used as source)
-  pct: number;              // 0..100
-  status: "uploading" | "ready" | "error";
-  abort?: AbortController;  // to cancel in-flight
 };
 
 export default function ChatComposer({
@@ -920,8 +915,8 @@ export default function ChatComposer({
   const [isClamped, setIsClamped] = useState(false);
   const [draft, setDraft] = useState(input);
 
-  // local attachment list
-  const [atts, setAtts] = useState<Att[]>([]);
+  const { atts, addFiles, removeAtt, anyUploading, anyReady, attachmentsForPost, reset } =
+    useAttachmentUploads(sessionId, onRefreshChats);
 
   useEffect(() => setDraft(input), [input]);
 
@@ -942,55 +937,35 @@ export default function ChatComposer({
     const onResize = () => autogrow();
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { autogrow(); }, [draft, atts.length]); // reflow when chips change
+  useEffect(() => { autogrow(); }, [draft, atts.length]);
 
   const hasText = draft.trim().length > 0;
-  const anyUploading = atts.some(a => a.status === "uploading");
-  const anyReady = atts.some(a => a.status === "ready");
 
   const forceScroll = (behavior: ScrollBehavior = "auto") => {
     window.dispatchEvent(new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } }));
   };
 
-  // ⬇️ NEW: build attachments payload for POST
-  function attachmentsForPost() {
-    if (!sessionId) return [];
-    return atts
-      .filter(a => a.status === "ready")
-      .map(a => ({
-        name: a.name,
-        source: a.name,   // RAG uses filename as source
-        sessionId,
-        // optionally: size, mime, chunks if you track them
-      }));
-  }
+  const handleSendClick = async () => {
+    const v = draft.trim();
+    if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
+    forceScroll("auto");
+    setDraft("");
+    setInput("");
+    reset();
+    try {
+      await onSend(v, attachmentsForPost());
+    } finally {
+      onRefreshChats?.();
+      requestAnimationFrame(() => forceScroll("smooth"));
+    }
+  };
 
-const handleSendClick = async () => {
-  const v = draft.trim();
-  if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
-
-  forceScroll("auto");
-
-  setDraft("");
-  setInput("");
-  setAtts([]);
-
-  try {
-    await onSend(v, attachmentsForPost());
-  } finally {
-    onRefreshChats?.();
-    requestAnimationFrame(() => forceScroll("smooth"));
-  }
-};
-
-// ✅ moved out of handleSendClick
-const handleStopClick = () => {
-  if (!loading && !queued) return;
-  void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
-};
+  const handleStopClick = () => {
+    if (!loading && !queued) return;
+    void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
+  };
 
   const pickFile = () => fileRef.current?.click();
 
@@ -998,53 +973,9 @@ const handleStopClick = () => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     if (!sessionId) { e.target.value = ""; return; }
-
-    const picked = Array.from(files);
-    // create local chip entries
-    const news: Att[] = picked.map((f, i) => ({
-      id: `${Date.now()}-${i}-${f.name}`,
-      name: f.name,
-      pct: 0,
-      status: "uploading",
-      abort: new AbortController(),
-    }));
-    setAtts(prev => [...prev, ...news]);
-
-    // kick uploads
-    news.forEach((att, idx) => {
-      const f = picked[idx];
-      uploadRagWithProgress(
-        f,
-        sessionId,
-        (pct) => setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct } : a)),
-        att.abort?.signal
-      ).then(() => {
-        setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct: 100, status: "ready", abort: undefined } : a));
-        onRefreshChats?.();
-      }).catch(() => {
-        setAtts(prev => prev.map(a => a.id === att.id ? { ...a, status: "error", abort: undefined } : a));
-      });
-    });
-
-    e.target.value = ""; // allow re-pick
+    await addFiles(files);
+    e.target.value = "";
   };
-
-const removeAtt = async (att: Att) => {
-  // 1) Cancel in-flight upload immediately
-  if (att.status === "uploading" && att.abort) {
-    att.abort.abort();
-  }
-
-  // 2) Always ask backend to purge any partial/queued ingest
-  if (sessionId) {
-    try { await deleteUploadHard(att.name, sessionId); } catch {}
-  }
-
-  // 3) Remove chip right away (UI feels instant)
-  setAtts(prev => prev.filter(a => a.id !== att.id));
-
-  onRefreshChats?.();
-};
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1054,49 +985,20 @@ const removeAtt = async (att: Att) => {
   }
 
   const disableActions = loading || queued || anyUploading;
-  const showSend = hasText || anyReady; // allow send even with empty text if file ready
+  const showSend = hasText || anyReady;
 
   return (
     <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
-      {/* Attachment chips */}
       {atts.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-2">
           {atts.map((a) => (
-            <div key={a.id} className="min-w-[160px] max-w-[280px] border rounded-lg px-2 py-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="truncate text-sm" title={a.name}>{a.name}</div>
-                <button
-                  className="p-1 rounded hover:bg-gray-100"
-                  aria-label="Remove file"
-                  onClick={() => removeAtt(a)}
-                >
-                  <X size={14} />
-                </button>
-              </div>
-              <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
-                <div
-                  className={`h-1.5 rounded ${a.status === "error" ? "bg-red-500" : "bg-black"}`}
-                  style={{ width: `${a.pct}%` }}
-                />
-              </div>
-              <div className="mt-1 text-xs text-gray-500 flex items-center gap-1">
-                {a.status === "uploading" && <span>Uploading… {a.pct}%</span>}
-                {a.status === "ready" && <><Check size={14} /> Ready</>}
-                {a.status === "error" && <span>Error</span>}
-              </div>
-            </div>
+            <AttachmentChip key={a.id} a={a} onRemove={removeAtt} />
           ))}
         </div>
       )}
 
       <div className="flex gap-2">
-        <input
-          ref={fileRef}
-          type="file"
-          multiple
-          className="hidden"
-          onChange={onFilePicked}
-        />
+        <input ref={fileRef} type="file" multiple className="hidden" onChange={onFilePicked} />
 
         <textarea
           ref={taRef}
@@ -1110,41 +1012,17 @@ const removeAtt = async (att: Att) => {
           }`}
           rows={1}
           style={{ maxHeight: MAX_HEIGHT_PX }}
-          disabled={queued} // typing allowed during upload if you prefer, keep as-is
+          disabled={queued}
         />
 
-        <div className="flex items-end gap-2">
-          <button
-            className={`p-2 rounded-lg border hover:bg-gray-50 ${disableActions || !sessionId ? "opacity-60 cursor-not-allowed" : ""}`}
-            onClick={pickFile}
-            title="Upload to this chat"
-            aria-label="Upload to this chat"
-            disabled={disableActions || !sessionId}
-          >
-            <Paperclip size={18} />
-          </button>
-
-          {(loading || queued) ? (
-            <button
-              className="p-2 rounded-lg border hover:bg-gray-50"
-              onClick={handleStopClick}
-              title={queued ? "Cancel queued message" : "Stop generating"}
-              aria-label={queued ? "Cancel queued message" : "Stop generating"}
-            >
-              <Square size={18} />
-            </button>
-          ) : showSend ? (
-            <button
-              className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px disabled:opacity-60"
-              onClick={handleSendClick}
-              title="Send"
-              aria-label="Send"
-              disabled={disableActions}
-            >
-              <SendHorizonal size={18} />
-            </button>
-          ) : null}
-        </div>
+        <ComposerActions
+          disabledUpload={disableActions || !sessionId}
+          onPickFile={pickFile}
+          showStop={loading || queued}
+          onStop={handleStopClick}
+          showSend={showSend}
+          onSend={handleSendClick}
+        />
       </div>
     </div>
   );
@@ -1314,7 +1192,7 @@ export default function ChatItem({
 # ===== frontend/src/file_read/components/ChatSidebar/ChatSidebar.tsx =====
 
 import { useState } from "react";
-import { deleteChatsBatch } from "../../hooks/data/chatApi";
+import { deleteChatsBatch } from "../../data/chatApi";
 import type { ChatRow } from "../../types/chat";
 import { useMultiSelect } from "../../hooks/useMultiSelect";
 import { useChatsPager } from "../../hooks/useChatsPager";
@@ -1612,18 +1490,11 @@ export default function SidebarListItem({
 # ===== frontend/src/file_read/components/ChatView/ChatView.tsx =====
 
 // frontend/src/file_read/components/ChatView/ChatView.tsx
-import { useEffect, useMemo, useRef } from "react";
 import type { ChatMsg } from "../../types/chat";
 import type { GenMetrics, RunJson } from "../../hooks/useChatStream";
 import ChatItem from "../ChatItem";
 import TypingIndicator from "../../shared/ui/TypingIndicator";
-
-// Autofollow sensitivity as a fraction of the visible height.
-const SCROLL_THRESHOLD_VH = 0.75;
-const MIN_THRESHOLD_PX = 24;
-
-// Custom event name dispatched by ChatComposer on Send
-const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
+import { useChatAutofollow } from "../../hooks/useChatAutoFollow";
 
 export default function ChatView({
   messages,
@@ -1644,103 +1515,12 @@ export default function ChatView({
   onDeleteMessages?: (ids: string[]) => void;
   autoFollow?: boolean;
 }) {
-  // Inner wrapper (not the scroller) + bottom sentinel for scrollIntoView
-  const listRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
-
-  // Track previous stream state & assistant text length for streaming nudge
-  const prevLoadingRef = useRef<boolean>(loading);
-  const prevAsstLenRef = useRef<number>(0);
-  const didInitialAutoscrollRef = useRef(false);
-
-  // The *real* scroll container (ChatContainer sets data-chat-scroll)
-  function getScrollEl(): HTMLElement | null {
-    const el = listRef.current;
-    if (!el) return null;
-    return el.closest<HTMLElement>("[data-chat-scroll]") ?? el;
-  }
-
-  // Are we close enough to the bottom of the scroll container?
-  function isNearBottom(ratio = SCROLL_THRESHOLD_VH): boolean {
-    const el = getScrollEl();
-    if (!el) return true; // default to follow if unsure
-    const threshold = Math.max(MIN_THRESHOLD_PX, el.clientHeight * ratio);
-    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
-    return dist <= threshold;
-  }
-
-  // Programmatic scroll helper
-  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
-    bottomRef.current?.scrollIntoView({ behavior, block: "end" });
-  };
-
-  // 🔹 NEW: On first open (first time messages appear), auto-scroll to bottom
-  useEffect(() => {
-    if (didInitialAutoscrollRef.current) return;
-    if (messages.length === 0) return;
-    didInitialAutoscrollRef.current = true;
-
-    // Do it twice (now and next frame) to account for layout/measure changes
-    scrollToBottom("auto");
-    requestAnimationFrame(() => scrollToBottom("auto"));
-  }, [messages.length]);
-
-  // 🔹 Respond to a global "force scroll" event from ChatComposer (Send)
-  useEffect(() => {
-    const handler = (evt: Event) => {
-      const behavior =
-        (evt as CustomEvent<{ behavior?: ScrollBehavior }>).detail?.behavior ??
-        "smooth";
-      bottomRef.current?.scrollIntoView({ behavior, block: "end" });
-    };
-    window.addEventListener(FORCE_SCROLL_EVT, handler as EventListener);
-    return () => window.removeEventListener(FORCE_SCROLL_EVT, handler as EventListener);
-  }, []);
-
-  // --- Assistant streaming deltas: gentle nudge only if already near bottom ---
-  const lastAssistantIndex = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "assistant") return i;
-    }
-    return -1;
-  }, [messages]);
-
-  const asstText =
-    lastAssistantIndex >= 0 ? (messages[lastAssistantIndex]?.text ?? "") : "";
-
-useEffect(() => {
-  if (lastAssistantIndex < 0) return;
-
-  const len = asstText.length;
-  const prev = prevAsstLenRef.current || 0;
-  prevAsstLenRef.current = len;
-
-  if (!autoFollow) return;
-
-  // Nudge whenever content grows, but only if already near bottom
-  if (len > prev && isNearBottom()) {
-    scrollToBottom("auto");
-  }
-}, [lastAssistantIndex, asstText, autoFollow]);
-
-  // --- Streaming finished: settle to bottom only if near bottom ---
-  useEffect(() => {
-    const prev = prevLoadingRef.current;
-    const cur = loading;
-    prevLoadingRef.current = cur;
-
-    if (prev && !cur && autoFollow && isNearBottom()) {
-      scrollToBottom("smooth");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, autoFollow]);
-
-  // --- Optional: when composer height changes, keep bottom visible only if near bottom ---
-  useEffect(() => {
-    if (autoFollow && isNearBottom()) {
-      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-    }
-  }, [bottomPad, autoFollow]);
+  const { listRef, bottomRef, lastAssistantIndex } = useChatAutofollow({
+    messages,
+    loading,
+    autoFollow,
+    bottomPad,
+  });
 
   const lastMsg = messages[messages.length - 1];
 
@@ -1768,7 +1548,6 @@ useEffect(() => {
           <TypingIndicator />
         )}
 
-      {/* Sentinel used for programmatic scrolls */}
       <div ref={bottomRef} className="h-0" />
     </div>
   );
@@ -1801,6 +1580,100 @@ export function buildStatus(json?: RunJson | null, flat?: GenMetrics | null) {
     return parts.join(" • ");
   }
   return "";
+}
+
+# ===== frontend/src/file_read/components/Composer/AttachmentChip.tsx =====
+
+import { X, Check } from "lucide-react";
+import ProgressBar from "./ProgressBar";
+import type { Att } from "../../hooks/useAttachmentUploads";
+
+export default function AttachmentChip({ a, onRemove }: { a: Att; onRemove: (a: Att) => void }) {
+  return (
+    <div className="min-w-[160px] max-w-[280px] border rounded-lg px-2 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="truncate text-sm" title={a.name}>{a.name}</div>
+        <button className="p-1 rounded hover:bg-gray-100" aria-label="Remove file" onClick={() => onRemove(a)}>
+          <X size={14} />
+        </button>
+      </div>
+      <ProgressBar pct={a.pct} error={a.status === "error"} />
+      <div className="mt-1 text-xs text-gray-500 flex items-center gap-1">
+        {a.status === "uploading" && <span>Uploading… {a.pct}%</span>}
+        {a.status === "ready" && <><Check size={14} /> Ready</>}
+        {a.status === "error" && <span>Error</span>}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Composer/ComposerActions.tsx =====
+
+import { Paperclip, Square, SendHorizonal } from "lucide-react";
+
+type Props = {
+  disabledUpload: boolean;
+  onPickFile: () => void;
+  showStop: boolean;
+  onStop: () => void;
+  showSend: boolean;
+  onSend: () => void;
+};
+
+export default function ComposerActions({
+  disabledUpload,
+  onPickFile,
+  showStop,
+  onStop,
+  showSend,
+  onSend,
+}: Props) {
+  return (
+    <div className="flex items-end gap-2">
+      <button
+        className={`p-2 rounded-lg border hover:bg-gray-50 ${disabledUpload ? "opacity-60 cursor-not-allowed" : ""}`}
+        onClick={onPickFile}
+        title="Upload to this chat"
+        aria-label="Upload to this chat"
+        disabled={disabledUpload}
+      >
+        <Paperclip size={18} />
+      </button>
+
+      {showStop ? (
+        <button
+          className="p-2 rounded-lg border hover:bg-gray-50"
+          onClick={onStop}
+          title="Stop generating"
+          aria-label="Stop generating"
+        >
+          <Square size={18} />
+        </button>
+      ) : showSend ? (
+        <button
+          className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
+          onClick={onSend}
+          title="Send"
+          aria-label="Send"
+        >
+          <SendHorizonal size={18} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Composer/ProgressBar.tsx =====
+
+export default function ProgressBar({ pct, error }: { pct: number; error?: boolean }) {
+  return (
+    <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
+      <div
+        className={`h-1.5 rounded ${error ? "bg-red-500" : "bg-black"}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
 }
 
 # ===== frontend/src/file_read/components/DesktopHeader.tsx =====
@@ -2120,15 +1993,16 @@ export default function MarkdownMessage({ text }: Props) {
 
 # ===== frontend/src/file_read/components/MetricsHoverCard.tsx =====
 
-import { useMemo, useRef, useState } from "react";
+// frontend/src/file_read/components/MetricsHoverCard.tsx
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Info, Copy, Check, X } from "lucide-react";
 
 type Props = {
-  data: unknown;                 // anything JSON-serializable
-  title?: string;                // optional header
-  align?: "left" | "right";      // popover alignment
-  maxWidthPx?: number;           // width of the panel
-  compact?: boolean;             // shrink button & paddings
+  data: unknown;
+  title?: string;
+  align?: "left" | "right";
+  maxWidthPx?: number;
+  compact?: boolean;
 };
 
 export default function MetricsHoverCard({
@@ -2140,7 +2014,15 @@ export default function MetricsHoverCard({
 }: Props) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+
   const btnRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const [panelStyle, setPanelStyle] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
 
   const json = useMemo(() => {
     try {
@@ -2154,17 +2036,83 @@ export default function MetricsHoverCard({
     try {
       await navigator.clipboard.writeText(json);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      window.setTimeout(() => setCopied(false), 1500);
     } catch {}
   }
 
-  // accessibility: close on ESC
-  function onKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Escape") {
-      setOpen(false);
-      btnRef.current?.focus();
-    }
+  function close() {
+    setOpen(false);
   }
+
+  // Close on ESC
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+        btnRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (btnRef.current?.contains(t)) return;
+      close();
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Compute clamped viewport position when opening, and on resize/scroll
+  useLayoutEffect(() => {
+    function place() {
+      if (!open || !btnRef.current) return;
+
+      const margin = 8;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const width = Math.min(maxWidthPx, vw - margin * 2);
+
+      const btnBox = btnRef.current.getBoundingClientRect();
+      let left =
+        align === "right" ? btnBox.right - width : btnBox.left;
+      left = Math.max(margin, Math.min(left, vw - margin - width));
+
+      // Provisional top below the button; flip above if it would overflow
+      let top = btnBox.bottom + margin;
+
+      // We may not know the panel height yet; try to use current, else a max
+      let panelH = panelRef.current?.offsetHeight || 0;
+      if (!panelH) {
+        panelH = 360 + 44; // body max (360) + header (~44) best-effort
+      }
+
+      if (top + panelH > vh - margin) {
+        top = Math.max(margin, btnBox.top - margin - panelH);
+      }
+
+      setPanelStyle({ top, left, width });
+    }
+
+    place();
+    if (!open) return;
+
+    const onReflow = () => place();
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
+    return () => {
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open, align, maxWidthPx]);
 
   return (
     <div className="relative inline-block">
@@ -2179,55 +2127,52 @@ export default function MetricsHoverCard({
         aria-expanded={open ? "true" : "false"}
         onClick={() => setOpen((v) => !v)}
         onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
       >
         <Info className={compact ? "w-4 h-4" : "w-5 h-5"} />
       </button>
 
-      {/* Panel */}
-      <div
-        role="dialog"
-        aria-label={title}
-        onKeyDown={onKeyDown}
-        className={`absolute z-50 mt-2 ${align === "right" ? "right-0" : "left-0"}`}
-        style={{ width: Math.min(maxWidthPx, window.innerWidth - 40) }}
-        onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
-      >
+      {open && panelStyle && (
         <div
-          className={`rounded-xl border bg-white shadow-xl overflow-hidden transition
-          ${open ? "opacity-100 translate-y-0" : "pointer-events-none opacity-0 -translate-y-1"}`}
+          ref={panelRef}
+          role="dialog"
+          aria-label={title}
+          className="fixed z-50"
+          style={{
+            top: panelStyle.top,
+            left: panelStyle.left,
+            width: panelStyle.width,
+          }}
+          onMouseLeave={close}
         >
-          <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
-            <div className="text-xs font-semibold text-gray-700">{title}</div>
-            <div className="flex items-center gap-1">
-              <button
-                className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
-                onClick={copy}
-                title="Copy JSON"
-              >
-                {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-              </button>
-              <button
-                className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
-                onClick={() => setOpen(false)}
-                title="Close"
-              >
-                <X className="w-4 h-4" />
-              </button>
+          <div className="rounded-xl border bg-white shadow-xl overflow-hidden">
+            <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
+              <div className="text-xs font-semibold text-gray-700">{title}</div>
+              <div className="flex items-center gap-1">
+                <button
+                  className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+                  onClick={copy}
+                  title="Copy JSON"
+                >
+                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                </button>
+                <button
+                  className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+                  onClick={close}
+                  title="Close"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-3">
+              <pre className="m-0 p-0 text-xs leading-relaxed overflow-auto" style={{ maxHeight: 360 }}>
+                <code>{json}</code>
+              </pre>
             </div>
           </div>
-
-          <div className="p-3">
-            <pre
-              className="m-0 p-0 text-xs leading-relaxed overflow-auto"
-              style={{ maxHeight: 360 }}
-            >
-              <code>{json}</code>
-            </pre>
-          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -2434,6 +2379,103 @@ export default function SettingsPanel({ sessionId, onClose }: { sessionId?: stri
   );
 }
 
+# ===== frontend/src/file_read/data/chatApi.ts =====
+
+import type { Attachment, ChatRow, ChatMessageRow} from "../types/chat";
+import { request } from "../services/http";
+
+// Spring Page<T> type
+export type PageResp<T> = {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  size: number;
+  number: number;      // current page index (0-based)
+  first: boolean;
+  last: boolean;
+  empty: boolean;
+};
+
+export function createChat(sessionId: string, title: string) {
+  return request<ChatRow>("/api/chats", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, title }),
+  });
+}
+
+export function updateChatLast(sessionId: string, lastMessage: string, title?: string) {
+  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lastMessage, title: title || "" }),
+  });
+}
+
+// Legacy (unused after pagination in sidebar)
+export function listChats() {
+  return request<ChatRow[]>("/api/chats");
+}
+
+// NEW: paginated list
+export function listChatsPage(page = 0, size = 30, ceiling?: string) {
+  const qs = new URLSearchParams({ page: String(page), size: String(size) });
+  if (ceiling) qs.set("ceiling", ceiling);
+  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
+}
+
+export function listMessages(sessionId: string) {
+  return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
+}
+
+export async function appendMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string,
+  attachments?: Attachment[]
+) {
+  const body: any = { role, content };
+  if (attachments && attachments.length) body.attachments = attachments;
+
+  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteChatsBatch(sessionIds: string[]) {
+  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionIds }),
+  });
+  return data.deleted;
+}
+
+export function deleteMessage(sessionId: string, messageId: string | number) {
+  return request<{ deleted: number }>(
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
+    { method: "DELETE" }
+  );
+}
+
+/** Delete a batch of messages. Backend returns { deleted: number[] } */
+export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
+  const ids = messageIds
+    .map((id) => (typeof id === "string" ? Number(id) : id))
+    .filter((n) => Number.isFinite(n)) as number[];
+
+  return request<{ deleted: number[] }>(  // <-- number[]
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messageIds: ids }),
+    }
+  );
+}
+
 # ===== frontend/src/file_read/data/ragApi.ts =====
 
 // frontend/src/file_read/data/ragApi.ts
@@ -2600,103 +2642,6 @@ export function recomputeAdaptive(sessionId?: string) {
   );
 }
 
-# ===== frontend/src/file_read/hooks/data/chatApi.ts =====
-
-import type { Attachment, ChatRow, ChatMessageRow} from "../../types/chat";
-import { request } from "../../services/http";
-
-// Spring Page<T> type
-export type PageResp<T> = {
-  content: T[];
-  totalElements: number;
-  totalPages: number;
-  size: number;
-  number: number;      // current page index (0-based)
-  first: boolean;
-  last: boolean;
-  empty: boolean;
-};
-
-export function createChat(sessionId: string, title: string) {
-  return request<ChatRow>("/api/chats", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, title }),
-  });
-}
-
-export function updateChatLast(sessionId: string, lastMessage: string, title?: string) {
-  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lastMessage, title: title || "" }),
-  });
-}
-
-// Legacy (unused after pagination in sidebar)
-export function listChats() {
-  return request<ChatRow[]>("/api/chats");
-}
-
-// NEW: paginated list
-export function listChatsPage(page = 0, size = 30, ceiling?: string) {
-  const qs = new URLSearchParams({ page: String(page), size: String(size) });
-  if (ceiling) qs.set("ceiling", ceiling);
-  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
-}
-
-export function listMessages(sessionId: string) {
-  return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
-}
-
-export async function appendMessage(
-  sessionId: string,
-  role: "user" | "assistant",
-  content: string,
-  attachments?: Attachment[]
-) {
-  const body: any = { role, content };
-  if (attachments && attachments.length) body.attachments = attachments;
-
-  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
-
-export async function deleteChatsBatch(sessionIds: string[]) {
-  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionIds }),
-  });
-  return data.deleted;
-}
-
-export function deleteMessage(sessionId: string, messageId: string | number) {
-  return request<{ deleted: number }>(
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
-    { method: "DELETE" }
-  );
-}
-
-/** Delete a batch of messages. Backend returns { deleted: number[] } */
-export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
-  const ids = messageIds
-    .map((id) => (typeof id === "string" ? Number(id) : id))
-    .filter((n) => Number.isFinite(n)) as number[];
-
-  return request<{ deleted: number[] }>(  // <-- number[]
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
-    {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messageIds: ids }),
-    }
-  );
-}
-
 # ===== frontend/src/file_read/hooks/stream/core/buffer.ts =====
 
 // frontend/src/file_read/hooks/stream/core/buffer.ts
@@ -2781,7 +2726,7 @@ export const STOP_FLUSH_TIMEOUT_MS = 3500;
 
 # ===== frontend/src/file_read/hooks/stream/core/controller.ts =====
 
-import { appendMessage } from "../../data/chatApi";
+import { appendMessage } from "../../../data/chatApi";
 import type { StreamController, StreamCoreOpts } from "./types";
 import { createScheduler, type QueueItem } from "./queue";
 import { createCanceller } from "./cancel";
@@ -2933,4 +2878,97 @@ export function createScheduler(runJob: RunJob) {
     },
     isActiveSid: (sid: string) => active?.sid === sid,
     dropJobsForSid(sid: string) {
-      for (let i = q.length - 1; i >=
+      for (let i = q.length - 1; i >= 0; i--) {
+        if (q[i].sid === sid) q.splice(i, 1);
+      }
+    },
+    getActiveSid: () => active?.sid ?? null,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
+
+// frontend/src/file_read/hooks/stream/core/runner.ts
+import { postStream } from "./network";
+import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
+import type { ChatMsg } from "../../../types/chat";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { readStreamLoop } from "./runner_stream";
+import {
+  pinLiveMetricsToSession,
+  pinLiveMetricsToBubble,
+  pinFallbackToSessionAndBubble,
+} from "./runner_metrics";
+import { persistAssistantTurn } from "./runner_persist";
+import type { QueueItem } from "./queue";
+import { listChatsPage } from "../../../data/chatApi";
+
+
+export type RunnerDeps = {
+  opts: {
+    ensureChatCreated: () => Promise<void>;
+    getSessionId: () => string;
+    getMessagesFor: (sid: string) => ChatMsg[];
+    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+    setInput: (v: string) => void;
+    setLoadingFor: (sid: string, v: boolean) => void;
+    setQueuedFor: (sid: string, v: boolean) => void;
+    resetMetricsFor: (sid: string) => void;
+    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+    onRetitle: (sid: string, finalText: string) => Promise<void>;
+    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+  };
+  getCancelForSid: () => string | null;
+  clearCancelIf: (sid: string) => void;
+  setController: (c: AbortController | null) => void;
+  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
+};
+
+export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
+  const { sid, prompt, asstId, attachments } = job;
+  const { opts } = d;
+  const wasCanceled = () => d.getCancelForSid() === sid;
+
+  opts.resetMetricsFor(sid);
+  opts.setLoadingFor(sid, true);
+
+  ensureAssistantPlaceholder(
+    { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
+    sid,
+    asstId
+  );
+
+  const MAX_HISTORY = 10;
+  const history = opts
+    .getMessagesFor(sid)
+    .slice(-MAX_HISTORY)
+    .map((m) => ({
+      role: m.role,
+      content: m.text || "",
+      attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
+    }))
+    .filter(
+      (m) =>
+        (m.content && m.content.trim().length > 0) ||
+        (m.attachments && m.attachments.length > 0)
+    );
+
+  const userTurn = {
+    role: "user" as const,
+    content: prompt,
+    attachments: attachments && attachments.length ? attachments : undefined,
+  };
+
+  const controller = new AbortController();
+  d.setController(controller);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  try {
+    reader = await postStream(
+      { sessionId: sid, messages: [...history, userTurn] },
+      controller.signal
+    );
+    d.setReader(reader);
+
+    const { finalText, gotMetrics, lastRunJson } = awa

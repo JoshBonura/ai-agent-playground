@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { deleteChatsBatch } from "../../hooks/data/chatApi";
+import { deleteChatsBatch } from "../../data/chatApi";
 import type { ChatRow } from "../../types/chat";
 import { useMultiSelect } from "../../hooks/useMultiSelect";
 import { useChatsPager } from "../../hooks/useChatsPager";
