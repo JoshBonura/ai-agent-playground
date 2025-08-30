@@ -12,11 +12,22 @@ function rowToMsg(r: ChatMessageRow): ChatMsg {
       serverId: r.id,
       role: r.role,
       text: clean,
+      // ✅ KEEP attachments from server
+      attachments: r.attachments ?? [],
     };
     if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
     return base;
   }
-  return { id: `cid-${r.id}`, serverId: r.id, role: r.role, text: r.content };
+
+  // user
+  return {
+    id: `cid-${r.id}`,
+    serverId: r.id,
+    role: r.role,
+    text: r.content,
+    // ✅ KEEP attachments from server
+    attachments: r.attachments ?? [],
+  };
 }
 
 export function useSession(opts: {
@@ -53,14 +64,13 @@ export function useSession(opts: {
       const prevClient = getMessagesForSession(sessionId) ?? [];
 
       if (isStreaming(sessionId)) {
-        // When streaming, merge by serverId (preserve any in-flight tail by clientId)
+        // Merge by serverId; preserve any in-flight tail
         const byServer = new Map<number, ChatMsg>(
           prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
         );
         const merged = serverMsgs.map(s => {
           const prev = byServer.get(s.serverId!);
           if (!prev) return s;
-          // prefer freshly parsed meta if present, else keep previous meta
           const meta = s.meta ?? prev.meta ?? undefined;
           return { ...prev, ...s, meta };
         });
@@ -68,7 +78,7 @@ export function useSession(opts: {
         const tail: ChatMsg[] = [];
         const last = prevClient[prevClient.length - 1];
         if (last?.role === "assistant" && (last.text?.length ?? 0) > 0 && last.serverId == null) {
-          tail.push(last); // keep streaming tail bubble (unsaved)
+          tail.push(last);
         }
 
         setMessagesForSession(sessionId, [...merged, ...tail]);

@@ -1,3 +1,4 @@
+// frontend/src/file_read/hooks/stream/core/runner.ts
 import { postStream } from "./network";
 import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
 import type { ChatMsg } from "../../../types/chat";
@@ -24,7 +25,7 @@ export type RunnerDeps = {
     setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
     setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
     onRetitle: (sid: string, finalText: string) => Promise<void>;
-    /** NEW: patch serverId by clientId */
+    /** patch serverId by clientId */
     setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
   };
   getCancelForSid: () => string | null;
@@ -34,33 +35,67 @@ export type RunnerDeps = {
 };
 
 export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
-  const { sid, prompt, asstId } = job;
+  const { sid, prompt, asstId, attachments } = job;
   const { opts } = d;
   const wasCanceled = () => d.getCancelForSid() === sid;
 
   opts.resetMetricsFor(sid);
   opts.setLoadingFor(sid, true);
-  ensureAssistantPlaceholder(opts, sid, asstId);
 
+  // Ensure assistant placeholder exists even for attachments-only turns
+  ensureAssistantPlaceholder(
+    { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
+    sid,
+    asstId
+  );
+
+  // Build short history and PRESERVE attachments for prior messages
   const MAX_HISTORY = 10;
   const history = opts
     .getMessagesFor(sid)
     .slice(-MAX_HISTORY)
-    .map((m) => ({ role: m.role, content: m.text }))
-    .filter((m) => m.content.trim().length > 0);
+    .map((m) => ({
+      role: m.role,
+      content: m.text || "",
+      attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
+    }))
+    // keep entries that have text OR attachments (so attachments-only past turns aren't dropped)
+    .filter(
+      (m) =>
+        (m.content && m.content.trim().length > 0) ||
+        (m.attachments && m.attachments.length > 0)
+    );
+
+  // Current user turn (may be text, attachments, or both)
+  const userTurn = {
+    role: "user" as const,
+    content: prompt,
+    attachments: attachments && attachments.length ? attachments : undefined,
+  };
+
+  // 🔎 helpful debug
+  console.log("[runner] postStream payload", {
+    sid,
+    historyCount: history.length,
+    lastHistHasAtts:
+      history.length > 0 && !!history[history.length - 1]?.attachments?.length,
+    promptLen: (prompt || "").length,
+    hasAttachments: !!(attachments && attachments.length),
+  });
 
   const controller = new AbortController();
   d.setController(controller);
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
   try {
+    // Send to backend; IMPORTANT: do not strip attachments in network.ts
     reader = await postStream(
-      { sessionId: sid, messages: [...history, { role: "user", content: prompt }] },
+      { sessionId: sid, messages: [...history, userTurn] },
       controller.signal
     );
     d.setReader(reader);
 
-    const result = await readStreamLoop(reader, {
+    const { finalText, gotMetrics, lastRunJson } = await readStreamLoop(reader, {
       wasCanceled,
       onDelta: (delta) => {
         // append assistant delta inline
@@ -81,7 +116,6 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
       },
     });
 
-    const { finalText, gotMetrics, lastRunJson } = result;
     let persistJson: RunJson | null = gotMetrics ? lastRunJson : null;
 
     if (!gotMetrics) {
@@ -93,11 +127,14 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     if (!wasCanceled() && finalText.trim()) {
       const newServerId = await persistAssistantTurn(sid, finalText, persistJson);
       if (newServerId != null) {
-        // patch serverId on the assistant placeholder (identified by clientId = asstId)
         opts.setServerIdFor(sid, asstId, newServerId);
       }
-      try { await opts.onRetitle(sid, finalText); } catch {}
-      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+      try {
+        await opts.onRetitle(sid, finalText);
+      } catch {}
+      try {
+        window.dispatchEvent(new CustomEvent("chats:refresh"));
+      } catch {}
     }
   } catch (e: any) {
     const localAbort =
@@ -110,7 +147,9 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     opts.setMessagesFor(sid, (prev) => {
       const end = prev[prev.length - 1];
       if (end?.role === "assistant" && !end.text.trim()) {
-        return prev.map((m, i) => (i === prev.length - 1 ? { ...m, text: "[stream error]" } : m));
+        return prev.map((m, i) =>
+          i === prev.length - 1 ? { ...m, text: "[stream error]" } : m
+        );
       }
       return prev;
     });

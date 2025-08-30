@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMsg } from "../types/chat";
 import type { RunJson, GenMetrics } from "../shared/lib/runjson";
 import { createStreamController } from "./stream/core/controller";
+import type { Attachment } from "../types/chat";
 
 type UseStreamDeps = {
   // not read directly; keeps memo deps stable
@@ -27,7 +28,11 @@ type UseStreamDeps = {
   setLoadingForSession: (sid: string, v: boolean) => void;
   setQueuedForSession?: (sid: string, v: boolean) => void;
   setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-  setMetricsFallbackForSession: (sid: string, reason: string, partialOut: string) => void;
+  setMetricsFallbackForSession: (
+    sid: string,
+    reason: string,
+    partialOut: string
+  ) => void;
   resetMetricsForSession: (sid: string) => void;
 };
 
@@ -47,7 +52,6 @@ export function useStream({
   const [loading, setLoading] = useState(false);
   const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
 
-  // Build the controller once; it manages its own queue + aborts.
   const controller = useMemo(() => {
     return createStreamController({
       // message access
@@ -67,7 +71,7 @@ export function useStream({
       setMetricsFallbackFor: (sid, reason, out) =>
         setMetricsFallbackForSession(sid, reason, out),
 
-      // NEW: patch server id onto a bubble identified by clientId
+      // patch server id onto a bubble identified by clientId
       setServerIdFor: (sid, clientId, serverId) => {
         setMessagesForSession(sid, (prev) =>
           prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
@@ -80,7 +84,6 @@ export function useStream({
       onRetitle,
       resetMetricsFor: (sid) => resetMetricsForSession(sid),
     });
-    // Intentionally stable: controller owns its own lifecycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -89,10 +92,10 @@ export function useStream({
     return () => controllerRef.current?.dispose();
   }, [controller]);
 
-  async function send(override?: string) {
+  async function send(override?: string, attachments: Attachment[] = []) {
     const text = (override ?? "").trim();
-    if (!text) return;
-    await controller.send(text);
+    if (!text && attachments.length === 0) return;
+    await controller.send(text, attachments);
   }
 
   async function stop() {

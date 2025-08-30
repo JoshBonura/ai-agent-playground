@@ -188,3 +188,35 @@ def build_rag_block(query: str, session_id: str | None = None) -> str | None:
     )
     print(f"[RAG BLOCK] chars={len(block)}")
     return block
+
+def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None) -> Optional[str]:
+    """
+    Same idea as build_rag_block, but ONLY searches the current session's vectors.
+    Used when a user turn includes attachments (we skip Web and global RAG).
+    """
+    if not bool(SETTINGS.get("rag_enabled", True)):
+        return None
+
+    if k is None:
+        k = int(SETTINGS.get("attachments_retrieve_top_k", SETTINGS.get("rag_top_k", 4)))
+
+    q = (query or "").strip()
+    print(f"[RAG SEARCH (session-only)] q={q!r} session={session_id} k={k}")
+    qvec = _embed_query(q)
+    if not qvec:
+        print("[RAG SEARCH (session-only)] no qvec")
+        return None
+
+    d = len(qvec)
+    hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
+    print(f"[RAG SEARCH (session-only)] hits={len(hits_chat)}")
+    if not hits_chat:
+        return None
+
+    hits_top = _dedupe_and_sort(hits_chat, k=k)
+    block = make_rag_block(
+        hits_top,
+        max_chars=int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
+    )
+    print(f"[RAG BLOCK (session-only)] chars={len(block)}")
+    return block

@@ -1,32 +1,40 @@
 import { useState } from "react";
 import { Copy, Check, Trash2 } from "lucide-react";
 import MarkdownMessage from "./Markdown/MarkdownMessage";
+import { parseRunJson } from "../utils/parseRunjson";
+import type { Attachment } from "../types/chat";   // ✅ import Attachment type
 
 const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
 
 export default function ChatBubble({
   role,
   text,
-  showActions = true, // NEW: parent decides when to show the toolbar
+  attachments = [],   // ✅ new prop
+  showActions = true,
   onDelete,
 }: {
   role: "user" | "assistant";
   text: string;
+  attachments?: Attachment[];   // ✅ allow attachments
   showActions?: boolean;
   onDelete?: () => void;
 }) {
   const isUser = role === "user";
-  const content = text?.trim() ?? "";
-  if (role === "assistant" && !content) return null;
+  const raw = text ?? "";
+  const { text: stripped } = parseRunJson(raw);
+  let content = stripped.trim();
 
-  // Never show the decorative stop line in assistant bubbles
-  const display = isUser ? content : content.replace(STOP_SENTINEL_RE, "");
+  if (!isUser) content = content.replace(STOP_SENTINEL_RE, "");
+
+  const hasOnlyAttachments =
+    isUser && (!content || content.length === 0) && attachments.length > 0;
+
+  if (role === "assistant" && !content && attachments.length === 0) return null;
 
   const [copiedMsg, setCopiedMsg] = useState(false);
-
   const copyWholeMessage = async () => {
     try {
-      await navigator.clipboard.writeText(display);
+      await navigator.clipboard.writeText(content);
       setCopiedMsg(true);
       setTimeout(() => setCopiedMsg(false), 2000);
     } catch {}
@@ -34,21 +42,41 @@ export default function ChatBubble({
 
   return (
     <div className="mb-2">
-      {/* Bubble */}
       <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
         <div
           className={`max-w-[80%] w-fit break-words rounded-2xl px-4 py-2 shadow-sm
                       prose prose-base max-w-none
             ${isUser ? "bg-black text-white prose-invert" : "bg-white border text-gray-900"}`}
-          style={{ wordBreak: "break-word" }}
         >
-          <div className="max-w-full">
-            <MarkdownMessage text={display} />
-          </div>
+          {/* ✅ Render attachments */}
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {attachments.map((att) => (
+                <div
+                  key={`${att.sessionId || "global"}:${att.source || att.name}`}
+                  className={`border rounded px-2 py-1 text-sm flex items-center gap-2 ${
+                    isUser
+                      ? "bg-white/10 border-white/30"
+                      : "bg-white"
+                  }`}
+                  title={att.name || att.source}
+                >
+                  📎 <span className="truncate max-w-[220px]">{att.name}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {content ? (
+            <div className="max-w-full">
+              <MarkdownMessage text={content} />
+            </div>
+          ) : hasOnlyAttachments ? null : isUser ? null : (
+            <span className="opacity-60">…</span>
+          )}
         </div>
       </div>
 
-      {/* Under-bubble toolbar (icon-only) */}
       {showActions && (
         <div className={`mt-1 flex ${isUser ? "justify-end" : "justify-start"}`}>
           <div className="flex items-center gap-2">
@@ -62,8 +90,6 @@ export default function ChatBubble({
             >
               {copiedMsg ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
             </button>
-
-            {/* Delete for BOTH roles when provided */}
             {onDelete && (
               <button
                 type="button"

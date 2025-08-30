@@ -4,6 +4,7 @@ import ChatView from "./ChatView/ChatView";
 import ChatComposer from "./ChatComposer";
 import type { ChatMsg } from "../types/chat";
 import type { GenMetrics, RunJson } from "../hooks/useChatStream";
+import type { Attachment } from "../types/chat";
 
 interface Props {
   messages: ChatMsg[];
@@ -11,14 +12,14 @@ interface Props {
   setInput: (s: string) => void;
   loading: boolean;
   queued?: boolean;
-  send: (text?: string) => Promise<void>;
+  send: (text?: string, attachments?: Attachment[]) => Promise<void>;
   stop: () => Promise<void> | void;
   runMetrics?: GenMetrics | null;
   runJson?: RunJson | null;
   onRefreshChats?: () => void;
   onDeleteMessages?: (ids: string[]) => void;
   autoFollow?: boolean;
-  sessionId?: string; // ⬅️ NEW
+  sessionId?: string;
 }
 
 export default function ChatContainer({
@@ -34,7 +35,7 @@ export default function ChatContainer({
   onRefreshChats,
   onDeleteMessages,
   autoFollow = true,
-  sessionId, // ⬅️ NEW
+  sessionId,
 }: Props) {
   const [composerH, setComposerH] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -44,7 +45,8 @@ export default function ChatContainer({
     const el = containerRef.current;
     if (!el) return;
     const threshold = 120;
-    const isNearBottom = () => el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+    const isNearBottom = () =>
+      el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
     const onScroll = () => setPinned(!isNearBottom());
     el.addEventListener("scroll", onScroll, { passive: true });
     setPinned(!isNearBottom());
@@ -57,9 +59,9 @@ export default function ChatContainer({
     el.scrollTo({ top: el.scrollHeight, behavior });
   };
 
-  const handleSend = async (text?: string) => {
+  const handleSend = async (text?: string, attachments?: Attachment[]) => {
     if (!pinned) forceScrollToBottom("auto");
-    await send(text);
+    await send(text, attachments);
     onRefreshChats?.();
     if (!pinned) requestAnimationFrame(() => forceScrollToBottom("smooth"));
   };
@@ -88,7 +90,7 @@ export default function ChatContainer({
         onStop={stop}
         onHeightChange={setComposerH}
         onRefreshChats={onRefreshChats}
-        sessionId={sessionId} // ⬅️ NEW
+        sessionId={sessionId}
       />
     </div>
   );

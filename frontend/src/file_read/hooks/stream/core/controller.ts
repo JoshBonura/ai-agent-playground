@@ -3,6 +3,7 @@ import type { StreamController, StreamCoreOpts } from "./types";
 import { createScheduler, type QueueItem } from "./queue";
 import { createCanceller } from "./cancel";
 import { runStreamOnce } from "./runner";
+import type { Attachment } from "../../../types/chat";
 
 export function createStreamController(opts: StreamCoreOpts): StreamController {
   let cancelForSid: string | null = null;
@@ -31,38 +32,38 @@ export function createStreamController(opts: StreamCoreOpts): StreamController {
     dropJobsForSid: scheduler.dropJobsForSid,
   });
 
-  async function send(override?: string) {
+  async function send(override?: string, attachments?: Attachment[]) {
     const prompt = (override ?? "").trim();
-    if (!prompt) return;
+    const atts = (attachments ?? []).filter(Boolean);
+    if (!prompt && atts.length === 0) return; // allow attachments-only, but not truly empty
 
     await opts.ensureChatCreated();
     const sid = opts.getSessionId();
 
-    // Stable UI ids
     const userCid = crypto.randomUUID();
     const asstCid = crypto.randomUUID();
 
-    // 1) Optimistically add user + assistant placeholder with serverId=null
+    // optimistic bubbles
     opts.setMessagesFor(sid, (prev) => [
       ...prev,
-      { id: userCid, serverId: null, role: "user",      text: prompt },
-      { id: asstCid, serverId: null, role: "assistant", text: ""     },
+      { id: userCid, serverId: null, role: "user", text: prompt, attachments: atts.length ? atts : undefined },
+      { id: asstCid, serverId: null, role: "assistant", text: "" },
     ]);
     opts.setInput("");
 
-    // 2) Persist user message; patch serverId when we get it
-    appendMessage(sid, "user", prompt)
+    // persist user
+    appendMessage(sid, "user", prompt, atts.length ? atts : undefined)
       .then((row) => {
         if (row?.id != null) {
           opts.setServerIdFor(sid, userCid, Number(row.id));
-          // Sidebar: make sure the chat shows up as soon as it really exists
           try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
         }
       })
-      .catch(() => { /* ignore; UI stays optimistic */ });
+      .catch(() => {});
 
+    // enqueue generation with attachments
     try { opts.setQueuedFor(sid, true); } catch {}
-    scheduler.enqueue({ sid, prompt, asstId: asstCid });
+    scheduler.enqueue({ sid, prompt, asstId: asstCid, attachments: atts.length ? atts : undefined });
   }
 
   async function stop() { await canceller.stopVisible(); }

@@ -1,9 +1,6 @@
 // frontend/src/file_read/data/ragApi.ts
-import { request } from "../services/http";
+import { request, API_BASE } from "../services/http";
 
-/**
- * Plain upload (no progress). Useful for simple flows/tests.
- */
 export function uploadRag(file: File, sessionId?: string, forceGlobal = false) {
   const form = new FormData();
   form.append("file", file);
@@ -15,11 +12,6 @@ export function uploadRag(file: File, sessionId?: string, forceGlobal = false) {
   );
 }
 
-/**
- * Upload with progress + cancel support.
- * - onProgress: receives % (0..100).
- * - signal: optional AbortSignal to cancel.
- */
 export function uploadRagWithProgress(
   file: File,
   sessionId: string,
@@ -32,34 +24,28 @@ export function uploadRagWithProgress(
     form.append("sessionId", sessionId);
 
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/rag/upload");
+    const url = `${API_BASE}/api/rag/upload`.replace(/([^:]\/)\/+/g, "$1");
+    xhr.open("POST", url);
 
     xhr.upload.onprogress = (e) => {
-      if (!e.lengthComputable) return;
-      const pct = Math.round((e.loaded / e.total) * 100);
-      onProgress(pct);
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
     };
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch {
-          resolve({ ok: true, added: 0 });
-        }
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { resolve({ ok: true, added: 0 }); }
       } else {
         reject(new Error(`Upload failed (${xhr.status})`));
       }
     };
 
+    // treat abort as a silent resolution, not an error
+    xhr.onabort = () => resolve({ ok: false, added: 0 });
     xhr.onerror = () => reject(new Error("Network error"));
 
     if (signal) {
-      if (signal.aborted) {
-        xhr.abort();
-        reject(new DOMException("Aborted", "AbortError"));
-        return;
-      }
+      if (signal.aborted) { xhr.abort(); return resolve({ ok: false, added: 0 }); }
       signal.addEventListener("abort", () => xhr.abort(), { once: true });
     }
 
@@ -67,9 +53,7 @@ export function uploadRagWithProgress(
   });
 }
 
-/**
- * RAG search (hybrid: chat + global).
- */
+
 export function searchRag(query: string, opts?: {
   sessionId?: string;
   kChat?: number;
@@ -84,8 +68,17 @@ export function searchRag(query: string, opts?: {
     hybrid_alpha: opts?.alpha ?? 0.5,
   };
 
-  return request<{ hits: Array<{ id?: string; score: number; source?: string; title?: string; text: string; sessionId?: string | null }> }>(
-    "/api/rag/search",
+  return request<{
+    hits: Array<{
+      id?: string;
+      score: number;
+      source?: string;
+      title?: string;
+      text: string;
+      sessionId?: string | null;
+    }>;
+  }>(
+    "/api/rag/search",   // ✅ relative path, request() adds API_BASE
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -100,22 +93,17 @@ export type UploadRow = {
   chunks: number;
 };
 
-/**
- * List indexed uploads (session-only or include global).
- */
 export async function listUploads(sessionId?: string, scope: "all" | "session" = "all") {
   const p = new URLSearchParams();
   if (sessionId) p.set("sessionId", sessionId);
   if (scope) p.set("scope", scope);
-  return request<{ uploads: UploadRow[] }>(`/api/rag/uploads?${p.toString()}`, {
-    method: "GET",
-  });
+
+  return request<{ uploads: UploadRow[] }>(
+    `/api/rag/uploads?${p.toString()}`,
+    { method: "GET" }
+  );
 }
 
-/**
- * Hard-delete an uploaded source (rebuilds index server-side).
- * `source` should match the filename used as `build_metas(..., source=filename)`.
- */
 export async function deleteUploadHard(source: string, sessionId?: string) {
   return request<{ ok: boolean; removed: number; remaining: number }>(
     `/api/rag/uploads/delete-hard`,

@@ -1,8 +1,1219 @@
+async function startNext() {
+    if (active || q.length === 0) return;
+    const job = q.shift()!;
+    active = { sid: job.sid };
+    try {
+      await runJob(job);
+    } finally {
+      active = null;
+      if (q.length) void startNext();
+    }
+  }
+
+  return {
+    enqueue(job: QueueItem) {
+      q.push(job);
+      void startNext();
+    },
+    isActiveSid: (sid: string) => active?.sid === sid,
+    dropJobsForSid(sid: string) {
+      for (let i = q.length - 1; i >= 0; i--) {
+        if (q[i].sid === sid) q.splice(i, 1);
+      }
+    },
+    getActiveSid: () => active?.sid ?? null,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
+
+// frontend/src/file_read/hooks/stream/core/runner.ts
+import { postStream } from "./network";
+import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
+import type { ChatMsg } from "../../../types/chat";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { readStreamLoop } from "./runner_stream";
+import {
+  pinLiveMetricsToSession,
+  pinLiveMetricsToBubble,
+  pinFallbackToSessionAndBubble,
+} from "./runner_metrics";
+import { persistAssistantTurn } from "./runner_persist";
+import type { QueueItem } from "./queue";
+
+export type RunnerDeps = {
+  opts: {
+    ensureChatCreated: () => Promise<void>;
+    getSessionId: () => string;
+    getMessagesFor: (sid: string) => ChatMsg[];
+    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+    setInput: (v: string) => void;
+    setLoadingFor: (sid: string, v: boolean) => void;
+    setQueuedFor: (sid: string, v: boolean) => void;
+    resetMetricsFor: (sid: string) => void;
+    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+    onRetitle: (sid: string, finalText: string) => Promise<void>;
+    /** patch serverId by clientId */
+    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+  };
+  getCancelForSid: () => string | null;
+  clearCancelIf: (sid: string) => void;
+  setController: (c: AbortController | null) => void;
+  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
+};
+
+export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
+  const { sid, prompt, asstId, attachments } = job;
+  const { opts } = d;
+  const wasCanceled = () => d.getCancelForSid() === sid;
+
+  opts.resetMetricsFor(sid);
+  opts.setLoadingFor(sid, true);
+
+  // Ensure assistant placeholder exists even for attachments-only turns
+  ensureAssistantPlaceholder(
+    { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
+    sid,
+    asstId
+  );
+
+  // Build short history and PRESERVE attachments for prior messages
+  const MAX_HISTORY = 10;
+  const history = opts
+    .getMessagesFor(sid)
+    .slice(-MAX_HISTORY)
+    .map((m) => ({
+      role: m.role,
+      content: m.text || "",
+      attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
+    }))
+    // keep entries that have text OR attachments (so attachments-only past turns aren't dropped)
+    .filter(
+      (m) =>
+        (m.content && m.content.trim().length > 0) ||
+        (m.attachments && m.attachments.length > 0)
+    );
+
+  // Current user turn (may be text, attachments, or both)
+  const userTurn = {
+    role: "user" as const,
+    content: prompt,
+    attachments: attachments && attachments.length ? attachments : undefined,
+  };
+
+  // 🔎 helpful debug
+  console.log("[runner] postStream payload", {
+    sid,
+    historyCount: history.length,
+    lastHistHasAtts:
+      history.length > 0 && !!history[history.length - 1]?.attachments?.length,
+    promptLen: (prompt || "").length,
+    hasAttachments: !!(attachments && attachments.length),
+  });
+
+  const controller = new AbortController();
+  d.setController(controller);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  try {
+    // Send to backend; IMPORTANT: do not strip attachments in network.ts
+    reader = await postStream(
+      { sessionId: sid, messages: [...history, userTurn] },
+      controller.signal
+    );
+    d.setReader(reader);
+
+    const { finalText, gotMetrics, lastRunJson } = await readStreamLoop(reader, {
+      wasCanceled,
+      onDelta: (delta) => {
+        // append assistant delta inline
+        opts.setMessagesFor(sid, (prev) => {
+          const idx = prev.findIndex((m) => m.id === asstId);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], text: (next[idx].text || "") + delta };
+          return next;
+        });
+      },
+      onMetrics: (json, flat) => {
+        pinLiveMetricsToSession(opts, sid, json, flat);
+        pinLiveMetricsToBubble(opts, sid, asstId, json, flat);
+      },
+      onCancelTimeout: (cleanSoFar) => {
+        opts.setMetricsFallbackFor(sid, "user_cancel_timeout", cleanSoFar);
+      },
+    });
+
+    let persistJson: RunJson | null = gotMetrics ? lastRunJson : null;
+
+    if (!gotMetrics) {
+      const reason = wasCanceled() ? "user_cancel" : "end_of_stream_no_metrics";
+      const fallback = pinFallbackToSessionAndBubble(opts, sid, asstId, reason, finalText);
+      if (!wasCanceled()) persistJson = fallback;
+    }
+
+    if (!wasCanceled() && finalText.trim()) {
+      const newServerId = await persistAssistantTurn(sid, finalText, persistJson);
+      if (newServerId != null) {
+        opts.setServerIdFor(sid, asstId, newServerId);
+      }
+      try {
+        await opts.onRetitle(sid, finalText);
+      } catch {}
+      try {
+        window.dispatchEvent(new CustomEvent("chats:refresh"));
+      } catch {}
+    }
+  } catch (e: any) {
+    const localAbort =
+      e?.name === "AbortError" && (wasCanceled() || controller.signal.aborted);
+    const reason = localAbort ? "client_abort_after_stop" : e?.name || "client_error";
+
+    const last = snapshotPendingAssistant(opts.getMessagesFor(sid));
+    opts.setMetricsFallbackFor(sid, reason, last);
+
+    opts.setMessagesFor(sid, (prev) => {
+      const end = prev[prev.length - 1];
+      if (end?.role === "assistant" && !end.text.trim()) {
+        return prev.map((m, i) =>
+          i === prev.length - 1 ? { ...m, text: "[stream error]" } : m
+        );
+      }
+      return prev;
+    });
+  } finally {
+    if (d.getCancelForSid() === sid) d.clearCancelIf(sid);
+    opts.setLoadingFor(sid, false);
+    d.setController(null);
+    d.setReader(null);
+  }
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner_metrics.ts =====
+
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import type { ChatMsg } from "../../../types/chat";
+
+type Opts = {
+  setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+  setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+};
+
+export function pinLiveMetricsToSession(
+  opts: Opts,
+  sid: string,
+  json?: RunJson,
+  flat?: GenMetrics
+) {
+  opts.setMetricsFor(sid, json, flat);
+}
+
+export function pinLiveMetricsToBubble(
+  opts: Opts,
+  sid: string,
+  asstId: string,
+  json?: RunJson,
+  flat?: GenMetrics
+) {
+  opts.setMessagesFor(sid, (prev) =>
+    prev.map((m) =>
+      m.id === asstId
+        ? { ...m, meta: { ...(m.meta ?? {}), runJson: json ?? m.meta?.runJson, flat: flat ?? m.meta?.flat } }
+        : m
+    )
+  );
+}
+
+/** Also returns the synthesized RunJson so caller can persist if needed. */
+export function pinFallbackToSessionAndBubble(
+  opts: Opts,
+  sid: string,
+  asstId: string,
+  reason: string,
+  finalText: string
+): RunJson {
+  const json: RunJson = {
+    stats: {
+      stopReason: reason,
+      tokensPerSecond: null,
+      timeToFirstTokenSec: null,
+      totalTimeSec: null,
+      promptTokensCount: null,
+      predictedTokensCount: finalText ? finalText.length : 0,
+      totalTokensCount: null,
+    },
+  };
+  const flat: GenMetrics = {
+    stop_reason: reason,
+    tok_per_sec: null,
+    ttft_ms: null,
+    output_tokens: null,
+    input_tokens_est: null,
+    total_tokens_est: null,
+  };
+
+  opts.setMetricsFallbackFor(sid, reason, finalText);
+  opts.setMessagesFor(sid, (prev) =>
+    prev.map((m) =>
+      m.id === asstId ? { ...m, meta: { ...(m.meta ?? {}), runJson: json, flat } } : m
+    )
+  );
+  return json;
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner_persist.ts =====
+
+import { appendMessage, updateChatLast } from "../../data/chatApi";
+import type { RunJson } from "../../../shared/lib/runjson";
+import { MET_START, MET_END } from "../../../shared/lib/runjson";
+
+/**
+ * Persist assistant turn; returns the new server message id (or null).
+ */
+export async function persistAssistantTurn(
+  sid: string,
+  finalText: string,
+  json: RunJson | null
+): Promise<number | null> {
+  let toPersist = finalText;
+  if (json) {
+    toPersist = `${finalText}\n${MET_START}\n${JSON.stringify(json)}\n${MET_END}\n`;
+  }
+  try {
+    const row = await appendMessage(sid, "assistant", toPersist);
+    await updateChatLast(sid, finalText, "").catch(() => {});
+    return row?.id != null ? Number(row.id) : null;
+  } catch {
+    return null;
+  }
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner_stream.ts =====
+
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { processChunk } from "./buffer";
+
+type LoopDeps = {
+  wasCanceled: () => boolean;
+  onDelta: (delta: string, cleanSoFar: string) => void;
+  onMetrics: (json?: RunJson, flat?: GenMetrics) => void;
+  onCancelTimeout: (cleanSoFar: string) => void;
+};
+
+export async function readStreamLoop(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  d: LoopDeps
+): Promise<{ finalText: string; gotMetrics: boolean; lastRunJson: RunJson | null }> {
+  const decoder = new TextDecoder();
+  let rawBuf = "";
+  let cleanSoFar = "";
+  let gotMetrics = false;
+  let lastRunJson: RunJson | null = null;
+  let stopTimeout: number | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    if (value) {
+      rawBuf += decoder.decode(value, { stream: true });
+      const step = processChunk(cleanSoFar, rawBuf);
+
+      if (step.metrics) {
+        gotMetrics = true;
+        if (step.metrics.json) lastRunJson = step.metrics.json;
+        d.onMetrics(step.metrics.json, step.metrics.flat);
+      }
+      if (step.delta) {
+        cleanSoFar = step.cleanText;
+        d.onDelta(step.delta, cleanSoFar);
+      }
+    }
+
+    if (d.wasCanceled()) break;
+
+    if (d.wasCanceled() && stopTimeout == null) {
+      stopTimeout = window.setTimeout(() => {
+        if (!gotMetrics) d.onCancelTimeout(cleanSoFar);
+      }, STOP_FLUSH_TIMEOUT_MS) as unknown as number;
+    }
+  }
+
+  if (stopTimeout != null) clearTimeout(stopTimeout);
+  return { finalText: cleanSoFar, gotMetrics, lastRunJson };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/types.ts =====
+
+// frontend/src/file_read/hooks/stream/core/types.ts
+import type { ChatMsg, Attachment } from "../../../types/chat";
+import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
+
+export type MsgAccessor = {
+  getMessagesFor: (sessionId: string) => ChatMsg[];
+  setMessagesFor: (sessionId: string, updater: (prev: ChatMsg[]) => ChatMsg[]) => void;
+};
+
+export type UiHooks = {
+  setInput: (v: string) => void;
+  setLoadingFor: (sessionId: string, v: boolean) => void;
+  setQueuedFor: (sessionId: string, v: boolean) => void;
+  setMetricsFor: (sessionId: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMetricsFallbackFor: (sessionId: string, reason: string, partialOut: string) => void;
+
+  /** patch the server id for a bubble identified by clientId */
+  setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+};
+
+export type SessionPlumbing = {
+  getSessionId: () => string;
+  ensureChatCreated: () => Promise<void>;
+  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
+  resetMetricsFor: (sessionId: string) => void;
+};
+
+export type StreamCoreOpts = MsgAccessor & UiHooks & SessionPlumbing;
+
+export type StreamController = {
+  /** text can be empty if attachments are present */
+  send: (override?: string, attachments?: Attachment[]) => Promise<void>;
+  stop: () => Promise<void>;
+  cancelBySessionId: (sid: string) => Promise<void>;
+  dispose: () => void;
+};
+
+# ===== frontend/src/file_read/hooks/stream/core/updater.ts =====
+
+import type { ChatMsg } from "../../../types/chat";
+import type { MsgAccessor } from "./types";
+
+export function appendAssistantDelta(
+  access: MsgAccessor,
+  sessionId: string,
+  asstId: string,
+  delta: string
+) {
+  if (!delta) return;
+  access.setMessagesFor(sessionId, (prev) => {
+    const idx = prev.findIndex((m) => m.id === asstId);
+    if (idx === -1) return prev;
+    const next = [...prev];
+    const cur = next[idx];
+    next[idx] = { ...cur, text: (cur.text || "") + delta };
+    return next;
+  });
+}
+
+export function ensureAssistantPlaceholder(
+  access: MsgAccessor,
+  sessionId: string,
+  asstId: string
+) {
+  access.setMessagesFor(sessionId, (prev) => {
+    const idx = prev.findIndex((m) => m.id === asstId);
+    if (idx !== -1) return prev;
+    return [...prev, { id: asstId, serverId: null, role: "assistant", text: "" } as ChatMsg];
+  });
+}
+
+export function snapshotPendingAssistant(msgs: ChatMsg[]): string {
+  if (!msgs.length) return "";
+  const last = msgs[msgs.length - 1];
+  return last.role === "assistant" ? last.text : "";
+}
+
+# ===== frontend/src/file_read/hooks/useAutoScroll.ts =====
+
+// frontend/src/file_read/hooks/useAutoScroll.ts
+import { useEffect } from "react";
+
+type AnyRef<T extends HTMLElement> = { current: T | null };
+
+/**
+ * Auto-scrolls to bottom when the user is already near the bottom.
+ * Supports BOTH:
+ *   1) useAutoScroll(ref, [dep1, dep2],)          // old style
+ *   2) useAutoScroll(ref, thresholdPx, dep1, dep2) // new style with threshold
+ */
+export function useAutoScroll<T extends HTMLElement>(
+  ref: AnyRef<T>,
+  depsOrThreshold: any[] | number = [],
+  ...restDeps: any[]
+) {
+  const thresholdPx =
+    typeof depsOrThreshold === "number" ? depsOrThreshold : 24;
+  const deps = Array.isArray(depsOrThreshold) ? depsOrThreshold : restDeps;
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceFromBottom <= thresholdPx;
+
+    if (atBottom) {
+      // wait a tick so layout paints, then scroll
+      requestAnimationFrame(() => {
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+      });
+    }
+    // include threshold so changing it retriggers
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thresholdPx, ...deps]);
+}
+
+# ===== frontend/src/file_read/hooks/useChatsPager.ts =====
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { listChatsPage } from "../hooks/data/chatApi";
+import type { ChatRow } from "../types/chat";
+
+export function useChatsPager(pageSize = 10, refreshKey?: number) {
+  const [chats, setChats] = useState<ChatRow[]>([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const [ceiling, setCeiling] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
+
+  const seenIds = useMemo(() => new Set(chats.map(c => c.sessionId)), [chats]);
+
+  async function loadFirst() {
+    setInitialLoading(true);
+    try {
+      const ceil = new Date().toISOString();
+      setCeiling(ceil);
+      const res = await listChatsPage(0, pageSize, ceil);
+      setChats(res.content);
+      setPage(1);
+      setHasMore(!res.last);
+      setTotal(res.totalElements ?? 0);
+      setTotalPages(res.totalPages ?? 0);
+    } catch {
+      setChats([]); setPage(0); setHasMore(false); setTotal(0); setTotalPages(0);
+    } finally {
+      setInitialLoading(false);
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMoreRef.current || loadingMore || !hasMore || !ceiling) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const res = await listChatsPage(page, pageSize, ceiling);
+      const next = res.content.filter(c => !seenIds.has(c.sessionId));
+      setChats(prev => [...prev, ...next]);
+      setPage(p => p + 1);
+      setHasMore(!res.last);
+      setTotal(res.totalElements ?? total);
+      setTotalPages(res.totalPages ?? totalPages);
+    } catch {
+      setHasMore(false);
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }
+
+  async function refreshFirst() {
+    setChats([]); setPage(0); setHasMore(true);
+    setTotal(0); setTotalPages(0); setCeiling(null);
+    await loadFirst();
+  }
+
+  // external refreshes
+  useEffect(() => { void refreshFirst(); /* eslint-disable-next-line */ }, [refreshKey]);
+  useEffect(() => {
+    const onRefresh = () => void refreshFirst();
+    window.addEventListener("chats:refresh", onRefresh);
+    return () => window.removeEventListener("chats:refresh", onRefresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // infinite scroll
+  useEffect(() => {
+    const rootEl = scrollRef.current, sentinel = sentinelRef.current;
+    if (!rootEl || !sentinel) return;
+    const hasOverflow = rootEl.scrollHeight - rootEl.clientHeight > 8;
+    if (!hasOverflow) return;
+
+    const io = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (entry?.isIntersecting) void loadMore();
+    }, { root: rootEl, rootMargin: "96px 0px", threshold: 0.01 });
+
+    io.observe(sentinel);
+    return () => io.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chats.length, page, hasMore, ceiling]);
+
+  return {
+    // state
+    chats, page, hasMore, total, totalPages,
+    initialLoading, loadingMore,
+    // refs
+    scrollRef, sentinelRef,
+    // actions
+    loadMore, refreshFirst, setChats,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useChatState.ts =====
+
+import { useState } from "react";
+import type { ChatMsg } from "../types/chat";
+
+type BySession<T> = Record<string, T>;
+
+export function useChatState() {
+  const [bySession, setBySession] = useState<BySession<ChatMsg[]>>({});
+  const [input, setInput] = useState("");
+
+  const getMsgs = (sid: string) => bySession[sid] ?? [];
+  const setMsgs = (
+    sid: string,
+    upd: ((prev: ChatMsg[]) => ChatMsg[]) | ChatMsg[]
+  ) => {
+    setBySession((prev) => {
+      const cur = prev[sid] ?? [];
+      const next = Array.isArray(upd) ? upd : upd(cur);
+      return next === cur ? prev : { ...prev, [sid]: next };
+    });
+  };
+
+  const resetMsgs = (sid: string) =>
+    setBySession((prev) => (prev[sid] ? { ...prev, [sid]: [] } : prev));
+
+  return { bySession, input, setInput, getMsgs, setMsgs, resetMsgs };
+}
+
+# ===== frontend/src/file_read/hooks/useChatStream.ts =====
+
+import { useMemo } from "react";
+import type { ChatMsg } from "../types/chat";
+import { useSession } from "./useSession";
+import { useStream } from "./useStream";
+import { useChatState } from "./useChatState";
+import { useRunState } from "./useRunState";
+import { useMetrics } from "./useMetrics";
+// Retitle disabled for now
+// import { useRetitle } from "./useRetitle";
+
+export type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export function useChatStream() {
+  // state slices
+  const chat = useChatState();
+  const run = useRunState();
+  const met = useMetrics();
+  // Retitle disabled
+  // const { retitleNow } = useRetitle(true);
+
+  // session plumbing
+  const { sessionIdRef, ensureChatCreated, loadHistory, setSessionId, resetSession } = useSession({
+    setMessagesForSession: (sid: string, msgs: ChatMsg[]) => chat.setMsgs(sid, msgs),
+    getMessagesForSession: (sid: string) => chat.getMsgs(sid),
+    isStreaming: (sid: string) => !!run.loadingBy[sid],
+  });
+
+  // stream controller
+  const { send, stop, cancelBySessionId } = useStream({
+    messages: chat.getMsgs(sessionIdRef.current), // keeps deps stable
+    setMessagesForSession: (sid, updater) => chat.setMsgs(sid, updater),
+    getMessagesForSession: chat.getMsgs,
+    setInput: chat.setInput,
+    sessionId: () => sessionIdRef.current,
+    ensureChatCreated,
+
+    // 🔕 Retitle disabled: provide a no-op with the expected signature
+    onRetitle: async (_sessionId: string, _latestAssistant: string) => { /* no-op */ },
+
+    setLoadingForSession: run.setLoadingFor,
+    setQueuedForSession: run.setQueuedFor,
+    setMetricsForSession: met.setMetricsFor,
+    setMetricsFallbackForSession: met.setMetricsFallbackFor,
+    resetMetricsForSession: met.resetMetricsFor,
+  });
+
+  async function cancelSessions(ids: string[]) {
+    await Promise.all(ids.map(cancelBySessionId));
+  }
+
+  // derived (active session)
+  const activeId = sessionIdRef.current;
+  const messages = useMemo(() => chat.getMsgs(activeId), [chat.bySession, activeId]);
+  const loading = !!run.loadingBy[activeId];
+  const queued = !!run.queuedBy[activeId];
+  const runJson = met.metricsBy[activeId]?.runJson ?? null;
+  const runMetrics = met.metricsBy[activeId]?.flat ?? null;
+
+  function reset() {
+    chat.setInput("");
+    met.resetMetricsFor(activeId);
+    resetSession();
+  }
+
+  function snapshotPendingAssistant(): string {
+    const msgs = chat.getMsgs(activeId);
+    const last = msgs[msgs.length - 1];
+    return last?.role === "assistant" ? (last.text ?? "") : "";
+  }
+
+  return {
+    // chat state
+    messages,
+    input: chat.input,
+    setInput: chat.setInput,
+    loading,
+    queued,
+
+    // actions
+    send,
+    stop,
+    cancelSessions,
+
+    // session ctl
+    setSessionId,
+    sessionIdRef,
+    loadHistory,
+    reset,
+    snapshotPendingAssistant,
+
+    // metrics (active only)
+    runMetrics,
+    runJson,
+    clearMetrics: () => met.resetMetricsFor(activeId),
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useLockBodyScroll.ts =====
+
+import { useEffect } from "react";
+
+export function useLockBodyScroll(lock: boolean) {
+  useEffect(() => {
+    const { overflow } = document.body.style;
+    if (lock) document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = overflow; };
+  }, [lock]);
+}
+
+# ===== frontend/src/file_read/hooks/useMetrics.ts =====
+
+import { useState } from "react";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+type BySession<T> = Record<string, T>;
+type Pair = { runJson: RunJson | null; flat: GenMetrics | null };
+
+export function useMetrics() {
+  const [metricsBy, setMetricsBy] = useState<BySession<Pair>>({});
+
+  function resetMetricsFor(sid: string) {
+    setMetricsBy((prev) => ({ ...prev, [sid]: { runJson: null, flat: null } }));
+  }
+
+  function setMetricsFor(sid: string, json?: RunJson, flat?: GenMetrics) {
+    setMetricsBy((prev) => {
+      const cur = prev[sid] ?? { runJson: null, flat: null };
+      return { ...prev, [sid]: { runJson: json ?? cur.runJson, flat: flat ?? cur.flat } };
+    });
+  }
+
+  function setMetricsFallbackFor(sid: string, reason: string, partialOut: string) {
+    const json: RunJson = {
+      stats: {
+        stopReason: reason,
+        tokensPerSecond: null,
+        timeToFirstTokenSec: null,
+        totalTimeSec: null,
+        promptTokensCount: null,
+        predictedTokensCount: partialOut ? partialOut.length : 0,
+        totalTokensCount: null,
+      },
+    };
+    const flat: GenMetrics = {
+      stop_reason: reason,
+      tok_per_sec: null,
+      ttft_ms: null,
+      output_tokens: null,
+      input_tokens_est: null,
+      total_tokens_est: null,
+    };
+    setMetricsFor(sid, json, flat);
+  }
+
+  return { metricsBy, resetMetricsFor, setMetricsFor, setMetricsFallbackFor };
+}
+
+# ===== frontend/src/file_read/hooks/useMultiSelect.ts =====
+
+// frontend/src/file_read/hooks/useMultiSelect.ts
+import { useEffect, useMemo, useState } from "react";
+
+export function useMultiSelect(allIds: string[]) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // keep selection pruned when the list of ids changes
+  useEffect(() => {
+    setSelected(prev => {
+      const next = new Set([...prev].filter(id => allIds.includes(id)));
+      // only update if it actually changed
+      return next.size === prev.size ? prev : next;
+    });
+  }, [allIds]);
+
+  const allSelected = useMemo(
+    () => selected.size > 0 && selected.size === allIds.length,
+    [selected, allIds.length]
+  );
+
+  const toggleOne = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelected(prev =>
+      prev.size === allIds.length ? new Set() : new Set(allIds)
+    );
+  };
+
+  return { selected, setSelected, allSelected, toggleOne, toggleAll };
+}
+
+# ===== frontend/src/file_read/hooks/useRetitle.ts =====
+
+// frontend/src/file_read/hooks/useRetitle.ts
+import { API_BASE } from "../services/http";
+import { listMessages, updateChatLast } from "../hooks/data/chatApi";
+import { stripRunJson } from "../shared/lib/runjson";
+
+const TITLE_MAX_WORDS = 6;
+
+function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
+  let t = (raw.split(/\r?\n/)[0] ?? "");
+  t = t.replace(/[^\p{L}\p{N} ]+/gu, " ");
+  t = t.replace(/\s+/g, " ").trim();
+  t = t.split(" ").slice(0, maxWords).join(" ").trim();
+  return t;
+}
+
+export function useRetitle(enabled = true) {
+  async function retitleNow(sessionId: string, latestAssistant: string) {
+    console.log("1")
+    if (!enabled) return;
+
+    try {
+      // Build a minimal transcript to title on
+      const rows = await listMessages(sessionId);
+      const textDump = rows
+        .map((r) => `${r.role === "user" ? "User" : "Assistant"}: ${r.content}`)
+        .join("\n");
+
+      // Ask the local model for a very short title
+      const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: `${sessionId}::titlebot`,
+          messages: [
+            {
+              role: "system",
+              content: "You output ultra-concise, neutral chat titles and nothing else.",
+            },
+            {
+              role: "user",
+              content:
+                "Write ONE short title summarizing the conversation below.\n" +
+                "Rules: at most 6 words — sentence or title case — no punctuation — no emojis — no quotes — return ONLY the title\n\n" +
+                textDump +
+                "\n\nTitle:",
+            },
+          ],
+          max_tokens: 24,
+          temperature: 0.2,
+          top_p: 0.9,
+        }),
+      });
+
+      if (!res.ok || !res.body) return;
+
+      // Gather the streamed text + strip runjson
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let raw = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) raw += decoder.decode(value, { stream: true });
+      }
+
+      const { text } = stripRunJson(raw);
+      const title = sanitizeTitle(text);
+      if (!title) return;
+
+      // Save title + lastMessage (lastMessage stays the full assistant text)
+      await updateChatLast(sessionId, latestAssistant, title).catch(() => {});
+      // Nudge sidebar so it shows new title immediately
+      try {
+        window.dispatchEvent(new CustomEvent("chats:refresh"));
+      } catch {}
+    } catch (e) {
+      console.warn("retitleNow failed:", e);
+    }
+  }
+
+  return { retitleNow };
+}
+
+# ===== frontend/src/file_read/hooks/useRunMetrics.ts =====
+
+import { useState } from "react";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export function useRunMetrics() {
+  const [runMetrics, setRunMetrics] = useState<GenMetrics | null>(null);
+  const [runJson, setRunJson] = useState<RunJson | null>(null);
+
+  function resetMetrics() {
+    setRunMetrics(null);
+    setRunJson(null);
+  }
+
+  function setFromParsed(json?: RunJson, flat?: GenMetrics) {
+    if (json) setRunJson(json);
+    if (flat) setRunMetrics(flat);
+  }
+
+  function synthesizeStop(reason: string, partialOut: string) {
+    const json: RunJson = {
+      stats: {
+        stopReason: reason,
+        tokensPerSecond: null,
+        timeToFirstTokenSec: null,
+        totalTimeSec: null,
+        promptTokensCount: null,
+        predictedTokensCount: partialOut ? partialOut.length : 0,
+        totalTokensCount: null,
+      },
+    };
+    const flat: GenMetrics = {
+      stop_reason: reason,
+      tok_per_sec: null,
+      ttft_ms: null,
+      output_tokens: null,
+      input_tokens_est: null,
+      total_tokens_est: null,
+    };
+    return { json, flat };
+  }
+
+  function setFallback(reason: string, partialOut: string) {
+    const { json, flat } = synthesizeStop(reason, partialOut);
+    setRunJson(prev => prev ?? json);
+    setRunMetrics(prev => prev ?? flat);
+  }
+
+  return {
+    runMetrics,
+    runJson,
+    resetMetrics,
+    setFromParsed,
+    setFallback,
+  };
+}
+
+export type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+# ===== frontend/src/file_read/hooks/useRunState.ts =====
+
+import { useState } from "react";
+
+type BySession<T> = Record<string, T>;
+
+export function useRunState() {
+  const [loadingBy, setLoadingBy] = useState<BySession<boolean>>({});
+  const [queuedBy, setQueuedBy] = useState<BySession<boolean>>({});
+
+  const setBool =
+    (setter: React.Dispatch<React.SetStateAction<BySession<boolean>>>) =>
+    (sid: string, v: boolean) =>
+      setter((prev) => (prev[sid] === v ? prev : { ...prev, [sid]: v }));
+
+  return {
+    loadingBy,
+    queuedBy,
+    setLoadingFor: setBool(setLoadingBy),
+    setQueuedFor: setBool(setQueuedBy),
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useSession.ts =====
+
+// frontend/src/file_read/hooks/useSession.ts
+import { useRef } from "react";
+import type { ChatMsg, ChatMessageRow } from "../types/chat";
+import { createChat, listMessages } from "../hooks/data/chatApi";
+import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
+
+function rowToMsg(r: ChatMessageRow): ChatMsg {
+  if (r.role === "assistant") {
+    const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
+    const base: ChatMsg = {
+      id: `cid-${r.id}`,        // stable UI id derived from server id
+      serverId: r.id,
+      role: r.role,
+      text: clean,
+      // ✅ KEEP attachments from server
+      attachments: r.attachments ?? [],
+    };
+    if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
+    return base;
+  }
+
+  // user
+  return {
+    id: `cid-${r.id}`,
+    serverId: r.id,
+    role: r.role,
+    text: r.content,
+    // ✅ KEEP attachments from server
+    attachments: r.attachments ?? [],
+  };
+}
+
+export function useSession(opts: {
+  setMessagesForSession: (sid: string, msgs: ChatMsg[]) => void;
+  getMessagesForSession: (sid: string) => ChatMsg[];
+  isStreaming: (sid: string) => boolean;
+}) {
+  const { setMessagesForSession, getMessagesForSession, isStreaming } = opts;
+  const sessionIdRef = useRef<string>(crypto.randomUUID());
+  const hasCreatedRef = useRef(false);
+
+  async function ensureChatCreated() {
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = crypto.randomUUID();
+      hasCreatedRef.current = false;
+    }
+    if (hasCreatedRef.current) return;
+    try {
+      await createChat(sessionIdRef.current, "New Chat");
+      hasCreatedRef.current = true;
+    } catch (e) {
+      console.warn("createChat failed:", e);
+    }
+  }
+
+  async function loadHistory(sessionId: string): Promise<void> {
+    sessionIdRef.current = sessionId;
+    hasCreatedRef.current = true;
+
+    try {
+      const rows = await listMessages(sessionId);
+      const serverMsgs = rows.map(rowToMsg);
+
+      const prevClient = getMessagesForSession(sessionId) ?? [];
+
+      if (isStreaming(sessionId)) {
+        // Merge by serverId; preserve any in-flight tail
+        const byServer = new Map<number, ChatMsg>(
+          prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
+        );
+        const merged = serverMsgs.map(s => {
+          const prev = byServer.get(s.serverId!);
+          if (!prev) return s;
+          const meta = s.meta ?? prev.meta ?? undefined;
+          return { ...prev, ...s, meta };
+        });
+
+        const tail: ChatMsg[] = [];
+        const last = prevClient[prevClient.length - 1];
+        if (last?.role === "assistant" && (last.text?.length ?? 0) > 0 && last.serverId == null) {
+          tail.push(last);
+        }
+
+        setMessagesForSession(sessionId, [...merged, ...tail]);
+      } else {
+        setMessagesForSession(sessionId, serverMsgs);
+      }
+    } catch (e) {
+      console.warn("listMessages failed:", e);
+      if (!isStreaming(sessionId)) setMessagesForSession(sessionId, []);
+    }
+  }
+
+  function setSessionId(newId: string) {
+    sessionIdRef.current = newId;
+    hasCreatedRef.current = false;
+    setMessagesForSession(newId, []);
+  }
+
+  function resetSession() {
+    const id = sessionIdRef.current;
+    if (id) setMessagesForSession(id, []);
+  }
+
+  return {
+    sessionIdRef,
+    ensureChatCreated,
+    loadHistory,
+    setSessionId,
+    resetSession,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useSettings.ts =====
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  getEffective, getOverrides, getDefaults, getAdaptive,
+  patchOverrides, putOverrides, recomputeAdaptive,
+} from "../data/settingsApi";
+
+type State = {
+  loading: boolean;
+  error: string | null;
+  effective: any | null;
+  overrides: any | null;
+  defaults: any | null;
+  adaptive: any | null;
+};
+
+export function useSettings(sessionId?: string) {
+  const [state, setState] = useState<State>({
+    loading: false,
+    error: null,
+    effective: null,
+    overrides: null,
+    defaults: null,
+    adaptive: null,
+  });
+
+  const load = useCallback(async () => {
+    setState(s => ({ ...s, loading: true, error: null }));
+    try {
+      const [effective, overrides, defaults, adaptive] = await Promise.all([
+        getEffective(sessionId),
+        getOverrides(),
+        getDefaults(),
+        getAdaptive(),
+      ]);
+      setState({
+        loading: false,
+        error: null,
+        effective,
+        overrides,
+        defaults,
+        adaptive,
+      });
+    } catch (e: any) {
+      setState(s => ({
+        ...s,
+        loading: false,
+        error: e?.message || "Failed to load settings",
+      }));
+    }
+  }, [sessionId]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const saveOverrides = useCallback(
+    async (data: Record<string, any>, method: "patch" | "put" = "patch") => {
+      if (method === "put") await putOverrides(data);
+      else await patchOverrides(data);
+      await load();
+    },
+    [load]
+  );
+
+  const runAdaptive = useCallback(async () => {
+    await recomputeAdaptive(sessionId);
+    await load();
+  }, [load, sessionId]);
+
+  return useMemo(
+    () => ({
+      ...state,
+      reload: load,
+      saveOverrides,
+      runAdaptive,
+    }),
+    [state, load, saveOverrides, runAdaptive]
+  );
+}
+
+# ===== frontend/src/file_read/hooks/useSidebar.ts =====
+
+// frontend/src/file_read/hooks/useSidebar.ts
+import { useEffect, useState } from "react";
+
+export function useSidebar() {
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
+
+  // pin on desktop
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth >= 768) setSidebarOpen(true);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Ctrl+B toggle
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
+        e.preventDefault();
+        setSidebarOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // mobile drawer helpers (DOM-level; safe here)
+  const openMobileDrawer = () => {
+    document.getElementById("mobile-drawer")?.classList.remove("hidden");
+    document.getElementById("mobile-backdrop")?.classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+  };
+  const closeMobileDrawer = () => {
+    document.getElementById("mobile-drawer")?.classList.add("hidden");
+    document.getElementById("mobile-backdrop")?.classList.add("hidden");
+    document.body.style.overflow = "";
+  };
+
+  return {
+    sidebarOpen,
+    setSidebarOpen,
+    openMobileDrawer,
+    closeMobileDrawer,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/useStream.ts =====
+
 // frontend/src/file_read/hooks/useStream.ts
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMsg } from "../types/chat";
 import type { RunJson, GenMetrics } from "../shared/lib/runjson";
 import { createStreamController } from "./stream/core/controller";
+import type { Attachment } from "../types/chat";
 
 type UseStreamDeps = {
   // not read directly; keeps memo deps stable
@@ -27,7 +1238,11 @@ type UseStreamDeps = {
   setLoadingForSession: (sid: string, v: boolean) => void;
   setQueuedForSession?: (sid: string, v: boolean) => void;
   setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-  setMetricsFallbackForSession: (sid: string, reason: string, partialOut: string) => void;
+  setMetricsFallbackForSession: (
+    sid: string,
+    reason: string,
+    partialOut: string
+  ) => void;
   resetMetricsForSession: (sid: string) => void;
 };
 
@@ -47,7 +1262,6 @@ export function useStream({
   const [loading, setLoading] = useState(false);
   const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
 
-  // Build the controller once; it manages its own queue + aborts.
   const controller = useMemo(() => {
     return createStreamController({
       // message access
@@ -67,7 +1281,7 @@ export function useStream({
       setMetricsFallbackFor: (sid, reason, out) =>
         setMetricsFallbackForSession(sid, reason, out),
 
-      // NEW: patch server id onto a bubble identified by clientId
+      // patch server id onto a bubble identified by clientId
       setServerIdFor: (sid, clientId, serverId) => {
         setMessagesForSession(sid, (prev) =>
           prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
@@ -80,7 +1294,6 @@ export function useStream({
       onRetitle,
       resetMetricsFor: (sid) => resetMetricsForSession(sid),
     });
-    // Intentionally stable: controller owns its own lifecycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -89,10 +1302,10 @@ export function useStream({
     return () => controllerRef.current?.dispose();
   }, [controller]);
 
-  async function send(override?: string) {
+  async function send(override?: string, attachments: Attachment[] = []) {
     const text = (override ?? "").trim();
-    if (!text) return;
-    await controller.send(text);
+    if (!text && attachments.length === 0) return;
+    await controller.send(text, attachments);
   }
 
   async function stop() {
@@ -386,6 +1599,7 @@ export default function AgentRunner() {
                   onRefreshChats={() => setRefreshKey((k) => k + 1)}
                   onDeleteMessages={handleDeleteMessages}
                   autoFollow={autoFollow}
+                  sessionId={chat.sessionIdRef.current} // ⬅️ this enables per-chat uploads
                 />
               </div>
               <Toast message={toast} />
@@ -512,15 +1726,18 @@ export function useInitialLoad(
 
 export const API_BASE = import.meta.env.VITE_API_URL || "";
 
-export async function request<T>(
-  path: string,
-  init?: RequestInit
-): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init);
+function buildUrl(path: string) {
+  const base = API_BASE.replace(/\/$/, "");
+  return `${base}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(buildUrl(path), init);
   const text = await res.text().catch(() => "");
   if (!res.ok) {
-    // bubble a readable error
-    throw new Error(`HTTP ${res.status} – ${text || res.statusText}`);
+    let msg = text || res.statusText;
+    try { msg = JSON.parse(text)?.detail || msg; } catch {}
+    throw new Error(`HTTP ${res.status} – ${msg}`);
   }
   return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
 }
@@ -723,16 +1940,21 @@ export type Role = "user" | "assistant";
 
 import type { GenMetrics, RunJson } from "../shared/lib/runjson";
 
-export type ChatMsg = {
-  /** Stable UI id that never changes. Always a UUID you assign client-side. */
-  id: string; // == clientId
-  /** Database id if persisted. Null until the backend saves it. */
-  serverId: number | null;
+export type Attachment = {
+  name: string;
+  source?: string;
+  sessionId?: string | null;
+};
 
+export type ChatMsg = {
+  id: string;                // clientId
+  serverId: number | null;
   role: Role;
   text: string;
 
-  // Per-message telemetry (assistant only is typical)
+  // NEW
+  attachments?: Attachment[];
+
   meta?: {
     runJson?: RunJson | null;
     flat?: GenMetrics | null;
@@ -749,11 +1971,12 @@ export type ChatRow = {
 };
 
 export type ChatMessageRow = {
-  id: number;              // server id
+  id: number;
   sessionId: string;
   role: Role;
   content: string;
   createdAt: string;
+  attachments?: Attachment[]; // ✅ this must exist
 };
 
 # ===== frontend/src/file_read/utils/metricsCache.ts =====
@@ -801,6 +2024,24 @@ export function clearMsgMetrics(messageId: string) {
     delete all[messageId];
     saveAll(all);
   }
+}
+
+# ===== frontend/src/file_read/utils/parseRunjson.ts =====
+
+// frontend/src/file_read/utils/parseRunjson.ts
+export function parseRunJson(content: string): { meta?: any; text: string } {
+  const START = "\n[[RUNJSON]]\n";
+  const END = "\n[[/RUNJSON]]\n";
+  if (!content) return { text: "" };
+  const s = content.indexOf(START);
+  if (s === -1) return { text: content };
+  const e = content.indexOf(END, s + START.length);
+  if (e === -1) return { text: content };
+
+  let meta: any | undefined;
+  try { meta = JSON.parse(content.slice(s + START.length, e).trim()); } catch {}
+  const text = (content.slice(0, s) + content.slice(e + END.length)).trim();
+  return { meta, text };
 }
 
 # ===== frontend/src/file_read/vite-env.d.ts =====

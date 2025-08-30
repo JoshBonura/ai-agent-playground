@@ -48,6 +48,7 @@ export default function ChatItem({
       <ChatBubble
         role={m.role}
         text={m.text}
+        attachments={m.attachments} 
         showActions={m.role === "user" || (m.role === "assistant" && !isCurrentStreamingAssistant)}
         onDelete={onDelete ? () => onDelete(m.id) : undefined}
       />

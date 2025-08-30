@@ -1,6 +1,7 @@
 # ===== aimodel/file_read/api/chats.py =====
-
 from __future__ import annotations
+
+from ..core.schemas import ChatMessage
 from dataclasses import asdict
 from typing import List, Optional, Dict
 from ..utils.streaming import strip_runjson
@@ -83,11 +84,12 @@ async def api_list_messages(session_id: str):
 
 
 @router.post("/api/chats/{session_id}/messages")
-async def api_append_message(session_id: str, body: Dict[str, str]):
-    role = (body.get("role") or "user").strip()
-    # 🔴 was: content = strip_runjson(...)
-    content = (body.get("content") or "").rstrip()
-    row = store_append(session_id, role, content)
+async def api_append_message(session_id: str, msg: ChatMessage):
+    role = msg.role
+    content = (msg.content or "").rstrip()
+    attachments = msg.attachments or []
+
+    row = store_append(session_id, role, content, attachments=attachments)
 
     if role == "assistant":
         try:

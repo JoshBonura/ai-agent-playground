@@ -2,6 +2,8 @@
 import { useEffect, useRef, useState } from "react";
 import { SendHorizonal, Square, Paperclip, X, Check } from "lucide-react";
 import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
+import { API_BASE } from "../services/http"; // ⬅️ NEW
+import type { Attachment } from "../types/chat";
 
 const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
 
@@ -10,7 +12,7 @@ type Props = {
   setInput: (v: string) => void;
   loading: boolean;
   queued?: boolean;
-  onSend: (text: string) => void | Promise<void>;
+  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;  // ✅ updated
   onStop: () => void | Promise<void>;
   onHeightChange?: (h: number) => void;
   onRefreshChats?: () => void;
@@ -44,7 +46,7 @@ export default function ChatComposer({
   const [isClamped, setIsClamped] = useState(false);
   const [draft, setDraft] = useState(input);
 
-  // NEW: local attachment list
+  // local attachment list
   const [atts, setAtts] = useState<Att[]>([]);
 
   useEffect(() => setDraft(input), [input]);
@@ -69,7 +71,7 @@ export default function ChatComposer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { autogrow(); }, [draft, atts.length]); // reflow when chips appear/disappear
+  useEffect(() => { autogrow(); }, [draft, atts.length]); // reflow when chips change
 
   const hasText = draft.trim().length > 0;
   const anyUploading = atts.some(a => a.status === "uploading");
@@ -79,25 +81,54 @@ export default function ChatComposer({
     window.dispatchEvent(new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } }));
   };
 
-  const handleSendClick = () => {
-    // can send if text OR has at least one finished upload
-    const v = draft.trim();
-    if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
-    forceScroll("auto");
-    setDraft("");
-    setInput("");
-    // Optional: clear local chips after send
-    setAtts([]);
-    void Promise.resolve(onSend(v)).finally(() => {
-      onRefreshChats?.();
-      requestAnimationFrame(() => forceScroll("smooth"));
-    });
-  };
+  // ⬇️ NEW: build attachments payload for POST
+  function attachmentsForPost() {
+    if (!sessionId) return [];
+    return atts
+      .filter(a => a.status === "ready")
+      .map(a => ({
+        name: a.name,
+        source: a.name,   // RAG uses filename as source
+        sessionId,
+        // optionally: size, mime, chunks if you track them
+      }));
+  }
 
-  const handleStopClick = () => {
-    if (!loading && !queued) return;
-    void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
-  };
+const handleSendClick = async () => {
+  const v = draft.trim();
+  if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
+
+  forceScroll("auto");
+
+  if (sessionId) {
+    const API = (API_BASE || "").replace(/\/$/, "");
+    const body = JSON.stringify({ role: "user", content: v, attachments: attachmentsForPost() });
+    try {
+      await fetch(`${API}/api/chats/${sessionId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+    } catch {}
+  }
+
+  setDraft("");
+  setInput("");
+  setAtts([]);
+
+  try {
+    await onSend(v, attachmentsForPost());
+  } finally {
+    onRefreshChats?.();
+    requestAnimationFrame(() => forceScroll("smooth"));
+  }
+};
+
+// ✅ moved out of handleSendClick
+const handleStopClick = () => {
+  if (!loading && !queued) return;
+  void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
+};
 
   const pickFile = () => fileRef.current?.click();
 
@@ -136,28 +167,32 @@ export default function ChatComposer({
     e.target.value = ""; // allow re-pick
   };
 
-  const removeAtt = async (att: Att) => {
-    // cancel in-flight
-    if (att.status === "uploading" && att.abort) {
-      att.abort.abort();
-    }
-    // hard-delete if already ingested
-    if (att.status === "ready" && sessionId) {
-      try { await deleteUploadHard(att.name, sessionId); } catch {}
-      onRefreshChats?.();
-    }
-    setAtts(prev => prev.filter(a => a.id !== att.id));
-  };
+const removeAtt = async (att: Att) => {
+  // 1) Cancel in-flight upload immediately
+  if (att.status === "uploading" && att.abort) {
+    att.abort.abort();
+  }
+
+  // 2) Always ask backend to purge any partial/queued ingest
+  if (sessionId) {
+    try { await deleteUploadHard(att.name, sessionId); } catch {}
+  }
+
+  // 3) Remove chip right away (UI feels instant)
+  setAtts(prev => prev.filter(a => a.id !== att.id));
+
+  onRefreshChats?.();
+};
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSendClick();
+      void handleSendClick();
     }
   }
 
   const disableActions = loading || queued || anyUploading;
-  const showSend = hasText || anyReady; // <- allow send even with empty text if file ready
+  const showSend = hasText || anyReady; // allow send even with empty text if file ready
 
   return (
     <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
@@ -213,7 +248,7 @@ export default function ChatComposer({
           }`}
           rows={1}
           style={{ maxHeight: MAX_HEIGHT_PX }}
-          disabled={queued} // (optional) keep typing allowed during upload
+          disabled={queued} // typing allowed during upload if you prefer, keep as-is
         />
 
         <div className="flex items-end gap-2">

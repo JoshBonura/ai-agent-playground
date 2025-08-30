@@ -278,6 +278,7 @@ ai-agent-playground/
         schemas.py
         search.py
         store.py
+        uploads.py
         worker.py
         _data/
         ingest/
@@ -289,10 +290,13 @@ ai-agent-playground/
         __init__.py
         model_runtime.py
       services/
+        attachments.py
         cancel.py
         context_window.py
         generate_flow.py
         packing.py
+        prompt_utils.py
+        router_text.py
         session_io.py
         streaming_worker.py
       store/
@@ -305,13 +309,56 @@ ai-agent-playground/
         override_settings.json
         rag/
           by_session/
-            13c07b0a-87ff-43c7-9dbe-1838e919b197/
+            006ad60e-8216-494c-b00a-47e90721ef3f/
               index.faiss
               meta.jsonl
-            eca9b34b-1369-47d2-9a4c-1f6de9dcf4ea/
+            08b8f232-33ba-474b-bca6-dec0230f5eba/
               index.faiss
+              meta.jsonl
+            0bf5b13d-0c8c-41d3-813a-b9b4d4638169/
+              index.faiss
+              meta.jsonl
+            431a3657-470a-45a1-a137-9b7339e83634/
+              index.faiss
+              meta.jsonl
+            46b0428d-4aec-4c46-8135-c1a2c6d6038f/
+              index.faiss
+              meta.jsonl
+            62f3b99f-e96e-45ab-aec6-83b7a4218238/
+              index.faiss
+              meta.jsonl
+            64c81442-6d52-4cf9-a6a7-d6b7dcbc8836/
+              index.faiss
+              meta.jsonl
+            7a346381-f150-43e6-89a0-0ce5e77f194d/
+            9532ad7e-f36d-4256-9ef5-4dc179867ba0/
+              index.faiss
+              meta.jsonl
+            96b3a093-a722-4e89-a717-bdcfe989e6da/
+              index.faiss
+              meta.jsonl
+            a0a4771b-2611-4ef2-9ca3-07b1a1a56c61/
+            abedadf5-f26e-4603-912d-3bb723d5689b/
+            afed75d1-4993-40af-b1c0-c7773b4b8d99/
+            bae1c605-1f17-4c23-b79a-322392d713d9/
+              index.faiss
+              meta.jsonl
+            cb282fb3-18fe-4549-bcee-a10554dee3d1/
+              index.faiss
+              meta.jsonl
+            d00ac3e9-3ef8-4932-9efc-7c80d0755e92/
+              index.faiss
+              meta.jsonl
+            d0411886-973c-4440-8da0-db1b24e0f81d/
+              index.faiss
+              meta.jsonl
+            dfaeec5f-2ea5-449d-af23-8ce6f49e720a/
+              index.faiss
+              meta.jsonl
+            ea6e9007-53e1-4415-bfd4-20406a0e3977/
               meta.jsonl
           global/
+            index.faiss
             meta.jsonl
       utils/
         streaming.py
@@ -723,7 +770,6 @@ ai-agent-playground/
         services/
           http.ts
         shared/
-          api/
           lib/
             runjson.ts
             text.ts
@@ -737,3 +783,4 @@ ai-agent-playground/
           chat.ts
         utils/
           metricsCache.ts
+          parseRunjson.ts

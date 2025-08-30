@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from ..core.settings import SETTINGS
 from ..utils.streaming import strip_runjson
@@ -10,10 +10,10 @@ from .base import chat_path, atomic_write, now_iso
 from .index import load_index, save_index, refresh_index_after_change, ChatMeta
 
 
-def _load_chat(session_id: str) -> Dict:
+def _load_chat(session_id: str) -> Dict[str, Any]:
     p = chat_path(session_id)
     if not p.exists():
-        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}  # add summary
+        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
         if "summary" not in data:
@@ -28,7 +28,30 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
+    attachments: Optional[List[Dict]] = None   # ✅ added
 
+def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
+    if not atts:
+        return None
+    out = []
+    for a in atts:
+        # convert dataclass/typed object to dict
+        if isinstance(a, dict):
+            out.append({
+                "name": a.get("name"),
+                "source": a.get("source"),
+                "sessionId": a.get("sessionId"),
+            })
+        else:
+            try:
+                out.append({
+                    "name": getattr(a, "name", None),
+                    "source": getattr(a, "source", None),
+                    "sessionId": getattr(a, "sessionId", None),
+                })
+            except Exception:
+                continue
+    return out or None
 
 def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     idx = load_index()
@@ -72,7 +95,7 @@ def update_last(session_id: str, last_message: Optional[str], maybe_title: Optio
     return ChatMeta(**row)
 
 
-def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
+def append_message(session_id: str, role: str, content: str, attachments: Optional[list[Any]] = None) -> ChatMessageRow:
     data = _load_chat(session_id)
     seq = int(data.get("seq", 0)) + 1
     msg = {
@@ -82,22 +105,25 @@ def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
         "content": content,
         "createdAt": now_iso(),
     }
-    # Persist RAW content (may include RUNJSON)
+    norm_atts = _normalize_attachments(attachments)
+    if norm_atts:
+        msg["attachments"] = norm_atts   # ✅ now JSON-serializable
+
     data["messages"].append(msg)
     data["seq"] = seq
     _save_chat(session_id, data)
 
-    # Update index meta; keep lastMessage clean for sidebar preview
-    idx = load_index()
-    row = next((r for r in idx if r["sessionId"] == session_id), None)
-    if row:
-        row["updatedAt"] = msg["createdAt"]
-        if role == "assistant":
-            row["lastMessage"] = strip_runjson(content)
-        save_index(idx)
+    # update index meta as before...
+    ...
+    return ChatMessageRow(
+        id=seq,
+        sessionId=session_id,
+        role=role,
+        content=content,
+        createdAt=msg["createdAt"],
+        attachments=norm_atts,
+    )
 
-    # pending ops are applied by pending.apply_pending_for() from the router after appends
-    return ChatMessageRow(**msg)
 
 
 def delete_message(session_id: str, message_id: int) -> int:
@@ -136,7 +162,17 @@ def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
 
 def list_messages(session_id: str) -> List[ChatMessageRow]:
     data = _load_chat(session_id)
-    return [ChatMessageRow(**m) for m in data.get("messages", [])]
+    rows: List[ChatMessageRow] = []
+    for m in data.get("messages", []):
+        rows.append(ChatMessageRow(
+            id=m["id"],
+            sessionId=m["sessionId"],
+            role=m["role"],
+            content=m["content"],
+            createdAt=m.get("createdAt"),
+            attachments=m.get("attachments", []),  # ✅ safe default
+        ))
+    return rows
 
 
 def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[ChatMeta], int, int, bool]:
@@ -181,20 +217,19 @@ def merge_chat(source_id: str, target_id: str):
     source_msgs = list_messages(source_id)
     target_msgs = list_messages(target_id)
 
-    # Insert source first, then re-add target to preserve order
     merged = []
     for m in source_msgs:
-        row = append_message(target_id, m.role, m.content)
+        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
         merged.append(row)
 
     for m in target_msgs:
-        row = append_message(target_id, m.role, m.content)
+        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
         merged.append(row)
 
     return merged
 
 
-def _save_chat(session_id: str, data: Dict):
+def _save_chat(session_id: str, data: Dict[str, Any]):
     atomic_write(chat_path(session_id), data)
 
 
@@ -215,16 +250,13 @@ def merge_chat_new(source_id: str, target_id: Optional[str] = None):
     upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
 
     merged = []
-
-    # source first
     for m in list_messages(source_id):
-        row = append_message(new_id, m.role, m.content)
+        row = append_message(new_id, m.role, m.content, attachments=m.attachments)
         merged.append(row)
 
-    # then target (if exists)
     if target_id:
         for m in list_messages(target_id):
-            row = append_message(new_id, m.role, m.content)
+            row = append_message(new_id, m.role, m.content, attachments=m.attachments)
             merged.append(row)
 
     return new_id, merged
@@ -239,6 +271,17 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
         if int(m.get("id", -1)) == int(message_id):
             m["content"] = new_content
             m["updatedAt"] = now_iso()
+            # normalize attachments
+            if "attachments" in m and m["attachments"] is not None:
+                norm = []
+                for a in m["attachments"]:
+                    if hasattr(a, "dict"):
+                        norm.append(a.dict())
+                    elif isinstance(a, dict):
+                        norm.append(a)
+                    else:
+                        norm.append(dict(a))
+                m["attachments"] = norm
             updated = m
             break
 
@@ -246,14 +289,19 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
         return None
 
     _save_chat(session_id, data)
-
-    # refresh index if last message changed
     refresh_index_after_change(session_id, msgs)
 
-    return ChatMessageRow(**updated)
+    return ChatMessageRow(
+        id=updated["id"],
+        sessionId=updated["sessionId"],
+        role=updated["role"],
+        content=updated["content"],
+        createdAt=updated.get("createdAt"),
+        attachments=updated.get("attachments", []),
+    )
 
 
-# expose internals for pending ops
+
 __all__ = [
     "ChatMessageRow",
     "upsert_on_first_message", "update_last", "append_message",

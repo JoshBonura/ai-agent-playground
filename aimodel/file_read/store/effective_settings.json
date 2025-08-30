@@ -81,7 +81,7 @@
   "chat_page_min_size": 1,
   "chat_page_max_size": 100,
   "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
-  "web_fetch_timeout_sec": 8.0,
+  "web_fetch_timeout_sec": 8,
   "web_fetch_max_chars": 3000,
   "web_fetch_max_bytes": 1048576,
   "web_fetch_max_parallel": 3,
@@ -91,14 +91,14 @@
   "web_orch_total_char_budget": 2000,
   "web_orch_per_doc_char_budget": 1200,
   "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 2.0,
+  "web_orch_overfetch_factor": 2,
   "web_orch_overfetch_min_extra": 2,
   "web_orch_enable_js_retry": true,
   "web_orch_js_retry_avg_q": 0.55,
   "web_orch_js_retry_low_q": 0.45,
   "web_orch_js_retry_lowish_ratio": 0.5,
-  "web_orch_js_retry_timeout_add": 4.0,
-  "web_orch_js_retry_timeout_cap": 12.0,
+  "web_orch_js_retry_timeout_add": 4,
+  "web_orch_js_retry_timeout_cap": 12,
   "web_orch_js_retry_parallel_delta": -1,
   "web_orch_js_retry_min_parallel": 2,
   "web_block_header": "Web findings for: {query}",
@@ -111,7 +111,7 @@
   "web_orch_bullet_prefix": "- ",
   "web_orch_indent_prefix": "  ",
   "web_orch_www_prefix": "www.",
-  "web_orch_fetch_cap_multiplier": 2.0,
+  "web_orch_fetch_cap_multiplier": 2,
   "__comment_web_orch_scoring": "=== Hit scoring weights ===",
   "web_orch_score_w_exact": 3,
   "web_orch_score_w_substr": 2,
@@ -119,28 +119,28 @@
   "web_orch_score_w_title_part": 1,
   "web_orch_score_w_snip_touch": 1,
   "__comment_web_orch_quality": "=== Content quality params ===",
-  "web_orch_q_len_norm_divisor": 2000.0,
+  "web_orch_q_len_norm_divisor": 2000,
   "web_orch_q_len_weight": 0.55,
   "web_orch_q_diversity_weight": 0.55,
   "web_orch_q_penalties": [
     {
       "token": "<script>",
-      "mult": 50.0,
+      "mult": 50,
       "cap": 0.3
     },
     {
       "token": "function(",
-      "mult": 20.0,
+      "mult": 20,
       "cap": 0.3
     },
     {
       "token": "{",
-      "mult": 5.0,
+      "mult": 5,
       "cap": 0.2
     },
     {
       "token": "}",
-      "mult": 5.0,
+      "mult": 5,
       "cap": 0.2
     }
   ],
@@ -150,8 +150,8 @@
   "query_sum_short_max_words": 3,
   "query_sum_prompt": "Summarize the user's request into a concise web search query.\nKeep only the key entities and terms.\nDo not explain, and do not surround the result in quotation marks or other punctuation.\nYou may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.\nKeep the original word order. Output only the query text.\n\nUser: {text}\nQuery:",
   "query_sum_max_tokens": 32,
-  "query_sum_temperature": 0.0,
-  "query_sum_top_p": 1.0,
+  "query_sum_temperature": 0,
+  "query_sum_top_p": 1,
   "query_sum_stop": [
     "\n",
     "</s>"
@@ -160,8 +160,8 @@
   "query_sum_overlap_jaccard_min": 0.6,
   "__comment_router_decider": "=== Web Router (LLM-based) ===",
   "router_decide_max_tokens": 96,
-  "router_decide_temperature": 0.0,
-  "router_decide_top_p": 1.0,
+  "router_decide_temperature": 0,
+  "router_decide_top_p": 1,
   "router_decide_stop": [
     "</s>"
   ],
@@ -223,7 +223,7 @@
   "retitle_user_suffix": "",
   "retitle_llm_max_tokens": 12,
   "retitle_llm_temperature": 0.1,
-  "retitle_llm_top_p": 1.0,
+  "retitle_llm_top_p": 1,
   "retitle_llm_stop": [
     "\n",
     "."
@@ -236,6 +236,10 @@
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "__comment_rag": "=== Local RAG ===",
+  "default_auto_rag": false,
+  "disable_web_on_attachments": true,
+  "disable_global_rag_on_attachments": true,
+  "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 4,
   "rag_max_chars_per_chunk": 1200,
@@ -243,9 +247,12 @@
   "rag_min_chars": 300,
   "rag_total_char_budget": 2200,
   "rag_db_path": "corpus.sqlite",
-  "rag_block_header": "Local knowledge:",
+  "rag_block_header": "",
   "rag_block_bullet_prefix": "- ",
   "rag_block_indent_prefix": "  ",
+  "rag_embedding_model": "intfloat/e5-small-v2",
+  "rag_default_need_when_invalid": false,
+  "rag_block_preamble": "Local knowledge",
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -257,7 +264,7 @@
     "\n⏹ stopped\n"
   ],
   "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2.0,
+  "stream_producer_join_timeout_sec": 2,
   "runjson_emit": true,
   "excel_emit_cells": false,
   "excel_max_cells_per_sheet": 250,
@@ -282,8 +289,8 @@
   "router_rag_strip_split_on_blank": true,
   "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
   "router_rag_decide_max_tokens": 300,
-  "router_rag_decide_temperature": 0.0,
-  "router_rag_decide_top_p": 1.0,
+  "router_rag_decide_temperature": 0,
+  "router_rag_decide_top_p": 1,
   "router_rag_decide_stop": [
     "\n\n"
   ],

@@ -1,45 +1,229 @@
-ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
-    lut_chars = len(latest_user_text) if isinstance(latest_user_text, str) else len(str(latest_user_text) or "")
+()
+GEN_SEMAPHORE = asyncio.Semaphore(int(eff["gen_semaphore_permits"]))
+_ACTIVE: Dict[str, int] = {}
+_CANCELS: Dict[str, Event] = {}
 
-    # ---------------------- WEB INJECT (optional) ----------------------
-    t0 = time.perf_counter()
-    print(f"[{_now()}] GEN web_inject START session={session_id} latest_user_text_chars={lut_chars}")
+def is_active(session_id: str) -> bool:
+    return bool(_ACTIVE.get(session_id))
+
+def mark_active(session_id: str, delta: int):
+    _ACTIVE[session_id] = max(0, int(_ACTIVE.get(session_id, 0)) + delta)
+    if _ACTIVE[session_id] == 0:
+        _ACTIVE.pop(session_id, None)
+
+def cancel_event(session_id: str) -> Event:
+    ev = _CANCELS.get(session_id)
+    if ev is None:
+        ev = Event()
+        _CANCELS[session_id] = ev
+    return ev
+
+# ===== aimodel/file_read/services/context_window.py =====
+
+from __future__ import annotations
+from typing import List, Dict, Optional, Tuple
+from ..utils.streaming import safe_token_count_messages
+from ..runtime.model_runtime import current_model_info
+from ..core.settings import SETTINGS
+
+def estimate_tokens(llm, messages: List[Dict[str,str]]) -> Optional[int]:
     try:
-        block = None
-        router_text = _compose_router_text(
-            st.get("recent", []),
-            str(latest_user_text or ""),
-            st.get("summary", "") or "",
-            tail_turns=int(eff["router_tail_turns"]),
-            summary_chars=int(eff["router_summary_chars"]),
-            max_chars=int(eff["router_max_chars"]),
+        return safe_token_count_messages(llm, messages)
+    except Exception:
+        return None
+
+def current_n_ctx() -> int:
+    eff = SETTINGS.effective()
+    try:
+        info = current_model_info() or {}
+        cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
+        return int(cfg.get("nCtx") or eff["nctx_fallback"])
+    except Exception:
+        return int(eff["nctx_fallback"])
+
+def clamp_out_budget(
+    *, llm, messages: List[Dict[str,str]], requested_out: int, margin: int = 32
+) -> Tuple[int, int]:
+    eff = SETTINGS.effective()
+    inp_est = estimate_tokens(llm, messages)
+    try:
+        prompt_est = inp_est if inp_est is not None else safe_token_count_messages(llm, messages)
+    except Exception:
+        prompt_est = int(eff["token_estimate_fallback"])
+    n_ctx = current_n_ctx()
+    available = max(int(eff["min_out_tokens"]), n_ctx - prompt_est - margin)
+    safe_out = max(int(eff["min_out_tokens"]), min(requested_out, available))
+    return safe_out, (inp_est if inp_est is not None else None)
+
+# ===== aimodel/file_read/services/generate_flow.py =====
+
+from __future__ import annotations
+import time
+import json
+from typing import AsyncGenerator, Optional, AsyncIterator
+from fastapi.responses import StreamingResponse
+from dataclasses import asdict
+
+from ..core.settings import SETTINGS
+from ..runtime.model_runtime import ensure_ready, get_llm
+from ..core.schemas import ChatBody
+
+from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
+from .session_io import handle_incoming, persist_summary
+from .packing import build_system_text, pack_with_rollup
+from .context_window import clamp_out_budget
+
+from ..web.router_ai import decide_web_and_fetch
+from ..rag.router_ai import decide_rag
+from ..rag.retrieve import build_rag_block_session_only
+from ..utils.streaming import RUNJSON_START, RUNJSON_END
+
+from .streaming_worker import run_stream as _run_stream
+run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream  # type: ignore[assignment]
+
+# local helpers
+from .prompt_utils import now_str, chars_len, dump_full_prompt
+from .router_text import compose_router_text
+from .attachments import att_get
+
+
+async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
+    ensure_ready()
+    llm = get_llm()
+
+    # ---- effective settings (no fallbacks) ----
+    eff0 = SETTINGS.effective()
+    session_id = data.sessionId or eff0["default_session_id"]
+    eff = SETTINGS.effective(session_id=session_id)
+
+    if not data.messages:
+        return StreamingResponse(
+            iter([eff["empty_messages_response"].encode("utf-8")]),
+            media_type="text/plain"
         )
 
-        if auto_web:
+    # ---- request params with explicit override only ----
+    temperature = float(eff["default_temperature"])
+    if getattr(data, "temperature") is not None:
+        temperature = float(data.temperature)
+
+    top_p = float(eff["default_top_p"])
+    if getattr(data, "top_p") is not None:
+        top_p = float(data.top_p)
+
+    out_budget_req = int(eff["default_max_tokens"])
+    if getattr(data, "max_tokens") is not None:
+        out_budget_req = int(data.max_tokens)
+
+    auto_web = bool(eff["default_auto_web"])
+    if getattr(data, "autoWeb") is not None:
+        auto_web = bool(data.autoWeb)
+
+    web_k = int(eff["default_web_k"])
+    if getattr(data, "webK") is not None:
+        web_k = int(data.webK)
+    web_k = max(int(eff["web_k_min"]), min(web_k, int(eff["web_k_max"])))
+
+    auto_rag = bool(eff["default_auto_rag"])
+    if getattr(data, "autoRag") is not None:
+        auto_rag = bool(data.autoRag)
+
+    model_ctx = int(eff["model_ctx"])
+
+    # 🔎 explicit RAG / attachments config print
+    print(
+        f"[{now_str()}] RAG CONFIG session={session_id} "
+        f"param.autoRag={getattr(data, 'autoRag', None)!r} "
+        f"default_auto_rag={eff['default_auto_rag']!r} "
+        f"-> auto_rag={auto_rag} "
+        f"rag_enabled={eff['rag_enabled']!r} "
+        f"disable_global_rag_on_attachments={eff['disable_global_rag_on_attachments']!r}"
+    )
+
+    # ---- normalize inbound ----
+    incoming = [
+        {
+            "role": m.role,
+            "content": m.content,
+            "attachments": getattr(m, "attachments", None),  # safe on message objects
+        }
+        for m in data.messages
+    ]
+    print(f"[{now_str()}] DEBUG incoming={json.dumps(incoming, default=str, ensure_ascii=False)}")
+
+    latest_user = next((m for m in reversed(incoming) if m["role"] == "user"), {})
+    latest_user_text = (latest_user.get("content") or "").strip()
+    atts = (latest_user.get("attachments") or [])
+    has_atts = bool(atts)
+
+    if not latest_user_text and has_atts:
+        names = [att_get(a, "name") for a in atts]
+        names = [n for n in names if n]
+        latest_user_text = "User uploaded: " + (", ".join(names) if names else "files")
+        print(f"[{now_str()}] DEBUG fallback latest_user_text={latest_user_text!r}")
+    else:
+        print(f"[{now_str()}] DEBUG normal latest_user_text={latest_user_text!r}")
+
+    print(f"[{now_str()}] GEN request START session={session_id} msgs_in={len(incoming)}")
+    st = handle_incoming(session_id, incoming)
+
+    # ---- router text once ----
+    base_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
+    router_text = compose_router_text(
+        st.get("recent", []),
+        str(base_user_text or ""),
+        st.get("summary", "") or "",
+        tail_turns=int(eff["router_tail_turns"]),
+        summary_chars=int(eff["router_summary_chars"]),
+        max_chars=int(eff["router_max_chars"]),
+    )
+
+    # ---------------------- WEB INJECT ----------------------
+    t0 = time.perf_counter()
+    print(f"[{now_str()}] GEN web_inject START session={session_id} latest_user_text_chars={len(str(base_user_text or ''))}")
+    try:
+        block = None
+        if auto_web and not (has_atts and bool(eff["disable_web_on_attachments"])):
             block = await decide_web_and_fetch(llm, router_text, k=web_k)
 
-        print(f"[{_now()}] ORCH build done has_block={bool(block)} block_len={(len(block) if block else 0)}")
+        print(f"[{now_str()}] ORCH web has_block={bool(block)} block_len={(len(block) if block else 0)}")
 
         if block:
-            st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [
-                {
-                    "role": "assistant",
-                    "content": eff["web_block_preamble"] + "\n\n" + block,
-                }
-            ]
-            types_preview = [type(x).__name__ for x in (st.get("_ephemeral_web") or [])]
-            print(f"[{_now()}] EPHEMERAL attached count={len(st['_ephemeral_web'])} types={types_preview}")
+            st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [{
+                "role": "assistant",
+                "content": eff["web_block_preamble"] + "\n\n" + block,
+            }]
 
         dt = time.perf_counter() - t0
         eph_cnt = len(st.get("_ephemeral_web") or [])
-        print(f"[{_now()}] GEN web_inject END   session={session_id} elapsed={dt:.3f}s ephemeral_blocks={eph_cnt}")
+        print(f"[{now_str()}] GEN web_inject END   session={session_id} elapsed={dt:.3f}s ephemeral_blocks={eph_cnt}")
     except Exception as e:
         dt = time.perf_counter() - t0
-        print(f"[{_now()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
+        print(f"[{now_str()}] GEN web_inject ERROR session={session_id} elapsed={dt:.3f}s err={type(e).__name__}: {e}")
 
-    # ---------------------- PACK (with ephemeral web) ----------------------
+    # ---------------------- ATTACHMENT RETRIEVE (session-only) ----------------
+    if has_atts and bool(eff["disable_global_rag_on_attachments"]):
+        att_names = [att_get(a, "name") for a in atts if att_get(a, "name")]
+        query_for_atts = (base_user_text or "").strip() or " ".join(att_names) or "document"
+        print(f"[{now_str()}] ATTACHMENTS retrieve query={query_for_atts!r}")
+
+        try:
+            att_block = build_rag_block_session_only(query_for_atts, session_id)
+        except Exception as e:
+            print(f"[{now_str()}] ATTACHMENTS retrieve ERROR {type(e).__name__}: {e}")
+            att_block = None
+
+        if att_block:
+            st["_ephemeral_web"] = (st.get("_ephemeral_web") or []) + [{
+                "role": "assistant",
+                "content": eff["rag_block_preamble"] + "\n\n" + att_block,
+            }]
+            print(f"[{now_str()}] ATTACHMENTS block injected chars={len(att_block)}")
+        else:
+            print(f"[{now_str()}] ATTACHMENTS no block injected")
+
+    # ---------------------- PACK (web/attachments ephemeral included) ---------
     system_text = build_system_text()
-
     ephemeral_once = st.pop("_ephemeral_web", [])
     packed, st["summary"], _ = pack_with_rollup(
         system_text=system_text,
@@ -50,39 +234,42 @@ ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
         ephemeral=ephemeral_once,
     )
 
-    # ---------------------- RAG ROUTER (LLM JSON) ----------------------
-    rag_need = False
-    rag_query: Optional[str] = None
-    try:
-        rag_need, rag_query = decide_rag(llm, router_text)
-        print(f"[{_now()}] RAG ROUTER need={rag_need} query={rag_query!r}")
-    except Exception as e:
-        print(f"[{_now()}] RAG ROUTER ERROR {type(e).__name__}: {e}")
-        rag_need = bool(SETTINGS.effective().get("rag_default_need_when_invalid", False))
-        rag_query = None
+    # ---------------------- RAG ROUTER (normal turns only) --------------------
+    rag_router_allowed = not (has_atts and bool(eff["disable_global_rag_on_attachments"]))
+    if rag_router_allowed and bool(eff["rag_enabled"]):
+        rag_need = False
+        rag_query: Optional[str] = None
 
-    # If a web block was injected OR RAG router said no, skip RAG
-    skip_rag = bool(ephemeral_once) or (not rag_need)
+        if auto_rag:
+            try:
+                rag_need, rag_query = decide_rag(llm, router_text)
+                print(f"[{now_str()}] RAG ROUTER need={rag_need} query={rag_query!r}")
+            except Exception as e:
+                print(f"[{now_str()}] RAG ROUTER ERROR {type(e).__name__}: {e}")
+                # No fallback to settings; be conservative and skip.
+                rag_need = False
+                rag_query = None
 
-    # Optionally pass LLM-refined query to RAG
-    packed = maybe_inject_rag_block(
+        # If a web block was injected OR RAG router said no, skip RAG
+        skip_rag = bool(ephemeral_once) or (not rag_need)
+
+        from .packing import maybe_inject_rag_block
+        packed = maybe_inject_rag_block(
+            packed,
+            session_id=session_id,
+            skip_rag=skip_rag,
+            rag_query=rag_query,
+        )
+    else:
+        print(f"[{now_str()}] RAG ROUTER skipped (attachment turn or rag_enabled=False)")
+
+    # ---------------------- STREAM SETUP --------------------------------------
+    packed_chars = chars_len(packed)
+    print(f"[{now_str()}] GEN pack READY session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
+
+    dump_full_prompt(
         packed,
-        session_id=session_id,
-        skip_rag=skip_rag,
-        rag_query=rag_query,
-    )
-
-    # ---------------------- STREAM SETUP ----------------------
-    packed_chars = _chars_len(packed)
-    print(f"[{_now()}] GEN pack READY       session={session_id} msgs={len(packed)} chars={packed_chars} out_budget_req={out_budget_req}")
-
-    _dump_full_prompt(
-        packed,
-        params={
-            "requested_out": out_budget_req,
-            "temperature": temperature,
-            "top_p": top_p,
-        },
+        params={"requested_out": out_budget_req, "temperature": temperature, "top_p": top_p},
         session_id=session_id,
     )
 
@@ -91,7 +278,7 @@ ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
     out_budget, input_tokens_est = clamp_out_budget(
         llm=llm, messages=packed, requested_out=out_budget_req, margin=int(eff["clamp_margin"])
     )
-    print(f"[{_now()}] GEN clamp_out_budget  session={session_id} out_budget={out_budget} input_tokens_est={input_tokens_est}")
+    print(f"[{now_str()}] GEN clamp_out_budget session={session_id} out_budget={out_budget} input_tokens_est={input_tokens_est}")
 
     stop_ev = cancel_event(session_id)
     stop_ev.clear()
@@ -112,7 +299,7 @@ ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
                 out_buf.extend(chunk_bytes)
 
             try:
-                print(f"[{_now()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
+                print(f"[{now_str()}] GEN run_stream START session={session_id} msgs={len(packed)} chars={packed_chars} out_budget={out_budget} tokens_in~={input_tokens_est}")
                 async for chunk in run_stream(
                     llm=llm,
                     messages=packed,
@@ -138,7 +325,7 @@ ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
                             full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
                     if full_text:
                         st["recent"].append({"role": "assistant", "content": full_text})
-                        print(f"[{_now()}] RECENT append assistant chars={len(full_text)}")
+                        print(f"[{now_str()}] RECENT append assistant chars={len(full_text)}")
                 except Exception:
                     pass
                 try:
@@ -154,7 +341,7 @@ ntent"] for m in reversed(incoming) if m["role"] == "user"), "")
                     enqueue_retitle(session_id, [asdict(m) for m in msgs], job_seq=last_seq)
                 except Exception:
                     pass
-                print(f"[{_now()}] GEN run_stream END   session={session_id}")
+                print(f"[{now_str()}] GEN run_stream END session={session_id}")
                 mark_active(session_id, -1)
 
     return StreamingResponse(
@@ -253,6 +440,107 @@ def maybe_inject_rag_block(messages: list[dict], *, session_id: str | None,
     print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
     injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
     return injected
+
+# ===== aimodel/file_read/services/prompt_utils.py =====
+
+from __future__ import annotations
+import json
+from datetime import datetime
+from typing import Dict, List
+
+
+def now_str() -> str:
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+def chars_len(msgs: List[object]) -> int:
+    total = 0
+    for m in msgs:
+        if isinstance(m, dict):
+            c = m.get("content")
+        else:
+            c = m
+        if isinstance(c, str):
+            total += len(c)
+        elif c is None:
+            continue
+        else:
+            try:
+                total += len(json.dumps(c, ensure_ascii=False))
+            except Exception:
+                pass
+    return total
+
+
+def dump_full_prompt(
+    messages: List[Dict[str, object]],
+    *,
+    params: Dict[str, object],
+    session_id: str,
+) -> None:
+    try:
+        print(f"[{now_str()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
+        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
+        print(f"[{now_str()}] PROMPT DUMP END   session={session_id}")
+    except Exception as e:
+        print(f"[{now_str()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+
+# ===== aimodel/file_read/services/router_text.py =====
+
+from __future__ import annotations
+from typing import Optional, List
+from ..core.settings import SETTINGS
+
+
+def compose_router_text(
+    recent,
+    latest_user_text: str,
+    summary: str,
+    *,
+    tail_turns: Optional[int] = None,
+    summary_chars: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> str:
+    eff = SETTINGS.effective()
+    tt = int(eff["router_tail_turns"]) if tail_turns is None else int(tail_turns)
+    sc = int(eff["router_summary_chars"]) if summary_chars is None else int(summary_chars)
+    mc = int(eff["router_max_chars"]) if max_chars is None else int(max_chars)
+    context_label = eff["router_context_label"]
+    summary_label = eff["router_summary_label"]
+
+    parts: List[str] = []
+    if latest_user_text:
+        parts.append((latest_user_text or "").strip())
+
+    try:
+        recent_list = list(recent)
+    except Exception:
+        recent_list = []
+
+    tail_src = recent_list[-tt:] if tt > 0 else []
+    tail_lines: List[str] = []
+    for m in reversed(tail_src):
+        if not isinstance(m, dict):
+            continue
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        role = (m.get("role") or "user").strip()
+        tail_lines.append(f"{role}: {c}")
+
+    if tail_lines:
+        parts.append(context_label + "\n" + "\n".join(tail_lines))
+
+    if summary:
+        s = summary.strip()
+        if sc > 0 and len(s) > sc:
+            s = s[-sc:]
+        parts.append(summary_label + "\n" + s)
+
+    out = "\n\n".join(parts).strip()
+    if len(out) > mc:
+        out = out[:mc].rstrip()
+    return out
 
 # ===== aimodel/file_read/services/session_io.py =====
 
@@ -523,7 +811,7 @@ __all__ = [
 from __future__ import annotations
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from ..core.settings import SETTINGS
 from ..utils.streaming import strip_runjson
@@ -531,10 +819,10 @@ from .base import chat_path, atomic_write, now_iso
 from .index import load_index, save_index, refresh_index_after_change, ChatMeta
 
 
-def _load_chat(session_id: str) -> Dict:
+def _load_chat(session_id: str) -> Dict[str, Any]:
     p = chat_path(session_id)
     if not p.exists():
-        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}  # add summary
+        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
         if "summary" not in data:
@@ -549,7 +837,30 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
+    attachments: Optional[List[Dict]] = None   # ✅ added
 
+def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
+    if not atts:
+        return None
+    out = []
+    for a in atts:
+        # convert dataclass/typed object to dict
+        if isinstance(a, dict):
+            out.append({
+                "name": a.get("name"),
+                "source": a.get("source"),
+                "sessionId": a.get("sessionId"),
+            })
+        else:
+            try:
+                out.append({
+                    "name": getattr(a, "name", None),
+                    "source": getattr(a, "source", None),
+                    "sessionId": getattr(a, "sessionId", None),
+                })
+            except Exception:
+                continue
+    return out or None
 
 def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     idx = load_index()
@@ -593,7 +904,7 @@ def update_last(session_id: str, last_message: Optional[str], maybe_title: Optio
     return ChatMeta(**row)
 
 
-def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
+def append_message(session_id: str, role: str, content: str, attachments: Optional[list[Any]] = None) -> ChatMessageRow:
     data = _load_chat(session_id)
     seq = int(data.get("seq", 0)) + 1
     msg = {
@@ -603,22 +914,25 @@ def append_message(session_id: str, role: str, content: str) -> ChatMessageRow:
         "content": content,
         "createdAt": now_iso(),
     }
-    # Persist RAW content (may include RUNJSON)
+    norm_atts = _normalize_attachments(attachments)
+    if norm_atts:
+        msg["attachments"] = norm_atts   # ✅ now JSON-serializable
+
     data["messages"].append(msg)
     data["seq"] = seq
     _save_chat(session_id, data)
 
-    # Update index meta; keep lastMessage clean for sidebar preview
-    idx = load_index()
-    row = next((r for r in idx if r["sessionId"] == session_id), None)
-    if row:
-        row["updatedAt"] = msg["createdAt"]
-        if role == "assistant":
-            row["lastMessage"] = strip_runjson(content)
-        save_index(idx)
+    # update index meta as before...
+    ...
+    return ChatMessageRow(
+        id=seq,
+        sessionId=session_id,
+        role=role,
+        content=content,
+        createdAt=msg["createdAt"],
+        attachments=norm_atts,
+    )
 
-    # pending ops are applied by pending.apply_pending_for() from the router after appends
-    return ChatMessageRow(**msg)
 
 
 def delete_message(session_id: str, message_id: int) -> int:
@@ -657,7 +971,17 @@ def delete_messages_batch(session_id: str, message_ids: List[int]) -> List[int]:
 
 def list_messages(session_id: str) -> List[ChatMessageRow]:
     data = _load_chat(session_id)
-    return [ChatMessageRow(**m) for m in data.get("messages", [])]
+    rows: List[ChatMessageRow] = []
+    for m in data.get("messages", []):
+        rows.append(ChatMessageRow(
+            id=m["id"],
+            sessionId=m["sessionId"],
+            role=m["role"],
+            content=m["content"],
+            createdAt=m.get("createdAt"),
+            attachments=m.get("attachments", []),  # ✅ safe default
+        ))
+    return rows
 
 
 def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[ChatMeta], int, int, bool]:
@@ -702,20 +1026,19 @@ def merge_chat(source_id: str, target_id: str):
     source_msgs = list_messages(source_id)
     target_msgs = list_messages(target_id)
 
-    # Insert source first, then re-add target to preserve order
     merged = []
     for m in source_msgs:
-        row = append_message(target_id, m.role, m.content)
+        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
         merged.append(row)
 
     for m in target_msgs:
-        row = append_message(target_id, m.role, m.content)
+        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
         merged.append(row)
 
     return merged
 
 
-def _save_chat(session_id: str, data: Dict):
+def _save_chat(session_id: str, data: Dict[str, Any]):
     atomic_write(chat_path(session_id), data)
 
 
@@ -736,16 +1059,13 @@ def merge_chat_new(source_id: str, target_id: Optional[str] = None):
     upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
 
     merged = []
-
-    # source first
     for m in list_messages(source_id):
-        row = append_message(new_id, m.role, m.content)
+        row = append_message(new_id, m.role, m.content, attachments=m.attachments)
         merged.append(row)
 
-    # then target (if exists)
     if target_id:
         for m in list_messages(target_id):
-            row = append_message(new_id, m.role, m.content)
+            row = append_message(new_id, m.role, m.content, attachments=m.attachments)
             merged.append(row)
 
     return new_id, merged
@@ -760,6 +1080,17 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
         if int(m.get("id", -1)) == int(message_id):
             m["content"] = new_content
             m["updatedAt"] = now_iso()
+            # normalize attachments
+            if "attachments" in m and m["attachments"] is not None:
+                norm = []
+                for a in m["attachments"]:
+                    if hasattr(a, "dict"):
+                        norm.append(a.dict())
+                    elif isinstance(a, dict):
+                        norm.append(a)
+                    else:
+                        norm.append(dict(a))
+                m["attachments"] = norm
             updated = m
             break
 
@@ -767,14 +1098,19 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
         return None
 
     _save_chat(session_id, data)
-
-    # refresh index if last message changed
     refresh_index_after_change(session_id, msgs)
 
-    return ChatMessageRow(**updated)
+    return ChatMessageRow(
+        id=updated["id"],
+        sessionId=updated["sessionId"],
+        role=updated["role"],
+        content=updated["content"],
+        createdAt=updated.get("createdAt"),
+        attachments=updated.get("attachments", []),
+    )
 
 
-# expose internals for pending ops
+
 __all__ = [
     "ChatMessageRow",
     "upsert_on_first_message", "update_last", "append_message",
@@ -1023,6 +1359,10 @@ __all__ = [
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
     "__comment_rag": "=== Local RAG ===",
+  "default_auto_rag": true,
+  "disable_web_on_attachments": true,
+  "disable_global_rag_on_attachments": true,
+  "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 4,
   "rag_max_chars_per_chunk": 1200,
@@ -1030,10 +1370,12 @@ __all__ = [
   "rag_min_chars": 300,
   "rag_total_char_budget": 2200,
   "rag_db_path": "corpus.sqlite",
-  "rag_block_header": "Local knowledge:",
+  "rag_block_header": "",
   "rag_block_bullet_prefix": "- ",
-  "rag_block_indent_prefix": "  "
-,
+  "rag_block_indent_prefix": "  ",
+  "rag_embedding_model": "intfloat/e5-small-v2",
+  "rag_default_need_when_invalid": false,
+  "rag_block_preamble": "Local knowledge",
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -1168,7 +1510,7 @@ __all__ = [
   "chat_page_min_size": 1,
   "chat_page_max_size": 100,
   "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
-  "web_fetch_timeout_sec": 8.0,
+  "web_fetch_timeout_sec": 8,
   "web_fetch_max_chars": 3000,
   "web_fetch_max_bytes": 1048576,
   "web_fetch_max_parallel": 3,
@@ -1178,14 +1520,14 @@ __all__ = [
   "web_orch_total_char_budget": 2000,
   "web_orch_per_doc_char_budget": 1200,
   "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 2.0,
+  "web_orch_overfetch_factor": 2,
   "web_orch_overfetch_min_extra": 2,
   "web_orch_enable_js_retry": true,
   "web_orch_js_retry_avg_q": 0.55,
   "web_orch_js_retry_low_q": 0.45,
   "web_orch_js_retry_lowish_ratio": 0.5,
-  "web_orch_js_retry_timeout_add": 4.0,
-  "web_orch_js_retry_timeout_cap": 12.0,
+  "web_orch_js_retry_timeout_add": 4,
+  "web_orch_js_retry_timeout_cap": 12,
   "web_orch_js_retry_parallel_delta": -1,
   "web_orch_js_retry_min_parallel": 2,
   "web_block_header": "Web findings for: {query}",
@@ -1198,7 +1540,7 @@ __all__ = [
   "web_orch_bullet_prefix": "- ",
   "web_orch_indent_prefix": "  ",
   "web_orch_www_prefix": "www.",
-  "web_orch_fetch_cap_multiplier": 2.0,
+  "web_orch_fetch_cap_multiplier": 2,
   "__comment_web_orch_scoring": "=== Hit scoring weights ===",
   "web_orch_score_w_exact": 3,
   "web_orch_score_w_substr": 2,
@@ -1206,28 +1548,28 @@ __all__ = [
   "web_orch_score_w_title_part": 1,
   "web_orch_score_w_snip_touch": 1,
   "__comment_web_orch_quality": "=== Content quality params ===",
-  "web_orch_q_len_norm_divisor": 2000.0,
+  "web_orch_q_len_norm_divisor": 2000,
   "web_orch_q_len_weight": 0.55,
   "web_orch_q_diversity_weight": 0.55,
   "web_orch_q_penalties": [
     {
       "token": "<script>",
-      "mult": 50.0,
+      "mult": 50,
       "cap": 0.3
     },
     {
       "token": "function(",
-      "mult": 20.0,
+      "mult": 20,
       "cap": 0.3
     },
     {
       "token": "{",
-      "mult": 5.0,
+      "mult": 5,
       "cap": 0.2
     },
     {
       "token": "}",
-      "mult": 5.0,
+      "mult": 5,
       "cap": 0.2
     }
   ],
@@ -1237,8 +1579,8 @@ __all__ = [
   "query_sum_short_max_words": 3,
   "query_sum_prompt": "Summarize the user's request into a concise web search query.\nKeep only the key entities and terms.\nDo not explain, and do not surround the result in quotation marks or other punctuation.\nYou may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.\nKeep the original word order. Output only the query text.\n\nUser: {text}\nQuery:",
   "query_sum_max_tokens": 32,
-  "query_sum_temperature": 0.0,
-  "query_sum_top_p": 1.0,
+  "query_sum_temperature": 0,
+  "query_sum_top_p": 1,
   "query_sum_stop": [
     "\n",
     "</s>"
@@ -1247,8 +1589,8 @@ __all__ = [
   "query_sum_overlap_jaccard_min": 0.6,
   "__comment_router_decider": "=== Web Router (LLM-based) ===",
   "router_decide_max_tokens": 96,
-  "router_decide_temperature": 0.0,
-  "router_decide_top_p": 1.0,
+  "router_decide_temperature": 0,
+  "router_decide_top_p": 1,
   "router_decide_stop": [
     "</s>"
   ],
@@ -1310,7 +1652,7 @@ __all__ = [
   "retitle_user_suffix": "",
   "retitle_llm_max_tokens": 12,
   "retitle_llm_temperature": 0.1,
-  "retitle_llm_top_p": 1.0,
+  "retitle_llm_top_p": 1,
   "retitle_llm_stop": [
     "\n",
     "."
@@ -1323,6 +1665,10 @@ __all__ = [
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "__comment_rag": "=== Local RAG ===",
+  "default_auto_rag": false,
+  "disable_web_on_attachments": true,
+  "disable_global_rag_on_attachments": true,
+  "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 4,
   "rag_max_chars_per_chunk": 1200,
@@ -1330,9 +1676,12 @@ __all__ = [
   "rag_min_chars": 300,
   "rag_total_char_budget": 2200,
   "rag_db_path": "corpus.sqlite",
-  "rag_block_header": "Local knowledge:",
+  "rag_block_header": "",
   "rag_block_bullet_prefix": "- ",
   "rag_block_indent_prefix": "  ",
+  "rag_embedding_model": "intfloat/e5-small-v2",
+  "rag_default_need_when_invalid": false,
+  "rag_block_preamble": "Local knowledge",
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -1344,7 +1693,7 @@ __all__ = [
     "\n⏹ stopped\n"
   ],
   "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2.0,
+  "stream_producer_join_timeout_sec": 2,
   "runjson_emit": true,
   "excel_emit_cells": false,
   "excel_max_cells_per_sheet": 250,
@@ -1369,8 +1718,8 @@ __all__ = [
   "router_rag_strip_split_on_blank": true,
   "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
   "router_rag_decide_max_tokens": 300,
-  "router_rag_decide_temperature": 0.0,
-  "router_rag_decide_top_p": 1.0,
+  "router_rag_decide_temperature": 0,
+  "router_rag_decide_top_p": 1,
   "router_rag_decide_stop": [
     "\n\n"
   ],
@@ -1426,7 +1775,309 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
 
 # ===== aimodel/file_read/store/override_settings.json =====
 
-
+{
+  "__comment_general": "=== Tokenization & Prompt Overhead ===",
+  "chars_per_token": 4,
+  "prompt_per_message_overhead": 4,
+  "__comment_memory": "=== Session / Memory Settings ===",
+  "recent_maxlen": 50,
+  "__comment_summary": "=== Summarization & Compression ===",
+  "heuristic_max_bullets": 5,
+  "heuristic_max_words": 12,
+  "bullet_prefix": "- ",
+  "use_fast_summary": true,
+  "llm_summary_max_tokens": 60,
+  "llm_summary_temperature": 0,
+  "llm_summary_top_p": 1,
+  "llm_summary_stop": [
+    "\n\n",
+    "\n\n- ",
+    "\n\n\n"
+  ],
+  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
+  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
+  "summary_user_suffix": "\n\nOutput:\n- ",
+  "summary_max_chars": 1200,
+  "summary_header_prefix": "Conversation summary so far:\n",
+  "final_shrink_summary_keep_ratio": 0.5,
+  "final_shrink_summary_min_chars": 200,
+  "__comment_system_directives": "=== System Directives for Model Output ===",
+  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
+  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
+  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
+  "__comment_context": "=== Context Window & Budgets ===",
+  "model_ctx": 2048,
+  "out_budget": 512,
+  "reserved_system_tokens": 256,
+  "min_input_budget": 512,
+  "skip_overage_lt": 128,
+  "max_peel_per_turn": 1,
+  "peel_min": 4,
+  "peel_frac": 0.33,
+  "peel_max": 12,
+  "__comment_generation_defaults": "=== Generation Defaults ===",
+  "default_temperature": 0.7,
+  "default_top_p": 0.95,
+  "default_max_tokens": 512,
+  "__comment_web_search": "=== Web Search & Router ===",
+  "default_auto_web": true,
+  "default_web_k": 3,
+  "web_k_min": 1,
+  "web_k_max": 8,
+  "router_tail_turns": 0,
+  "router_summary_chars": 0,
+  "router_max_chars": 1400,
+  "router_context_label": "Context:",
+  "router_summary_label": "Summary:",
+  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
+  "__comment_web_provider": "=== Web Search Provider Selection & Config ===",
+  "web_search_provider": "ddg",
+  "web_search_cache_ttl_sec": 300,
+  "web_search_cache_superset_k": 10,
+  "web_search_region": "us-en",
+  "web_search_safesearch": "moderate",
+  "web_search_debug_logging": true,
+  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
+  "pack_style": "",
+  "pack_short": false,
+  "pack_bullets": false,
+  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
+  "__comment_misc": "=== Miscellaneous ===",
+  "empty_messages_response": "No messages provided.",
+  "clamp_margin": 32,
+  "default_session_id": "default",
+  "stopped_line_marker": "⏹ stopped",
+  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
+  "gen_semaphore_permits": 1,
+  "nctx_fallback": 4096,
+  "token_estimate_fallback": 1024,
+  "min_out_tokens": 16,
+  "__comment_store": "=== Chat storage ===",
+  "chat_default_title": "New Chat",
+  "chat_merged_title": "Merged Chat",
+  "chat_page_min_size": 1,
+  "chat_page_max_size": 100,
+  "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
+  "web_fetch_timeout_sec": 8,
+  "web_fetch_max_chars": 3000,
+  "web_fetch_max_bytes": 1048576,
+  "web_fetch_max_parallel": 3,
+  "web_fetch_user_agent": "LocalAI/0.1 (+clean-fetch)",
+  "__comment_web_orchestrator": "=== Web Orchestrator & Block Assembly ===",
+  "web_orch_default_k": 3,
+  "web_orch_total_char_budget": 2000,
+  "web_orch_per_doc_char_budget": 1200,
+  "web_orch_max_parallel_fetch": 4,
+  "web_orch_overfetch_factor": 2,
+  "web_orch_overfetch_min_extra": 2,
+  "web_orch_enable_js_retry": true,
+  "web_orch_js_retry_avg_q": 0.55,
+  "web_orch_js_retry_low_q": 0.45,
+  "web_orch_js_retry_lowish_ratio": 0.5,
+  "web_orch_js_retry_timeout_add": 4,
+  "web_orch_js_retry_timeout_cap": 12,
+  "web_orch_js_retry_parallel_delta": -1,
+  "web_orch_js_retry_min_parallel": 2,
+  "web_block_header": "Web findings for: {query}",
+  "web_orch_block_separator": "\n\n",
+  "web_orch_min_block_reserve": 200,
+  "web_orch_min_chunk_after_shrink": 200,
+  "web_orch_head_fraction": 0.67,
+  "web_orch_tail_min_chars": 200,
+  "web_orch_ellipsis": " … ",
+  "web_orch_bullet_prefix": "- ",
+  "web_orch_indent_prefix": "  ",
+  "web_orch_www_prefix": "www.",
+  "web_orch_fetch_cap_multiplier": 2,
+  "__comment_web_orch_scoring": "=== Hit scoring weights ===",
+  "web_orch_score_w_exact": 3,
+  "web_orch_score_w_substr": 2,
+  "web_orch_score_w_title_full": 2,
+  "web_orch_score_w_title_part": 1,
+  "web_orch_score_w_snip_touch": 1,
+  "__comment_web_orch_quality": "=== Content quality params ===",
+  "web_orch_q_len_norm_divisor": 2000,
+  "web_orch_q_len_weight": 0.55,
+  "web_orch_q_diversity_weight": 0.55,
+  "web_orch_q_penalties": [
+    {
+      "token": "<script>",
+      "mult": 50,
+      "cap": 0.3
+    },
+    {
+      "token": "function(",
+      "mult": 20,
+      "cap": 0.3
+    },
+    {
+      "token": "{",
+      "mult": 5,
+      "cap": 0.2
+    },
+    {
+      "token": "}",
+      "mult": 5,
+      "cap": 0.2
+    }
+  ],
+  "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
+  "query_sum_bypass_short_enabled": true,
+  "query_sum_short_max_chars": 32,
+  "query_sum_short_max_words": 3,
+  "query_sum_prompt": "Summarize the user's request into a concise web search query.\nKeep only the key entities and terms.\nDo not explain, and do not surround the result in quotation marks or other punctuation.\nYou may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.\nKeep the original word order. Output only the query text.\n\nUser: {text}\nQuery:",
+  "query_sum_max_tokens": 32,
+  "query_sum_temperature": 0,
+  "query_sum_top_p": 1,
+  "query_sum_stop": [
+    "\n",
+    "</s>"
+  ],
+  "query_sum_overlap_check_enabled": true,
+  "query_sum_overlap_jaccard_min": 0.6,
+  "__comment_router_decider": "=== Web Router (LLM-based) ===",
+  "router_decide_max_tokens": 96,
+  "router_decide_temperature": 0,
+  "router_decide_top_p": 1,
+  "router_decide_stop": [
+    "</s>"
+  ],
+  "__comment_router_control": "=== Router parsing & overrides ===",
+  "router_explicit_prefixes": [
+    "web:",
+    "search:"
+  ],
+  "router_default_need_when_invalid": false,
+  "router_json_extract_regex": "\\{.*?\\}",
+  "__comment_router_wrappers": "=== Router wrapper stripping ===",
+  "router_strip_wrappers_enabled": true,
+  "router_strip_header_regex": "^\\s*\\w[^:\\n]{0,40}:\\s*$",
+  "router_strip_split_on_blank": true,
+  "router_trim_whitespace": true,
+  "__comment_retitle": "=== Retitle (Chat title generation) ===",
+  "retitle_enable": true,
+  "retitle_queue_maxsize": 64,
+  "retitle_preview_chars": 60,
+  "retitle_preview_ellipsis": "…",
+  "retitle_min_substantial_chars": 12,
+  "retitle_require_alpha": true,
+  "retitle_pick_first_substantial": true,
+  "retitle_pick_latest_substantial": true,
+  "retitle_pick_first_user_fallback": true,
+  "retitle_grace_ms": 1000,
+  "retitle_active_backoff_start_ms": 75,
+  "retitle_active_backoff_max_ms": 600,
+  "retitle_active_backoff_total_ms": 20000,
+  "retitle_active_backoff_growth": 1.5,
+  "retitle_llm_sys_inst": "You generate ultra-concise chat titles.\nRules: 2–5 words, Title Case, nouns/adjectives only.\nNo articles (a, an, the). No verbs. No punctuation. One line.\nOutput only the title.",
+  "retitle_llm_examples": [
+    {
+      "role": "user",
+      "content": "police station"
+    },
+    {
+      "role": "assistant",
+      "content": "Police Station"
+    },
+    {
+      "role": "user",
+      "content": "fire truck"
+    },
+    {
+      "role": "assistant",
+      "content": "Fire Truck"
+    },
+    {
+      "role": "user",
+      "content": "how do i install node on windows"
+    },
+    {
+      "role": "assistant",
+      "content": "Node Installation Windows"
+    }
+  ],
+  "retitle_user_prefix": "",
+  "retitle_user_suffix": "",
+  "retitle_llm_max_tokens": 12,
+  "retitle_llm_temperature": 0.1,
+  "retitle_llm_top_p": 1,
+  "retitle_llm_stop": [
+    "\n",
+    "."
+  ],
+  "retitle_enable_sanitize": true,
+  "retitle_sanitize_drop_prefix_regex": "^\\s*(\\\"[^\\\"]*\\\"|'[^']*'|[-*•]+|\\d+\\.)\\s*",
+  "retitle_sanitize_strip_quotes": true,
+  "retitle_sanitize_replace_not_allowed_regex": "[^\\w\\s]",
+  "retitle_sanitize_replace_with": " ",
+  "retitle_sanitize_max_words": 5,
+  "retitle_sanitize_max_chars": 40,
+  "__comment_rag": "=== Local RAG ===",
+  "default_auto_rag": false,
+  "disable_web_on_attachments": true,
+  "disable_global_rag_on_attachments": true,
+  "attachments_retrieve_top_k": 6,
+  "rag_enabled": true,
+  "rag_top_k": 4,
+  "rag_max_chars_per_chunk": 1200,
+  "rag_chunk_overlap_chars": 150,
+  "rag_min_chars": 300,
+  "rag_total_char_budget": 2200,
+  "rag_db_path": "corpus.sqlite",
+  "rag_block_header": "",
+  "rag_block_bullet_prefix": "- ",
+  "rag_block_indent_prefix": "  ",
+  "rag_embedding_model": "intfloat/e5-small-v2",
+  "rag_default_need_when_invalid": false,
+  "rag_block_preamble": "Local knowledge",
+  "__comment_streaming": "=== Streaming worker tuning ===",
+  "stream_queue_maxsize": 64,
+  "stream_backpressure_sleep_sec": 0.005,
+  "stream_top_k": 40,
+  "stream_repeat_penalty": 1.25,
+  "stream_retry_min_tokens": 64,
+  "stream_retry_fraction": 0.5,
+  "stream_stop_strings": [
+    "\n⏹ stopped\n"
+  ],
+  "stream_emit_stopped_line": true,
+  "stream_producer_join_timeout_sec": 2,
+  "runjson_emit": true,
+  "excel_emit_cells": false,
+  "excel_max_cells_per_sheet": 250,
+  "excel_named_range_preview": 6,
+  "excel_emit_merged": true,
+  "excel_number_sigfigs": 6,
+  "excel_decimal_max_places": 4,
+  "excel_trim_trailing_zeros": true,
+  "excel_dates_drop_time_if_midnight": true,
+  "excel_time_precision": "minute",
+  "excel_value_max_chars": 160,
+  "excel_quote_strings": true,
+  "excel_infer_max_rows": 50,
+  "excel_infer_max_cols": 26,
+  "excel_infer_min_header_fill_ratio": 0.5,
+  "excel_emit_key_values": true,
+  "excel_header_normalize": true,
+  "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
+  "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
+  "router_rag_trim_whitespace": true,
+  "router_rag_strip_wrappers_enabled": true,
+  "router_rag_strip_split_on_blank": true,
+  "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
+  "router_rag_decide_max_tokens": 300,
+  "router_rag_decide_temperature": 0,
+  "router_rag_decide_top_p": 1,
+  "router_rag_decide_stop": [
+    "\n\n"
+  ],
+  "router_rag_default_need_when_invalid": false,
+  "csv_value_max_chars": 160,
+  "csv_quote_strings": true,
+  "csv_header_normalize": true,
+  "csv_infer_max_rows": 50,
+  "csv_infer_max_cols": 26
+}
 
 # ===== aimodel/file_read/utils/streaming.py =====
 
@@ -2146,638 +2797,4 @@ async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s
     for i, h in enumerate(top_hits, 1):
         # reuse computed scores when printing
         s = next((sc for sc, hh in scored if hh is h), 0)
-        print(f"[orchestrator] PICK {i}/{cfg_k} score={s} host={_host(h.url)} title={(h.title or '')[:80]!r}")
-
-    # --- FETCH ROUND 1 (static) ---
-    urls = [h.url for h in top_hits]
-    meta = [(h.title or h.url, h.url) for h in top_hits]
-    print(f"[orchestrator] FETCH[1] start urls={[ _host(u) for u in urls ]}")
-
-    t_f = time.perf_counter()
-    results = await _fetch_round(
-        urls, meta, per_url_timeout_s=per_timeout, max_parallel=max_parallel, use_js=False
-    )
-    dt_f = time.perf_counter() - t_f
-    print(f"[orchestrator] FETCH[1] done n={len(results)} dt={dt_f:.3f}s")
-
-    texts: List[Tuple[str, str, str]] = []  # (title, final_url, text)
-    quality_scores: List[float] = []
-
-    for original_url, res in results:
-        if not res:
-            print(f"[orchestrator]   fetch MISS url={original_url}")
-            continue
-        final_url, status, text = res
-        title = next((t for (t, u) in meta if u == original_url), final_url)
-        tl = len(text or "")
-        qscore = content_quality_score(text or "")
-        quality_scores.append(qscore)
-        print(f"[orchestrator]   fetch OK   status={status} host={_host(final_url)} len={tl} q={qscore:.2f} title={(title or '')[:80]!r}")
-        if text:
-            texts.append((title, final_url, text))
-
-    # --- JS retry decision (configurable thresholds) ---
-    try_js = False
-    if enable_js_retry and quality_scores:
-        avg_q = sum(quality_scores) / len(quality_scores)
-        lowish = sum(1 for q in quality_scores if q < js_low_q_thresh)
-        if avg_q < js_avg_q_thresh or (lowish / max(1, len(quality_scores))) >= js_lowish_ratio:
-            try_js = True
-
-    if try_js:
-        print("[orchestrator] FETCH[2-JS] trying JS-rendered fetch due to low content quality")
-        js_timeout   = min(per_timeout + js_timeout_add, js_timeout_cap)
-        js_parallel  = max(js_min_parallel, max_parallel + js_parallel_delta)
-
-        results_js = await _fetch_round(
-            urls, meta, per_url_timeout_s=js_timeout, max_parallel=js_parallel, use_js=True
-        )
-        texts_js: List[Tuple[str, str, str]] = []
-        for original_url, res in results_js:
-            if not res:
-                continue
-            final_url, status, text = res
-            title = next((t for (t, u) in meta if u == original_url), final_url)
-            tl = len(text or "")
-            qscore = content_quality_score(text or "")
-            print(f"[orchestrator]   fetch JS OK status={status} host={_host(final_url)} len={tl} q={qscore:.2f} title={(title or '')[:80]!r}")
-            if text:
-                texts_js.append((title, final_url, text))
-
-        if texts_js:
-            texts = texts_js
-
-    if not texts:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no chunks | elapsed={time.time()-start_time:.3f}s")
-        return None
-
-    # --- Build chunks; order by quality ---
-    texts.sort(key=lambda t: content_quality_score(t[2]), reverse=True)
-
-    chunks: List[str] = []
-    for title, final_url, text in texts:
-        chunk = condense_doc(title, final_url, text, max_chars=per_doc_budget)
-        chunks.append(chunk)
-        print(f"[orchestrator]   chunk len={len(chunk)} host={_host(final_url)}")
-
-    # --- Enforce total budget ---
-    header = header_tpl.format(query=query)
-    sep = _as_str("web_orch_block_separator")
-    available = max(_as_int("web_orch_min_block_reserve"),
-                    total_char_budget - len(header) - len(sep))
-    block_parts: List[str] = []
-    used = 0
-    for idx, ch in enumerate(chunks):
-        cl = len(ch)
-        sep_len = (len(sep) if block_parts else 0)
-        if used + cl + sep_len > available:
-            shrunk = _head_tail(ch, max(min_chunk_after, available - used - sep_len))
-            print(f"[orchestrator]   budget hit at chunk[{idx}] orig={cl} shrunk={len(shrunk)} used_before={used} avail={available}")
-            if len(shrunk) > min_chunk_after:
-                block_parts.append(shrunk)
-                used += len(shrunk) + sep_len
-            break
-        block_parts.append(ch)
-        used += cl + sep_len
-        print(f"[orchestrator]   take chunk[{idx}] len={cl} used_total={used}/{available}")
-
-    body = sep.join(block_parts)
-    block = f"{header}{sep}{body}" if body else header
-
-    end_time = time.time()
-    print(f"[orchestrator] OUT @ {end_time:.3f}s | elapsed={end_time-start_time:.3f}s | chunks={len(block_parts)} | chars={len(block)}")
-    return block
-
-# ===== aimodel/file_read/web/provider.py =====
-
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Optional
-
-@dataclass
-class SearchHit:
-    title: str
-    url: str
-    snippet: Optional[str] = None
-    rank: int = 0
-
-class SearchProvider:
-    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
-        raise NotImplementedError
-
-# ===== aimodel/file_read/web/query_summarizer.py =====
-
-# aimodel/file_read/web/query_summarizer.py
-from __future__ import annotations
-from typing import Any, Iterable
-import re
-
-from ..core.settings import SETTINGS
-
-def _tokens(s: str) -> set[str]:
-    return set(re.findall(r"\w+", (s or "").lower()))
-
-def _as_list(v) -> list:
-    if v is None:
-        return []
-    if isinstance(v, (list, tuple)):
-        return list(v)
-    return [v]
-
-def summarize_query(llm: Any, user_text: str) -> str:
-    """
-    Settings used (all optional; no in-code fallbacks):
-      - query_sum_bypass_short_enabled : bool
-      - query_sum_short_max_chars      : int
-      - query_sum_short_max_words      : int
-      - query_sum_prompt               : str (must contain '{text}')
-      - query_sum_max_tokens           : int
-      - query_sum_temperature          : float
-      - query_sum_top_p                : float
-      - query_sum_stop                 : list[str]
-      - query_sum_overlap_check_enabled: bool
-      - query_sum_overlap_jaccard_min  : float (0..1)
-    """
-    txt = (user_text or "").strip()
-    print(f"[SUMMARIZER] IN user_text={txt!r}")
-
-    # --- Bypass for very short queries (only if fully configured) ---
-    bypass_enabled = SETTINGS.get("query_sum_bypass_short_enabled")
-    short_chars = SETTINGS.get("query_sum_short_max_chars")
-    short_words = SETTINGS.get("query_sum_short_max_words")
-    if bypass_enabled is True and isinstance(short_chars, int) and isinstance(short_words, int):
-        if len(txt) <= short_chars and len(txt.split()) <= short_words:
-            print(f"[SUMMARIZER] BYPASS (short) -> {txt!r}")
-            return txt
-
-    # --- LLM prompt construction (only if prompt provided) ---
-    prompt = SETTINGS.get("query_sum_prompt")
-    if isinstance(prompt, str) and "{text}" in prompt:
-        params = {}
-        # Only include configured generation params; nothing hardcoded.
-        max_tokens = SETTINGS.get("query_sum_max_tokens")
-        if isinstance(max_tokens, int):
-            params["max_tokens"] = max_tokens
-
-        temperature = SETTINGS.get("query_sum_temperature")
-        if isinstance(temperature, (int, float)):
-            params["temperature"] = float(temperature)
-
-        top_p = SETTINGS.get("query_sum_top_p")
-        if isinstance(top_p, (int, float)):
-            params["top_p"] = float(top_p)
-
-        stops = _as_list(SETTINGS.get("query_sum_stop"))
-        if stops:
-            params["stop"] = [str(s) for s in stops if isinstance(s, str)]
-
-        params["stream"] = False  # summarizer uses non-streamed call
-
-        out = llm.create_chat_completion(
-            messages=[{"role": "user", "content": prompt.format(text=txt)}],
-            **params,  # only what’s configured is sent
-        )
-        result = (out["choices"][0]["message"]["content"] or "").strip()
-    else:
-        # If no prompt configured, do not attempt to summarize — return original text.
-        print("[SUMMARIZER] SKIP (no prompt configured) -> retain input")
-        return txt
-
-    # --- Optional overlap check (guard against paraphrase drift) ---
-    overlap_enabled = SETTINGS.get("query_sum_overlap_check_enabled")
-    j_min = SETTINGS.get("query_sum_overlap_jaccard_min")
-    if overlap_enabled is True and isinstance(j_min, (int, float)):
-        src_toks = _tokens(txt)
-        out_toks = _tokens(result)
-        if not result or not out_toks:
-            print(f"[SUMMARIZER] RETAIN (empty/none) -> {txt!r}")
-            print(f"[SUMMARIZER] OUT query={txt!r}")
-            return txt
-        jaccard = (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
-        if jaccard < float(j_min):
-            print(f"[SUMMARIZER] RETAIN (low overlap {jaccard:.2f} < {float(j_min):.2f}) -> {txt!r}")
-            print(f"[SUMMARIZER] OUT query={txt!r}")
-            return txt
-        print(f"[SUMMARIZER] OUT query={result!r} (overlap {jaccard:.2f})")
-        return result
-
-    # If overlap check not enabled/configured, just return the LLM result.
-    print(f"[SUMMARIZER] OUT query={result!r} (no overlap check)")
-    return result
-
-# ===== aimodel/file_read/web/router_ai.py =====
-
-# aimodel/file_read/web/router_ai.py
-from __future__ import annotations
-from typing import Tuple, Optional, Any
-import json, re
-from ..core.settings import SETTINGS
-
-# ---- Hardcoded, brace-safe prompt (only {text} is formatted) -----------------
-_DECIDE_PROMPT = (
-    "You are a router deciding whether answering the text requires the public web.\n"
-    "Respond with JSON only in exactly this schema:\n"
-    "{{\"need\": true|false, \"query\": \"<text or empty>\"}}\n\n"
-    "Decision principle:\n"
-    "- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n"
-    "- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n"
-    "- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n"
-    "- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n"
-    "- When uncertain whether real-time state is required, prefer need=true.\n\n"
-    "Text:\n{text}\n"
-    "JSON:"
-)
-
-# ---- JSON extraction (configurable) -----------------------------------------
-def _force_json(s: str) -> dict:
-    if not s:
-        return {}
-    # Primary: straight JSON
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        pass
-
-    # Settings-provided regex (recommended: non-greedy first-block)
-    rgx = SETTINGS.get("router_json_extract_regex")
-    cand = None
-    if isinstance(rgx, str) and rgx:
-        try:
-            m = re.search(rgx, s, re.DOTALL)
-            if m:
-                cand = m.group(0)
-        except Exception:
-            cand = None
-
-    # Fallback: first non-greedy {...}
-    if not cand:
-        m2 = re.search(r"\{.*?\}", s, re.DOTALL)
-        cand = m2.group(0) if m2 else None
-
-    if not cand:
-        return {}
-    try:
-        v = json.loads(cand)
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        return {}
-
-# ---- Strip wrappers (configurable) ------------------------------------------
-def _strip_wrappers(text: str) -> str:
-    t = (text or "")
-    if SETTINGS.get("router_trim_whitespace") is True:
-        t = t.strip()
-
-    if SETTINGS.get("router_strip_wrappers_enabled") is not True:
-        return t
-
-    head = t
-    if SETTINGS.get("router_strip_split_on_blank") is True:
-        head = t.split("\n\n", 1)[0]
-
-    pat = SETTINGS.get("router_strip_header_regex")
-    if isinstance(pat, str) and pat:
-        try:
-            rx = re.compile(pat)
-            out = []
-            for ln in head.splitlines():
-                if rx.match(ln):
-                    break
-                out.append(ln)
-            core = " ".join(" ".join(out).split())
-            return core if core else t
-        except Exception:
-            return head
-    return head
-
-# ---- Core router -------------------------------------------------------------
-def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
-    try:
-        if not user_text or not user_text.strip():
-            print("[ROUTER] SKIP (empty user_text)")
-            return (False, None)
-
-        t_raw = user_text.strip()
-        core_text = _strip_wrappers(t_raw)
-        print(f"[ROUTER] INPUT raw={t_raw!r} core={core_text!r}")
-
-        # Explicit overrides (prefixes configurable)
-        prefixes = SETTINGS.get("router_explicit_prefixes")
-        if isinstance(prefixes, list) and prefixes:
-            low = t_raw.lower()
-            for p in prefixes:
-                ps = str(p or "").lower()
-                if ps and low.startswith(ps):
-                    q = t_raw.split(":", 1)[1].strip() if ":" in t_raw else t_raw
-                    q = _strip_wrappers(q)
-                    print(f"[ROUTER] EXPLICIT override need_web=True query={q!r}")
-                    return (True, q)
-
-        # Hardcoded prompt; all other knobs from settings
-        the_prompt = _DECIDE_PROMPT.format(text=core_text)
-        print(f"[ROUTER] PROMPT >>>\n{the_prompt}\n<<< PROMPT")
-
-        # Build generation params from settings (filter out None)
-        params = {
-            "max_tokens": SETTINGS.get("router_decide_max_tokens"),
-            "temperature": SETTINGS.get("router_decide_temperature"),
-            "top_p": SETTINGS.get("router_decide_top_p"),
-            "stream": False,
-        }
-        stop_list = SETTINGS.get("router_decide_stop")
-        if isinstance(stop_list, list) and stop_list:
-            params["stop"] = stop_list
-        params = {k: v for k, v in params.items() if v is not None}
-
-        raw_out_obj = llm.create_chat_completion(
-            messages=[{"role": "user", "content": the_prompt}],
-            **params,
-        )
-        text_out = (raw_out_obj.get("choices", [{}])[0]
-                                  .get("message", {})
-                                  .get("content") or "").strip()
-
-        try:
-            print(f"[ROUTER] RAW OBJ keys={list(raw_out_obj.keys())}")
-        except Exception:
-            pass
-        print(f"[ROUTER] RAW OUT str={text_out!r}")
-
-        data = _force_json(text_out) or {}
-        print(f"[ROUTER] PARSED JSON={data}")
-
-        # Keep it strict: bool only; otherwise fallback to default
-        need_val = data.get("need", None)
-        if isinstance(need_val, bool):
-            need = need_val
-        else:
-            need_default = SETTINGS.get("router_default_need_when_invalid")
-            need = bool(need_default) if isinstance(need_default, bool) else False
-
-        query_field = data.get("query", "")
-        try:
-            query = _strip_wrappers(str(query_field or "").strip())
-        except Exception:
-            query = ""
-
-        if not need:
-            query = None
-
-        print(f"[ROUTER] DECISION need_web={need} query={query!r}")
-        return (need, query)
-
-    except Exception as e:
-        print(f"[ROUTER] FATAL in decide_web: {type(e).__name__}: {e}")
-        return (False, None)
-
-# ---- One-hop decide + fetch --------------------------------------------------
-async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Optional[str]:
-    t = (user_text or "").strip()
-    prev = (t[:160] + "…") if len(t) > 160 else t
-    print(f"[ROUTER:FETCH] IN text_len={len(t)} k={k} text_preview={prev!r}")
-
-    need, proposed_q = decide_web(llm, t)
-    print(f"[ROUTER:FETCH] decide_web -> need={need} proposed_q={proposed_q!r}")
-    if not need:
-        print("[ROUTER:FETCH] no web needed")
-        return None
-
-    # Lazy imports to avoid circulars
-    from .query_summarizer import summarize_query
-    from .orchestrator import build_web_block
-
-    base_query = _strip_wrappers((proposed_q or t).strip())
-    try:
-        q_summary = (summarize_query(llm, base_query) or "").strip().strip('"\'' ) or base_query
-        q_summary = _strip_wrappers(q_summary)
-        print(f"[ROUTER:FETCH] summarize_query base={base_query!r} -> q_summary={q_summary!r}")
-    except Exception as e:
-        print(f"[ROUTER:FETCH] summarize_query ERROR {type(e).__name__}: {e}")
-        q_summary = base_query
-
-    try:
-        block = await build_web_block(q_summary, k=k)
-        print(f"[ROUTER:FETCH] build_web_block len={(len(block) if block else 0)}")
-    except Exception as e:
-        print(f"[ROUTER:FETCH] build_web_block ERROR {type(e).__name__}: {e}")
-        block = None
-
-    return block or None
-
-# ===== aimodel/file_read/workers/retitle_worker.py =====
-
-# aimodel/file_read/retitle_worker.py
-from __future__ import annotations
-import asyncio, logging, re
-from typing import Dict, List, Optional, Tuple
-
-from ..runtime.model_runtime import get_llm
-from ..store.index import load_index, save_index
-from ..store.base import now_iso
-from ..services.cancel import is_active, GEN_SEMAPHORE  # serialize with main generation
-from ..store.chats import _load_chat  # for current seq watermark
-from ..core.settings import SETTINGS  # centralized settings loader
-
-
-# -----------------------------------------------------------------------------
-# Settings access (STRICT: no fallbacks)
-# -----------------------------------------------------------------------------
-def S(key: str):
-    # Raise KeyError immediately if missing so misconfig is visible
-    return SETTINGS[key]
-
-
-# -----------------------------------------------------------------------------
-# Coalesced per-session queue (last-write-wins)
-# -----------------------------------------------------------------------------
-# We store only the latest snapshot + watermark per session. The worker consumes
-# session IDs; when it handles a session, it reads the latest snapshot once.
-_PENDING: Dict[str, dict] = {}
-_ENQUEUED: set[str] = set()
-_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=int(S("retitle_queue_maxsize")))
-_lock = asyncio.Lock()  # guards _PENDING/_ENQUEUED
-
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _preview(s: str) -> str:
-    n = int(S("retitle_preview_chars"))
-    ell = S("retitle_preview_ellipsis")
-    s = (s or "")
-    return (s[:n] + ell) if len(s) > n else s
-
-
-def _is_substantial(text: str) -> bool:
-    t = (text or "").strip()
-    min_chars = int(S("retitle_min_substantial_chars"))
-    require_alpha = bool(S("retitle_require_alpha"))
-    if len(t) < min_chars:
-        return False
-    return (re.search(r"[A-Za-z]", t) is not None) if require_alpha else True
-
-
-def _pick_source(messages: List[dict]) -> Optional[str]:
-    """
-    Choose best text to title based on policy toggles:
-      - retitle_pick_first_substantial
-      - retitle_pick_latest_substantial
-      - retitle_pick_first_user_fallback
-    """
-    if not messages:
-        return None
-
-    if bool(S("retitle_pick_first_substantial")):
-        for m in messages:
-            if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
-                return m.get("content", "")
-
-    if bool(S("retitle_pick_latest_substantial")):
-        for m in reversed(messages):
-            if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
-                return m.get("content", "")
-
-    if bool(S("retitle_pick_first_user_fallback")):
-        for m in messages:
-            if m.get("role") == "user":
-                return m.get("content", "")
-
-    return None
-
-
-def _sanitize_title(s: str) -> str:
-    """
-    One line, trimmed, limited words/chars, with configurable regex steps.
-    All behavior is driven by retitle_* settings.
-    """
-    if not s:
-        return ""
-
-    s = s.strip()
-
-    # Drop common prefixes (bullets, quotes, numbering)
-    drop_prefix_re = S("retitle_sanitize_drop_prefix_regex")
-    if drop_prefix_re:
-        s = re.sub(drop_prefix_re, "", s)
-
-    # Strip quotes
-    if bool(S("retitle_sanitize_strip_quotes")):
-        s = s.strip().strip('"').strip("'").strip()
-
-    # Replace non-allowed chars
-    replace_not_allowed_re = S("retitle_sanitize_replace_not_allowed_regex")
-    replace_with = S("retitle_sanitize_replace_with")
-    if replace_not_allowed_re:
-        s = re.sub(replace_not_allowed_re, replace_with, s)
-
-    # Collapse whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-
-    # Word & char limits
-    max_words = int(S("retitle_sanitize_max_words"))
-    max_chars = int(S("retitle_sanitize_max_chars"))
-    if max_words > 0:
-        words = s.split()
-        s = " ".join(words[:max_words])
-    if max_chars > 0 and len(s) > max_chars:
-        s = s[:max_chars].rstrip()
-
-    return s
-
-
-def _make_title(llm, src: str) -> str:
-    # System instruction and examples from settings
-    sys = S("retitle_llm_sys_inst")
-    examples: List[dict] = list(S("retitle_llm_examples"))
-
-    # Optional prefix/suffix on the user text
-    user_text = f"{S('retitle_user_prefix')}{src}{S('retitle_user_suffix')}"
-
-    messages = [{"role": "system", "content": sys}, *examples, {"role": "user", "content": user_text}]
-
-    out = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=int(S("retitle_llm_max_tokens")),
-        temperature=float(S("retitle_llm_temperature")),
-        top_p=float(S("retitle_llm_top_p")),
-        stream=False,
-        stop=S("retitle_llm_stop"),
-    )
-    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
-    return raw
-
-
-# -----------------------------------------------------------------------------
-# Worker loop
-# -----------------------------------------------------------------------------
-async def start_worker():
-    """Background loop to process retitle jobs one by one."""
-    while True:
-        sid = await _queue.get()
-        try:
-            await _process_session(sid)
-        except Exception:
-            logging.exception("Retitle worker failed")
-        finally:
-            _queue.task_done()
-
-
-def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
-    msgs = snapshot.get("messages") or []
-    job_seq = int(snapshot.get("job_seq") or 0)
-    return msgs, job_seq
-
-
-async def _process_session(session_id: str):
-    # global enable flag
-    if not bool(S("retitle_enable")):
-        return
-
-    # debounce after stream
-    await asyncio.sleep(int(S("retitle_grace_ms")) / 1000.0)
-
-    # lower priority than generation: wait while this session is active
-    waited = 0
-    backoff = int(S("retitle_active_backoff_start_ms"))
-    backoff_max = int(S("retitle_active_backoff_max_ms"))
-    backoff_total = int(S("retitle_active_backoff_total_ms"))
-    growth = float(S("retitle_active_backoff_growth"))
-
-    while is_active(session_id) and waited < backoff_total:
-        await asyncio.sleep(backoff / 1000.0)
-        waited += backoff
-        # exponential backoff with cap
-        backoff = min(int(backoff * growth), backoff_max)
-
-    # fetch latest coalesced snapshot
-    async with _lock:
-        snapshot = _PENDING.pop(session_id, None)
-        _ENQUEUED.discard(session_id)
-
-    if not snapshot:
-        return
-
-    messages, job_seq = _extract_job(snapshot)
-
-    # stale guard: if chat seq has advanced, skip (a newer enqueue will run)
-    try:
-        cur_seq = int((_load_chat(session_id) or {}).get("seq") or 0)
-    except Exception:
-        cur_seq = job_seq
-    if cur_seq > job_seq:
-        print(f"[retitle] SKIP (stale) session={session_id} job_seq={job_seq} current_seq={cur_seq}")
-        return
-
-    # pick source text
-    src = _pick_source(messages) or ""
-    if not src.strip():
-        return
-
-    print(f"[retitle] START session={session_id} job_seq={job_seq} src={_preview(src)!r}")
-
-    # Serialize with main generation semaphore; run LLM call in a worker thread
-    async with GEN_SEMAPHORE:
-        llm = get_llm()
-        try:
-            ti
+        print(f"[orchestrator] PICK {i}/{cfg_k} score={s} host

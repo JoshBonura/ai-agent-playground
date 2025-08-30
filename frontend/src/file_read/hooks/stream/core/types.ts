@@ -1,4 +1,5 @@
-import type { ChatMsg } from "../../../types/chat";
+// frontend/src/file_read/hooks/stream/core/types.ts
+import type { ChatMsg, Attachment } from "../../../types/chat";
 import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
 
 export type MsgAccessor = {
@@ -13,7 +14,7 @@ export type UiHooks = {
   setMetricsFor: (sessionId: string, json?: RunJson, flat?: GenMetrics) => void;
   setMetricsFallbackFor: (sessionId: string, reason: string, partialOut: string) => void;
 
-  /** NEW: patch the server id for a bubble identified by clientId */
+  /** patch the server id for a bubble identified by clientId */
   setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
 };
 
@@ -27,7 +28,8 @@ export type SessionPlumbing = {
 export type StreamCoreOpts = MsgAccessor & UiHooks & SessionPlumbing;
 
 export type StreamController = {
-  send: (override?: string) => Promise<void>;
+  /** text can be empty if attachments are present */
+  send: (override?: string, attachments?: Attachment[]) => Promise<void>;
   stop: () => Promise<void>;
   cancelBySessionId: (sid: string) => Promise<void>;
   dispose: () => void;

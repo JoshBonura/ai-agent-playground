@@ -3,9 +3,16 @@ from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel
 
+
+class Attachment(BaseModel):
+    name: str
+    source: Optional[str] = None
+    sessionId: Optional[str] = None
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+    attachments: Optional[List[Attachment]] = None  # ✅ new
 
 class MergeChatReq(BaseModel):
     sourceId: str
@@ -52,3 +59,4 @@ class ChatBody(BaseModel):
     # ↓ also optional; defaults come from settings
     autoWeb: Optional[bool] = None
     webK: Optional[int] = None
+    autoRag: Optional[bool] = None   

@@ -1,4 +1,4 @@
-import type { ChatRow, ChatMessageRow, Role } from "../../types/chat";
+import type { Attachment, ChatRow, ChatMessageRow} from "../../types/chat";
 import { request } from "../../services/http";
 
 // Spring Page<T> type
@@ -45,11 +45,19 @@ export function listMessages(sessionId: string) {
   return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
 }
 
-export function appendMessage(sessionId: string, role: Role, content: string) {
-  return request<ChatMessageRow>(`/api/chats/${encodeURIComponent(sessionId)}/messages`, {
+export async function appendMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string,
+  attachments?: Attachment[]
+) {
+  const body: any = { role, content };
+  if (attachments && attachments.length) body.attachments = attachments;
+
+  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ role, content }),
+    body: JSON.stringify(body),
   });
 }
 

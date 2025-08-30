@@ -390,8 +390,9 @@ def write_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
 # ===== aimodel/file_read/api/chats.py =====
 
 # ===== aimodel/file_read/api/chats.py =====
-
 from __future__ import annotations
+
+from ..core.schemas import ChatMessage
 from dataclasses import asdict
 from typing import List, Optional, Dict
 from ..utils.streaming import strip_runjson
@@ -472,16 +473,16 @@ async def api_list_messages(session_id: str):
     rows = store_list_messages(session_id)
     return [asdict(r) for r in rows]
 
-# ✅ Single append route; triggers retitle only after assistant turn is persisted
+
 @router.post("/api/chats/{session_id}/messages")
-async def api_append_message(session_id: str, body: Dict[str, str]):
-    role = (body.get("role") or "user").strip()
-    # 🔴 was: content = strip_runjson(...)
-    content = (body.get("content") or "").rstrip()
-    row = store_append(session_id, role, content)
+async def api_append_message(session_id: str, msg: ChatMessage):
+    role = msg.role
+    content = (msg.content or "").rstrip()
+    attachments = msg.attachments or []
+
+    row = store_append(session_id, role, content, attachments=attachments)
 
     if role == "assistant":
-        # Retitle should *not* see RUNJSON blobs
         try:
             msgs = store_list_messages(session_id)
             last_seq = max((int(m.id) for m in msgs), default=0)
@@ -601,11 +602,11 @@ async def api_update_settings(patch: Dict[str, object]):
 # aimodel/file_read/api/rag.py
 from __future__ import annotations
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from typing import Optional, List
+from typing import Optional, List, Dict
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from threading import RLock
-
+from ..rag.uploads import list_sources as rag_list_sources, hard_delete_source
 from ..rag.schemas import SearchReq, SearchHit
 from ..rag.ingest import sniff_and_extract, chunk_text, build_metas
 from ..rag.store import add_vectors, search_vectors
@@ -674,10 +675,7 @@ async def search(req: SearchReq):
 
 @router.get("/list")
 async def list_items(sessionId: Optional[str] = None, k: int = 20):
-    """
-    Debug: show a lightweight list of stored chunks for a session (or global if sessionId is None).
-    Returns id/source/score and a short text preview so you can verify ingestion.
-    """
+
     qv = np.array(_embed(["list"])[0], dtype="float32")
     hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
 
@@ -716,6 +714,27 @@ async def dump_items(sessionId: Optional[str] = None, k: int = 50):
         })
     print(f"[RAG DUMP] sessionId={sessionId} k={k} -> {len(chunks)} items")
     return {"chunks": chunks}
+
+@router.get("/uploads")
+async def api_list_uploads(sessionId: Optional[str] = None, scope: str = "all"):
+    include_global = scope != "session"
+    return {"uploads": rag_list_sources(sessionId, include_global=include_global)}
+
+@router.post("/uploads/delete-hard")
+async def api_delete_upload_hard(body: dict[str, str]):
+    source = (body.get("source") or "").strip()
+    session_id = (body.get("sessionId") or None)
+    if not source:
+        return {"error": "source required"}
+
+    # use the same model as ingest/search
+    model = _get_st_model()  # you already have this in rag.py
+    def _embed(texts: List[str]):
+        arr = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        return arr.astype("float32")
+
+    out = hard_delete_source(source, session_id=session_id, embedder=_embed)
+    return out
 
 # ===== aimodel/file_read/api/settings.py =====
 
@@ -1157,9 +1176,16 @@ from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel
 
+
+class Attachment(BaseModel):
+    name: str
+    source: Optional[str] = None
+    sessionId: Optional[str] = None
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+    attachments: Optional[List[Attachment]] = None  # ✅ new
 
 class MergeChatReq(BaseModel):
     sourceId: str
@@ -1206,6 +1232,7 @@ class ChatBody(BaseModel):
     # ↓ also optional; defaults come from settings
     autoWeb: Optional[bool] = None
     webK: Optional[int] = None
+    autoRag: Optional[bool] = None   
 
 # ===== aimodel/file_read/core/settings.py =====
 
@@ -2214,6 +2241,38 @@ def build_rag_block(query: str, session_id: str | None = None) -> str | None:
     print(f"[RAG BLOCK] chars={len(block)}")
     return block
 
+def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None) -> Optional[str]:
+    """
+    Same idea as build_rag_block, but ONLY searches the current session's vectors.
+    Used when a user turn includes attachments (we skip Web and global RAG).
+    """
+    if not bool(SETTINGS.get("rag_enabled", True)):
+        return None
+
+    if k is None:
+        k = int(SETTINGS.get("attachments_retrieve_top_k", SETTINGS.get("rag_top_k", 4)))
+
+    q = (query or "").strip()
+    print(f"[RAG SEARCH (session-only)] q={q!r} session={session_id} k={k}")
+    qvec = _embed_query(q)
+    if not qvec:
+        print("[RAG SEARCH (session-only)] no qvec")
+        return None
+
+    d = len(qvec)
+    hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
+    print(f"[RAG SEARCH (session-only)] hits={len(hits_chat)}")
+    if not hits_chat:
+        return None
+
+    hits_top = _dedupe_and_sort(hits_chat, k=k)
+    block = make_rag_block(
+        hits_top,
+        max_chars=int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
+    )
+    print(f"[RAG BLOCK (session-only)] chars={len(block)}")
+    return block
+
 # ===== aimodel/file_read/rag/router_ai.py =====
 
 from __future__ import annotations
@@ -2531,6 +2590,140 @@ def add_texts(
     add_vectors(session_id, vecs, metas, dim)
     return len(texts)
 
+# ===== aimodel/file_read/rag/uploads.py =====
+
+from __future__ import annotations
+from typing import Dict, List, Optional, Iterable, Tuple
+from pathlib import Path
+import json, os
+import numpy as np
+import faiss
+
+from .store import _ns_dir  # reuse your namespace layout
+
+_META_FN = "meta.jsonl"
+_INDEX_FN = "index.faiss"
+
+# ---------- Read-only helpers (NO mkdir) ----------
+def _meta_path_ro(session_id: Optional[str]) -> Path:
+    return _ns_dir(session_id) / _META_FN
+
+def _index_path_ro(session_id: Optional[str]) -> Path:
+    return _ns_dir(session_id) / _INDEX_FN
+
+# ---------- Mutating helpers (mkdir when writing) ----------
+def _paths_mut(session_id: Optional[str]) -> Tuple[Path, Path]:
+    d = _ns_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / _INDEX_FN, d / _META_FN
+
+def _read_meta(meta_path: Path) -> List[dict]:
+    if not meta_path.exists():
+        return []
+    out: List[dict] = []
+    with meta_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                j = json.loads(line)
+                if isinstance(j, dict):
+                    out.append(j)
+            except:
+                pass
+    return out
+
+def _write_meta(meta_path: Path, rows: List[dict]) -> None:
+    tmp = meta_path.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for j in rows:
+            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+    tmp.replace(meta_path)
+
+def _norm(x: np.ndarray) -> np.ndarray:
+    x = x.astype("float32")
+    faiss.normalize_L2(x)
+    return x
+
+def list_sources(session_id: Optional[str], include_global: bool = True) -> List[dict]:
+    def _agg(ns: Optional[str]) -> Dict[str, int]:
+        mp = _meta_path_ro(ns)  # read-only, no mkdir
+        agg: Dict[str, int] = {}
+        for j in _read_meta(mp):
+            src = (j.get("source") or "").strip()
+            if not src:
+                continue
+            agg[src] = agg.get(src, 0) + 1
+        return agg
+
+    rows: List[dict] = []
+    # session first
+    if session_id is not None:
+        for src, n in _agg(session_id).items():
+            rows.append({"source": src, "sessionId": session_id, "chunks": n})
+    if include_global:
+        for src, n in _agg(None).items():
+            rows.append({"source": src, "sessionId": None, "chunks": n})
+    return rows
+
+def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> dict:
+    """
+    Remove all chunks for `source` in the given namespace and REBUILD the FAISS index.
+    `embedder`: callable(List[str]) -> np.ndarray[float32] (same one used on ingest).
+    """
+    idx_path, meta_path = _paths_mut(session_id)  # mutating path (mkdir allowed)
+    rows = _read_meta(meta_path)
+    if not rows:
+        return {"ok": True, "removed": 0, "remaining": 0}
+
+    keep: List[dict] = []
+    removed = 0
+    for j in rows:
+        if str(j.get("source") or "").strip() == source:
+            removed += 1
+        else:
+            keep.append(j)
+
+    if removed == 0:
+        return {"ok": True, "removed": 0, "remaining": len(keep)}
+
+    # Reassign contiguous row ids for the kept entries
+    for i, j in enumerate(keep):
+        j["row"] = i
+
+    if len(keep) == 0:
+        # No rows left: drop index; empty meta file
+        if idx_path.exists():
+            try:
+                idx_path.unlink()
+            except:
+                pass
+        _write_meta(meta_path, [])
+        return {"ok": True, "removed": removed, "remaining": 0}
+
+    # Re-embed kept texts in batches
+    texts = [str(j.get("text") or "") for j in keep]
+    B = 128  # batch size
+    parts: List[np.ndarray] = []
+    for i in range(0, len(texts), B):
+        vec = embedder(texts[i:i + B])
+        if not isinstance(vec, np.ndarray):
+            vec = np.asarray(vec, dtype="float32")
+        parts.append(vec.astype("float32"))
+    embeds = np.vstack(parts)
+    embeds = _norm(embeds)
+
+    dim = int(embeds.shape[-1])
+    new_index = faiss.IndexFlatIP(dim)
+    new_index.add(embeds)
+
+    # Save rebuilt index + meta
+    faiss.write_index(new_index, str(idx_path))
+    _write_meta(meta_path, keep)
+
+    return {"ok": True, "removed": removed, "remaining": len(keep)}
+
 # ===== aimodel/file_read/rag/worker.py =====
 
 
@@ -2722,6 +2915,27 @@ def list_local_models() -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x["sizeBytes"], reverse=True)
     return out
 
+# ===== aimodel/file_read/services/attachments.py =====
+
+from __future__ import annotations
+from typing import Any, Iterable, Optional, List
+
+
+def att_get(att: Any, key: str, default=None):
+    """Safe accessor for dicts OR Pydantic models."""
+    try:
+        return att.get(key, default)          # dict-like
+    except AttributeError:
+        return getattr(att, key, default)     # model-like
+
+
+def join_attachment_names(attachments: Optional[Iterable[Any]]) -> str:
+    if not attachments:
+        return ""
+    names: List[str] = [att_get(a, "name") for a in attachments]  # type: ignore[list-item]
+    names = [n for n in names if n]
+    return ", ".join(names)
+
 # ===== aimodel/file_read/services/cancel.py =====
 
 from __future__ import annotations
@@ -2730,198 +2944,4 @@ from threading import Event
 from typing import Dict
 from ..core.settings import SETTINGS
 
-eff = SETTINGS.effective()
-GEN_SEMAPHORE = asyncio.Semaphore(int(eff["gen_semaphore_permits"]))
-_ACTIVE: Dict[str, int] = {}
-_CANCELS: Dict[str, Event] = {}
-
-def is_active(session_id: str) -> bool:
-    return bool(_ACTIVE.get(session_id))
-
-def mark_active(session_id: str, delta: int):
-    _ACTIVE[session_id] = max(0, int(_ACTIVE.get(session_id, 0)) + delta)
-    if _ACTIVE[session_id] == 0:
-        _ACTIVE.pop(session_id, None)
-
-def cancel_event(session_id: str) -> Event:
-    ev = _CANCELS.get(session_id)
-    if ev is None:
-        ev = Event()
-        _CANCELS[session_id] = ev
-    return ev
-
-# ===== aimodel/file_read/services/context_window.py =====
-
-from __future__ import annotations
-from typing import List, Dict, Optional, Tuple
-from ..utils.streaming import safe_token_count_messages
-from ..runtime.model_runtime import current_model_info
-from ..core.settings import SETTINGS
-
-def estimate_tokens(llm, messages: List[Dict[str,str]]) -> Optional[int]:
-    try:
-        return safe_token_count_messages(llm, messages)
-    except Exception:
-        return None
-
-def current_n_ctx() -> int:
-    eff = SETTINGS.effective()
-    try:
-        info = current_model_info() or {}
-        cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
-        return int(cfg.get("nCtx") or eff["nctx_fallback"])
-    except Exception:
-        return int(eff["nctx_fallback"])
-
-def clamp_out_budget(
-    *, llm, messages: List[Dict[str,str]], requested_out: int, margin: int = 32
-) -> Tuple[int, int]:
-    eff = SETTINGS.effective()
-    inp_est = estimate_tokens(llm, messages)
-    try:
-        prompt_est = inp_est if inp_est is not None else safe_token_count_messages(llm, messages)
-    except Exception:
-        prompt_est = int(eff["token_estimate_fallback"])
-    n_ctx = current_n_ctx()
-    available = max(int(eff["min_out_tokens"]), n_ctx - prompt_est - margin)
-    safe_out = max(int(eff["min_out_tokens"]), min(requested_out, available))
-    return safe_out, (inp_est if inp_est is not None else None)
-
-# ===== aimodel/file_read/services/generate_flow.py =====
-
-# aimodel/file_read/services/generate_flow.py
-from __future__ import annotations
-import asyncio, time, json
-from typing import AsyncGenerator, Dict, List, Optional
-from fastapi.responses import StreamingResponse
-from datetime import datetime
-from dataclasses import asdict
-
-from ..core.settings import SETTINGS
-from ..runtime.model_runtime import ensure_ready, get_llm
-from ..core.schemas import ChatBody
-
-from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
-from .session_io import handle_incoming, persist_summary
-from .packing import build_system_text, pack_with_rollup, maybe_inject_rag_block
-from .context_window import clamp_out_budget
-
-from ..web.router_ai import decide_web_and_fetch
-from ..rag.router_ai import decide_rag  # <-- NEW: LLM JSON router for RAG
-from ..utils.streaming import RUNJSON_START, RUNJSON_END
-
-from .streaming_worker import run_stream as _run_stream
-from typing import AsyncIterator
-run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream  # type: ignore[assignment]
-
-
-def _now() -> str:
-    return datetime.now().isoformat(timespec="milliseconds")
-
-
-def _chars_len(msgs: List[object]) -> int:
-    total = 0
-    for m in msgs:
-        if isinstance(m, dict):
-            c = m.get("content")
-        else:
-            c = m
-        if isinstance(c, str):
-            total += len(c)
-        elif c is None:
-            continue
-        else:
-            try:
-                total += len(json.dumps(c, ensure_ascii=False))
-            except Exception:
-                pass
-    return total
-
-
-def _dump_full_prompt(messages: List[Dict[str, object]], *, params: Dict[str, object], session_id: str) -> None:
-    try:
-        print(f"[{_now()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
-        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
-        print(f"[{_now()}] PROMPT DUMP END   session={session_id}")
-    except Exception as e:
-        print(f"[{_now()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
-
-
-def _compose_router_text(
-    recent,
-    latest_user_text: str,
-    summary: str,
-    *,
-    tail_turns: Optional[int] = None,
-    summary_chars: Optional[int] = None,
-    max_chars: Optional[int] = None,
-) -> str:
-    eff = SETTINGS.effective()
-    tt = int(eff["router_tail_turns"]) if tail_turns is None else int(tail_turns)
-    sc = int(eff["router_summary_chars"]) if summary_chars is None else int(summary_chars)
-    mc = int(eff["router_max_chars"]) if max_chars is None else int(max_chars)
-    context_label = eff["router_context_label"]
-    summary_label = eff["router_summary_label"]
-
-    parts: List[str] = []
-    if latest_user_text:
-        parts.append((latest_user_text or "").strip())
-
-    try:
-        recent_list = list(recent)
-    except Exception:
-        recent_list = []
-
-    tail_src = recent_list[-tt:] if tt > 0 else []
-    tail_lines: List[str] = []
-    for m in reversed(tail_src):
-        if not isinstance(m, dict):
-            continue
-        c = (m.get("content") or "").strip()
-        if not c:
-            continue
-        role = (m.get("role") or "user").strip()
-        tail_lines.append(f"{role}: {c}")
-
-    if tail_lines:
-        parts.append(context_label + "\n" + "\n".join(tail_lines))
-
-    if summary:
-        s = summary.strip()
-        if sc > 0 and len(s) > sc:
-            s = s[-sc:]
-        parts.append(summary_label + "\n" + s)
-
-    out = "\n\n".join(parts).strip()
-    if len(out) > mc:
-        out = out[:mc].rstrip()
-    return out
-
-
-async def generate_stream_flow(data: ChatBody, request) -> StreamingResponse:
-    ensure_ready()
-    llm = get_llm()
-
-    eff0 = SETTINGS.effective()
-    session_id = data.sessionId or eff0["default_session_id"]
-    eff = SETTINGS.effective(session_id=session_id)
-
-    if not data.messages:
-        return StreamingResponse(iter([eff["empty_messages_response"].encode("utf-8")]), media_type="text/plain")
-
-    temperature = data.temperature if getattr(data, "temperature", None) is not None else float(eff["default_temperature"])
-    top_p = data.top_p if getattr(data, "top_p", None) is not None else float(eff["default_top_p"])
-    out_budget_req = int(data.max_tokens) if getattr(data, "max_tokens", None) is not None else int(eff["default_max_tokens"])
-
-    auto_web = data.autoWeb if getattr(data, "autoWeb", None) is not None else bool(eff["default_auto_web"])
-    web_k = int(data.webK) if getattr(data, "webK", None) is not None else int(eff["default_web_k"])
-    web_k = max(int(eff["web_k_min"]), min(web_k, int(eff["web_k_max"])))
-
-    model_ctx = int(eff["model_ctx"])
-
-    incoming = [{"role": m.role, "content": m.content} for m in data.messages]
-    print(f"[{_now()}] GEN request START session={session_id} msgs_in={len(incoming)}")
-
-    st = handle_incoming(session_id, incoming)
-
-    latest_user_text = next((m["co
+eff = SETTINGS.effective
