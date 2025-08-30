@@ -62,16 +62,58 @@ export function useChatsPager(pageSize = 10, refreshKey?: number) {
     await loadFirst();
   }
 
-  // external refreshes
-  useEffect(() => { void refreshFirst(); /* eslint-disable-next-line */ }, [refreshKey]);
+  // Only react to refreshKey after mount.
+  const didMountRef = useRef(false);
   useEffect(() => {
-    const onRefresh = () => void refreshFirst();
-    window.addEventListener("chats:refresh", onRefresh);
-    return () => window.removeEventListener("chats:refresh", onRefresh);
+    if (!didMountRef.current) { didMountRef.current = true; return; }
+    if (typeof refreshKey !== "undefined") void refreshFirst();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [refreshKey]);
 
-  // infinite scroll
+  // Surgical sidebar updates + inject if missing.
+useEffect(() => {
+const handler = (evt: Event) => {
+  const detail = (evt as CustomEvent<any>).detail;
+  if (!detail?.sessionId) return;
+
+  const sid = String(detail.sessionId);
+  setChats(prev => {
+    const ix = prev.findIndex(c => c.sessionId === sid);
+    const shouldMoveToTop = typeof detail.lastMessage === "string";
+
+    if (ix === -1) {
+      // Inject only for new activity; skip for title-only patches
+      if (!shouldMoveToTop) return prev;
+      const injected: ChatRow = {
+        sessionId: sid,
+        id: -1, // placeholder if needed by your UI
+        title: detail.title ?? "New Chat",
+        lastMessage: detail.lastMessage ?? "",
+        createdAt: new Date().toISOString(),
+        updatedAt: detail.updatedAt ?? new Date().toISOString(),
+      };
+      return [injected, ...prev];
+    }
+
+    const cur = prev[ix];
+    const patched: ChatRow = {
+      ...cur,
+      lastMessage: detail.lastMessage ?? cur.lastMessage,
+      title: detail.title ?? cur.title,
+      updatedAt: detail.updatedAt ?? cur.updatedAt,
+    };
+
+    const rest = prev.filter((_, i) => i !== ix);
+    return shouldMoveToTop ? [patched, ...rest] : [...prev.slice(0, ix), patched, ...prev.slice(ix + 1)];
+  });
+};
+
+  window.addEventListener("chats:refresh", handler as EventListener);
+  return () => window.removeEventListener("chats:refresh", handler as EventListener);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+  // Infinite scroll
   useEffect(() => {
     const rootEl = scrollRef.current, sentinel = sentinelRef.current;
     if (!rootEl || !sentinel) return;
@@ -89,12 +131,9 @@ export function useChatsPager(pageSize = 10, refreshKey?: number) {
   }, [chats.length, page, hasMore, ceiling]);
 
   return {
-    // state
     chats, page, hasMore, total, totalPages,
     initialLoading, loadingMore,
-    // refs
     scrollRef, sentinelRef,
-    // actions
     loadMore, refreshFirst, setChats,
   };
 }

@@ -11,6 +11,7 @@ import {
 } from "./runner_metrics";
 import { persistAssistantTurn } from "./runner_persist";
 import type { QueueItem } from "./queue";
+import { listChatsPage } from "../../data/chatApi";
 
 export type RunnerDeps = {
   opts: {
@@ -25,7 +26,6 @@ export type RunnerDeps = {
     setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
     setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
     onRetitle: (sid: string, finalText: string) => Promise<void>;
-    /** patch serverId by clientId */
     setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
   };
   getCancelForSid: () => string | null;
@@ -42,14 +42,12 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
   opts.resetMetricsFor(sid);
   opts.setLoadingFor(sid, true);
 
-  // Ensure assistant placeholder exists even for attachments-only turns
   ensureAssistantPlaceholder(
     { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
     sid,
     asstId
   );
 
-  // Build short history and PRESERVE attachments for prior messages
   const MAX_HISTORY = 10;
   const history = opts
     .getMessagesFor(sid)
@@ -59,36 +57,23 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
       content: m.text || "",
       attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
     }))
-    // keep entries that have text OR attachments (so attachments-only past turns aren't dropped)
     .filter(
       (m) =>
         (m.content && m.content.trim().length > 0) ||
         (m.attachments && m.attachments.length > 0)
     );
 
-  // Current user turn (may be text, attachments, or both)
   const userTurn = {
     role: "user" as const,
     content: prompt,
     attachments: attachments && attachments.length ? attachments : undefined,
   };
 
-  // 🔎 helpful debug
-  console.log("[runner] postStream payload", {
-    sid,
-    historyCount: history.length,
-    lastHistHasAtts:
-      history.length > 0 && !!history[history.length - 1]?.attachments?.length,
-    promptLen: (prompt || "").length,
-    hasAttachments: !!(attachments && attachments.length),
-  });
-
   const controller = new AbortController();
   d.setController(controller);
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
   try {
-    // Send to backend; IMPORTANT: do not strip attachments in network.ts
     reader = await postStream(
       { sessionId: sid, messages: [...history, userTurn] },
       controller.signal
@@ -98,7 +83,6 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
     const { finalText, gotMetrics, lastRunJson } = await readStreamLoop(reader, {
       wasCanceled,
       onDelta: (delta) => {
-        // append assistant delta inline
         opts.setMessagesFor(sid, (prev) => {
           const idx = prev.findIndex((m) => m.id === asstId);
           if (idx === -1) return prev;
@@ -129,12 +113,42 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
       if (newServerId != null) {
         opts.setServerIdFor(sid, asstId, newServerId);
       }
+
+      try { await opts.onRetitle(sid, finalText); } catch {}
       try {
-        await opts.onRetitle(sid, finalText);
+        window.dispatchEvent(
+          new CustomEvent("chats:refresh", {
+            detail: {
+              sessionId: sid,
+              lastMessage: finalText,
+              updatedAt: new Date().toISOString(),
+            },
+          })
+        );
       } catch {}
-      try {
-        window.dispatchEvent(new CustomEvent("chats:refresh"));
-      } catch {}
+
+      const pokeForTitle = (delayMs: number) => {
+        window.setTimeout(async () => {
+          try {
+            const ceil = new Date().toISOString();
+            const page = await listChatsPage(0, 30, ceil);
+            const row = page.content.find((r: any) => r.sessionId === sid);
+            if (row?.title) {
+              window.dispatchEvent(
+                new CustomEvent("chats:refresh", {
+                  detail: {
+                    sessionId: sid,
+                    title: row.title,
+                    updatedAt: row.updatedAt,
+                  },
+                })
+              );
+            }
+          } catch {}
+        }, delayMs);
+      };
+      pokeForTitle(1000);
+      pokeForTitle(3000);
     }
   } catch (e: any) {
     const localAbort =
@@ -143,6 +157,7 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
 
     const last = snapshotPendingAssistant(opts.getMessagesFor(sid));
     opts.setMetricsFallbackFor(sid, reason, last);
+    pinFallbackToSessionAndBubble(opts, sid, asstId, reason, last);
 
     opts.setMessagesFor(sid, (prev) => {
       const end = prev[prev.length - 1];

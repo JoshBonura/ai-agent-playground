@@ -136,8 +136,6 @@ async def run_stream(
             item = await q.get()
             if item is SENTINEL:
                 break
-            if stop_ev.is_set():
-                break
             yield (item if isinstance(item, bytes) else item.encode("utf-8"))
         if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
             yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")

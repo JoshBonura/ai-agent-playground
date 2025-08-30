@@ -1,12 +1,13 @@
-import { useMemo, useRef, useState } from "react";
+// frontend/src/file_read/components/MetricsHoverCard.tsx
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Info, Copy, Check, X } from "lucide-react";
 
 type Props = {
-  data: unknown;                 // anything JSON-serializable
-  title?: string;                // optional header
-  align?: "left" | "right";      // popover alignment
-  maxWidthPx?: number;           // width of the panel
-  compact?: boolean;             // shrink button & paddings
+  data: unknown;
+  title?: string;
+  align?: "left" | "right";
+  maxWidthPx?: number;
+  compact?: boolean;
 };
 
 export default function MetricsHoverCard({
@@ -18,7 +19,15 @@ export default function MetricsHoverCard({
 }: Props) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+
   const btnRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const [panelStyle, setPanelStyle] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
 
   const json = useMemo(() => {
     try {
@@ -32,17 +41,83 @@ export default function MetricsHoverCard({
     try {
       await navigator.clipboard.writeText(json);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      window.setTimeout(() => setCopied(false), 1500);
     } catch {}
   }
 
-  // accessibility: close on ESC
-  function onKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Escape") {
-      setOpen(false);
-      btnRef.current?.focus();
-    }
+  function close() {
+    setOpen(false);
   }
+
+  // Close on ESC
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+        btnRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (btnRef.current?.contains(t)) return;
+      close();
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Compute clamped viewport position when opening, and on resize/scroll
+  useLayoutEffect(() => {
+    function place() {
+      if (!open || !btnRef.current) return;
+
+      const margin = 8;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const width = Math.min(maxWidthPx, vw - margin * 2);
+
+      const btnBox = btnRef.current.getBoundingClientRect();
+      let left =
+        align === "right" ? btnBox.right - width : btnBox.left;
+      left = Math.max(margin, Math.min(left, vw - margin - width));
+
+      // Provisional top below the button; flip above if it would overflow
+      let top = btnBox.bottom + margin;
+
+      // We may not know the panel height yet; try to use current, else a max
+      let panelH = panelRef.current?.offsetHeight || 0;
+      if (!panelH) {
+        panelH = 360 + 44; // body max (360) + header (~44) best-effort
+      }
+
+      if (top + panelH > vh - margin) {
+        top = Math.max(margin, btnBox.top - margin - panelH);
+      }
+
+      setPanelStyle({ top, left, width });
+    }
+
+    place();
+    if (!open) return;
+
+    const onReflow = () => place();
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
+    return () => {
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open, align, maxWidthPx]);
 
   return (
     <div className="relative inline-block">
@@ -57,55 +132,52 @@ export default function MetricsHoverCard({
         aria-expanded={open ? "true" : "false"}
         onClick={() => setOpen((v) => !v)}
         onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
       >
         <Info className={compact ? "w-4 h-4" : "w-5 h-5"} />
       </button>
 
-      {/* Panel */}
-      <div
-        role="dialog"
-        aria-label={title}
-        onKeyDown={onKeyDown}
-        className={`absolute z-50 mt-2 ${align === "right" ? "right-0" : "left-0"}`}
-        style={{ width: Math.min(maxWidthPx, window.innerWidth - 40) }}
-        onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
-      >
+      {open && panelStyle && (
         <div
-          className={`rounded-xl border bg-white shadow-xl overflow-hidden transition
-          ${open ? "opacity-100 translate-y-0" : "pointer-events-none opacity-0 -translate-y-1"}`}
+          ref={panelRef}
+          role="dialog"
+          aria-label={title}
+          className="fixed z-50"
+          style={{
+            top: panelStyle.top,
+            left: panelStyle.left,
+            width: panelStyle.width,
+          }}
+          onMouseLeave={close}
         >
-          <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
-            <div className="text-xs font-semibold text-gray-700">{title}</div>
-            <div className="flex items-center gap-1">
-              <button
-                className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
-                onClick={copy}
-                title="Copy JSON"
-              >
-                {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-              </button>
-              <button
-                className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
-                onClick={() => setOpen(false)}
-                title="Close"
-              >
-                <X className="w-4 h-4" />
-              </button>
+          <div className="rounded-xl border bg-white shadow-xl overflow-hidden">
+            <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
+              <div className="text-xs font-semibold text-gray-700">{title}</div>
+              <div className="flex items-center gap-1">
+                <button
+                  className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+                  onClick={copy}
+                  title="Copy JSON"
+                >
+                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                </button>
+                <button
+                  className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+                  onClick={close}
+                  title="Close"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-3">
+              <pre className="m-0 p-0 text-xs leading-relaxed overflow-auto" style={{ maxHeight: 360 }}>
+                <code>{json}</code>
+              </pre>
             </div>
           </div>
-
-          <div className="p-3">
-            <pre
-              className="m-0 p-0 text-xs leading-relaxed overflow-auto"
-              style={{ maxHeight: 360 }}
-            >
-              <code>{json}</code>
-            </pre>
-          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

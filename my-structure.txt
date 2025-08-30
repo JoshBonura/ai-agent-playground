@@ -357,8 +357,10 @@ ai-agent-playground/
               meta.jsonl
             ea6e9007-53e1-4415-bfd4-20406a0e3977/
               meta.jsonl
+            ec8ee6ae-e511-4b0a-b225-9076aaaa7ef1/
+              index.faiss
+              meta.jsonl
           global/
-            index.faiss
             meta.jsonl
       utils/
         streaming.py

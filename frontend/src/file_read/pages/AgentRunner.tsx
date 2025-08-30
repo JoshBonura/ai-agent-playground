@@ -1,5 +1,4 @@
-// frontend/src/file_read/pages/AgentRunner.tsx
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import ChatContainer from "../components/ChatContainer";
 import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
 import { useChatStream } from "../hooks/useChatStream";
@@ -8,13 +7,12 @@ import { useToast } from "../hooks/useToast";
 import DesktopHeader from "../components/DesktopHeader";
 import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
-import { createChat, listChatsPage, deleteMessagesBatch } from "../hooks/data/chatApi";
+import { createChat, deleteMessagesBatch } from "../hooks/data/chatApi";
 
 // NEW: settings panel
 import SettingsPanel from "../components/SettingsPanel";
 import KnowledgePanel from "../components/KnowledgePanel";
 
-const PAGE_SIZE = 30;
 const LS_KEY = "lastSessionId";
 
 export default function AgentRunner() {
@@ -28,24 +26,7 @@ export default function AgentRunner() {
   // NEW: settings modal
   const [showSettings, setShowSettings] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const ceil = new Date().toISOString();
-        const page = await listChatsPage(0, PAGE_SIZE, ceil);
-        const saved = localStorage.getItem(LS_KEY) || "";
-        const targetId =
-          (saved && page.content.find((c) => c.sessionId === saved)?.sessionId) ||
-          page.content[0]?.sessionId ||
-          "";
-        if (targetId) {
-          await chat.loadHistory(targetId);
-          localStorage.setItem(LS_KEY, targetId);
-        }
-      } catch {}
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // ⛔ Removed the mount-time bootstrap that fetched chats and loaded history.
 
   async function newChat(): Promise<void> {
     const id = crypto.randomUUID();
@@ -166,18 +147,6 @@ export default function AgentRunner() {
           onShowSidebar={() => setSidebarOpen(true)}
         />
 
-        {/* NEW: small settings trigger row above the chat */}
-        <div className="px-3 md:px-6 pt-2">
-          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end">
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowSettings(true)}
-              title="Open Settings"
-            >
-              Settings
-            </button>
-          </div>
-        </div>
         <div className="px-3 md:px-6 pt-2">
           <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
             <button
@@ -212,10 +181,10 @@ export default function AgentRunner() {
                   stop={chat.stop}
                   runMetrics={chat.runMetrics}
                   runJson={chat.runJson}
-                  onRefreshChats={() => setRefreshKey((k) => k + 1)}
+                  onRefreshChats={() => {}}
                   onDeleteMessages={handleDeleteMessages}
                   autoFollow={autoFollow}
-                  sessionId={chat.sessionIdRef.current} // ⬅️ this enables per-chat uploads
+                  sessionId={chat.sessionIdRef.current} // enables per-chat uploads
                 />
               </div>
               <Toast message={toast} />

@@ -1,4 +1,5 @@
 import { postCancel } from "./network";
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
 
 type Deps = {
   getVisibleSid: () => string;
@@ -13,20 +14,31 @@ type Deps = {
 
 export function createCanceller(d: Deps) {
   async function cancelBySessionId(id: string) {
+    // Mark as canceled so read loop can react, but DO NOT abort fetch yet.
     d.setCancelForSid(id);
 
+    // Tell the backend to stop gracefully (flush metrics + close).
+    postCancel(id).catch(() => {});
+
     if (d.isActiveSid(id)) {
-      try { d.getController()?.abort(); } catch {}
-      try { d.getReader()?.cancel(); } catch {}
-      d.setLoadingFor(id, false);
+      // Drop any queued jobs for this session, but keep loading true —
+      // runStreamOnce will turn loading off in its finally after the stream ends.
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+
+      // Safety net: if server doesn’t flush within timeout, hard-abort.
+      window.setTimeout(() => {
+        if (d.isActiveSid(id)) {
+          try { d.getReader()?.cancel(); } catch {}
+          try { d.getController()?.abort(); } catch {}
+        }
+      }, STOP_FLUSH_TIMEOUT_MS + 500);
     } else {
+      // Not active: just clear queued jobs and cancel flag.
       d.dropJobsForSid(id);
       d.setQueuedFor(id, false);
       d.setCancelForSid(null);
     }
-
-    // fire-and-forget server stop
-    postCancel(id).catch(() => {});
   }
 
   async function stopVisible() {

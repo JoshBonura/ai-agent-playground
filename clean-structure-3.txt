@@ -1,6 +1,4 @@
-={_host(h.url)} title={(h.title or '')[:80]!r}")
-
-    # --- FETCH ROUND 1 (static) ---
+ --- FETCH ROUND 1 (static) ---
     urls = [h.url for h in top_hits]
     meta = [(h.title or h.url, h.url) for h in top_hits]
     print(f"[orchestrator] FETCH[1] start urls={[ _host(u) for u in urls ]}")
@@ -878,7 +876,7 @@ export default function ChatBubble({
 import { useEffect, useRef, useState } from "react";
 import { SendHorizonal, Square, Paperclip, X, Check } from "lucide-react";
 import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
-import { API_BASE } from "../services/http"; // ⬅️ NEW
+
 import type { Attachment } from "../types/chat";
 
 const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
@@ -975,18 +973,6 @@ const handleSendClick = async () => {
   if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
 
   forceScroll("auto");
-
-  if (sessionId) {
-    const API = (API_BASE || "").replace(/\/$/, "");
-    const body = JSON.stringify({ role: "user", content: v, attachments: attachmentsForPost() });
-    try {
-      await fetch(`${API}/api/chats/${sessionId}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-    } catch {}
-  }
 
   setDraft("");
   setInput("");
@@ -2248,24 +2234,18 @@ export default function MetricsHoverCard({
 
 # ===== frontend/src/file_read/components/MobileDrawer.tsx =====
 
+import { useState } from "react";
 import { PanelLeftOpen } from "lucide-react";
 import ChatSidebar from "./ChatSidebar/ChatSidebar";
 
-export default function MobileDrawer({
-  onOpenSession,
-  onNewChat,
-  refreshKey,
-  activeId,
-  openMobileDrawer,
-  closeMobileDrawer,
-}: {
-  onOpenSession: (id: string) => Promise<void>;
-  onNewChat: () => Promise<void>;
-  refreshKey: number;
-  activeId?: string;
-  openMobileDrawer: () => void;
-  closeMobileDrawer: () => void;
-}) {
+export default function MobileDrawer({ ...props }) {
+  const {
+    onOpenSession, onNewChat, refreshKey, activeId,
+    openMobileDrawer, closeMobileDrawer,
+  } = props;
+
+  const [mounted, setMounted] = useState(false);
+
   return (
     <>
       {/* Mobile top bar */}
@@ -2273,7 +2253,7 @@ export default function MobileDrawer({
         <div className="h-14 flex items-center justify-between px-3">
           <button
             className="inline-flex items-center justify-center h-9 w-9 rounded-lg border hover:bg-gray-50"
-            onClick={openMobileDrawer}
+            onClick={() => { setMounted(true); openMobileDrawer(); }}  // ⬅️ mount on open
             aria-label="Open sidebar"
             title="Open sidebar"
           >
@@ -2288,7 +2268,7 @@ export default function MobileDrawer({
       <div
         id="mobile-backdrop"
         className="md:hidden fixed inset-0 z-40 bg-black/40 hidden"
-        onClick={closeMobileDrawer}
+        onClick={() => { setMounted(false); closeMobileDrawer(); }}  // ⬅️ unmount on close
       />
 
       {/* Drawer */}
@@ -2302,19 +2282,21 @@ export default function MobileDrawer({
           <div className="font-medium">Chats</div>
           <button
             className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
-            onClick={closeMobileDrawer}
+            onClick={() => { setMounted(false); closeMobileDrawer(); }}  // ⬅️ unmount on close
             aria-label="Close sidebar"
           >
             <span className="rotate-45 text-xl leading-none">+</span>
           </button>
         </div>
 
-        <ChatSidebar
-          onOpen={async (id) => { await onOpenSession(id); closeMobileDrawer(); }}
-          onNew={async () => { await onNewChat(); closeMobileDrawer(); }}
-          refreshKey={refreshKey}
-          activeId={activeId}
-        />
+        {mounted && (                                             // ⬅️ only mount when open
+          <ChatSidebar
+            onOpen={async (id) => { await onOpenSession(id); setMounted(false); closeMobileDrawer(); }}
+            onNew={async () => { await onNewChat(); setMounted(false); closeMobileDrawer(); }}
+            refreshKey={refreshKey}
+            activeId={activeId}
+          />
+        )}
       </aside>
 
       <style>{`@keyframes slideIn{from{transform:translateX(-12px);opacity:.0}to{transform:translateX(0);opacity:1}}`}</style>
@@ -2618,38 +2600,6 @@ export function recomputeAdaptive(sessionId?: string) {
   );
 }
 
-# ===== frontend/src/file_read/hooks/data/aiApi.ts =====
-
-import { API_BASE } from "../../services/http";
-
-export function streamGenerate(
-  payload: unknown,
-  abortSignal: AbortSignal,
-): ReadableStream<Uint8Array> | null {
-  // Note: fetch streaming body works in modern browsers + Vite dev server
-  let stream: ReadableStream<Uint8Array> | null = null;
-
-  // We purposefully do NOT await; the caller will read res.body
-  fetch(`${API_BASE}/api/ai/generate/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: abortSignal,
-  }).then(res => {
-    if (res.ok) stream = res.body ?? null;
-  }).catch(() => { /* surface in hook if needed */ });
-
-  // The caller will poll for stream being set in the next tick
-  // (or just call fetch directly if they prefer).
-  return stream;
-}
-
-export async function cancelSession(sessionId: string): Promise<void> {
-  try {
-    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, { method: "POST" });
-  } catch { /* best-effort */ }
-}
-
 # ===== frontend/src/file_read/hooks/data/chatApi.ts =====
 
 import type { Attachment, ChatRow, ChatMessageRow} from "../../types/chat";
@@ -2773,6 +2723,7 @@ export function processChunk(prevClean: string, rawBufIn: string): BufferStep {
 # ===== frontend/src/file_read/hooks/stream/core/cancel.ts =====
 
 import { postCancel } from "./network";
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
 
 type Deps = {
   getVisibleSid: () => string;
@@ -2787,20 +2738,31 @@ type Deps = {
 
 export function createCanceller(d: Deps) {
   async function cancelBySessionId(id: string) {
+    // Mark as canceled so read loop can react, but DO NOT abort fetch yet.
     d.setCancelForSid(id);
 
+    // Tell the backend to stop gracefully (flush metrics + close).
+    postCancel(id).catch(() => {});
+
     if (d.isActiveSid(id)) {
-      try { d.getController()?.abort(); } catch {}
-      try { d.getReader()?.cancel(); } catch {}
-      d.setLoadingFor(id, false);
+      // Drop any queued jobs for this session, but keep loading true —
+      // runStreamOnce will turn loading off in its finally after the stream ends.
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+
+      // Safety net: if server doesn’t flush within timeout, hard-abort.
+      window.setTimeout(() => {
+        if (d.isActiveSid(id)) {
+          try { d.getReader()?.cancel(); } catch {}
+          try { d.getController()?.abort(); } catch {}
+        }
+      }, STOP_FLUSH_TIMEOUT_MS + 500);
     } else {
+      // Not active: just clear queued jobs and cancel flag.
       d.dropJobsForSid(id);
       d.setQueuedFor(id, false);
       d.setCancelForSid(null);
     }
-
-    // fire-and-forget server stop
-    postCancel(id).catch(() => {});
   }
 
   async function stopVisible() {
@@ -2877,7 +2839,17 @@ export function createStreamController(opts: StreamCoreOpts): StreamController {
       .then((row) => {
         if (row?.id != null) {
           opts.setServerIdFor(sid, userCid, Number(row.id));
-          try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+          try {
+            window.dispatchEvent(
+              new CustomEvent("chats:refresh", {
+                detail: {
+                  sessionId: sid,
+                  lastMessage: prompt,
+                  updatedAt: new Date().toISOString(),
+                },
+              })
+            );
+          } catch {}
         }
       })
       .catch(() => {});
@@ -2942,4 +2914,23 @@ export function createScheduler(runJob: RunJob) {
   const q: QueueItem[] = [];
   let active: { sid: string } | null = null;
 
-  
+  async function startNext() {
+    if (active || q.length === 0) return;
+    const job = q.shift()!;
+    active = { sid: job.sid };
+    try {
+      await runJob(job);
+    } finally {
+      active = null;
+      if (q.length) void startNext();
+    }
+  }
+
+  return {
+    enqueue(job: QueueItem) {
+      q.push(job);
+      void startNext();
+    },
+    isActiveSid: (sid: string) => active?.sid === sid,
+    dropJobsForSid(sid: string) {
+      for (let i = q.length - 1; i >=

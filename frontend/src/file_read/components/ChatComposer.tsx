@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { SendHorizonal, Square, Paperclip, X, Check } from "lucide-react";
 import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
-import { API_BASE } from "../services/http"; // ⬅️ NEW
+
 import type { Attachment } from "../types/chat";
 
 const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
@@ -99,18 +99,6 @@ const handleSendClick = async () => {
   if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
 
   forceScroll("auto");
-
-  if (sessionId) {
-    const API = (API_BASE || "").replace(/\/$/, "");
-    const body = JSON.stringify({ role: "user", content: v, attachments: attachmentsForPost() });
-    try {
-      await fetch(`${API}/api/chats/${sessionId}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-    } catch {}
-  }
 
   setDraft("");
   setInput("");

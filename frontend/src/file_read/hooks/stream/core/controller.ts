@@ -56,7 +56,17 @@ export function createStreamController(opts: StreamCoreOpts): StreamController {
       .then((row) => {
         if (row?.id != null) {
           opts.setServerIdFor(sid, userCid, Number(row.id));
-          try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+          try {
+            window.dispatchEvent(
+              new CustomEvent("chats:refresh", {
+                detail: {
+                  sessionId: sid,
+                  lastMessage: prompt,
+                  updatedAt: new Date().toISOString(),
+                },
+              })
+            );
+          } catch {}
         }
       })
       .catch(() => {});

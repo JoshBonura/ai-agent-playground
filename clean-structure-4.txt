@@ -1,23 +1,4 @@
-async function startNext() {
-    if (active || q.length === 0) return;
-    const job = q.shift()!;
-    active = { sid: job.sid };
-    try {
-      await runJob(job);
-    } finally {
-      active = null;
-      if (q.length) void startNext();
-    }
-  }
-
-  return {
-    enqueue(job: QueueItem) {
-      q.push(job);
-      void startNext();
-    },
-    isActiveSid: (sid: string) => active?.sid === sid,
-    dropJobsForSid(sid: string) {
-      for (let i = q.length - 1; i >= 0; i--) {
+ 0; i--) {
         if (q[i].sid === sid) q.splice(i, 1);
       }
     },
@@ -162,7 +143,16 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
         await opts.onRetitle(sid, finalText);
       } catch {}
       try {
-        window.dispatchEvent(new CustomEvent("chats:refresh"));
+       window.dispatchEvent(
+          new CustomEvent("chats:refresh", {
+            detail: {
+              sessionId: sid,
+              lastMessage: finalText,
+              // title: <if you retitle>,   // keep if/when you re-enable title bot
+              updatedAt: new Date().toISOString(),
+            },
+          })
+        );
       } catch {}
     }
   } catch (e: any) {
@@ -172,6 +162,7 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
 
     const last = snapshotPendingAssistant(opts.getMessagesFor(sid));
     opts.setMetricsFallbackFor(sid, reason, last);
+    pinFallbackToSessionAndBubble(opts, sid, asstId, reason, last);
 
     opts.setMessagesFor(sid, (prev) => {
       const end = prev[prev.length - 1];
@@ -333,16 +324,22 @@ export async function readStreamLoop(
       }
     }
 
-    if (d.wasCanceled()) break;
-
-    if (d.wasCanceled() && stopTimeout == null) {
+    // If user canceled, schedule a final flush check, but DO NOT break early
+    if (d.wasCanceled() && stopTimeout === null) {
       stopTimeout = window.setTimeout(() => {
         if (!gotMetrics) d.onCancelTimeout(cleanSoFar);
       }, STOP_FLUSH_TIMEOUT_MS) as unknown as number;
     }
   }
 
-  if (stopTimeout != null) clearTimeout(stopTimeout);
+  if (stopTimeout !== null) {
+    // If we scheduled a timeout but finished before it fired, synthesize now.
+    if (!gotMetrics && d.wasCanceled()) {
+      d.onCancelTimeout(cleanSoFar);
+    }
+    window.clearTimeout(stopTimeout);
+  }
+
   return { finalText: cleanSoFar, gotMetrics, lastRunJson };
 }
 
@@ -533,12 +530,42 @@ export function useChatsPager(pageSize = 10, refreshKey?: number) {
 
   // external refreshes
   useEffect(() => { void refreshFirst(); /* eslint-disable-next-line */ }, [refreshKey]);
-  useEffect(() => {
-    const onRefresh = () => void refreshFirst();
-    window.addEventListener("chats:refresh", onRefresh);
-    return () => window.removeEventListener("chats:refresh", onRefresh);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+useEffect(() => {
+  const handler = (evt: Event) => {
+    const detail = (evt as CustomEvent<any>).detail;
+
+    // Surgical path: update one row + move it to top
+    if (detail?.sessionId) {
+      const sid = String(detail.sessionId);
+      setChats(prev => {
+        const ix = prev.findIndex(c => c.sessionId === sid);
+        if (ix === -1) {
+          // Not on the current page; avoid a full reload to prevent flashing.
+          // (Server ordering will catch up on the next natural refresh.)
+          return prev;
+        }
+        const cur = prev[ix];
+        const patched = {
+          ...cur,
+          lastMessage: detail.lastMessage ?? cur.lastMessage,
+          title: detail.title ?? cur.title,
+          updatedAt: detail.updatedAt ?? new Date().toISOString(),
+        } as ChatRow;
+
+        const rest = prev.filter((_, i) => i !== ix);
+        return [patched, ...rest]; // move to top
+      });
+      return;
+    }
+
+    // Fallback: if no detail, do the old full refresh
+    void refreshFirst();
+  };
+
+  window.addEventListener("chats:refresh", handler as EventListener);
+  return () => window.removeEventListener("chats:refresh", handler as EventListener);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
 
   // infinite scroll
   useEffect(() => {
@@ -879,65 +906,6 @@ export function useRetitle(enabled = true) {
 
   return { retitleNow };
 }
-
-# ===== frontend/src/file_read/hooks/useRunMetrics.ts =====
-
-import { useState } from "react";
-import type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-export function useRunMetrics() {
-  const [runMetrics, setRunMetrics] = useState<GenMetrics | null>(null);
-  const [runJson, setRunJson] = useState<RunJson | null>(null);
-
-  function resetMetrics() {
-    setRunMetrics(null);
-    setRunJson(null);
-  }
-
-  function setFromParsed(json?: RunJson, flat?: GenMetrics) {
-    if (json) setRunJson(json);
-    if (flat) setRunMetrics(flat);
-  }
-
-  function synthesizeStop(reason: string, partialOut: string) {
-    const json: RunJson = {
-      stats: {
-        stopReason: reason,
-        tokensPerSecond: null,
-        timeToFirstTokenSec: null,
-        totalTimeSec: null,
-        promptTokensCount: null,
-        predictedTokensCount: partialOut ? partialOut.length : 0,
-        totalTokensCount: null,
-      },
-    };
-    const flat: GenMetrics = {
-      stop_reason: reason,
-      tok_per_sec: null,
-      ttft_ms: null,
-      output_tokens: null,
-      input_tokens_est: null,
-      total_tokens_est: null,
-    };
-    return { json, flat };
-  }
-
-  function setFallback(reason: string, partialOut: string) {
-    const { json, flat } = synthesizeStop(reason, partialOut);
-    setRunJson(prev => prev ?? json);
-    setRunMetrics(prev => prev ?? flat);
-  }
-
-  return {
-    runMetrics,
-    runJson,
-    resetMetrics,
-    setFromParsed,
-    setFallback,
-  };
-}
-
-export type { GenMetrics, RunJson } from "../shared/lib/runjson";
 
 # ===== frontend/src/file_read/hooks/useRunState.ts =====
 
@@ -1550,18 +1518,6 @@ export default function AgentRunner() {
           onShowSidebar={() => setSidebarOpen(true)}
         />
 
-        {/* NEW: small settings trigger row above the chat */}
-        <div className="px-3 md:px-6 pt-2">
-          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end">
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowSettings(true)}
-              title="Open Settings"
-            >
-              Settings
-            </button>
-          </div>
-        </div>
         <div className="px-3 md:px-6 pt-2">
           <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
             <button
@@ -1596,7 +1552,7 @@ export default function AgentRunner() {
                   stop={chat.stop}
                   runMetrics={chat.runMetrics}
                   runJson={chat.runJson}
-                  onRefreshChats={() => setRefreshKey((k) => k + 1)}
+                  onRefreshChats={() => {}}  
                   onDeleteMessages={handleDeleteMessages}
                   autoFollow={autoFollow}
                   sessionId={chat.sessionIdRef.current} // ⬅️ this enables per-chat uploads

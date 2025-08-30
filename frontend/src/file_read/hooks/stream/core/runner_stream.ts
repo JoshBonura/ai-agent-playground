@@ -39,15 +39,21 @@ export async function readStreamLoop(
       }
     }
 
-    if (d.wasCanceled()) break;
-
-    if (d.wasCanceled() && stopTimeout == null) {
+    // If user canceled, schedule a final flush check, but DO NOT break early
+    if (d.wasCanceled() && stopTimeout === null) {
       stopTimeout = window.setTimeout(() => {
         if (!gotMetrics) d.onCancelTimeout(cleanSoFar);
       }, STOP_FLUSH_TIMEOUT_MS) as unknown as number;
     }
   }
 
-  if (stopTimeout != null) clearTimeout(stopTimeout);
+  if (stopTimeout !== null) {
+    // If we scheduled a timeout but finished before it fired, synthesize now.
+    if (!gotMetrics && d.wasCanceled()) {
+      d.onCancelTimeout(cleanSoFar);
+    }
+    window.clearTimeout(stopTimeout);
+  }
+
   return { finalText: cleanSoFar, gotMetrics, lastRunJson };
 }

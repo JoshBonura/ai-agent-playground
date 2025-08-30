@@ -1,21 +1,15 @@
+import { useState } from "react";
 import { PanelLeftOpen } from "lucide-react";
 import ChatSidebar from "./ChatSidebar/ChatSidebar";
 
-export default function MobileDrawer({
-  onOpenSession,
-  onNewChat,
-  refreshKey,
-  activeId,
-  openMobileDrawer,
-  closeMobileDrawer,
-}: {
-  onOpenSession: (id: string) => Promise<void>;
-  onNewChat: () => Promise<void>;
-  refreshKey: number;
-  activeId?: string;
-  openMobileDrawer: () => void;
-  closeMobileDrawer: () => void;
-}) {
+export default function MobileDrawer({ ...props }) {
+  const {
+    onOpenSession, onNewChat, refreshKey, activeId,
+    openMobileDrawer, closeMobileDrawer,
+  } = props;
+
+  const [mounted, setMounted] = useState(false);
+
   return (
     <>
       {/* Mobile top bar */}
@@ -23,7 +17,7 @@ export default function MobileDrawer({
         <div className="h-14 flex items-center justify-between px-3">
           <button
             className="inline-flex items-center justify-center h-9 w-9 rounded-lg border hover:bg-gray-50"
-            onClick={openMobileDrawer}
+            onClick={() => { setMounted(true); openMobileDrawer(); }}  // ⬅️ mount on open
             aria-label="Open sidebar"
             title="Open sidebar"
           >
@@ -38,7 +32,7 @@ export default function MobileDrawer({
       <div
         id="mobile-backdrop"
         className="md:hidden fixed inset-0 z-40 bg-black/40 hidden"
-        onClick={closeMobileDrawer}
+        onClick={() => { setMounted(false); closeMobileDrawer(); }}  // ⬅️ unmount on close
       />
 
       {/* Drawer */}
@@ -52,19 +46,21 @@ export default function MobileDrawer({
           <div className="font-medium">Chats</div>
           <button
             className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
-            onClick={closeMobileDrawer}
+            onClick={() => { setMounted(false); closeMobileDrawer(); }}  // ⬅️ unmount on close
             aria-label="Close sidebar"
           >
             <span className="rotate-45 text-xl leading-none">+</span>
           </button>
         </div>
 
-        <ChatSidebar
-          onOpen={async (id) => { await onOpenSession(id); closeMobileDrawer(); }}
-          onNew={async () => { await onNewChat(); closeMobileDrawer(); }}
-          refreshKey={refreshKey}
-          activeId={activeId}
-        />
+        {mounted && (                                             // ⬅️ only mount when open
+          <ChatSidebar
+            onOpen={async (id) => { await onOpenSession(id); setMounted(false); closeMobileDrawer(); }}
+            onNew={async () => { await onNewChat(); setMounted(false); closeMobileDrawer(); }}
+            refreshKey={refreshKey}
+            activeId={activeId}
+          />
+        )}
       </aside>
 
       <style>{`@keyframes slideIn{from{transform:translateX(-12px);opacity:.0}to{transform:translateX(0);opacity:1}}`}</style>
