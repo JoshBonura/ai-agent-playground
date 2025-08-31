@@ -299,5 +299,21 @@
 "csv_quote_strings": true,
 "csv_header_normalize": true,
 "csv_infer_max_rows": 50,
-"csv_infer_max_cols": 26
+"csv_infer_max_cols": 26,
+  "doc_debug": false,
+  "docx_heading_max_level": 3,
+  "docx_use_markdown_headings": true,
+  "docx_preserve_bullets": true,
+  "docx_include_tables": true,
+  "docx_include_headers_footers": false,
+  "docx_para_max_chars": 0,
+  "docx_drop_empty_lines": true,
+  "doc_ole_min_run_chars": 8,
+  "doc_ole_max_line_chars": 600,
+  "doc_ole_min_alpha_ratio": 0.25,
+  "doc_ole_drop_xmlish": true,
+  "doc_ole_drop_pathish": true,
+  "doc_ole_drop_symbol_lines": true,
+  "doc_ole_dedupe_short_repeats": true
+
 }
