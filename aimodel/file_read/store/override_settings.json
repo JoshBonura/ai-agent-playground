@@ -170,7 +170,7 @@
     "web:",
     "search:"
   ],
-  "router_default_need_when_invalid": false,
+  "router_default_need_when_invalid": true,
   "router_json_extract_regex": "\\{.*?\\}",
   "__comment_router_wrappers": "=== Router wrapper stripping ===",
   "router_strip_wrappers_enabled": true,
@@ -236,7 +236,7 @@
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,

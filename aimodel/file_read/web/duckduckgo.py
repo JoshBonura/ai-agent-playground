@@ -1,22 +1,20 @@
 # aimodel/file_read/web/duckduckgo.py
 from __future__ import annotations
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import asyncio, time
 from urllib.parse import urlparse
 
-# Prefer new package; fallback for compatibility
 try:
     from ddgs import DDGS  # type: ignore
 except Exception:
     try:
         from duckduckgo_search import DDGS  # type: ignore
     except Exception:
-        DDGS = None  # no provider
+        DDGS = None  # type: ignore
 
 from ..core.settings import SETTINGS
 from .provider import SearchHit
 
-# -------- simple in-memory cache (superset caching) --------------------------
 _CACHE: dict[str, Tuple[float, List[SearchHit]]] = {}
 
 def _cache_key(query: str) -> str:
@@ -30,7 +28,7 @@ def _host(u: str) -> str:
         return ""
 
 def _cache_get(query: str) -> Optional[List[SearchHit]]:
-    eff = SETTINGS.effective()  # no fallbacks allowed
+    eff = SETTINGS.effective()
     ttl = int(eff["web_search_cache_ttl_sec"])
     key = _cache_key(query)
     v = _CACHE.get(key)
@@ -45,15 +43,12 @@ def _cache_get(query: str) -> Optional[List[SearchHit]]:
 def _cache_set(query: str, hits: List[SearchHit]) -> None:
     _CACHE[_cache_key(query)] = (time.time(), hits)
 
-# -------- DDGS (official client) --------------------------------------------
 def _ddg_sync_search(query: str, k: int, *, region: str, safesearch: str) -> List[SearchHit]:
     results: List[SearchHit] = []
     if DDGS is None:
-        print(f"[{time.strftime('%X')}] ddg: PROVIDER MISSING (DDGS=None)")
         return results
     with DDGS() as ddg:
-        for i, r in enumerate(ddg.text(query, max_results=max(1, k),
-                                       safesearch=safesearch, region=region)):
+        for i, r in enumerate(ddg.text(query, max_results=max(1, k), safesearch=safesearch, region=region)):
             title = (r.get("title") or "").strip()
             url = (r.get("href") or "").strip()
             snippet: Optional[str] = (r.get("body") or "").strip() or None
@@ -64,51 +59,61 @@ def _ddg_sync_search(query: str, k: int, *, region: str, safesearch: str) -> Lis
                 break
     return results
 
-# -------- public provider ----------------------------------------------------
 class DuckDuckGoProvider:
-    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
-        eff = SETTINGS.effective()  # strict read; raise if missing
+    async def search(self, query: str, k: int = 3, telemetry: Optional[Dict[str, Any]] = None) -> List[SearchHit]:
+        t_start = time.perf_counter()
+        eff = SETTINGS.effective()
         q_norm = (query or "").strip()
         if not q_norm:
+            if telemetry is not None:
+                telemetry.update({"query": q_norm, "k": int(k), "supersetK": int(k), "elapsedSec": round(time.perf_counter() - t_start, 6), "cache": {"hit": False}})
             return []
-
         superset_k = max(int(k), int(eff["web_search_cache_superset_k"]))
         region = str(eff["web_search_region"])
         safesearch = str(eff["web_search_safesearch"])
-        verbose = bool(eff["web_search_debug_logging"])
 
-        t0 = time.time()
-        if verbose:
-            print(f"[{time.strftime('%X')}] ddg: START q={q_norm!r} k={k}")
-
-        # cache
+        tel: Dict[str, Any] = {"query": q_norm, "k": int(k), "supersetK": superset_k, "region": region, "safesearch": safesearch}
+        t_cache = time.perf_counter()
         cached = _cache_get(q_norm)
+        tel["cache"] = {"hit": cached is not None, "elapsedSec": round(time.perf_counter() - t_cache, 6)}
         if cached is not None:
             out = cached[:k]
-            if verbose:
-                top_preview = [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]]
-                print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={time.time()-t0:.2f}s hits={len(out)} top={top_preview}")
+            tel["hits"] = {
+                "total": len(cached),
+                "returned": len(out),
+                "top": [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]],
+            }
+            tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
+            if telemetry is not None:
+                telemetry.update(tel)
             return out
 
-        # fetch superset once
         hits: List[SearchHit] = []
+        prov_info: Dict[str, Any] = {"available": DDGS is not None}
+        t_fetch = time.perf_counter()
         if DDGS is not None:
             try:
-                step = time.time()
-                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, superset_k,
-                                               region=region, safesearch=safesearch)
-                if verbose:
-                    print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={time.time()-step:.2f}s count={len(hits)}")
-                    for h in hits[:5]:
-                        print(f"[{time.strftime('%X')}] ddg:   {h.rank:>2} | host={_host(h.url)} | "
-                              f"title={(h.title or '')[:80]!r}")
+                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, superset_k, region=region, safesearch=safesearch)
+                prov_info["errorType"] = None
+                prov_info["errorMsg"] = None
             except Exception as e:
-                print(f"[{time.strftime('%X')}] ddg: ERROR {e}")
+                prov_info["errorType"] = type(e).__name__
+                prov_info["errorMsg"] = str(e)
+                hits = []
         else:
-            print(f"[{time.strftime('%X')}] ddg: SKIP (DDGS unavailable)")
+            prov_info["errorType"] = "ProviderUnavailable"
+            prov_info["errorMsg"] = "DDGS is not installed or failed to import."
+        prov_info["elapsedSec"] = round(time.perf_counter() - t_fetch, 6)
+        tel["provider"] = prov_info
 
         _cache_set(q_norm, hits)
         out = hits[:k]
-        if verbose:
-            print(f"[{time.strftime('%X')}] ddg: RETURN dt={time.time()-t0:.2f}s hits={len(out)}")
+        tel["hits"] = {
+            "total": len(hits),
+            "returned": len(out),
+            "top": [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]],
+        }
+        tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
+        if telemetry is not None:
+            telemetry.update(tel)
         return out

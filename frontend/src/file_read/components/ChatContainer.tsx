@@ -2,8 +2,9 @@
 import { useState, useRef, useEffect } from "react";
 import ChatView from "./ChatView/ChatView";
 import ChatComposer from "./ChatComposer";
+import BudgetBar from "./Budget/BudgetBar";
 import type { ChatMsg } from "../types/chat";
-import type { GenMetrics, RunJson } from "../hooks/useChatStream";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
 import type { Attachment } from "../types/chat";
 
 interface Props {
@@ -45,8 +46,7 @@ export default function ChatContainer({
     const el = containerRef.current;
     if (!el) return;
     const threshold = 120;
-    const isNearBottom = () =>
-      el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+    const isNearBottom = () => el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
     const onScroll = () => setPinned(!isNearBottom());
     el.addEventListener("scroll", onScroll, { passive: true });
     setPinned(!isNearBottom());
@@ -80,6 +80,8 @@ export default function ChatContainer({
           autoFollow={autoFollow}
         />
       </div>
+
+      <BudgetBar runJson={runJson ?? null} />
 
       <ChatComposer
         input={input}

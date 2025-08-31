@@ -115,7 +115,7 @@ ai-agent-playground/
         packaging/
         packaging-25.0.dist-info/
         pandas/
-        pandas-2.3.2.dist-info/
+        pandas-2.2.2.dist-info/
         pandas.libs/
         pdfminer/
         pdfminer.six-20240706.dist-info/
@@ -167,6 +167,8 @@ ai-agent-playground/
         soupsieve-2.7.dist-info/
         starlette/
         starlette-0.47.2.dist-info/
+        striprtf/
+        striprtf-0.0.26.dist-info/
         sympy/
         sympy-1.14.0.dist-info/
         threadpoolctl-3.6.0.dist-info/
@@ -202,6 +204,8 @@ ai-agent-playground/
         websockets-15.0.1.dist-info/
         wheel/
         wheel-0.45.1.dist-info/
+        xlrd/
+        xlrd-2.0.2.dist-info/
         yaml/
         ~xml/
     Scripts/
@@ -229,6 +233,8 @@ ai-agent-playground/
       pybabel.exe
       python.exe
       pythonw.exe
+      runxlrd.py
+      striprtf
       tiny-agents.exe
       torchfrtrace.exe
       torchrun.exe
@@ -285,7 +291,10 @@ ai-agent-playground/
           __init__.py
           common.py
           csv_ingest.py
+          doc_ingest.py
           excel_ingest.py
+          excel_ingest_core.py
+          xls_ingest.py
       runtime/
         __init__.py
         model_runtime.py
@@ -309,61 +318,7 @@ ai-agent-playground/
         override_settings.json
         rag/
           by_session/
-            006ad60e-8216-494c-b00a-47e90721ef3f/
-              index.faiss
-              meta.jsonl
-            08b8f232-33ba-474b-bca6-dec0230f5eba/
-              index.faiss
-              meta.jsonl
-            0bf5b13d-0c8c-41d3-813a-b9b4d4638169/
-              index.faiss
-              meta.jsonl
-            431a3657-470a-45a1-a137-9b7339e83634/
-              index.faiss
-              meta.jsonl
-            46b0428d-4aec-4c46-8135-c1a2c6d6038f/
-              index.faiss
-              meta.jsonl
-            62f3b99f-e96e-45ab-aec6-83b7a4218238/
-              index.faiss
-              meta.jsonl
-            64c81442-6d52-4cf9-a6a7-d6b7dcbc8836/
-              index.faiss
-              meta.jsonl
-            7a346381-f150-43e6-89a0-0ce5e77f194d/
-            93e5b230-292a-4424-9df0-bfbd329e8096/
-              index.faiss
-              meta.jsonl
-            9532ad7e-f36d-4256-9ef5-4dc179867ba0/
-              index.faiss
-              meta.jsonl
-            96b3a093-a722-4e89-a717-bdcfe989e6da/
-              index.faiss
-              meta.jsonl
-            a0a4771b-2611-4ef2-9ca3-07b1a1a56c61/
-            abedadf5-f26e-4603-912d-3bb723d5689b/
-            afed75d1-4993-40af-b1c0-c7773b4b8d99/
-            bae1c605-1f17-4c23-b79a-322392d713d9/
-              index.faiss
-              meta.jsonl
-            cb282fb3-18fe-4549-bcee-a10554dee3d1/
-              index.faiss
-              meta.jsonl
-            d00ac3e9-3ef8-4932-9efc-7c80d0755e92/
-              index.faiss
-              meta.jsonl
-            d0411886-973c-4440-8da0-db1b24e0f81d/
-              index.faiss
-              meta.jsonl
-            dfaeec5f-2ea5-449d-af23-8ce6f49e720a/
-              index.faiss
-              meta.jsonl
-            e7caf595-4368-471f-9e73-6020138b09ea/
-              index.faiss
-              meta.jsonl
-            ea6e9007-53e1-4415-bfd4-20406a0e3977/
-              meta.jsonl
-            ec8ee6ae-e511-4b0a-b225-9076aaaa7ef1/
+            a5b37b4a-abd5-4435-90ce-aab2d6d18498/
               index.faiss
               meta.jsonl
           global/

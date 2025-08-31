@@ -1,4 +1,620 @@
- scored if hh is h), 0)
+re", "value": request_cfg.get("temperature", 0.6)},
+                {"key": "llm.prediction.topKSampling", "value": 40},
+                {"key": "llm.prediction.topPSampling", "value": {"checked": True, "value": request_cfg.get("top_p", 0.9)}},
+                {"key": "llm.prediction.repeatPenalty", "value": {"checked": True, "value": 1.25}},
+                {"key": "llm.prediction.maxTokens", "value": request_cfg.get("max_tokens", 512)},
+                {"key": "llm.prediction.stopStrings", "value": STOP_STRINGS},
+                {"key": "llm.prediction.llama.cpuThreads", "value": int(cfg.get("nThreads") or 0)},
+                {"key": "llm.prediction.contextPrefill", "value": []},
+                {"key": "llm.prediction.tools", "value": {"type": "none"}},
+                {"key": "llm.prediction.promptTemplate", "value": {"type": "none"}},
+            ]
+        },
+        "stats": {
+            "stopReason": stop_reason_final,
+            "tokensPerSecond": tok_per_sec,
+            "numGpuLayers": int(cfg.get("nGpuLayers") or 0),
+            "timeToFirstTokenSec": round((ttft_ms or 0) / 1000.0, 3),
+            "totalTimeSec": round(t_end - t_start, 3),
+            "promptTokensCount": input_tokens_est,
+            "predictedTokensCount": out_tokens,
+            "totalTokensCount": total_tokens,
+        },
+    }
+
+# ---------- connection helper ----------
+
+async def watch_disconnect(request, stop_ev):
+    if await request.is_disconnected():
+        stop_ev.set()
+        return
+    while not stop_ev.is_set():
+        await asyncio.sleep(0.2)
+        if await request.is_disconnected():
+            stop_ev.set()
+            break
+
+# ===== aimodel/file_read/web/__init__.py =====
+
+
+
+# ===== aimodel/file_read/web/duckduckgo.py =====
+
+# aimodel/file_read/web/duckduckgo.py
+from __future__ import annotations
+from typing import List, Optional, Tuple
+import asyncio, time
+from urllib.parse import urlparse
+
+# Prefer new package; fallback for compatibility
+try:
+    from ddgs import DDGS  # type: ignore
+except Exception:
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+    except Exception:
+        DDGS = None  # no provider
+
+from ..core.settings import SETTINGS
+from .provider import SearchHit
+
+# -------- simple in-memory cache (superset caching) --------------------------
+_CACHE: dict[str, Tuple[float, List[SearchHit]]] = {}
+
+def _cache_key(query: str) -> str:
+    return (query or "").strip().lower()
+
+def _host(u: str) -> str:
+    try:
+        h = (urlparse(u).hostname or "").lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
+def _cache_get(query: str) -> Optional[List[SearchHit]]:
+    eff = SETTINGS.effective()  # no fallbacks allowed
+    ttl = int(eff["web_search_cache_ttl_sec"])
+    key = _cache_key(query)
+    v = _CACHE.get(key)
+    if not v:
+        return None
+    ts, hits = v
+    if (time.time() - ts) > ttl:
+        _CACHE.pop(key, None)
+        return None
+    return hits
+
+def _cache_set(query: str, hits: List[SearchHit]) -> None:
+    _CACHE[_cache_key(query)] = (time.time(), hits)
+
+# -------- DDGS (official client) --------------------------------------------
+def _ddg_sync_search(query: str, k: int, *, region: str, safesearch: str) -> List[SearchHit]:
+    results: List[SearchHit] = []
+    if DDGS is None:
+        print(f"[{time.strftime('%X')}] ddg: PROVIDER MISSING (DDGS=None)")
+        return results
+    with DDGS() as ddg:
+        for i, r in enumerate(ddg.text(query, max_results=max(1, k),
+                                       safesearch=safesearch, region=region)):
+            title = (r.get("title") or "").strip()
+            url = (r.get("href") or "").strip()
+            snippet: Optional[str] = (r.get("body") or "").strip() or None
+            if not url:
+                continue
+            results.append(SearchHit(title=title or url, url=url, snippet=snippet, rank=i))
+            if i + 1 >= k:
+                break
+    return results
+
+# -------- public provider ----------------------------------------------------
+class DuckDuckGoProvider:
+    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
+        eff = SETTINGS.effective()  # strict read; raise if missing
+        q_norm = (query or "").strip()
+        if not q_norm:
+            return []
+
+        superset_k = max(int(k), int(eff["web_search_cache_superset_k"]))
+        region = str(eff["web_search_region"])
+        safesearch = str(eff["web_search_safesearch"])
+        verbose = bool(eff["web_search_debug_logging"])
+
+        t0 = time.time()
+        if verbose:
+            print(f"[{time.strftime('%X')}] ddg: START q={q_norm!r} k={k}")
+
+        # cache
+        cached = _cache_get(q_norm)
+        if cached is not None:
+            out = cached[:k]
+            if verbose:
+                top_preview = [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]]
+                print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={time.time()-t0:.2f}s hits={len(out)} top={top_preview}")
+            return out
+
+        # fetch superset once
+        hits: List[SearchHit] = []
+        if DDGS is not None:
+            try:
+                step = time.time()
+                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, superset_k,
+                                               region=region, safesearch=safesearch)
+                if verbose:
+                    print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={time.time()-step:.2f}s count={len(hits)}")
+                    for h in hits[:5]:
+                        print(f"[{time.strftime('%X')}] ddg:   {h.rank:>2} | host={_host(h.url)} | "
+                              f"title={(h.title or '')[:80]!r}")
+            except Exception as e:
+                print(f"[{time.strftime('%X')}] ddg: ERROR {e}")
+        else:
+            print(f"[{time.strftime('%X')}] ddg: SKIP (DDGS unavailable)")
+
+        _cache_set(q_norm, hits)
+        out = hits[:k]
+        if verbose:
+            print(f"[{time.strftime('%X')}] ddg: RETURN dt={time.time()-t0:.2f}s hits={len(out)}")
+        return out
+
+# ===== aimodel/file_read/web/fetch.py =====
+
+# aimodel/file_read/web/fetch.py
+from __future__ import annotations
+import asyncio
+from typing import Tuple, List, Optional
+import httpx
+
+# Optional extractors (use whatever is installed)
+try:
+    from readability import Document  # readability-lxml
+except Exception:
+    Document = None  # type: ignore
+
+try:
+    from bs4 import BeautifulSoup  # beautifulsoup4 + lxml
+except Exception:
+    BeautifulSoup = None  # type: ignore
+
+try:
+    from selectolax.parser import HTMLParser  # selectolax
+except Exception:
+    HTMLParser = None  # type: ignore
+
+from ..core.settings import SETTINGS
+
+
+def _ua() -> str:
+    return str(SETTINGS.get("web_fetch_user_agent", "LocalAI/0.1 (+clean-fetch)"))
+
+def _timeout() -> float:
+    try:
+        return float(SETTINGS.get("web_fetch_timeout_sec", 8.0))
+    except Exception:
+        return 8.0
+
+def _max_chars() -> int:
+    try:
+        return int(SETTINGS.get("web_fetch_max_chars", 3000))
+    except Exception:
+        return 3000
+
+def _max_bytes() -> int:
+    try:
+        return int(SETTINGS.get("web_fetch_max_bytes", 1_048_576))
+    except Exception:
+        return 1_048_576
+
+def _max_parallel() -> int:
+    try:
+        return max(1, int(SETTINGS.get("web_fetch_max_parallel", 3)))
+    except Exception:
+        return 3
+
+
+async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
+    # Stream and cap to avoid huge downloads
+    out = bytearray()
+    async for chunk in resp.aiter_bytes():
+        if not chunk:
+            continue
+        remaining = cap_bytes - len(out)
+        if remaining <= 0:
+            break
+        out.extend(chunk[:remaining])
+        if len(out) >= cap_bytes:
+            break
+    return bytes(out)
+
+
+def _extract_text_from_html(raw_html: str, url: str) -> str:
+    """
+    Best-effort HTML → text:
+      1) readability-lxml (if available): main-article extraction
+      2) selectolax (if available): fast DOM text
+      3) BeautifulSoup (if available): generic text fallback
+      4) Raw text as last resort
+    """
+    html = raw_html or ""
+
+    # 1) readability main content
+    if Document is not None:
+        try:
+            doc = Document(html)
+            summary_html = doc.summary(html_partial=True) or ""
+            if summary_html:
+                if BeautifulSoup is not None:
+                    soup = BeautifulSoup(summary_html, "lxml")
+                    txt = soup.get_text(" ", strip=True)
+                    if txt:
+                        return txt
+                # If bs4 missing, fall back to selectolax/plain below
+        except Exception:
+            pass
+
+    # 2) selectolax full text
+    if HTMLParser is not None:
+        try:
+            tree = HTMLParser(html)
+            # Remove script/style/noscript quickly if present
+            for bad in ("script", "style", "noscript"):
+                for n in tree.tags(bad):
+                    n.decompose()
+            txt = tree.body.text(separator=" ", strip=True) if tree.body else tree.text(separator=" ", strip=True)
+            if txt:
+                return txt
+        except Exception:
+            pass
+
+    # 3) BeautifulSoup full text
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            # Strip scripts/styles
+            for s in soup(["script", "style", "noscript"]):
+                s.extract()
+            txt = soup.get_text(" ", strip=True)
+            if txt:
+                return txt
+        except Exception:
+            pass
+
+    # 4) Raw (no HTML parsing available)
+    return html
+
+
+async def fetch_clean(
+    url: str,
+    timeout_s: Optional[float] = None,
+    max_chars: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+) -> Tuple[str, int, str]:
+    """
+    Returns: (final_url, status_code, cleaned_text)
+    - cleaned_text is extracted via readability/selectolax/bs4 if available; else raw
+    - caps by bytes first, then by chars
+    """
+    timeout = _timeout() if timeout_s is None else float(timeout_s)
+    cap_chars = _max_chars() if max_chars is None else int(max_chars)
+    cap_bytes = _max_bytes() if max_bytes is None else int(max_bytes)
+
+    headers = {"User-Agent": _ua()}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+
+        # Stream with byte cap
+        raw_bytes = await _read_capped_bytes(r, cap_bytes)
+        # Text decode with fallback (httpx sets encoding heuristically)
+        enc = r.encoding or "utf-8"
+        raw_text = raw_bytes.decode(enc, errors="ignore")
+
+        # Extract/clean HTML to text (no trafilatura)
+        txt = _extract_text_from_html(raw_text, str(r.url))
+        txt = (txt or "").strip().replace("\r", "")
+
+        if len(txt) > cap_chars:
+            txt = txt[:cap_chars]
+
+        return (str(r.url), r.status_code, txt)
+
+
+async def fetch_many(
+    urls: List[str],
+    per_timeout_s: Optional[float] = None,
+    cap_chars: Optional[int] = None,
+    cap_bytes: Optional[int] = None,
+    max_parallel: Optional[int] = None,
+):
+    sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
+
+    async def _one(u: str):
+        async with sem:
+            try:
+                return u, await fetch_clean(
+                    u,
+                    timeout_s=per_timeout_s,
+                    max_chars=cap_chars,
+                    max_bytes=cap_bytes,
+                )
+            except Exception:
+                return u, None
+
+    tasks = [_one(u) for u in urls]
+    return await asyncio.gather(*tasks)
+
+# ===== aimodel/file_read/web/orchestrator.py =====
+
+# aimodel/file_read/web/orchestrator.py
+from __future__ import annotations
+from typing import List, Tuple, Optional
+from urllib.parse import urlparse
+import time
+import re
+
+from ..core.settings import SETTINGS
+from .duckduckgo import DuckDuckGoProvider
+from .provider import SearchHit
+from .fetch import fetch_many  # optional JS path resolved dynamically (see below)
+
+# ===== helpers to read config (strict: no silent defaults) ====================
+
+def _req(key: str):
+    return SETTINGS[key]
+
+def _as_int(key: str) -> int: return int(_req(key))
+def _as_float(key: str) -> float: return float(_req(key))
+def _as_bool(key: str) -> bool: return bool(_req(key))
+def _as_str(key: str) -> str:
+    v = _req(key)
+    return "" if v is None else str(v)
+
+# ===== small utils ============================================================
+
+def _clean_ws(s: str) -> str:
+    return " ".join((s or "").split())
+
+def _host(url: str) -> str:
+    h = (urlparse(url).hostname or "").lower()
+    pref = _as_str("web_orch_www_prefix")
+    return h[len(pref):] if pref and h.startswith(pref) else h
+
+def _tokens(s: str) -> List[str]:
+    return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
+
+def _head_tail(text: str, max_chars: int) -> str:
+    """
+    Trim long text to head/tail, using settings:
+      - web_orch_head_fraction
+      - web_orch_tail_min_chars
+      - web_orch_ellipsis
+    Mirrors the old behavior but configurable.
+    """
+    text = text or ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return _clean_ws(text)
+
+    head_frac      = _as_float("web_orch_head_fraction")      # e.g., 0.67
+    tail_min_chars = _as_int("web_orch_tail_min_chars")       # e.g., 200
+    ellipsis       = _as_str("web_orch_ellipsis")             # e.g., " … "
+
+    head = int(max_chars * head_frac)
+    tail = max_chars - head
+    if tail < tail_min_chars:
+        head = max(1, max_chars - tail_min_chars)
+        tail = tail_min_chars
+
+    return _clean_ws(text[:head] + ellipsis + text[-tail:])
+
+def condense_doc(title: str, url: str, text: str, *, max_chars: int) -> str:
+    body = _head_tail(text or "", max_chars)
+    safe_title = _clean_ws(title or url)
+    bullet = _as_str("web_orch_bullet_prefix") or "- "
+    indent = _as_str("web_orch_indent_prefix") or "  "
+    return f"{bullet}{safe_title}\n{indent}{url}\n{indent}{body}"
+
+# ===== scoring (generic; no domain/date heuristics) ===========================
+
+def score_hit(hit: SearchHit, query: str) -> int:
+    """
+    Generic, content-based scoring.
+      - exact phrase in title (+web_orch_score_w_exact)
+      - substring in title (+web_orch_score_w_substr)
+      - token coverage in title (+0..web_orch_score_w_title_full/title_part)
+      - any token in snippet (+web_orch_score_w_snip_touch)
+    """
+    w_exact      = _as_int("web_orch_score_w_exact")
+    w_substr     = _as_int("web_orch_score_w_substr")
+    w_title_full = _as_int("web_orch_score_w_title_full")
+    w_title_part = _as_int("web_orch_score_w_title_part")
+    w_snip_touch = _as_int("web_orch_score_w_snip_touch")
+
+    score = 0
+    q = (query or "").strip().lower()
+    title = (hit.title or "").strip()
+    snippet = (hit.snippet or "").strip()
+    title_l = title.lower()
+    snip_l  = snippet.lower()
+
+    if q:
+        if title_l == q:
+            score += w_exact
+        elif q in title_l:
+            score += w_substr
+
+    qtoks = _tokens(q)
+    if qtoks:
+        cov_title = sum(1 for t in qtoks if t in title_l)
+        if cov_title == len(qtoks) and len(qtoks) > 0:
+            score += w_title_full
+        elif cov_title > 0:
+            score += w_title_part
+        cov_snip = sum(1 for t in qtoks if t in snip_l)
+        if cov_snip > 0:
+            score += w_snip_touch
+
+    return score
+
+# ===== quality estimate (generic; configurable penalties) =====================
+
+def _type_ratio(text: str, sub: str) -> float:
+    if not text:
+        return 1.0
+    cnt = text.lower().count(sub)
+    return float(cnt) / max(1, len(text))
+
+def content_quality_score(text: str) -> float:
+    if not text:
+        return 0.0
+    t = text.strip()
+    n = len(t)
+
+    len_div     = _as_float("web_orch_q_len_norm_divisor")
+    w_len       = _as_float("web_orch_q_len_weight")
+    w_div       = _as_float("web_orch_q_diversity_weight")
+
+    length_score = min(1.0, n / len_div) if len_div > 0 else 0.0
+
+    toks = _tokens(t)
+    if not toks:
+        return 0.1 * length_score  # tiny signal if no tokens
+
+    uniq = len(set(toks))
+    diversity = uniq / max(1.0, float(len(toks)))
+
+    pen = 0.0
+    # penalties: [{"token": str, "mult": float, "cap": float}, ...]
+    for rule in _req("web_orch_q_penalties"):
+        token = str(rule.get("token") or "")
+        mult  = float(rule.get("mult") or 0.0)
+        cap   = float(rule.get("cap") or 1.0)
+        pen += min(cap, _type_ratio(t, token) * mult)
+
+    raw = (w_len * length_score) + (w_div * diversity) - pen
+    return max(0.0, min(1.0, raw))
+
+def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
+    picked: List[SearchHit] = []
+    seen_hosts = set()
+    for s, h in sorted(scored_hits, key=lambda x: x[0], reverse=True):
+        u = (h.url or "").strip()
+        if not u:
+            continue
+        host = _host(u)
+        if host in seen_hosts:
+            continue
+        seen_hosts.add(host)
+        picked.append(h)
+        if len(picked) >= k:
+            break
+    return picked
+
+# ===== fetch layer ============================================================
+
+async def _fetch_round(
+    urls: List[str],
+    meta: List[Tuple[str, str]],
+    per_url_timeout_s: float,
+    max_parallel: int,
+    use_js: bool = False,
+) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
+
+    fetch_fn = fetch_many
+    if use_js:
+        try:
+            from . import fetch as _fetch_mod  # type: ignore
+            fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
+        except Exception:
+            fetch_fn = fetch_many
+
+    # Cap per doc by multiplier, but never exceed global max bytes/chars
+    cap_mult        = _as_float("web_orch_fetch_cap_multiplier")
+    per_doc_budget  = _as_int("web_orch_per_doc_char_budget")
+    fetch_max_chars = _as_int("web_fetch_max_chars")
+    per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
+
+    results = await fetch_fn(
+        urls,
+        per_timeout_s=per_url_timeout_s,
+        cap_chars=per_doc_cap,
+        max_parallel=max_parallel,
+    )
+    return results
+
+# ===== main ===================================================================
+
+async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> str | None:
+    # pull config each call (to honor hot-reloads)
+    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
+    total_char_budget   = _as_int("web_orch_total_char_budget")
+    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
+    max_parallel        = _as_int("web_orch_max_parallel_fetch")
+    overfetch_factor    = _as_float("web_orch_overfetch_factor")
+    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
+
+    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
+    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
+    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
+    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
+    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
+    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
+    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
+    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
+
+    header_tpl          = _as_str("web_block_header")
+    sep_str             = _as_str("web_orch_block_separator")
+    min_block_reserve   = _as_int("web_orch_min_block_reserve")
+    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
+
+    # timeouts
+    per_timeout = (float(per_url_timeout_s)
+                   if per_url_timeout_s is not None
+                   else _as_float("web_fetch_timeout_sec"))
+
+    start_time = time.time()
+    print(f"[orchestrator] IN  @ {start_time:.3f}s | query={query!r}")
+
+    provider = DuckDuckGoProvider()
+
+    # --- SEARCH (configurable overfetch) ---
+    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
+    print(f"[orchestrator] SEARCH start overfetch={overfetch} k={cfg_k}")
+
+    t0 = time.perf_counter()
+    try:
+        hits: List[SearchHit] = await provider.search(query, k=overfetch)
+    except Exception as e:
+        print(f"[orchestrator] ERROR during search for {query!r}: {e}")
+        return None
+    print(f"[orchestrator] SEARCH done hits={len(hits)} dt={time.perf_counter() - t0:.3f}s")
+
+    if not hits:
+        print(f"[orchestrator] OUT @ {time.time():.3f}s | no hits | elapsed={time.time()-start_time:.3f}s")
+        return None
+
+    # --- SCORING / DEDUPE ---
+    print(f"[orchestrator] SCORING generic (no hardcoded boosts)")
+    seen_urls = set()
+    scored: List[Tuple[int, SearchHit]] = []
+    for idx, h in enumerate(hits):
+        u = (h.url or "").strip()
+        if not u:
+            print(f"[orchestrator]   skip[{idx}] empty url")
+            continue
+        if u in seen_urls:
+            print(f"[orchestrator]   dup [{idx}] host={_host(u)} title={(h.title or '')[:60]!r}")
+            continue
+        seen_urls.add(u)
+        s = score_hit(h, query)
+        scored.append((s, h))
+        print(f"[orchestrator]   meta[{idx}] score={s} host={_host(u)} title={(h.title or '')[:80]!r} url={u}")
+
+    if not scored:
+        print(f"[orchestrator] OUT @ {time.time():.3f}s | no unique hits | elapsed={time.time()-start_time:.3f}s")
+        return None
+
+    top_hits = _dedupe_by_host(scored, cfg_k)
+    for i, h in enumerate(top_hits, 1):
+        # reuse computed scores when printing
+        s = next((sc for sc, hh in scored if hh is h), 0)
         print(f"[orchestrator] PICK {i}/{cfg_k} score={s} host={_host(h.url)} title={(h.title or '')[:80]!r}")
 
     # --- FETCH ROUND 1 (static) ---
@@ -428,39 +1044,23 @@ from typing import Dict, List, Optional, Tuple
 from ..runtime.model_runtime import get_llm
 from ..store.index import load_index, save_index
 from ..store.base import now_iso
-from ..services.cancel import is_active, GEN_SEMAPHORE  # serialize with main generation
-from ..store.chats import _load_chat  # for current seq watermark
-from ..core.settings import SETTINGS  # centralized settings loader
+from ..services.cancel import is_active, GEN_SEMAPHORE
+from ..store.chats import _load_chat
+from ..core.settings import SETTINGS
 
-
-# -----------------------------------------------------------------------------
-# Settings access (STRICT: no fallbacks)
-# -----------------------------------------------------------------------------
 def S(key: str):
-    # Raise KeyError immediately if missing so misconfig is visible
     return SETTINGS[key]
 
-
-# -----------------------------------------------------------------------------
-# Coalesced per-session queue (last-write-wins)
-# -----------------------------------------------------------------------------
-# We store only the latest snapshot + watermark per session. The worker consumes
-# session IDs; when it handles a session, it reads the latest snapshot once.
 _PENDING: Dict[str, dict] = {}
 _ENQUEUED: set[str] = set()
 _queue: asyncio.Queue[str] = asyncio.Queue(maxsize=int(S("retitle_queue_maxsize")))
-_lock = asyncio.Lock()  # guards _PENDING/_ENQUEUED
+_lock = asyncio.Lock()
 
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 def _preview(s: str) -> str:
     n = int(S("retitle_preview_chars"))
     ell = S("retitle_preview_ellipsis")
     s = (s or "")
     return (s[:n] + ell) if len(s) > n else s
-
 
 def _is_substantial(text: str) -> bool:
     t = (text or "").strip()
@@ -470,64 +1070,35 @@ def _is_substantial(text: str) -> bool:
         return False
     return (re.search(r"[A-Za-z]", t) is not None) if require_alpha else True
 
-
 def _pick_source(messages: List[dict]) -> Optional[str]:
-    """
-    Choose best text to title based on policy toggles:
-      - retitle_pick_first_substantial
-      - retitle_pick_latest_substantial
-      - retitle_pick_first_user_fallback
-    """
     if not messages:
         return None
-
-    if bool(S("retitle_pick_first_substantial")):
-        for m in messages:
-            if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
-                return m.get("content", "")
-
-    if bool(S("retitle_pick_latest_substantial")):
-        for m in reversed(messages):
-            if (m.get("role") == "user") and _is_substantial(m.get("content", "")):
-                return m.get("content", "")
-
-    if bool(S("retitle_pick_first_user_fallback")):
-        for m in messages:
-            if m.get("role") == "user":
-                return m.get("content", "")
-
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            txt = (m.get("content") or "").strip()
+            if _is_substantial(txt):
+                return txt
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            txt = (m.get("content") or "").strip()
+            if _is_substantial(txt):
+                return txt
     return None
 
-
 def _sanitize_title(s: str) -> str:
-    """
-    One line, trimmed, limited words/chars, with configurable regex steps.
-    All behavior is driven by retitle_* settings.
-    """
     if not s:
         return ""
-
     s = s.strip()
-
-    # Drop common prefixes (bullets, quotes, numbering)
     drop_prefix_re = S("retitle_sanitize_drop_prefix_regex")
     if drop_prefix_re:
         s = re.sub(drop_prefix_re, "", s)
-
-    # Strip quotes
     if bool(S("retitle_sanitize_strip_quotes")):
         s = s.strip().strip('"').strip("'").strip()
-
-    # Replace non-allowed chars
     replace_not_allowed_re = S("retitle_sanitize_replace_not_allowed_regex")
     replace_with = S("retitle_sanitize_replace_with")
     if replace_not_allowed_re:
         s = re.sub(replace_not_allowed_re, replace_with, s)
-
-    # Collapse whitespace
     s = re.sub(r"\s+", " ", s).strip()
-
-    # Word & char limits
     max_words = int(S("retitle_sanitize_max_words"))
     max_chars = int(S("retitle_sanitize_max_chars"))
     if max_words > 0:
@@ -535,20 +1106,13 @@ def _sanitize_title(s: str) -> str:
         s = " ".join(words[:max_words])
     if max_chars > 0 and len(s) > max_chars:
         s = s[:max_chars].rstrip()
-
     return s
 
-
 def _make_title(llm, src: str) -> str:
-    # System instruction and examples from settings
     sys = S("retitle_llm_sys_inst")
     examples: List[dict] = list(S("retitle_llm_examples"))
-
-    # Optional prefix/suffix on the user text
     user_text = f"{S('retitle_user_prefix')}{src}{S('retitle_user_suffix')}"
-
     messages = [{"role": "system", "content": sys}, *examples, {"role": "user", "content": user_text}]
-
     out = llm.create_chat_completion(
         messages=messages,
         max_tokens=int(S("retitle_llm_max_tokens")),
@@ -560,12 +1124,7 @@ def _make_title(llm, src: str) -> str:
     raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
     return raw
 
-
-# -----------------------------------------------------------------------------
-# Worker loop
-# -----------------------------------------------------------------------------
 async def start_worker():
-    """Background loop to process retitle jobs one by one."""
     while True:
         sid = await _queue.get()
         try:
@@ -575,45 +1134,30 @@ async def start_worker():
         finally:
             _queue.task_done()
 
-
 def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
     msgs = snapshot.get("messages") or []
     job_seq = int(snapshot.get("job_seq") or 0)
     return msgs, job_seq
 
-
 async def _process_session(session_id: str):
-    # global enable flag
     if not bool(S("retitle_enable")):
         return
-
-    # debounce after stream
     await asyncio.sleep(int(S("retitle_grace_ms")) / 1000.0)
-
-    # lower priority than generation: wait while this session is active
     waited = 0
     backoff = int(S("retitle_active_backoff_start_ms"))
     backoff_max = int(S("retitle_active_backoff_max_ms"))
     backoff_total = int(S("retitle_active_backoff_total_ms"))
     growth = float(S("retitle_active_backoff_growth"))
-
     while is_active(session_id) and waited < backoff_total:
         await asyncio.sleep(backoff / 1000.0)
         waited += backoff
-        # exponential backoff with cap
         backoff = min(int(backoff * growth), backoff_max)
-
-    # fetch latest coalesced snapshot
     async with _lock:
         snapshot = _PENDING.pop(session_id, None)
         _ENQUEUED.discard(session_id)
-
     if not snapshot:
         return
-
     messages, job_seq = _extract_job(snapshot)
-
-    # stale guard: if chat seq has advanced, skip (a newer enqueue will run)
     try:
         cur_seq = int((_load_chat(session_id) or {}).get("seq") or 0)
     except Exception:
@@ -621,15 +1165,10 @@ async def _process_session(session_id: str):
     if cur_seq > job_seq:
         print(f"[retitle] SKIP (stale) session={session_id} job_seq={job_seq} current_seq={cur_seq}")
         return
-
-    # pick source text
     src = _pick_source(messages) or ""
     if not src.strip():
         return
-
     print(f"[retitle] START session={session_id} job_seq={job_seq} src={_preview(src)!r}")
-
-    # Serialize with main generation semaphore; run LLM call in a worker thread
     async with GEN_SEMAPHORE:
         llm = get_llm()
         try:
@@ -642,65 +1181,47 @@ async def _process_session(session_id: str):
                 llm.reset()
             except Exception:
                 pass
-
-    # Optional sanitize (fully controlled by settings)
     if bool(S("retitle_enable_sanitize")):
         title = _sanitize_title(title_raw)
     else:
         title = title_raw
-
     print(f"[retitle] FINISH session={session_id} -> {title!r}")
-
     if not title:
         return
-
-    # write only if changed
     idx = load_index()
     row = next((r for r in idx if r.get("sessionId") == session_id), None)
     if not row:
         return
     if (row.get("title") or "").strip() == title:
         return
-
     row["title"] = title
     row["updatedAt"] = now_iso()
     save_index(idx)
 
-
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
 def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
-    """Coalesced enqueue; last-write-wins per session, with a seq watermark."""
     if not session_id:
         return
     if not isinstance(messages, list):
         messages = []
-    # infer watermark if not provided (max message id)
     if job_seq is None:
         try:
             job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
         except Exception:
             job_seq = 0
-
     snap = {"messages": messages, "job_seq": int(job_seq)}
-
     async def _put():
         async with _lock:
-            _PENDING[session_id] = snap  # overwrite older snapshot
+            _PENDING[session_id] = snap
             if session_id not in _ENQUEUED:
                 _ENQUEUED.add(session_id)
                 try:
                     _queue.put_nowait(session_id)
                 except Exception as e:
                     logging.warning(f"Failed to enqueue retitle: {e}")
-
-    # enqueue can be called from sync contexts; schedule safely
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_put())
     except RuntimeError:
-        # no running loop (unlikely here); run a temporary loop
         asyncio.run(_put())
 
 # ===== frontend/src/file_read/App.tsx =====
@@ -2381,594 +2902,4 @@ export default function SettingsPanel({ sessionId, onClose }: { sessionId?: stri
 
 # ===== frontend/src/file_read/data/chatApi.ts =====
 
-import type { Attachment, ChatRow, ChatMessageRow} from "../types/chat";
-import { request } from "../services/http";
-
-// Spring Page<T> type
-export type PageResp<T> = {
-  content: T[];
-  totalElements: number;
-  totalPages: number;
-  size: number;
-  number: number;      // current page index (0-based)
-  first: boolean;
-  last: boolean;
-  empty: boolean;
-};
-
-export function createChat(sessionId: string, title: string) {
-  return request<ChatRow>("/api/chats", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, title }),
-  });
-}
-
-export function updateChatLast(sessionId: string, lastMessage: string, title?: string) {
-  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lastMessage, title: title || "" }),
-  });
-}
-
-// Legacy (unused after pagination in sidebar)
-export function listChats() {
-  return request<ChatRow[]>("/api/chats");
-}
-
-// NEW: paginated list
-export function listChatsPage(page = 0, size = 30, ceiling?: string) {
-  const qs = new URLSearchParams({ page: String(page), size: String(size) });
-  if (ceiling) qs.set("ceiling", ceiling);
-  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
-}
-
-export function listMessages(sessionId: string) {
-  return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
-}
-
-export async function appendMessage(
-  sessionId: string,
-  role: "user" | "assistant",
-  content: string,
-  attachments?: Attachment[]
-) {
-  const body: any = { role, content };
-  if (attachments && attachments.length) body.attachments = attachments;
-
-  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
-
-export async function deleteChatsBatch(sessionIds: string[]) {
-  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionIds }),
-  });
-  return data.deleted;
-}
-
-export function deleteMessage(sessionId: string, messageId: string | number) {
-  return request<{ deleted: number }>(
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
-    { method: "DELETE" }
-  );
-}
-
-/** Delete a batch of messages. Backend returns { deleted: number[] } */
-export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
-  const ids = messageIds
-    .map((id) => (typeof id === "string" ? Number(id) : id))
-    .filter((n) => Number.isFinite(n)) as number[];
-
-  return request<{ deleted: number[] }>(  // <-- number[]
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
-    {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messageIds: ids }),
-    }
-  );
-}
-
-# ===== frontend/src/file_read/data/ragApi.ts =====
-
-// frontend/src/file_read/data/ragApi.ts
-import { request, API_BASE } from "../services/http";
-
-export function uploadRag(file: File, sessionId?: string, forceGlobal = false) {
-  const form = new FormData();
-  form.append("file", file);
-  if (sessionId && !forceGlobal) form.append("sessionId", sessionId);
-
-  return request<{ ok: boolean; added: number }>(
-    "/api/rag/upload",
-    { method: "POST", body: form }
-  );
-}
-
-export function uploadRagWithProgress(
-  file: File,
-  sessionId: string,
-  onProgress: (pct: number) => void,
-  signal?: AbortSignal
-): Promise<{ ok: boolean; added: number }> {
-  return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("sessionId", sessionId);
-
-    const xhr = new XMLHttpRequest();
-    const url = `${API_BASE}/api/rag/upload`.replace(/([^:]\/)\/+/g, "$1");
-    xhr.open("POST", url);
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try { resolve(JSON.parse(xhr.responseText)); }
-        catch { resolve({ ok: true, added: 0 }); }
-      } else {
-        reject(new Error(`Upload failed (${xhr.status})`));
-      }
-    };
-
-    // treat abort as a silent resolution, not an error
-    xhr.onabort = () => resolve({ ok: false, added: 0 });
-    xhr.onerror = () => reject(new Error("Network error"));
-
-    if (signal) {
-      if (signal.aborted) { xhr.abort(); return resolve({ ok: false, added: 0 }); }
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    }
-
-    xhr.send(form);
-  });
-}
-
-
-export function searchRag(query: string, opts?: {
-  sessionId?: string;
-  kChat?: number;
-  kGlobal?: number;
-  alpha?: number; // hybrid_alpha
-}) {
-  const body = {
-    query,
-    sessionId: opts?.sessionId ?? undefined,
-    kChat: opts?.kChat ?? 6,
-    kGlobal: opts?.kGlobal ?? 4,
-    hybrid_alpha: opts?.alpha ?? 0.5,
-  };
-
-  return request<{
-    hits: Array<{
-      id?: string;
-      score: number;
-      source?: string;
-      title?: string;
-      text: string;
-      sessionId?: string | null;
-    }>;
-  }>(
-    "/api/rag/search",   // ✅ relative path, request() adds API_BASE
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }
-  );
-}
-
-export type UploadRow = {
-  source: string;
-  sessionId?: string | null;
-  chunks: number;
-};
-
-export async function listUploads(sessionId?: string, scope: "all" | "session" = "all") {
-  const p = new URLSearchParams();
-  if (sessionId) p.set("sessionId", sessionId);
-  if (scope) p.set("scope", scope);
-
-  return request<{ uploads: UploadRow[] }>(
-    `/api/rag/uploads?${p.toString()}`,
-    { method: "GET" }
-  );
-}
-
-export async function deleteUploadHard(source: string, sessionId?: string) {
-  return request<{ ok: boolean; removed: number; remaining: number }>(
-    `/api/rag/uploads/delete-hard`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, sessionId }),
-    }
-  );
-}
-
-# ===== frontend/src/file_read/data/settingsApi.ts =====
-
-// frontend/src/file_read/data/settingsApi.ts
-import { request } from "../services/http";
-
-export function getDefaults() {
-  return request<Record<string, any>>("/api/settings/defaults");
-}
-
-export function getAdaptive(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<Record<string, any>>(`/api/settings/adaptive${qs}`);
-}
-
-export function getOverrides() {
-  return request<Record<string, any>>("/api/settings/overrides");
-}
-
-export function getEffective(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<Record<string, any>>(`/api/settings/effective${qs}`);
-}
-
-export function putOverrides(overrides: Record<string, any>) {
-  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(overrides), // ← send raw object
-  });
-}
-
-export function patchOverrides(patch: Record<string, any>) {
-  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch), // ← send raw object
-  });
-}
-
-export function recomputeAdaptive(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<{ ok: boolean; adaptive: any }>(
-    `/api/settings/adaptive/recompute${qs}`,
-    { method: "POST" }
-  );
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/buffer.ts =====
-
-// frontend/src/file_read/hooks/stream/core/buffer.ts
-import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
-import { extractRunJsonFromBuffer } from "../../../shared/lib/runjson";
-import { STOP_SENTINEL_AT_END } from "./constants";
-
-export type BufferStep = {
-  cleanText: string;
-  delta: string;
-  metrics?: { json?: RunJson; flat?: GenMetrics };
-};
-
-export function processChunk(prevClean: string, rawBufIn: string): BufferStep {
-  let rawBuf = rawBufIn;
-  if (STOP_SENTINEL_AT_END.test(rawBuf)) {
-    rawBuf = rawBuf.replace(STOP_SENTINEL_AT_END, "");
-  }
-  const { clean, json, flat } = extractRunJsonFromBuffer(rawBuf);
-  const delta = clean.slice(prevClean.length);
-  return { cleanText: clean, delta, metrics: json || flat ? { json, flat } : undefined };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/cancel.ts =====
-
-import { postCancel } from "./network";
-import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
-
-type Deps = {
-  getVisibleSid: () => string;
-  setLoadingFor: (sid: string, v: boolean) => void;
-  setQueuedFor: (sid: string, v: boolean) => void;
-  getController: () => AbortController | null;
-  getReader: () => ReadableStreamDefaultReader<Uint8Array> | null;
-  setCancelForSid: (sid: string | null) => void;
-  isActiveSid: (sid: string) => boolean;
-  dropJobsForSid: (sid: string) => void;
-};
-
-export function createCanceller(d: Deps) {
-  async function cancelBySessionId(id: string) {
-    // Mark as canceled so read loop can react, but DO NOT abort fetch yet.
-    d.setCancelForSid(id);
-
-    // Tell the backend to stop gracefully (flush metrics + close).
-    postCancel(id).catch(() => {});
-
-    if (d.isActiveSid(id)) {
-      // Drop any queued jobs for this session, but keep loading true —
-      // runStreamOnce will turn loading off in its finally after the stream ends.
-      d.dropJobsForSid(id);
-      d.setQueuedFor(id, false);
-
-      // Safety net: if server doesn’t flush within timeout, hard-abort.
-      window.setTimeout(() => {
-        if (d.isActiveSid(id)) {
-          try { d.getReader()?.cancel(); } catch {}
-          try { d.getController()?.abort(); } catch {}
-        }
-      }, STOP_FLUSH_TIMEOUT_MS + 500);
-    } else {
-      // Not active: just clear queued jobs and cancel flag.
-      d.dropJobsForSid(id);
-      d.setQueuedFor(id, false);
-      d.setCancelForSid(null);
-    }
-  }
-
-  async function stopVisible() {
-    const id = d.getVisibleSid();
-    await cancelBySessionId(id);
-  }
-
-  return { cancelBySessionId, stopVisible };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/constants.ts =====
-
-// frontend/src/file_read/hooks/stream/core/constants.ts
-export const STOP_SENTINEL_AT_END = /(?:\r?\n)?\u23F9 stopped(?:\r?\n)?$/u;
-export const STOP_FLUSH_TIMEOUT_MS = 3500;
-
-# ===== frontend/src/file_read/hooks/stream/core/controller.ts =====
-
-import { appendMessage } from "../../../data/chatApi";
-import type { StreamController, StreamCoreOpts } from "./types";
-import { createScheduler, type QueueItem } from "./queue";
-import { createCanceller } from "./cancel";
-import { runStreamOnce } from "./runner";
-import type { Attachment } from "../../../types/chat";
-
-export function createStreamController(opts: StreamCoreOpts): StreamController {
-  let cancelForSid: string | null = null;
-  let controllerRef: AbortController | null = null;
-  let readerRef: ReadableStreamDefaultReader<Uint8Array> | null = null;
-
-  const scheduler = createScheduler(async (job: QueueItem) => {
-    try { opts.setQueuedFor(job.sid, false); } catch {}
-    await runStreamOnce(job, {
-      opts,
-      getCancelForSid: () => cancelForSid,
-      clearCancelIf: (sid) => { if (cancelForSid === sid) cancelForSid = null; },
-      setController: (c) => { controllerRef = c; },
-      setReader: (r) => { readerRef = r; },
-    });
-  });
-
-  const canceller = createCanceller({
-    getVisibleSid: opts.getSessionId,
-    setLoadingFor: opts.setLoadingFor,
-    setQueuedFor: opts.setQueuedFor,
-    getController: () => controllerRef,
-    getReader: () => readerRef,
-    setCancelForSid: (sid) => { cancelForSid = sid; },
-    isActiveSid: scheduler.isActiveSid,
-    dropJobsForSid: scheduler.dropJobsForSid,
-  });
-
-  async function send(override?: string, attachments?: Attachment[]) {
-    const prompt = (override ?? "").trim();
-    const atts = (attachments ?? []).filter(Boolean);
-    if (!prompt && atts.length === 0) return; // allow attachments-only, but not truly empty
-
-    await opts.ensureChatCreated();
-    const sid = opts.getSessionId();
-
-    const userCid = crypto.randomUUID();
-    const asstCid = crypto.randomUUID();
-
-    // optimistic bubbles
-    opts.setMessagesFor(sid, (prev) => [
-      ...prev,
-      { id: userCid, serverId: null, role: "user", text: prompt, attachments: atts.length ? atts : undefined },
-      { id: asstCid, serverId: null, role: "assistant", text: "" },
-    ]);
-    opts.setInput("");
-
-    // persist user
-    appendMessage(sid, "user", prompt, atts.length ? atts : undefined)
-      .then((row) => {
-        if (row?.id != null) {
-          opts.setServerIdFor(sid, userCid, Number(row.id));
-          try {
-            window.dispatchEvent(
-              new CustomEvent("chats:refresh", {
-                detail: {
-                  sessionId: sid,
-                  lastMessage: prompt,
-                  updatedAt: new Date().toISOString(),
-                },
-              })
-            );
-          } catch {}
-        }
-      })
-      .catch(() => {});
-
-    // enqueue generation with attachments
-    try { opts.setQueuedFor(sid, true); } catch {}
-    scheduler.enqueue({ sid, prompt, asstId: asstCid, attachments: atts.length ? atts : undefined });
-  }
-
-  async function stop() { await canceller.stopVisible(); }
-  async function cancelBySessionId(id: string) { await canceller.cancelBySessionId(id); }
-  function dispose() {
-    try { controllerRef?.abort(); } catch {}
-    try { readerRef?.cancel(); } catch {}
-    controllerRef = null; readerRef = null;
-  }
-
-  return { send, stop, cancelBySessionId, dispose };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/network.ts =====
-
-// frontend/src/file_read/hooks/stream/core/network.ts
-import { API_BASE } from "../../../services/http";
-
-export async function postStream(body: unknown, signal: AbortSignal) {
-  const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-  return res.body.getReader();
-}
-
-export async function postCancel(sessionId: string) {
-  try {
-    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, {
-      method: "POST",
-    });
-  } catch {
-    /* best-effort */
-  }
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/queue.ts =====
-
-// frontend/src/file_read/hooks/stream/core/queue.ts
-import type { Attachment } from "../../../types/chat";
-
-export type QueueItem = {
-  sid: string;
-  prompt: string;              // may be empty when attachments-only
-  asstId: string;              // client id of the assistant bubble to stream into
-  attachments?: Attachment[];  // optional attachments for this turn
-};
-
-export type RunJob = (job: QueueItem) => Promise<void>;
-
-export function createScheduler(runJob: RunJob) {
-  const q: QueueItem[] = [];
-  let active: { sid: string } | null = null;
-
-  async function startNext() {
-    if (active || q.length === 0) return;
-    const job = q.shift()!;
-    active = { sid: job.sid };
-    try {
-      await runJob(job);
-    } finally {
-      active = null;
-      if (q.length) void startNext();
-    }
-  }
-
-  return {
-    enqueue(job: QueueItem) {
-      q.push(job);
-      void startNext();
-    },
-    isActiveSid: (sid: string) => active?.sid === sid,
-    dropJobsForSid(sid: string) {
-      for (let i = q.length - 1; i >= 0; i--) {
-        if (q[i].sid === sid) q.splice(i, 1);
-      }
-    },
-    getActiveSid: () => active?.sid ?? null,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
-
-// frontend/src/file_read/hooks/stream/core/runner.ts
-import { postStream } from "./network";
-import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
-import type { ChatMsg } from "../../../types/chat";
-import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
-import { readStreamLoop } from "./runner_stream";
-import {
-  pinLiveMetricsToSession,
-  pinLiveMetricsToBubble,
-  pinFallbackToSessionAndBubble,
-} from "./runner_metrics";
-import { persistAssistantTurn } from "./runner_persist";
-import type { QueueItem } from "./queue";
-import { listChatsPage } from "../../../data/chatApi";
-
-
-export type RunnerDeps = {
-  opts: {
-    ensureChatCreated: () => Promise<void>;
-    getSessionId: () => string;
-    getMessagesFor: (sid: string) => ChatMsg[];
-    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
-    setInput: (v: string) => void;
-    setLoadingFor: (sid: string, v: boolean) => void;
-    setQueuedFor: (sid: string, v: boolean) => void;
-    resetMetricsFor: (sid: string) => void;
-    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
-    onRetitle: (sid: string, finalText: string) => Promise<void>;
-    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
-  };
-  getCancelForSid: () => string | null;
-  clearCancelIf: (sid: string) => void;
-  setController: (c: AbortController | null) => void;
-  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
-};
-
-export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
-  const { sid, prompt, asstId, attachments } = job;
-  const { opts } = d;
-  const wasCanceled = () => d.getCancelForSid() === sid;
-
-  opts.resetMetricsFor(sid);
-  opts.setLoadingFor(sid, true);
-
-  ensureAssistantPlaceholder(
-    { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
-    sid,
-    asstId
-  );
-
-  const MAX_HISTORY = 10;
-  const history = opts
-    .getMessagesFor(sid)
-    .slice(-MAX_HISTORY)
-    .map((m) => ({
-      role: m.role,
-      content: m.text || "",
-      attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
-    }))
-    .filter(
-      (m) =>
-        (m.content && m.content.trim().length > 0) ||
-        (m.attachments && m.attachments.length > 0)
-    );
-
-  const userTurn = {
-    role: "user" as const,
-    content: prompt,
-    attachments: attachments && attachments.length ? attachments : undefined,
-  };
-
-  const controller = new AbortController();
-  d.setController(controller);
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-
-  try {
-    reader = await postStream(
-      { sessionId: sid, messages: [...history, userTurn] },
-      controller.signal
-    );
-    d.setReader(reader);
-
-    const { finalText, gotMetrics, lastRunJson } = awa
+import type { Atta

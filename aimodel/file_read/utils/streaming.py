@@ -6,14 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..runtime.model_runtime import current_model_info, get_llm
 
-# Markers MUST match the frontend parser
 RUNJSON_START = "\n[[RUNJSON]]\n"
 RUNJSON_END = "\n[[/RUNJSON]]\n"
 
-# llama.cpp common stop strings
 STOP_STRINGS = ["</s>", "User:", "\nUser:"]
-
-# ---------- token + model helpers ----------
 
 def strip_runjson(s: str) -> str:
     if not isinstance(s, str) or not s:
@@ -27,7 +23,7 @@ def strip_runjson(s: str) -> str:
         out.append(s[i:start])
         end = s.find(RUNJSON_END, start)
         if end == -1:
-            break  # unmatched start → drop tail
+            break
         i = end + len(RUNJSON_END)
     return "".join(out).strip()
 
@@ -36,7 +32,7 @@ def safe_token_count_text(llm: Any, text: str) -> int:
         return len(llm.tokenize(text.encode("utf-8")))
     except Exception:
         try:
-            return len(llm.tokenize(text, special=True))  # type: ignore[arg-type]
+            return len(llm.tokenize(text, special=True))
         except Exception:
             return max(1, len(text) // 4)
 
@@ -59,9 +55,69 @@ def derive_stop_reason(stop_set: bool, finish_reason: Optional[str], err_text: O
         return "error"
     return "end_of_stream"
 
+def _first(obj: dict, keys: List[str]):
+    for k in keys:
+        if k in obj and obj[k] is not None:
+            return obj[k]
+    return None
+
+def _sec_from_ms(v: Any) -> Optional[float]:
+    try:
+        x = float(v)
+        return round(x / 1000.0, 6)
+    except Exception:
+        return None
+
+def collect_engine_timings(llm: Any) -> Optional[Dict[str, Optional[float]]]:
+    src = None
+    try:
+        if hasattr(llm, "get_last_timings") and callable(llm.get_last_timings):
+            src = llm.get_last_timings()
+        elif hasattr(llm, "get_timings") and callable(llm.get_timings):
+            src = llm.get_timings()
+        elif hasattr(llm, "timings"):
+            t = llm.timings
+            src = t() if callable(t) else t
+        elif hasattr(llm, "perf"):
+            p = llm.perf
+            src = p() if callable(p) else p
+        elif hasattr(llm, "stats"):
+            s = llm.stats
+            src = s() if callable(s) else s
+        elif hasattr(llm, "get_stats") and callable(llm.get_stats):
+            src = llm.get_stats()
+    except Exception:
+        src = None
+
+    if not isinstance(src, dict):
+        return None
+
+    load_ms = _first(src, ["load_ms", "loadMs", "model_load_ms", "load_time_ms"])
+    prompt_ms = _first(src, ["prompt_ms", "promptMs", "prompt_eval_ms", "prompt_time_ms", "prefill_ms"])
+    eval_ms = _first(src, ["eval_ms", "evalMs", "decode_ms", "eval_time_ms"])
+    prompt_n = _first(src, ["prompt_n", "promptN", "prompt_tokens", "n_prompt_tokens"])
+    eval_n = _first(src, ["eval_n", "evalN", "eval_tokens", "n_eval_tokens"])
+
+    out: Dict[str, Optional[float]] = {
+        "loadSec": _sec_from_ms(load_ms),
+        "promptSec": _sec_from_ms(prompt_ms),
+        "evalSec": _sec_from_ms(eval_ms),
+        "promptN": None,
+        "evalN": None,
+    }
+    try:
+        out["promptN"] = int(prompt_n) if prompt_n is not None else None
+    except Exception:
+        out["promptN"] = None
+    try:
+        out["evalN"] = int(eval_n) if eval_n is not None else None
+    except Exception:
+        out["evalN"] = None
+    return out
+
 def build_run_json(
     *,
-    request_cfg: Dict[str, object],   # temperature, top_p, max_tokens
+    request_cfg: Dict[str, object],
     out_text: str,
     t_start: float,
     t_first: Optional[float],
@@ -69,6 +125,9 @@ def build_run_json(
     stop_set: bool,
     finish_reason: Optional[str],
     input_tokens_est: Optional[int],
+    budget_view: Optional[dict] = None,
+    extra_timings: Optional[dict] = None,
+    error_text: Optional[str] = None,
 ) -> Dict[str, object]:
     llm = get_llm()
     out_tokens = safe_token_count_text(llm, out_text)
@@ -76,11 +135,13 @@ def build_run_json(
     ttft_ms = ((t_first or t_end) - t_start) * 1000.0
     gen_secs = (t_last - t_first) if (t_first is not None and t_last is not None) else 0.0
     tok_per_sec = (out_tokens / gen_secs) if gen_secs > 0 else None
-
     stop_reason_final = derive_stop_reason(stop_set, finish_reason, None)
     ident, cfg = model_ident_and_cfg()
-
     total_tokens = (input_tokens_est or 0) + out_tokens if input_tokens_est is not None else None
+
+    timings_payload = dict(extra_timings or {})
+    if "engine" not in timings_payload or timings_payload.get("engine") is None:
+        timings_payload["engine"] = collect_engine_timings(llm)
 
     return {
         "indexedModelIdentifier": ident,
@@ -118,10 +179,12 @@ def build_run_json(
             "promptTokensCount": input_tokens_est,
             "predictedTokensCount": out_tokens,
             "totalTokensCount": total_tokens,
+            "budget": budget_view or {},
+            "timings": timings_payload,
+            "error": error_text or None,
         },
+        "budget_view": (budget_view or {}),
     }
-
-# ---------- connection helper ----------
 
 async def watch_disconnect(request, stop_ev):
     if await request.is_disconnected():

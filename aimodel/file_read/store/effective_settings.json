@@ -170,7 +170,7 @@
     "web:",
     "search:"
   ],
-  "router_default_need_when_invalid": false,
+  "router_default_need_when_invalid": true,
   "router_json_extract_regex": "\\{.*?\\}",
   "__comment_router_wrappers": "=== Router wrapper stripping ===",
   "router_strip_wrappers_enabled": true,
@@ -236,7 +236,7 @@
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
@@ -281,6 +281,7 @@
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
   "excel_emit_key_values": true,
+  "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
   "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
   "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
@@ -314,5 +315,19 @@
   "doc_ole_drop_xmlish": true,
   "doc_ole_drop_pathish": true,
   "doc_ole_drop_symbol_lines": true,
-  "doc_ole_dedupe_short_repeats": true
+  "doc_ole_dedupe_short_repeats": true,
+  "warmup_enabled": true,
+  "warmup_on_start": true,
+  "warmup_on_interval_sec": 600,
+  "warmup_jitter_sec": 8,
+  "warmup_llm_enabled": true,
+  "warmup_web_enabled": false,
+  "web_enabled": false,
+  "warmup_web_k": 2,
+  "warmup_timeout_sec": 5,
+  "warmup_queries": [
+    "current US president",
+    "S&P 500 today",
+    "weather tomorrow"
+  ]
 }

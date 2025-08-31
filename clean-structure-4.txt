@@ -1,4 +1,594 @@
-it readStreamLoop(reader, {
+chment, ChatRow, ChatMessageRow} from "../types/chat";
+import { request } from "../services/http";
+
+// Spring Page<T> type
+export type PageResp<T> = {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  size: number;
+  number: number;      // current page index (0-based)
+  first: boolean;
+  last: boolean;
+  empty: boolean;
+};
+
+export function createChat(sessionId: string, title: string) {
+  return request<ChatRow>("/api/chats", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, title }),
+  });
+}
+
+export function updateChatLast(sessionId: string, lastMessage: string, title?: string) {
+  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lastMessage, title: title || "" }),
+  });
+}
+
+// Legacy (unused after pagination in sidebar)
+export function listChats() {
+  return request<ChatRow[]>("/api/chats");
+}
+
+// NEW: paginated list
+export function listChatsPage(page = 0, size = 30, ceiling?: string) {
+  const qs = new URLSearchParams({ page: String(page), size: String(size) });
+  if (ceiling) qs.set("ceiling", ceiling);
+  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
+}
+
+export function listMessages(sessionId: string) {
+  return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
+}
+
+export async function appendMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string,
+  attachments?: Attachment[]
+) {
+  const body: any = { role, content };
+  if (attachments && attachments.length) body.attachments = attachments;
+
+  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteChatsBatch(sessionIds: string[]) {
+  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionIds }),
+  });
+  return data.deleted;
+}
+
+export function deleteMessage(sessionId: string, messageId: string | number) {
+  return request<{ deleted: number }>(
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
+    { method: "DELETE" }
+  );
+}
+
+/** Delete a batch of messages. Backend returns { deleted: number[] } */
+export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
+  const ids = messageIds
+    .map((id) => (typeof id === "string" ? Number(id) : id))
+    .filter((n) => Number.isFinite(n)) as number[];
+
+  return request<{ deleted: number[] }>(  // <-- number[]
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messageIds: ids }),
+    }
+  );
+}
+
+# ===== frontend/src/file_read/data/ragApi.ts =====
+
+// frontend/src/file_read/data/ragApi.ts
+import { request, API_BASE } from "../services/http";
+
+export function uploadRag(file: File, sessionId?: string, forceGlobal = false) {
+  const form = new FormData();
+  form.append("file", file);
+  if (sessionId && !forceGlobal) form.append("sessionId", sessionId);
+
+  return request<{ ok: boolean; added: number }>(
+    "/api/rag/upload",
+    { method: "POST", body: form }
+  );
+}
+
+export function uploadRagWithProgress(
+  file: File,
+  sessionId: string,
+  onProgress: (pct: number) => void,
+  signal?: AbortSignal
+): Promise<{ ok: boolean; added: number }> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("sessionId", sessionId);
+
+    const xhr = new XMLHttpRequest();
+    const url = `${API_BASE}/api/rag/upload`.replace(/([^:]\/)\/+/g, "$1");
+    xhr.open("POST", url);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { resolve({ ok: true, added: 0 }); }
+      } else {
+        reject(new Error(`Upload failed (${xhr.status})`));
+      }
+    };
+
+    // treat abort as a silent resolution, not an error
+    xhr.onabort = () => resolve({ ok: false, added: 0 });
+    xhr.onerror = () => reject(new Error("Network error"));
+
+    if (signal) {
+      if (signal.aborted) { xhr.abort(); return resolve({ ok: false, added: 0 }); }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+
+    xhr.send(form);
+  });
+}
+
+
+export function searchRag(query: string, opts?: {
+  sessionId?: string;
+  kChat?: number;
+  kGlobal?: number;
+  alpha?: number; // hybrid_alpha
+}) {
+  const body = {
+    query,
+    sessionId: opts?.sessionId ?? undefined,
+    kChat: opts?.kChat ?? 6,
+    kGlobal: opts?.kGlobal ?? 4,
+    hybrid_alpha: opts?.alpha ?? 0.5,
+  };
+
+  return request<{
+    hits: Array<{
+      id?: string;
+      score: number;
+      source?: string;
+      title?: string;
+      text: string;
+      sessionId?: string | null;
+    }>;
+  }>(
+    "/api/rag/search",   // ✅ relative path, request() adds API_BASE
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+}
+
+export type UploadRow = {
+  source: string;
+  sessionId?: string | null;
+  chunks: number;
+};
+
+export async function listUploads(sessionId?: string, scope: "all" | "session" = "all") {
+  const p = new URLSearchParams();
+  if (sessionId) p.set("sessionId", sessionId);
+  if (scope) p.set("scope", scope);
+
+  return request<{ uploads: UploadRow[] }>(
+    `/api/rag/uploads?${p.toString()}`,
+    { method: "GET" }
+  );
+}
+
+export async function deleteUploadHard(source: string, sessionId?: string) {
+  return request<{ ok: boolean; removed: number; remaining: number }>(
+    `/api/rag/uploads/delete-hard`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, sessionId }),
+    }
+  );
+}
+
+# ===== frontend/src/file_read/data/settingsApi.ts =====
+
+// frontend/src/file_read/data/settingsApi.ts
+import { request } from "../services/http";
+
+export function getDefaults() {
+  return request<Record<string, any>>("/api/settings/defaults");
+}
+
+export function getAdaptive(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<Record<string, any>>(`/api/settings/adaptive${qs}`);
+}
+
+export function getOverrides() {
+  return request<Record<string, any>>("/api/settings/overrides");
+}
+
+export function getEffective(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<Record<string, any>>(`/api/settings/effective${qs}`);
+}
+
+export function putOverrides(overrides: Record<string, any>) {
+  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(overrides), // ← send raw object
+  });
+}
+
+export function patchOverrides(patch: Record<string, any>) {
+  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch), // ← send raw object
+  });
+}
+
+export function recomputeAdaptive(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<{ ok: boolean; adaptive: any }>(
+    `/api/settings/adaptive/recompute${qs}`,
+    { method: "POST" }
+  );
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/buffer.ts =====
+
+// frontend/src/file_read/hooks/stream/core/buffer.ts
+import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
+import { extractRunJsonFromBuffer } from "../../../shared/lib/runjson";
+import { STOP_SENTINEL_AT_END } from "./constants";
+
+export type BufferStep = {
+  cleanText: string;
+  delta: string;
+  metrics?: { json?: RunJson; flat?: GenMetrics };
+};
+
+export function processChunk(prevClean: string, rawBufIn: string): BufferStep {
+  let rawBuf = rawBufIn;
+  if (STOP_SENTINEL_AT_END.test(rawBuf)) {
+    rawBuf = rawBuf.replace(STOP_SENTINEL_AT_END, "");
+  }
+  const { clean, json, flat } = extractRunJsonFromBuffer(rawBuf);
+  const delta = clean.slice(prevClean.length);
+  return { cleanText: clean, delta, metrics: json || flat ? { json, flat } : undefined };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/cancel.ts =====
+
+import { postCancel } from "./network";
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
+
+type Deps = {
+  getVisibleSid: () => string;
+  setLoadingFor: (sid: string, v: boolean) => void;
+  setQueuedFor: (sid: string, v: boolean) => void;
+  getController: () => AbortController | null;
+  getReader: () => ReadableStreamDefaultReader<Uint8Array> | null;
+  setCancelForSid: (sid: string | null) => void;
+  isActiveSid: (sid: string) => boolean;
+  dropJobsForSid: (sid: string) => void;
+};
+
+export function createCanceller(d: Deps) {
+  async function cancelBySessionId(id: string) {
+    // Mark as canceled so read loop can react, but DO NOT abort fetch yet.
+    d.setCancelForSid(id);
+
+    // Tell the backend to stop gracefully (flush metrics + close).
+    postCancel(id).catch(() => {});
+
+    if (d.isActiveSid(id)) {
+      // Drop any queued jobs for this session, but keep loading true —
+      // runStreamOnce will turn loading off in its finally after the stream ends.
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+
+      // Safety net: if server doesn’t flush within timeout, hard-abort.
+      window.setTimeout(() => {
+        if (d.isActiveSid(id)) {
+          try { d.getReader()?.cancel(); } catch {}
+          try { d.getController()?.abort(); } catch {}
+        }
+      }, STOP_FLUSH_TIMEOUT_MS + 500);
+    } else {
+      // Not active: just clear queued jobs and cancel flag.
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+      d.setCancelForSid(null);
+    }
+  }
+
+  async function stopVisible() {
+    const id = d.getVisibleSid();
+    await cancelBySessionId(id);
+  }
+
+  return { cancelBySessionId, stopVisible };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/constants.ts =====
+
+// frontend/src/file_read/hooks/stream/core/constants.ts
+export const STOP_SENTINEL_AT_END = /(?:\r?\n)?\u23F9 stopped(?:\r?\n)?$/u;
+export const STOP_FLUSH_TIMEOUT_MS = 3500;
+
+# ===== frontend/src/file_read/hooks/stream/core/controller.ts =====
+
+import { appendMessage } from "../../../data/chatApi";
+import type { StreamController, StreamCoreOpts } from "./types";
+import { createScheduler, type QueueItem } from "./queue";
+import { createCanceller } from "./cancel";
+import { runStreamOnce } from "./runner";
+import type { Attachment } from "../../../types/chat";
+
+export function createStreamController(opts: StreamCoreOpts): StreamController {
+  let cancelForSid: string | null = null;
+  let controllerRef: AbortController | null = null;
+  let readerRef: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  const scheduler = createScheduler(async (job: QueueItem) => {
+    try { opts.setQueuedFor(job.sid, false); } catch {}
+    await runStreamOnce(job, {
+      opts,
+      getCancelForSid: () => cancelForSid,
+      clearCancelIf: (sid) => { if (cancelForSid === sid) cancelForSid = null; },
+      setController: (c) => { controllerRef = c; },
+      setReader: (r) => { readerRef = r; },
+    });
+  });
+
+  const canceller = createCanceller({
+    getVisibleSid: opts.getSessionId,
+    setLoadingFor: opts.setLoadingFor,
+    setQueuedFor: opts.setQueuedFor,
+    getController: () => controllerRef,
+    getReader: () => readerRef,
+    setCancelForSid: (sid) => { cancelForSid = sid; },
+    isActiveSid: scheduler.isActiveSid,
+    dropJobsForSid: scheduler.dropJobsForSid,
+  });
+
+  async function send(override?: string, attachments?: Attachment[]) {
+    const prompt = (override ?? "").trim();
+    const atts = (attachments ?? []).filter(Boolean);
+    if (!prompt && atts.length === 0) return; // allow attachments-only, but not truly empty
+
+    await opts.ensureChatCreated();
+    const sid = opts.getSessionId();
+
+    const userCid = crypto.randomUUID();
+    const asstCid = crypto.randomUUID();
+
+    // optimistic bubbles
+    opts.setMessagesFor(sid, (prev) => [
+      ...prev,
+      { id: userCid, serverId: null, role: "user", text: prompt, attachments: atts.length ? atts : undefined },
+      { id: asstCid, serverId: null, role: "assistant", text: "" },
+    ]);
+    opts.setInput("");
+
+    // persist user
+    appendMessage(sid, "user", prompt, atts.length ? atts : undefined)
+      .then((row) => {
+        if (row?.id != null) {
+          opts.setServerIdFor(sid, userCid, Number(row.id));
+          try {
+            window.dispatchEvent(
+              new CustomEvent("chats:refresh", {
+                detail: {
+                  sessionId: sid,
+                  lastMessage: prompt,
+                  updatedAt: new Date().toISOString(),
+                },
+              })
+            );
+          } catch {}
+        }
+      })
+      .catch(() => {});
+
+    // enqueue generation with attachments
+    try { opts.setQueuedFor(sid, true); } catch {}
+    scheduler.enqueue({ sid, prompt, asstId: asstCid, attachments: atts.length ? atts : undefined });
+  }
+
+  async function stop() { await canceller.stopVisible(); }
+  async function cancelBySessionId(id: string) { await canceller.cancelBySessionId(id); }
+  function dispose() {
+    try { controllerRef?.abort(); } catch {}
+    try { readerRef?.cancel(); } catch {}
+    controllerRef = null; readerRef = null;
+  }
+
+  return { send, stop, cancelBySessionId, dispose };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/network.ts =====
+
+// frontend/src/file_read/hooks/stream/core/network.ts
+import { API_BASE } from "../../../services/http";
+
+export async function postStream(body: unknown, signal: AbortSignal) {
+  const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  return res.body.getReader();
+}
+
+export async function postCancel(sessionId: string) {
+  try {
+    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/queue.ts =====
+
+// frontend/src/file_read/hooks/stream/core/queue.ts
+import type { Attachment } from "../../../types/chat";
+
+export type QueueItem = {
+  sid: string;
+  prompt: string;              // may be empty when attachments-only
+  asstId: string;              // client id of the assistant bubble to stream into
+  attachments?: Attachment[];  // optional attachments for this turn
+};
+
+export type RunJob = (job: QueueItem) => Promise<void>;
+
+export function createScheduler(runJob: RunJob) {
+  const q: QueueItem[] = [];
+  let active: { sid: string } | null = null;
+
+  async function startNext() {
+    if (active || q.length === 0) return;
+    const job = q.shift()!;
+    active = { sid: job.sid };
+    try {
+      await runJob(job);
+    } finally {
+      active = null;
+      if (q.length) void startNext();
+    }
+  }
+
+  return {
+    enqueue(job: QueueItem) {
+      q.push(job);
+      void startNext();
+    },
+    isActiveSid: (sid: string) => active?.sid === sid,
+    dropJobsForSid(sid: string) {
+      for (let i = q.length - 1; i >= 0; i--) {
+        if (q[i].sid === sid) q.splice(i, 1);
+      }
+    },
+    getActiveSid: () => active?.sid ?? null,
+  };
+}
+
+# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
+
+// frontend/src/file_read/hooks/stream/core/runner.ts
+import { postStream } from "./network";
+import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
+import type { ChatMsg } from "../../../types/chat";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { readStreamLoop } from "./runner_stream";
+import {
+  pinLiveMetricsToSession,
+  pinLiveMetricsToBubble,
+  pinFallbackToSessionAndBubble,
+} from "./runner_metrics";
+import { persistAssistantTurn } from "./runner_persist";
+import type { QueueItem } from "./queue";
+import { listChatsPage } from "../../../data/chatApi";
+
+
+export type RunnerDeps = {
+  opts: {
+    ensureChatCreated: () => Promise<void>;
+    getSessionId: () => string;
+    getMessagesFor: (sid: string) => ChatMsg[];
+    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+    setInput: (v: string) => void;
+    setLoadingFor: (sid: string, v: boolean) => void;
+    setQueuedFor: (sid: string, v: boolean) => void;
+    resetMetricsFor: (sid: string) => void;
+    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+    onRetitle: (sid: string, finalText: string) => Promise<void>;
+    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+  };
+  getCancelForSid: () => string | null;
+  clearCancelIf: (sid: string) => void;
+  setController: (c: AbortController | null) => void;
+  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
+};
+
+export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
+  const { sid, prompt, asstId, attachments } = job;
+  const { opts } = d;
+  const wasCanceled = () => d.getCancelForSid() === sid;
+
+  opts.resetMetricsFor(sid);
+  opts.setLoadingFor(sid, true);
+
+  ensureAssistantPlaceholder(
+    { getMessagesFor: opts.getMessagesFor, setMessagesFor: opts.setMessagesFor },
+    sid,
+    asstId
+  );
+
+  const MAX_HISTORY = 10;
+  const history = opts
+    .getMessagesFor(sid)
+    .slice(-MAX_HISTORY)
+    .map((m) => ({
+      role: m.role,
+      content: m.text || "",
+      attachments: m.attachments && m.attachments.length ? m.attachments : undefined,
+    }))
+    .filter(
+      (m) =>
+        (m.content && m.content.trim().length > 0) ||
+        (m.attachments && m.attachments.length > 0)
+    );
+
+  const userTurn = {
+    role: "user" as const,
+    content: prompt,
+    attachments: attachments && attachments.length ? attachments : undefined,
+  };
+
+  const controller = new AbortController();
+  d.setController(controller);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  try {
+    reader = await postStream(
+      { sessionId: sid, messages: [...history, userTurn] },
+      controller.signal
+    );
+    d.setReader(reader);
+
+    const { finalText, gotMetrics, lastRunJson } = await readStreamLoop(reader, {
       wasCanceled,
       onDelta: (delta) => {
         opts.setMessagesFor(sid, (prev) => {

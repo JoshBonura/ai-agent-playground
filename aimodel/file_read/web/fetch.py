@@ -1,58 +1,48 @@
 # aimodel/file_read/web/fetch.py
 from __future__ import annotations
 import asyncio
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict, Any
+import time
 import httpx
 
-# Optional extractors (use whatever is installed)
 try:
-    from readability import Document  # readability-lxml
+    from readability import Document
 except Exception:
     Document = None  # type: ignore
 
 try:
-    from bs4 import BeautifulSoup  # beautifulsoup4 + lxml
+    from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None  # type: ignore
 
 try:
-    from selectolax.parser import HTMLParser  # selectolax
+    from selectolax.parser import HTMLParser
 except Exception:
     HTMLParser = None  # type: ignore
 
 from ..core.settings import SETTINGS
 
 
+def _req(key: str):
+    return SETTINGS[key]
+
 def _ua() -> str:
-    return str(SETTINGS.get("web_fetch_user_agent", "LocalAI/0.1 (+clean-fetch)"))
+    return str(_req("web_fetch_user_agent"))
 
 def _timeout() -> float:
-    try:
-        return float(SETTINGS.get("web_fetch_timeout_sec", 8.0))
-    except Exception:
-        return 8.0
+    return float(_req("web_fetch_timeout_sec"))
 
 def _max_chars() -> int:
-    try:
-        return int(SETTINGS.get("web_fetch_max_chars", 3000))
-    except Exception:
-        return 3000
+    return int(_req("web_fetch_max_chars"))
 
 def _max_bytes() -> int:
-    try:
-        return int(SETTINGS.get("web_fetch_max_bytes", 1_048_576))
-    except Exception:
-        return 1_048_576
+    return int(_req("web_fetch_max_bytes"))
 
 def _max_parallel() -> int:
-    try:
-        return max(1, int(SETTINGS.get("web_fetch_max_parallel", 3)))
-    except Exception:
-        return 3
+    return max(1, int(_req("web_fetch_max_parallel")))
 
 
 async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
-    # Stream and cap to avoid huge downloads
     out = bytearray()
     async for chunk in resp.aiter_bytes():
         if not chunk:
@@ -67,16 +57,7 @@ async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
 
 
 def _extract_text_from_html(raw_html: str, url: str) -> str:
-    """
-    Best-effort HTML → text:
-      1) readability-lxml (if available): main-article extraction
-      2) selectolax (if available): fast DOM text
-      3) BeautifulSoup (if available): generic text fallback
-      4) Raw text as last resort
-    """
     html = raw_html or ""
-
-    # 1) readability main content
     if Document is not None:
         try:
             doc = Document(html)
@@ -87,15 +68,11 @@ def _extract_text_from_html(raw_html: str, url: str) -> str:
                     txt = soup.get_text(" ", strip=True)
                     if txt:
                         return txt
-                # If bs4 missing, fall back to selectolax/plain below
         except Exception:
             pass
-
-    # 2) selectolax full text
     if HTMLParser is not None:
         try:
             tree = HTMLParser(html)
-            # Remove script/style/noscript quickly if present
             for bad in ("script", "style", "noscript"):
                 for n in tree.tags(bad):
                     n.decompose()
@@ -104,12 +81,9 @@ def _extract_text_from_html(raw_html: str, url: str) -> str:
                 return txt
         except Exception:
             pass
-
-    # 3) BeautifulSoup full text
     if BeautifulSoup is not None:
         try:
             soup = BeautifulSoup(html, "lxml")
-            # Strip scripts/styles
             for s in soup(["script", "style", "noscript"]):
                 s.extract()
             txt = soup.get_text(" ", strip=True)
@@ -117,8 +91,6 @@ def _extract_text_from_html(raw_html: str, url: str) -> str:
                 return txt
         except Exception:
             pass
-
-    # 4) Raw (no HTML parsing available)
     return html
 
 
@@ -127,12 +99,9 @@ async def fetch_clean(
     timeout_s: Optional[float] = None,
     max_chars: Optional[int] = None,
     max_bytes: Optional[int] = None,
+    telemetry: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, int, str]:
-    """
-    Returns: (final_url, status_code, cleaned_text)
-    - cleaned_text is extracted via readability/selectolax/bs4 if available; else raw
-    - caps by bytes first, then by chars
-    """
+    t0 = time.perf_counter()
     timeout = _timeout() if timeout_s is None else float(timeout_s)
     cap_chars = _max_chars() if max_chars is None else int(max_chars)
     cap_bytes = _max_bytes() if max_bytes is None else int(max_bytes)
@@ -141,20 +110,25 @@ async def fetch_clean(
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
         r = await client.get(url)
         r.raise_for_status()
-
-        # Stream with byte cap
         raw_bytes = await _read_capped_bytes(r, cap_bytes)
-        # Text decode with fallback (httpx sets encoding heuristically)
         enc = r.encoding or "utf-8"
         raw_text = raw_bytes.decode(enc, errors="ignore")
-
-        # Extract/clean HTML to text (no trafilatura)
         txt = _extract_text_from_html(raw_text, str(r.url))
         txt = (txt or "").strip().replace("\r", "")
-
         if len(txt) > cap_chars:
             txt = txt[:cap_chars]
-
+        if telemetry is not None:
+            telemetry.update({
+                "reqUrl": url,
+                "finalUrl": str(r.url),
+                "status": int(r.status_code),
+                "elapsedSec": round(time.perf_counter() - t0, 6),
+                "bytes": len(raw_bytes),
+                "chars": len(txt),
+                "timeoutSec": timeout,
+                "capBytes": cap_bytes,
+                "capChars": cap_chars,
+            })
         return (str(r.url), r.status_code, txt)
 
 
@@ -164,20 +138,59 @@ async def fetch_many(
     cap_chars: Optional[int] = None,
     cap_bytes: Optional[int] = None,
     max_parallel: Optional[int] = None,
+    telemetry: Optional[Dict[str, Any]] = None,
 ):
+    t_total0 = time.perf_counter()
     sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
+    tel_items: List[Dict[str, Any]] = []
 
     async def _one(u: str):
+        item_tel: Dict[str, Any] = {"reqUrl": u}
+        t0 = time.perf_counter()
         async with sem:
             try:
-                return u, await fetch_clean(
+                res = await fetch_clean(
                     u,
                     timeout_s=per_timeout_s,
                     max_chars=cap_chars,
                     max_bytes=cap_bytes,
+                    telemetry=item_tel,
                 )
-            except Exception:
+                item_tel.setdefault("elapsedSec", round(time.perf_counter() - t0, 6))
+                item_tel["ok"] = True
+                tel_items.append(item_tel)
+                return u, res
+            except Exception as e:
+                item_tel.update({
+                    "ok": False,
+                    "errorType": type(e).__name__,
+                    "errorMsg": str(e),
+                    "elapsedSec": round(time.perf_counter() - t0, 6),
+                    "timeoutSec": (float(per_timeout_s) if per_timeout_s is not None else _timeout()),
+                    "capBytes": (int(cap_bytes) if cap_bytes is not None else _max_bytes()),
+                    "capChars": (int(cap_chars) if cap_chars is not None else _max_chars()),
+                })
+                tel_items.append(item_tel)
                 return u, None
 
     tasks = [_one(u) for u in urls]
-    return await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks)
+
+    if telemetry is not None:
+        ok_cnt = sum(1 for it in tel_items if it.get("ok"))
+        telemetry.update({
+            "totalSec": round(time.perf_counter() - t_total0, 6),
+            "requested": len(urls),
+            "ok": ok_cnt,
+            "miss": len(urls) - ok_cnt,
+            "items": tel_items,
+            "settings": {
+                "userAgent": _ua(),
+                "defaultTimeoutSec": _timeout(),
+                "defaultCapChars": _max_chars(),
+                "defaultCapBytes": _max_bytes(),
+                "maxParallel": _max_parallel() if max_parallel is None else int(max_parallel),
+            },
+        })
+
+    return results

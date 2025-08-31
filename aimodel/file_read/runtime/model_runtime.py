@@ -47,18 +47,44 @@ def _build_kwargs(cfg: ModelConfig) -> Dict[str, Any]:
         n_gpu_layers=cfg.nGpuLayers,
         n_batch=cfg.nBatch,
     )
-    # advanced optional tuning
     if cfg.ropeFreqBase is not None:
         kw["rope_freq_base"] = cfg.ropeFreqBase
     if cfg.ropeFreqScale is not None:
         kw["rope_freq_scale"] = cfg.ropeFreqScale
     return kw
 
+def _attach_introspection(llm: Llama) -> None:
+    def get_last_timings():
+        try:
+            t = getattr(llm, "get_timings", None)
+            if callable(t):
+                v = t()
+                if isinstance(v, dict):
+                    return v
+        except Exception:
+            pass
+        try:
+            v = getattr(llm, "timings", None)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+        try:
+            v = getattr(llm, "perf", None)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+        return None
+    try:
+        setattr(llm, "get_last_timings", get_last_timings)
+    except Exception:
+        pass
+
 def _close_llm():
     global _llm
     try:
         if _llm is not None:
-            # llama_cpp doesn't expose explicit close; allow GC
             _llm = None
     except Exception:
         _llm = None
@@ -71,9 +97,6 @@ def current_model_info() -> Dict[str, Any]:
         }
 
 def ensure_ready() -> None:
-    """
-    Lazily load a model based on current settings if nothing is loaded.
-    """
     global _llm, _cfg
     with _runtime_lock:
         if _llm is not None:
@@ -86,6 +109,7 @@ def ensure_ready() -> None:
         if not p.exists():
             raise FileNotFoundError(f"Model path not found: {p}")
         _llm = Llama(**_build_kwargs(cfg))
+        _attach_introspection(_llm)
         _cfg = cfg
 
 def get_llm() -> Llama:
@@ -94,10 +118,6 @@ def get_llm() -> Llama:
     return _llm
 
 def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Load/swap to a new model with given config fields (any subset).
-    Persists to settings.json so the choice survives restarts.
-    """
     global _llm, _cfg
     with _runtime_lock:
         s = read_settings()
@@ -107,26 +127,19 @@ def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("modelPath is required")
         if not Path(cfg.modelPath).exists():
             raise FileNotFoundError(f"Model not found: {cfg.modelPath}")
-
-        # swap
         _close_llm()
         _llm = Llama(**_build_kwargs(cfg))
+        _attach_introspection(_llm)
         _cfg = cfg
         write_settings(asdict(cfg))
         return current_model_info()
 
 def unload_model() -> None:
-    """
-    Unload current model, keep settings as-is.
-    """
     global _llm
     with _runtime_lock:
         _close_llm()
 
 def list_local_models() -> List[Dict[str, Any]]:
-    """
-    Scan modelsDir for .gguf files and return a lightweight listing.
-    """
     s = read_settings()
     root = Path(s.get("modelsDir") or "")
     root.mkdir(parents=True, exist_ok=True)
@@ -141,6 +154,5 @@ def list_local_models() -> List[Dict[str, Any]]:
             })
         except Exception:
             pass
-    # sort largest first (usually higher quant or full precision)
     out.sort(key=lambda x: x["sizeBytes"], reverse=True)
     return out

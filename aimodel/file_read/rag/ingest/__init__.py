@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import Tuple
 import io, json
-
+from .xls_ingest import extract_xls
 from .excel_ingest import extract_excel
 from .csv_ingest import extract_csv
 from .common import _utf8, _strip_html, Chunk, chunk_text, build_metas
@@ -25,6 +25,10 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
     if name.endswith((".xlsx", ".xlsm")):
         _ing_dbg("-> excel")
         return extract_excel(data)
+
+    if name.endswith(".xls"):
+        _ing_dbg("-> excel (xls via xlrd)")
+        return extract_xls(data)
 
     if name.endswith((".csv", ".tsv")):
         _ing_dbg("-> csv/tsv")

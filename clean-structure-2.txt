@@ -1,4 +1,679 @@
-()
+k)}")
+    return block
+
+# ===== aimodel/file_read/rag/router_ai.py =====
+
+from __future__ import annotations
+from typing import Tuple, Optional, Any
+import json, re, traceback
+from ..core.settings import SETTINGS
+
+def _dbg(msg: str):
+    print(f"[RAG ROUTER] {msg}")
+
+def _force_json_strict(s: str) -> dict:
+    """Strict JSON parse: try direct, else (optionally) regex from settings. No other fallbacks."""
+    if not s:
+        return {}
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        pass
+
+    rgx = SETTINGS.get("router_rag_json_extract_regex")
+    if isinstance(rgx, str) and rgx:
+        try:
+            m = re.search(rgx, s, re.DOTALL)
+            if m:
+                cand = m.group(0)
+                v = json.loads(cand)
+                return v if isinstance(v, dict) else {}
+        except Exception:
+            pass
+
+    return {}
+
+def _strip_wrappers(text: str) -> str:
+    """All controls via router_rag_* settings; no internal defaults."""
+    t = text or ""
+    if SETTINGS.get("router_rag_trim_whitespace") is True:
+        t = t.strip()
+
+    if SETTINGS.get("router_rag_strip_wrappers_enabled") is not True:
+        return t
+
+    head = t
+    if SETTINGS.get("router_rag_strip_split_on_blank") is True:
+        head = t.split("\n\n", 1)[0]
+
+    pat = SETTINGS.get("router_rag_strip_header_regex")
+    if isinstance(pat, str) and pat:
+        try:
+            rx = re.compile(pat)
+            out = []
+            for ln in head.splitlines():
+                if rx.match(ln):
+                    break
+                out.append(ln)
+            core = " ".join(" ".join(out).split())
+            return core if core else t
+        except Exception:
+            return head
+    return head
+
+def _normalize_keys(d: dict) -> dict:
+    return {str(k).strip().strip('"').strip("'").strip().lower(): v for k, v in d.items()}
+
+def _as_bool(v) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().strip('"').strip("'").lower()
+        if s in ("true", "yes", "y", "1"):  return True
+        if s in ("false", "no", "n", "0"):  return False
+    return None
+
+def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
+    try:
+        if not user_text or not user_text.strip():
+            return (False, None)
+
+        core_text = _strip_wrappers(user_text.strip())
+
+        # Prompt must come from settings; supports either $text (Template) or {text} (format)
+        prompt_tpl = SETTINGS.get("router_rag_decide_prompt")
+        if not isinstance(prompt_tpl, str) or ("$text" not in prompt_tpl and "{text}" not in prompt_tpl):
+            _dbg("router_rag_decide_prompt missing/invalid")
+            return (False, None)
+
+        from string import Template
+        if "$text" in prompt_tpl:
+            the_prompt = Template(prompt_tpl).safe_substitute(text=core_text)
+        else:
+            the_prompt = prompt_tpl.format(text=core_text)
+
+        params = {
+            "max_tokens": SETTINGS.get("router_rag_decide_max_tokens"),
+            "temperature": SETTINGS.get("router_rag_decide_temperature"),
+            "top_p": SETTINGS.get("router_rag_decide_top_p"),
+            "stream": False,
+        }
+        stop_list = SETTINGS.get("router_rag_decide_stop")
+        if isinstance(stop_list, list) and stop_list:
+            params["stop"] = stop_list
+        params = {k: v for k, v in params.items() if v is not None}
+
+        raw = llm.create_chat_completion(
+            messages=[{"role": "user", "content": the_prompt}],
+            **params,
+        )
+        text_out = (raw.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+        data = _force_json_strict(text_out)
+        if not isinstance(data, dict):
+            return (False, None)
+        data = _normalize_keys(data)
+
+        need_raw = data.get("need")
+        need_bool = _as_bool(need_raw) if not isinstance(need_raw, bool) else need_raw
+        if need_bool is None:
+            need_default = SETTINGS.get("router_rag_default_need_when_invalid")
+            return (bool(need_default) if isinstance(need_default, bool) else False, None)
+
+        need = bool(need_bool)
+        query_field = data.get("query", "")
+        query = _strip_wrappers(str(query_field or "").strip()) if need else None
+        return (need, query)
+
+    except Exception as e:
+        _dbg(f"FATAL {type(e).__name__}: {e}")
+        traceback.print_exc()
+        need_default = SETTINGS.get("router_rag_default_need_when_invalid")
+        return (bool(need_default) if isinstance(need_default, bool) else False, None)
+
+# ===== aimodel/file_read/rag/schemas.py =====
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal, Dict
+
+class SearchReq(BaseModel):
+    query: str
+    sessionId: Optional[str] = None
+    kChat: int = 6
+    kGlobal: int = 4
+    hybrid_alpha: float = 0.5  # 0..1, higher = semantic weight
+
+class ItemRow(BaseModel):
+    id: str
+    sessionId: Optional[str]
+    source: str
+    title: Optional[str]
+    mime: Optional[str]
+    size: Optional[int]
+    createdAt: str
+    meta: Dict[str, str] = Field(default_factory=dict)
+
+class SearchHit(BaseModel):
+    id: str
+    text: str
+    score: float
+    source: Optional[str] = None   # <-- safer
+    title: Optional[str] = None
+    sessionId: Optional[str] = None
+    url: Optional[str] = None
+
+# ===== aimodel/file_read/rag/search.py =====
+
+from __future__ import annotations
+from typing import List, Dict, Optional
+import numpy as np
+from .store import search_vectors
+
+def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]:
+    # results = [list_from_chat, list_from_global]
+    scores: Dict[str, float] = {}
+    lookup: Dict[str, Dict] = {}
+    for lst in results:
+        for rank, r in enumerate(lst, start=1):
+            rid = r["id"]
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank)
+            lookup[rid] = r
+    fused = [{"score": s, **lookup[rid]} for rid, s in scores.items()]
+    fused.sort(key=lambda x: x["score"], reverse=True)
+    return fused
+
+def merge_chat_first(chat_hits: List[Dict], global_hits: List[Dict], alpha: float = 0.5) -> List[Dict]:
+    # alpha weights semantic scores; RRF stabilizes positions
+    fused = reciprocal_rank_fusion([chat_hits, global_hits])
+    return fused
+
+# ===== aimodel/file_read/rag/store.py =====
+
+from __future__ import annotations
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+import faiss, json, os, time, hashlib
+import numpy as np
+
+BASE = Path(__file__).resolve().parents[1] / "store" / "rag"
+
+def _ns_dir(session_id: Optional[str]) -> Path:
+    if session_id:
+        return BASE / "by_session" / session_id
+    return BASE / "global"
+
+def _paths(session_id: Optional[str]) -> Tuple[Path, Path]:
+    d = _ns_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "index.faiss", d / "meta.jsonl"
+
+def _norm(x: np.ndarray) -> np.ndarray:
+    x = x.astype("float32")
+    faiss.normalize_L2(x)
+    return x
+
+def _load_index(dim: int, p: Path) -> faiss.Index:
+    if p.exists():
+        return faiss.read_index(str(p))
+    return faiss.IndexFlatIP(dim)
+
+def _save_index(idx: faiss.Index, p: Path) -> None:
+    faiss.write_index(idx, str(p))
+
+def add_vectors(session_id: Optional[str], embeds: np.ndarray, metas: List[Dict], dim: int):
+    idx_path, meta_path = _paths(session_id)
+    idx = _load_index(dim, idx_path)
+
+    # ensure index type
+    if not isinstance(idx, faiss.IndexFlatIP):
+        idx = faiss.IndexFlatIP(dim) if idx.ntotal == 0 else idx
+
+    # normalize vectors
+    embeds = _norm(embeds)
+
+    # ✅ read existing ids to avoid duplicates
+    existing_ids = set()
+    if meta_path.exists():
+        with meta_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    j = json.loads(line)
+                    existing_ids.add(j["id"])
+                except:
+                    pass
+
+    start = idx.ntotal
+    new_embeds = []
+    new_metas = []
+
+    for i, m in enumerate(metas):
+        if m["id"] in existing_ids:
+            continue
+        m["row"] = start + len(new_embeds)
+        new_embeds.append(embeds[i])
+        new_metas.append(m)
+
+    if new_embeds:
+        idx.add(np.vstack(new_embeds))
+        _save_index(idx, idx_path)
+        with meta_path.open("a", encoding="utf-8") as f:
+            for m in new_metas:
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+def search_vectors(session_id: Optional[str], query_vec: np.ndarray, topk: int, dim: int) -> List[Dict]:
+    idx_path, meta_path = _paths(session_id)
+    if not idx_path.exists() or not meta_path.exists():
+        return []
+
+    idx = _load_index(dim, idx_path)
+
+    # ✅ ensure numpy array for reshape
+    query_vec = np.asarray(query_vec, dtype="float32")
+    q = _norm(query_vec.reshape(1, -1))
+
+    D, I = idx.search(q, topk)
+    out: List[Dict] = []
+    rows: Dict[int, Dict] = {}
+    with meta_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                j = json.loads(line)
+                rows[int(j["row"])] = j
+            except:
+                pass
+    for score, row in zip(D[0].tolist(), I[0].tolist()):
+        if row < 0:
+            continue
+        m = rows.get(row)
+        if not m:
+            continue
+        m = dict(m)
+        m["score"] = float(score)
+        out.append(m)
+    return out
+
+def search_similar(qvec: List[float] | np.ndarray, *, k: int = 5, session_id: Optional[str] = None) -> List[Dict]:
+    """
+    Compatibility wrapper used by retrieve.py.
+    qvec: a single embedding vector (list or np.ndarray)
+    """
+    arr = np.asarray(qvec, dtype="float32")
+    dim = int(arr.shape[-1])
+    return search_vectors(session_id, arr, k, dim)
+
+def add_texts(
+    texts: List[str],
+    metas: List[Dict],
+    *,
+    session_id: Optional[str],
+    embed_fn,  # callable: List[str] -> np.ndarray[float32]
+) -> int:
+    if not texts:
+        return 0
+    vecs = embed_fn(texts)  # should return (n, d) float32
+    if not isinstance(vecs, np.ndarray):
+        vecs = np.asarray(vecs, dtype="float32")
+    dim = int(vecs.shape[-1])
+    add_vectors(session_id, vecs, metas, dim)
+    return len(texts)
+
+# ===== aimodel/file_read/rag/uploads.py =====
+
+from __future__ import annotations
+from typing import Dict, List, Optional, Iterable, Tuple
+from pathlib import Path
+import json, os
+import numpy as np
+import faiss
+
+from .store import _ns_dir  # reuse your namespace layout
+
+_META_FN = "meta.jsonl"
+_INDEX_FN = "index.faiss"
+
+# ---------- Read-only helpers (NO mkdir) ----------
+def _meta_path_ro(session_id: Optional[str]) -> Path:
+    return _ns_dir(session_id) / _META_FN
+
+def _index_path_ro(session_id: Optional[str]) -> Path:
+    return _ns_dir(session_id) / _INDEX_FN
+
+# ---------- Mutating helpers (mkdir when writing) ----------
+def _paths_mut(session_id: Optional[str]) -> Tuple[Path, Path]:
+    d = _ns_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / _INDEX_FN, d / _META_FN
+
+def _read_meta(meta_path: Path) -> List[dict]:
+    if not meta_path.exists():
+        return []
+    out: List[dict] = []
+    with meta_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                j = json.loads(line)
+                if isinstance(j, dict):
+                    out.append(j)
+            except:
+                pass
+    return out
+
+def _write_meta(meta_path: Path, rows: List[dict]) -> None:
+    tmp = meta_path.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for j in rows:
+            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+    tmp.replace(meta_path)
+
+def _norm(x: np.ndarray) -> np.ndarray:
+    x = x.astype("float32")
+    faiss.normalize_L2(x)
+    return x
+
+def list_sources(session_id: Optional[str], include_global: bool = True) -> List[dict]:
+    def _agg(ns: Optional[str]) -> Dict[str, int]:
+        mp = _meta_path_ro(ns)  # read-only, no mkdir
+        agg: Dict[str, int] = {}
+        for j in _read_meta(mp):
+            src = (j.get("source") or "").strip()
+            if not src:
+                continue
+            agg[src] = agg.get(src, 0) + 1
+        return agg
+
+    rows: List[dict] = []
+    # session first
+    if session_id is not None:
+        for src, n in _agg(session_id).items():
+            rows.append({"source": src, "sessionId": session_id, "chunks": n})
+    if include_global:
+        for src, n in _agg(None).items():
+            rows.append({"source": src, "sessionId": None, "chunks": n})
+    return rows
+
+def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> dict:
+    """
+    Remove all chunks for `source` in the given namespace and REBUILD the FAISS index.
+    `embedder`: callable(List[str]) -> np.ndarray[float32] (same one used on ingest).
+    """
+    idx_path, meta_path = _paths_mut(session_id)  # mutating path (mkdir allowed)
+    rows = _read_meta(meta_path)
+    if not rows:
+        return {"ok": True, "removed": 0, "remaining": 0}
+
+    keep: List[dict] = []
+    removed = 0
+    for j in rows:
+        if str(j.get("source") or "").strip() == source:
+            removed += 1
+        else:
+            keep.append(j)
+
+    if removed == 0:
+        return {"ok": True, "removed": 0, "remaining": len(keep)}
+
+    # Reassign contiguous row ids for the kept entries
+    for i, j in enumerate(keep):
+        j["row"] = i
+
+    if len(keep) == 0:
+        # No rows left: drop index; empty meta file
+        if idx_path.exists():
+            try:
+                idx_path.unlink()
+            except:
+                pass
+        _write_meta(meta_path, [])
+        return {"ok": True, "removed": removed, "remaining": 0}
+
+    # Re-embed kept texts in batches
+    texts = [str(j.get("text") or "") for j in keep]
+    B = 128  # batch size
+    parts: List[np.ndarray] = []
+    for i in range(0, len(texts), B):
+        vec = embedder(texts[i:i + B])
+        if not isinstance(vec, np.ndarray):
+            vec = np.asarray(vec, dtype="float32")
+        parts.append(vec.astype("float32"))
+    embeds = np.vstack(parts)
+    embeds = _norm(embeds)
+
+    dim = int(embeds.shape[-1])
+    new_index = faiss.IndexFlatIP(dim)
+    new_index.add(embeds)
+
+    # Save rebuilt index + meta
+    faiss.write_index(new_index, str(idx_path))
+    _write_meta(meta_path, keep)
+
+    return {"ok": True, "removed": removed, "remaining": len(keep)}
+
+# ===== aimodel/file_read/rag/worker.py =====
+
+
+
+# ===== aimodel/file_read/requirements.txt =====
+
+fastapi==0.116.1
+uvicorn==0.30.6
+pydantic==2.11.7
+starlette==0.47.2
+llama-cpp-python==0.3.4
+ddgs==9.5.4
+httpx==0.27.0
+# HTML parsing / readability (permissive)
+lxml==6.0.1
+readability-lxml==0.8.1
+selectolax==0.3.21
+beautifulsoup4==4.12.3
+
+# RAG
+faiss-cpu==1.8.0.post1
+numpy==1.26.4
+sentence-transformers==3.0.1
+tzlocal==5.2
+openpyxl==3.1.5 
+python-multipart==0.0.20
+
+python-docx==1.1.2
+PyYAML==6.0.2
+toml==0.10.2
+pdfminer.six==20240706
+
+PyPDF2==3.0.1
+pandas==2.2.2
+
+striprtf==0.0.26
+
+
+
+# ===== aimodel/file_read/runtime/__init__.py =====
+
+
+
+# ===== aimodel/file_read/runtime/model_runtime.py =====
+
+# aimodel/file_read/model_runtime.py
+from __future__ import annotations
+import os
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from threading import RLock
+from typing import Any, Dict, Optional, List
+
+from ..adaptive.config.paths import read_settings, write_settings
+
+try:
+    from llama_cpp import Llama
+except Exception as e:
+    raise RuntimeError("llama-cpp-python not installed or GPU libs missing") from e
+
+@dataclass
+class ModelConfig:
+    modelPath: str
+    nCtx: int = 4096
+    nThreads: int = 8
+    nGpuLayers: int = 40
+    nBatch: int = 256
+    ropeFreqBase: Optional[float] = None
+    ropeFreqScale: Optional[float] = None
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "ModelConfig":
+        return ModelConfig(
+            modelPath=str(d.get("modelPath","")).strip(),
+            nCtx=int(d.get("nCtx", 4096)),
+            nThreads=int(d.get("nThreads", 8)),
+            nGpuLayers=int(d.get("nGpuLayers", 40)),
+            nBatch=int(d.get("nBatch", 256)),
+            ropeFreqBase=(float(d["ropeFreqBase"]) if d.get("ropeFreqBase") not in (None,"") else None),
+            ropeFreqScale=(float(d["ropeFreqScale"]) if d.get("ropeFreqScale") not in (None,"") else None),
+        )
+
+_runtime_lock = RLock()
+_llm: Optional[Llama] = None
+_cfg: Optional[ModelConfig] = None
+
+def _build_kwargs(cfg: ModelConfig) -> Dict[str, Any]:
+    kw = dict(
+        model_path=cfg.modelPath,
+        n_ctx=cfg.nCtx,
+        n_threads=cfg.nThreads,
+        n_gpu_layers=cfg.nGpuLayers,
+        n_batch=cfg.nBatch,
+    )
+    # advanced optional tuning
+    if cfg.ropeFreqBase is not None:
+        kw["rope_freq_base"] = cfg.ropeFreqBase
+    if cfg.ropeFreqScale is not None:
+        kw["rope_freq_scale"] = cfg.ropeFreqScale
+    return kw
+
+def _close_llm():
+    global _llm
+    try:
+        if _llm is not None:
+            # llama_cpp doesn't expose explicit close; allow GC
+            _llm = None
+    except Exception:
+        _llm = None
+
+def current_model_info() -> Dict[str, Any]:
+    with _runtime_lock:
+        return {
+            "loaded": _llm is not None,
+            "config": asdict(_cfg) if _cfg else None,
+        }
+
+def ensure_ready() -> None:
+    """
+    Lazily load a model based on current settings if nothing is loaded.
+    """
+    global _llm, _cfg
+    with _runtime_lock:
+        if _llm is not None:
+            return
+        s = read_settings()
+        cfg = ModelConfig.from_dict(s)
+        if not cfg.modelPath:
+            raise RuntimeError("No model selected. Load one via /models/load or set LOCALAI_MODEL_PATH.")
+        p = Path(cfg.modelPath)
+        if not p.exists():
+            raise FileNotFoundError(f"Model path not found: {p}")
+        _llm = Llama(**_build_kwargs(cfg))
+        _cfg = cfg
+
+def get_llm() -> Llama:
+    ensure_ready()
+    assert _llm is not None
+    return _llm
+
+def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Load/swap to a new model with given config fields (any subset).
+    Persists to settings.json so the choice survives restarts.
+    """
+    global _llm, _cfg
+    with _runtime_lock:
+        s = read_settings()
+        s.update({k:v for k,v in config_patch.items() if v is not None})
+        cfg = ModelConfig.from_dict(s)
+        if not cfg.modelPath:
+            raise ValueError("modelPath is required")
+        if not Path(cfg.modelPath).exists():
+            raise FileNotFoundError(f"Model not found: {cfg.modelPath}")
+
+        # swap
+        _close_llm()
+        _llm = Llama(**_build_kwargs(cfg))
+        _cfg = cfg
+        write_settings(asdict(cfg))
+        return current_model_info()
+
+def unload_model() -> None:
+    """
+    Unload current model, keep settings as-is.
+    """
+    global _llm
+    with _runtime_lock:
+        _close_llm()
+
+def list_local_models() -> List[Dict[str, Any]]:
+    """
+    Scan modelsDir for .gguf files and return a lightweight listing.
+    """
+    s = read_settings()
+    root = Path(s.get("modelsDir") or "")
+    root.mkdir(parents=True, exist_ok=True)
+    out: List[Dict[str, Any]] = []
+    for p in root.rglob("*.gguf"):
+        try:
+            out.append({
+                "path": str(p.resolve()),
+                "sizeBytes": p.stat().st_size,
+                "name": p.name,
+                "rel": str(p.relative_to(root)),
+            })
+        except Exception:
+            pass
+    # sort largest first (usually higher quant or full precision)
+    out.sort(key=lambda x: x["sizeBytes"], reverse=True)
+    return out
+
+# ===== aimodel/file_read/services/attachments.py =====
+
+from __future__ import annotations
+from typing import Any, Iterable, Optional, List
+
+
+def att_get(att: Any, key: str, default=None):
+    """Safe accessor for dicts OR Pydantic models."""
+    try:
+        return att.get(key, default)          # dict-like
+    except AttributeError:
+        return getattr(att, key, default)     # model-like
+
+
+def join_attachment_names(attachments: Optional[Iterable[Any]]) -> str:
+    if not attachments:
+        return ""
+    names: List[str] = [att_get(a, "name") for a in attachments]  # type: ignore[list-item]
+    names = [n for n in names if n]
+    return ", ".join(names)
+
+# ===== aimodel/file_read/services/cancel.py =====
+
+from __future__ import annotations
+import asyncio
+from threading import Event
+from typing import Dict
+from ..core.settings import SETTINGS
+
+eff = SETTINGS.effective()
 GEN_SEMAPHORE = asyncio.Semaphore(int(eff["gen_semaphore_permits"]))
 _ACTIVE: Dict[str, int] = {}
 _CANCELS: Dict[str, Event] = {}
@@ -1404,6 +2079,7 @@ __all__ = [
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
   "excel_emit_key_values": true,
+  "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
  "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
   "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
@@ -1422,7 +2098,23 @@ __all__ = [
 "csv_quote_strings": true,
 "csv_header_normalize": true,
 "csv_infer_max_rows": 50,
-"csv_infer_max_cols": 26
+"csv_infer_max_cols": 26,
+  "doc_debug": false,
+  "docx_heading_max_level": 3,
+  "docx_use_markdown_headings": true,
+  "docx_preserve_bullets": true,
+  "docx_include_tables": true,
+  "docx_include_headers_footers": false,
+  "docx_para_max_chars": 0,
+  "docx_drop_empty_lines": true,
+  "doc_ole_min_run_chars": 8,
+  "doc_ole_max_line_chars": 600,
+  "doc_ole_min_alpha_ratio": 0.25,
+  "doc_ole_drop_xmlish": true,
+  "doc_ole_drop_pathish": true,
+  "doc_ole_drop_symbol_lines": true,
+  "doc_ole_dedupe_short_repeats": true
+
 }
 
 # ===== aimodel/file_read/store/effective_settings.json =====
@@ -1710,6 +2402,7 @@ __all__ = [
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
   "excel_emit_key_values": true,
+  "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
   "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
   "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
@@ -1728,7 +2421,22 @@ __all__ = [
   "csv_quote_strings": true,
   "csv_header_normalize": true,
   "csv_infer_max_rows": 50,
-  "csv_infer_max_cols": 26
+  "csv_infer_max_cols": 26,
+  "doc_debug": false,
+  "docx_heading_max_level": 3,
+  "docx_use_markdown_headings": true,
+  "docx_preserve_bullets": true,
+  "docx_include_tables": true,
+  "docx_include_headers_footers": false,
+  "docx_para_max_chars": 0,
+  "docx_drop_empty_lines": true,
+  "doc_ole_min_run_chars": 8,
+  "doc_ole_max_line_chars": 600,
+  "doc_ole_min_alpha_ratio": 0.25,
+  "doc_ole_drop_xmlish": true,
+  "doc_ole_drop_pathish": true,
+  "doc_ole_drop_symbol_lines": true,
+  "doc_ole_dedupe_short_repeats": true
 }
 
 # ===== aimodel/file_read/store/index.py =====
@@ -2180,620 +2888,4 @@ def build_run_json(
         },
         "predictionConfig": {
             "fields": [
-                {"key": "llm.prediction.temperature", "value": request_cfg.get("temperature", 0.6)},
-                {"key": "llm.prediction.topKSampling", "value": 40},
-                {"key": "llm.prediction.topPSampling", "value": {"checked": True, "value": request_cfg.get("top_p", 0.9)}},
-                {"key": "llm.prediction.repeatPenalty", "value": {"checked": True, "value": 1.25}},
-                {"key": "llm.prediction.maxTokens", "value": request_cfg.get("max_tokens", 512)},
-                {"key": "llm.prediction.stopStrings", "value": STOP_STRINGS},
-                {"key": "llm.prediction.llama.cpuThreads", "value": int(cfg.get("nThreads") or 0)},
-                {"key": "llm.prediction.contextPrefill", "value": []},
-                {"key": "llm.prediction.tools", "value": {"type": "none"}},
-                {"key": "llm.prediction.promptTemplate", "value": {"type": "none"}},
-            ]
-        },
-        "stats": {
-            "stopReason": stop_reason_final,
-            "tokensPerSecond": tok_per_sec,
-            "numGpuLayers": int(cfg.get("nGpuLayers") or 0),
-            "timeToFirstTokenSec": round((ttft_ms or 0) / 1000.0, 3),
-            "totalTimeSec": round(t_end - t_start, 3),
-            "promptTokensCount": input_tokens_est,
-            "predictedTokensCount": out_tokens,
-            "totalTokensCount": total_tokens,
-        },
-    }
-
-# ---------- connection helper ----------
-
-async def watch_disconnect(request, stop_ev):
-    if await request.is_disconnected():
-        stop_ev.set()
-        return
-    while not stop_ev.is_set():
-        await asyncio.sleep(0.2)
-        if await request.is_disconnected():
-            stop_ev.set()
-            break
-
-# ===== aimodel/file_read/web/__init__.py =====
-
-
-
-# ===== aimodel/file_read/web/duckduckgo.py =====
-
-# aimodel/file_read/web/duckduckgo.py
-from __future__ import annotations
-from typing import List, Optional, Tuple
-import asyncio, time
-from urllib.parse import urlparse
-
-# Prefer new package; fallback for compatibility
-try:
-    from ddgs import DDGS  # type: ignore
-except Exception:
-    try:
-        from duckduckgo_search import DDGS  # type: ignore
-    except Exception:
-        DDGS = None  # no provider
-
-from ..core.settings import SETTINGS
-from .provider import SearchHit
-
-# -------- simple in-memory cache (superset caching) --------------------------
-_CACHE: dict[str, Tuple[float, List[SearchHit]]] = {}
-
-def _cache_key(query: str) -> str:
-    return (query or "").strip().lower()
-
-def _host(u: str) -> str:
-    try:
-        h = (urlparse(u).hostname or "").lower()
-        return h[4:] if h.startswith("www.") else h
-    except Exception:
-        return ""
-
-def _cache_get(query: str) -> Optional[List[SearchHit]]:
-    eff = SETTINGS.effective()  # no fallbacks allowed
-    ttl = int(eff["web_search_cache_ttl_sec"])
-    key = _cache_key(query)
-    v = _CACHE.get(key)
-    if not v:
-        return None
-    ts, hits = v
-    if (time.time() - ts) > ttl:
-        _CACHE.pop(key, None)
-        return None
-    return hits
-
-def _cache_set(query: str, hits: List[SearchHit]) -> None:
-    _CACHE[_cache_key(query)] = (time.time(), hits)
-
-# -------- DDGS (official client) --------------------------------------------
-def _ddg_sync_search(query: str, k: int, *, region: str, safesearch: str) -> List[SearchHit]:
-    results: List[SearchHit] = []
-    if DDGS is None:
-        print(f"[{time.strftime('%X')}] ddg: PROVIDER MISSING (DDGS=None)")
-        return results
-    with DDGS() as ddg:
-        for i, r in enumerate(ddg.text(query, max_results=max(1, k),
-                                       safesearch=safesearch, region=region)):
-            title = (r.get("title") or "").strip()
-            url = (r.get("href") or "").strip()
-            snippet: Optional[str] = (r.get("body") or "").strip() or None
-            if not url:
-                continue
-            results.append(SearchHit(title=title or url, url=url, snippet=snippet, rank=i))
-            if i + 1 >= k:
-                break
-    return results
-
-# -------- public provider ----------------------------------------------------
-class DuckDuckGoProvider:
-    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
-        eff = SETTINGS.effective()  # strict read; raise if missing
-        q_norm = (query or "").strip()
-        if not q_norm:
-            return []
-
-        superset_k = max(int(k), int(eff["web_search_cache_superset_k"]))
-        region = str(eff["web_search_region"])
-        safesearch = str(eff["web_search_safesearch"])
-        verbose = bool(eff["web_search_debug_logging"])
-
-        t0 = time.time()
-        if verbose:
-            print(f"[{time.strftime('%X')}] ddg: START q={q_norm!r} k={k}")
-
-        # cache
-        cached = _cache_get(q_norm)
-        if cached is not None:
-            out = cached[:k]
-            if verbose:
-                top_preview = [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]]
-                print(f"[{time.strftime('%X')}] ddg: CACHE HIT dt={time.time()-t0:.2f}s hits={len(out)} top={top_preview}")
-            return out
-
-        # fetch superset once
-        hits: List[SearchHit] = []
-        if DDGS is not None:
-            try:
-                step = time.time()
-                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, superset_k,
-                                               region=region, safesearch=safesearch)
-                if verbose:
-                    print(f"[{time.strftime('%X')}] ddg: HITS RECEIVED dt={time.time()-step:.2f}s count={len(hits)}")
-                    for h in hits[:5]:
-                        print(f"[{time.strftime('%X')}] ddg:   {h.rank:>2} | host={_host(h.url)} | "
-                              f"title={(h.title or '')[:80]!r}")
-            except Exception as e:
-                print(f"[{time.strftime('%X')}] ddg: ERROR {e}")
-        else:
-            print(f"[{time.strftime('%X')}] ddg: SKIP (DDGS unavailable)")
-
-        _cache_set(q_norm, hits)
-        out = hits[:k]
-        if verbose:
-            print(f"[{time.strftime('%X')}] ddg: RETURN dt={time.time()-t0:.2f}s hits={len(out)}")
-        return out
-
-# ===== aimodel/file_read/web/fetch.py =====
-
-# aimodel/file_read/web/fetch.py
-from __future__ import annotations
-import asyncio
-from typing import Tuple, List, Optional
-import httpx
-
-# Optional extractors (use whatever is installed)
-try:
-    from readability import Document  # readability-lxml
-except Exception:
-    Document = None  # type: ignore
-
-try:
-    from bs4 import BeautifulSoup  # beautifulsoup4 + lxml
-except Exception:
-    BeautifulSoup = None  # type: ignore
-
-try:
-    from selectolax.parser import HTMLParser  # selectolax
-except Exception:
-    HTMLParser = None  # type: ignore
-
-from ..core.settings import SETTINGS
-
-
-def _ua() -> str:
-    return str(SETTINGS.get("web_fetch_user_agent", "LocalAI/0.1 (+clean-fetch)"))
-
-def _timeout() -> float:
-    try:
-        return float(SETTINGS.get("web_fetch_timeout_sec", 8.0))
-    except Exception:
-        return 8.0
-
-def _max_chars() -> int:
-    try:
-        return int(SETTINGS.get("web_fetch_max_chars", 3000))
-    except Exception:
-        return 3000
-
-def _max_bytes() -> int:
-    try:
-        return int(SETTINGS.get("web_fetch_max_bytes", 1_048_576))
-    except Exception:
-        return 1_048_576
-
-def _max_parallel() -> int:
-    try:
-        return max(1, int(SETTINGS.get("web_fetch_max_parallel", 3)))
-    except Exception:
-        return 3
-
-
-async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
-    # Stream and cap to avoid huge downloads
-    out = bytearray()
-    async for chunk in resp.aiter_bytes():
-        if not chunk:
-            continue
-        remaining = cap_bytes - len(out)
-        if remaining <= 0:
-            break
-        out.extend(chunk[:remaining])
-        if len(out) >= cap_bytes:
-            break
-    return bytes(out)
-
-
-def _extract_text_from_html(raw_html: str, url: str) -> str:
-    """
-    Best-effort HTML → text:
-      1) readability-lxml (if available): main-article extraction
-      2) selectolax (if available): fast DOM text
-      3) BeautifulSoup (if available): generic text fallback
-      4) Raw text as last resort
-    """
-    html = raw_html or ""
-
-    # 1) readability main content
-    if Document is not None:
-        try:
-            doc = Document(html)
-            summary_html = doc.summary(html_partial=True) or ""
-            if summary_html:
-                if BeautifulSoup is not None:
-                    soup = BeautifulSoup(summary_html, "lxml")
-                    txt = soup.get_text(" ", strip=True)
-                    if txt:
-                        return txt
-                # If bs4 missing, fall back to selectolax/plain below
-        except Exception:
-            pass
-
-    # 2) selectolax full text
-    if HTMLParser is not None:
-        try:
-            tree = HTMLParser(html)
-            # Remove script/style/noscript quickly if present
-            for bad in ("script", "style", "noscript"):
-                for n in tree.tags(bad):
-                    n.decompose()
-            txt = tree.body.text(separator=" ", strip=True) if tree.body else tree.text(separator=" ", strip=True)
-            if txt:
-                return txt
-        except Exception:
-            pass
-
-    # 3) BeautifulSoup full text
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            # Strip scripts/styles
-            for s in soup(["script", "style", "noscript"]):
-                s.extract()
-            txt = soup.get_text(" ", strip=True)
-            if txt:
-                return txt
-        except Exception:
-            pass
-
-    # 4) Raw (no HTML parsing available)
-    return html
-
-
-async def fetch_clean(
-    url: str,
-    timeout_s: Optional[float] = None,
-    max_chars: Optional[int] = None,
-    max_bytes: Optional[int] = None,
-) -> Tuple[str, int, str]:
-    """
-    Returns: (final_url, status_code, cleaned_text)
-    - cleaned_text is extracted via readability/selectolax/bs4 if available; else raw
-    - caps by bytes first, then by chars
-    """
-    timeout = _timeout() if timeout_s is None else float(timeout_s)
-    cap_chars = _max_chars() if max_chars is None else int(max_chars)
-    cap_bytes = _max_bytes() if max_bytes is None else int(max_bytes)
-
-    headers = {"User-Agent": _ua()}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-
-        # Stream with byte cap
-        raw_bytes = await _read_capped_bytes(r, cap_bytes)
-        # Text decode with fallback (httpx sets encoding heuristically)
-        enc = r.encoding or "utf-8"
-        raw_text = raw_bytes.decode(enc, errors="ignore")
-
-        # Extract/clean HTML to text (no trafilatura)
-        txt = _extract_text_from_html(raw_text, str(r.url))
-        txt = (txt or "").strip().replace("\r", "")
-
-        if len(txt) > cap_chars:
-            txt = txt[:cap_chars]
-
-        return (str(r.url), r.status_code, txt)
-
-
-async def fetch_many(
-    urls: List[str],
-    per_timeout_s: Optional[float] = None,
-    cap_chars: Optional[int] = None,
-    cap_bytes: Optional[int] = None,
-    max_parallel: Optional[int] = None,
-):
-    sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
-
-    async def _one(u: str):
-        async with sem:
-            try:
-                return u, await fetch_clean(
-                    u,
-                    timeout_s=per_timeout_s,
-                    max_chars=cap_chars,
-                    max_bytes=cap_bytes,
-                )
-            except Exception:
-                return u, None
-
-    tasks = [_one(u) for u in urls]
-    return await asyncio.gather(*tasks)
-
-# ===== aimodel/file_read/web/orchestrator.py =====
-
-# aimodel/file_read/web/orchestrator.py
-from __future__ import annotations
-from typing import List, Tuple, Optional
-from urllib.parse import urlparse
-import time
-import re
-
-from ..core.settings import SETTINGS
-from .duckduckgo import DuckDuckGoProvider
-from .provider import SearchHit
-from .fetch import fetch_many  # optional JS path resolved dynamically (see below)
-
-# ===== helpers to read config (strict: no silent defaults) ====================
-
-def _req(key: str):
-    return SETTINGS[key]
-
-def _as_int(key: str) -> int: return int(_req(key))
-def _as_float(key: str) -> float: return float(_req(key))
-def _as_bool(key: str) -> bool: return bool(_req(key))
-def _as_str(key: str) -> str:
-    v = _req(key)
-    return "" if v is None else str(v)
-
-# ===== small utils ============================================================
-
-def _clean_ws(s: str) -> str:
-    return " ".join((s or "").split())
-
-def _host(url: str) -> str:
-    h = (urlparse(url).hostname or "").lower()
-    pref = _as_str("web_orch_www_prefix")
-    return h[len(pref):] if pref and h.startswith(pref) else h
-
-def _tokens(s: str) -> List[str]:
-    return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
-
-def _head_tail(text: str, max_chars: int) -> str:
-    """
-    Trim long text to head/tail, using settings:
-      - web_orch_head_fraction
-      - web_orch_tail_min_chars
-      - web_orch_ellipsis
-    Mirrors the old behavior but configurable.
-    """
-    text = text or ""
-    if max_chars <= 0 or len(text) <= max_chars:
-        return _clean_ws(text)
-
-    head_frac      = _as_float("web_orch_head_fraction")      # e.g., 0.67
-    tail_min_chars = _as_int("web_orch_tail_min_chars")       # e.g., 200
-    ellipsis       = _as_str("web_orch_ellipsis")             # e.g., " … "
-
-    head = int(max_chars * head_frac)
-    tail = max_chars - head
-    if tail < tail_min_chars:
-        head = max(1, max_chars - tail_min_chars)
-        tail = tail_min_chars
-
-    return _clean_ws(text[:head] + ellipsis + text[-tail:])
-
-def condense_doc(title: str, url: str, text: str, *, max_chars: int) -> str:
-    body = _head_tail(text or "", max_chars)
-    safe_title = _clean_ws(title or url)
-    bullet = _as_str("web_orch_bullet_prefix") or "- "
-    indent = _as_str("web_orch_indent_prefix") or "  "
-    return f"{bullet}{safe_title}\n{indent}{url}\n{indent}{body}"
-
-# ===== scoring (generic; no domain/date heuristics) ===========================
-
-def score_hit(hit: SearchHit, query: str) -> int:
-    """
-    Generic, content-based scoring.
-      - exact phrase in title (+web_orch_score_w_exact)
-      - substring in title (+web_orch_score_w_substr)
-      - token coverage in title (+0..web_orch_score_w_title_full/title_part)
-      - any token in snippet (+web_orch_score_w_snip_touch)
-    """
-    w_exact      = _as_int("web_orch_score_w_exact")
-    w_substr     = _as_int("web_orch_score_w_substr")
-    w_title_full = _as_int("web_orch_score_w_title_full")
-    w_title_part = _as_int("web_orch_score_w_title_part")
-    w_snip_touch = _as_int("web_orch_score_w_snip_touch")
-
-    score = 0
-    q = (query or "").strip().lower()
-    title = (hit.title or "").strip()
-    snippet = (hit.snippet or "").strip()
-    title_l = title.lower()
-    snip_l  = snippet.lower()
-
-    if q:
-        if title_l == q:
-            score += w_exact
-        elif q in title_l:
-            score += w_substr
-
-    qtoks = _tokens(q)
-    if qtoks:
-        cov_title = sum(1 for t in qtoks if t in title_l)
-        if cov_title == len(qtoks) and len(qtoks) > 0:
-            score += w_title_full
-        elif cov_title > 0:
-            score += w_title_part
-        cov_snip = sum(1 for t in qtoks if t in snip_l)
-        if cov_snip > 0:
-            score += w_snip_touch
-
-    return score
-
-# ===== quality estimate (generic; configurable penalties) =====================
-
-def _type_ratio(text: str, sub: str) -> float:
-    if not text:
-        return 1.0
-    cnt = text.lower().count(sub)
-    return float(cnt) / max(1, len(text))
-
-def content_quality_score(text: str) -> float:
-    if not text:
-        return 0.0
-    t = text.strip()
-    n = len(t)
-
-    len_div     = _as_float("web_orch_q_len_norm_divisor")
-    w_len       = _as_float("web_orch_q_len_weight")
-    w_div       = _as_float("web_orch_q_diversity_weight")
-
-    length_score = min(1.0, n / len_div) if len_div > 0 else 0.0
-
-    toks = _tokens(t)
-    if not toks:
-        return 0.1 * length_score  # tiny signal if no tokens
-
-    uniq = len(set(toks))
-    diversity = uniq / max(1.0, float(len(toks)))
-
-    pen = 0.0
-    # penalties: [{"token": str, "mult": float, "cap": float}, ...]
-    for rule in _req("web_orch_q_penalties"):
-        token = str(rule.get("token") or "")
-        mult  = float(rule.get("mult") or 0.0)
-        cap   = float(rule.get("cap") or 1.0)
-        pen += min(cap, _type_ratio(t, token) * mult)
-
-    raw = (w_len * length_score) + (w_div * diversity) - pen
-    return max(0.0, min(1.0, raw))
-
-def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
-    picked: List[SearchHit] = []
-    seen_hosts = set()
-    for s, h in sorted(scored_hits, key=lambda x: x[0], reverse=True):
-        u = (h.url or "").strip()
-        if not u:
-            continue
-        host = _host(u)
-        if host in seen_hosts:
-            continue
-        seen_hosts.add(host)
-        picked.append(h)
-        if len(picked) >= k:
-            break
-    return picked
-
-# ===== fetch layer ============================================================
-
-async def _fetch_round(
-    urls: List[str],
-    meta: List[Tuple[str, str]],
-    per_url_timeout_s: float,
-    max_parallel: int,
-    use_js: bool = False,
-) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
-
-    fetch_fn = fetch_many
-    if use_js:
-        try:
-            from . import fetch as _fetch_mod  # type: ignore
-            fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
-        except Exception:
-            fetch_fn = fetch_many
-
-    # Cap per doc by multiplier, but never exceed global max bytes/chars
-    cap_mult        = _as_float("web_orch_fetch_cap_multiplier")
-    per_doc_budget  = _as_int("web_orch_per_doc_char_budget")
-    fetch_max_chars = _as_int("web_fetch_max_chars")
-    per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
-
-    results = await fetch_fn(
-        urls,
-        per_timeout_s=per_url_timeout_s,
-        cap_chars=per_doc_cap,
-        max_parallel=max_parallel,
-    )
-    return results
-
-# ===== main ===================================================================
-
-async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> str | None:
-    # pull config each call (to honor hot-reloads)
-    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
-    total_char_budget   = _as_int("web_orch_total_char_budget")
-    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
-    max_parallel        = _as_int("web_orch_max_parallel_fetch")
-    overfetch_factor    = _as_float("web_orch_overfetch_factor")
-    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
-
-    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
-    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
-    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
-    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
-    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
-    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
-    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
-    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
-
-    header_tpl          = _as_str("web_block_header")
-    sep_str             = _as_str("web_orch_block_separator")
-    min_block_reserve   = _as_int("web_orch_min_block_reserve")
-    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
-
-    # timeouts
-    per_timeout = (float(per_url_timeout_s)
-                   if per_url_timeout_s is not None
-                   else _as_float("web_fetch_timeout_sec"))
-
-    start_time = time.time()
-    print(f"[orchestrator] IN  @ {start_time:.3f}s | query={query!r}")
-
-    provider = DuckDuckGoProvider()
-
-    # --- SEARCH (configurable overfetch) ---
-    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
-    print(f"[orchestrator] SEARCH start overfetch={overfetch} k={cfg_k}")
-
-    t0 = time.perf_counter()
-    try:
-        hits: List[SearchHit] = await provider.search(query, k=overfetch)
-    except Exception as e:
-        print(f"[orchestrator] ERROR during search for {query!r}: {e}")
-        return None
-    print(f"[orchestrator] SEARCH done hits={len(hits)} dt={time.perf_counter() - t0:.3f}s")
-
-    if not hits:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no hits | elapsed={time.time()-start_time:.3f}s")
-        return None
-
-    # --- SCORING / DEDUPE ---
-    print(f"[orchestrator] SCORING generic (no hardcoded boosts)")
-    seen_urls = set()
-    scored: List[Tuple[int, SearchHit]] = []
-    for idx, h in enumerate(hits):
-        u = (h.url or "").strip()
-        if not u:
-            print(f"[orchestrator]   skip[{idx}] empty url")
-            continue
-        if u in seen_urls:
-            print(f"[orchestrator]   dup [{idx}] host={_host(u)} title={(h.title or '')[:60]!r}")
-            continue
-        seen_urls.add(u)
-        s = score_hit(h, query)
-        scored.append((s, h))
-        print(f"[orchestrator]   meta[{idx}] score={s} host={_host(u)} title={(h.title or '')[:80]!r} url={u}")
-
-    if not scored:
-        print(f"[orchestrator] OUT @ {time.time():.3f}s | no unique hits | elapsed={time.time()-start_time:.3f}s")
-        return None
-
-    top_hits = _dedupe_by_host(scored, cfg_k)
-    for i, h in enumerate(top_hits, 1):
-        # reuse computed scores when printing
-        s = next((sc for sc, hh in
+                {"key": "llm.prediction.temperatu

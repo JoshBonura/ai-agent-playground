@@ -1,10 +1,9 @@
-# aimodel/file_read/services/packing.py
+# ===== aimodel/file_read/services/packing.py =====
 from __future__ import annotations
-from typing import Tuple, List, Dict, Optional
-from ..rag.retrieve import build_rag_block
+from typing import Tuple, List, Dict, Optional, Any
+from ..rag.retrieve import build_rag_block_with_telemetry
 from ..core.settings import SETTINGS
-from ..core.memory import build_system, pack_messages, roll_summary_if_needed
-
+from ..core.packing_ops import build_system, pack_messages, roll_summary_if_needed
 
 def build_system_text() -> str:
     eff = SETTINGS.effective()
@@ -15,7 +14,6 @@ def build_system_text() -> str:
     )
     guidance = str(eff["packing_guidance"])
     return base + guidance
-
 
 def pack_with_rollup(
     *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
@@ -41,7 +39,6 @@ def pack_with_rollup(
         system_text=system_text,
     )
 
-    # Inject ephemeral (web findings) BEFORE the last user message, so the final turn is still user.
     if ephemeral:
         last_user_idx = None
         for i in range(len(packed) - 1, -1, -1):
@@ -57,22 +54,29 @@ def pack_with_rollup(
 
     return packed, new_summary, input_budget
 
-def maybe_inject_rag_block(messages: list[dict], *, session_id: str | None,
-                           skip_rag: bool = False, rag_query: str | None = None) -> list[dict]:
+def maybe_inject_rag_block(
+    messages: list[dict], *,
+    session_id: str | None,
+    skip_rag: bool = False,
+    rag_query: str | None = None,
+) -> tuple[list[dict], Optional[Dict[str, Any]], Optional[str]]:
     if skip_rag:
-        return messages
+        return messages, None, None
     if not SETTINGS.get("rag_enabled", True):
-        return messages
+        return messages, None, None
     if not messages or messages[-1].get("role") != "user":
-        return messages
+        return messages, None, None
 
     user_q = rag_query or (messages[-1].get("content") or "")
-    block = build_rag_block(user_q, session_id=session_id)
-
+    block, tel = build_rag_block_with_telemetry(user_q, session_id=session_id)
     if not block:
         print(f"[RAG INJECT] no hits (session={session_id}) q={(user_q or '')!r}")
-        return messages
+        return messages, None, None
 
     print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
     injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
-    return injected
+
+    tel = dict(tel or {})
+    tel["injected"] = True
+    tel["mode"] = tel.get("mode") or "global"  # from telemetry
+    return injected, tel, block

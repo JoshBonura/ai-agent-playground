@@ -1436,52 +1436,89 @@ def extract_style_and_prefs(user_text: str) -> Tuple[Optional[str], bool, bool]:
 from __future__ import annotations
 from typing import Tuple
 import io, json
-
+from .xls_ingest import extract_xls
 from .excel_ingest import extract_excel
 from .csv_ingest import extract_csv
 from .common import _utf8, _strip_html, Chunk, chunk_text, build_metas
+from .doc_ingest import extract_docx, extract_doc_binary
+from ...core.settings import SETTINGS
 
 __all__ = ["sniff_and_extract", "Chunk", "chunk_text", "build_metas"]
 
+def _ing_dbg(*args):
+    try:
+        if bool(SETTINGS.effective().get("ingest_debug", False)):
+            print("[ingest]", *args)
+    except Exception:
+        pass
+
 def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
     name = (filename or "").lower()
+    _ing_dbg("route:", name, "bytes=", len(data))
 
     if name.endswith((".xlsx", ".xlsm")):
+        _ing_dbg("-> excel")
         return extract_excel(data)
 
+    if name.endswith(".xls"):
+        _ing_dbg("-> excel (xls via xlrd)")
+        return extract_xls(data)
+
     if name.endswith((".csv", ".tsv")):
+        _ing_dbg("-> csv/tsv")
         return extract_csv(data)
 
     if name.endswith(".docx"):
+        _ing_dbg("-> docx")
         try:
-            from docx import Document  # python-docx
-            doc = Document(io.BytesIO(data))
-            paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
-            return "\n".join(paras).strip(), "text/plain"
-        except Exception:
+            return extract_docx(data)
+        except Exception as e:
+            _ing_dbg("docx err:", repr(e))
+            return _utf8(data), "text/plain"
+
+    if name.endswith(".doc"):
+        _ing_dbg("-> doc (binary/rtf)")
+        try:
+            return extract_doc_binary(data)
+        except Exception as e:
+            _ing_dbg("doc err:", repr(e))
+            return _utf8(data), "text/plain"
+
+    if name.endswith(".rtf"):
+        _ing_dbg("-> rtf (via doc_binary)")
+        try:
+            return extract_doc_binary(data)
+        except Exception as e:
+            _ing_dbg("rtf err:", repr(e))
             return _utf8(data), "text/plain"
 
     if name.endswith(".pdf"):
+        _ing_dbg("-> pdf")
         try:
             from pdfminer.high_level import extract_text
             txt = extract_text(io.BytesIO(data)) or ""
             return txt.strip(), "text/plain"
-        except Exception:
+        except Exception as e:
+            _ing_dbg("pdfminer err:", repr(e))
             try:
                 from PyPDF2 import PdfReader
                 r = PdfReader(io.BytesIO(data))
                 pages = [(p.extract_text() or "").strip() for p in r.pages]
                 return "\n\n".join([p for p in pages if p]).strip(), "text/plain"
-            except Exception:
+            except Exception as e2:
+                _ing_dbg("pypdf2 err:", repr(e2))
                 return _utf8(data), "text/plain"
 
     if name.endswith(".json"):
+        _ing_dbg("-> json")
         try:
             return json.dumps(json.loads(_utf8(data)), ensure_ascii=False, indent=2), "text/plain"
-        except Exception:
+        except Exception as e:
+            _ing_dbg("json err:", repr(e))
             return _utf8(data), "text/plain"
 
     if name.endswith((".jsonl", ".jsonlines")):
+        _ing_dbg("-> jsonl")
         lines = _utf8(data).splitlines()
         out = []
         for ln in lines:
@@ -1495,14 +1532,17 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
         return "\n".join(out).strip(), "text/plain"
 
     if name.endswith((".yaml", ".yml")):
+        _ing_dbg("-> yaml")
         try:
             import yaml
             obj = yaml.safe_load(_utf8(data))
             return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
-        except Exception:
+        except Exception as e:
+            _ing_dbg("yaml err:", repr(e))
             return _utf8(data), "text/plain"
 
     if name.endswith(".toml"):
+        _ing_dbg("-> toml")
         try:
             try:
                 import tomllib
@@ -1511,10 +1551,12 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
                 import toml
                 obj = toml.loads(_utf8(data))
             return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
-        except Exception:
+        except Exception as e:
+            _ing_dbg("toml err:", repr(e))
             return _utf8(data), "text/plain"
 
     if name.endswith((".htm", ".html", ".xml")):
+        _ing_dbg("-> html/xml")
         return _strip_html(_utf8(data)), "text/plain"
 
     # plaintext / code-ish
@@ -1526,9 +1568,10 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
         ".rs", ".java", ".go", ".rb", ".php",
         ".swift", ".kt", ".scala", ".lua", ".perl",
     )):
+        _ing_dbg("-> plaintext/code")
         return _utf8(data), "text/plain"
 
-    # Default
+    _ing_dbg("-> default fallback")
     return _utf8(data), "text/plain"
 
 # ===== aimodel/file_read/rag/ingest/common.py =====
@@ -1774,6 +1817,248 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
     lines.append("")
     return "\n".join(lines).strip() + "\n", "text/plain"
 
+# ===== aimodel/file_read/rag/ingest/doc_ingest.py =====
+
+from __future__ import annotations
+from typing import Tuple, List, Optional
+import io, re
+from ...core.settings import SETTINGS
+
+_WS_RE = re.compile(r"[ \t]+")
+def _squeeze_spaces(s: str) -> str:
+    s = (s or "").replace("\xa0", " ")
+    s = _WS_RE.sub(" ", s)
+    return s.strip()
+
+def _dbg(msg: str):
+    try:
+        S = SETTINGS.effective
+        if bool(S().get("doc_debug", False)):
+            print(f"[doc_ingest] {msg}")
+    except Exception:
+        pass
+
+def _is_heading(style_name: str) -> Optional[int]:
+    if not style_name:
+        return None
+    m = re.match(r"Heading\s+(\d+)", style_name, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return max(1, min(6, int(m.group(1))))
+    except Exception:
+        return None
+
+def _is_list_style(style_name: str) -> bool:
+    return bool(style_name) and any(k in style_name.lower() for k in ("list", "bullet", "number"))
+
+def _extract_paragraph_text(p) -> str:
+    return _squeeze_spaces(p.text)
+
+def extract_docx(data: bytes) -> Tuple[str, str]:
+    from docx import Document
+    S = SETTINGS.effective
+    HEADING_MAX_LEVEL = int(S().get("docx_heading_max_level", 3))
+    USE_MARKDOWN_HEADINGS = bool(S().get("docx_use_markdown_headings", True))
+    PRESERVE_BULLETS = bool(S().get("docx_preserve_bullets", True))
+    INCLUDE_TABLES = bool(S().get("docx_include_tables", True))
+    INCLUDE_HEADERS_FOOTERS = bool(S().get("docx_include_headers_footers", False))
+    MAX_PARA_CHARS = int(S().get("docx_para_max_chars", 0))
+    DROP_EMPTY_LINES = bool(S().get("docx_drop_empty_lines", True))
+    doc = Document(io.BytesIO(data))
+    lines: List[str] = []
+    try:
+        title = (getattr(doc, "core_properties", None) or {}).title
+        if title:
+            lines.append(f"# {title}")
+            lines.append("")
+    except Exception:
+        pass
+    def _clip(s: str) -> str:
+        if MAX_PARA_CHARS > 0 and len(s) > MAX_PARA_CHARS:
+            return s[:MAX_PARA_CHARS] + "…"
+        return s
+    if INCLUDE_HEADERS_FOOTERS:
+        try:
+            for i, sec in enumerate(getattr(doc, "sections", []) or []):
+                if i > 0:
+                    break
+                try:
+                    hdr_ps = getattr(sec.header, "paragraphs", []) or []
+                    hdr_text = "\n".join(_squeeze_spaces(p.text) for p in hdr_ps if _squeeze_spaces(p.text))
+                    if hdr_text:
+                        lines.append("## Header")
+                        lines.append(_clip(hdr_text))
+                        lines.append("")
+                except Exception:
+                    pass
+                try:
+                    ftr_ps = getattr(sec.footer, "paragraphs", []) or []
+                    ftr_text = "\n".join(_squeeze_spaces(p.text) for p in ftr_ps if _squeeze_spaces(p.text))
+                    if ftr_text:
+                        lines.append("## Footer")
+                        lines.append(_clip(ftr_text))
+                        lines.append("")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    for p in doc.paragraphs:
+        txt = _extract_paragraph_text(p)
+        if not txt and DROP_EMPTY_LINES:
+            continue
+        style_name = getattr(p.style, "name", "") or ""
+        lvl = _is_heading(style_name)
+        if lvl and lvl <= HEADING_MAX_LEVEL and USE_MARKDOWN_HEADINGS:
+            prefix = "#" * max(1, min(6, lvl))
+            lines.append(f"{prefix} {txt}".strip())
+            continue
+        if PRESERVE_BULLETS and _is_list_style(style_name):
+            if txt:
+                lines.append(f"- {_clip(txt)}")
+            continue
+        if txt:
+            lines.append(_clip(txt))
+        elif not DROP_EMPTY_LINES:
+            lines.append("")
+    if INCLUDE_TABLES and getattr(doc, "tables", None):
+        for t_idx, tbl in enumerate(doc.tables):
+            try:
+                non_empty = any(_squeeze_spaces(cell.text) for row in tbl.rows for cell in row.cells)
+            except Exception:
+                non_empty = True
+            if not non_empty:
+                continue
+            lines.append("")
+            lines.append(f"## Table {t_idx + 1}")
+            try:
+                for row in tbl.rows:
+                    cells = [_squeeze_spaces(c.text) for c in row.cells]
+                    if any(cells):
+                        lines.append(" | ".join(c for c in cells if c))
+            except Exception:
+                pass
+    text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
+    return (text + "\n" if text else ""), "text/plain"
+
+_RTF_CTRL_RE = re.compile(r"\\[a-zA-Z]+-?\d* ?")
+_RTF_GROUP_RE = re.compile(r"[{}]")
+_RTF_UNICODE_RE = re.compile(r"\\u(-?\d+)\??")
+_RTF_HEX_RE = re.compile(r"\\'[0-9a-fA-F]{2}")
+_HEX_BLOCK_RE = re.compile(r"(?:\s*[0-9A-Fa-f]{2}){120,}")
+
+def _rtf_to_text_simple(data: bytes, *, keep_newlines: bool = True) -> str:
+    try:
+        s = data.decode("latin-1", errors="ignore")
+    except Exception:
+        s = data.decode("utf-8", errors="ignore")
+    def _hex_sub(m):
+        try:
+            return bytes.fromhex(m.group(0)[2:]).decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+    s = _RTF_HEX_RE.sub(_hex_sub, s)
+    def _uni_sub(m):
+        try:
+            cp = int(m.group(1))
+            if cp < 0:
+                cp = 65536 + cp
+            return chr(cp)
+        except Exception:
+            return ""
+    s = _RTF_UNICODE_RE.sub(_uni_sub, s)
+    s = s.replace(r"\par", "\n").replace(r"\line", "\n")
+    s = _RTF_CTRL_RE.sub("", s)
+    s = _RTF_GROUP_RE.sub("", s)
+    s = _HEX_BLOCK_RE.sub("", s)
+    s = s.replace("\r", "\n")
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    s = _squeeze_spaces(s)
+    return s if keep_newlines else s.replace("\n", " ")
+
+def _rtf_to_text_via_lib(data: bytes, *, keep_newlines: bool = True) -> str:
+    try:
+        from striprtf.striprtf import rtf_to_text
+    except Exception:
+        return _rtf_to_text_simple(data, keep_newlines=keep_newlines)
+    try:
+        s = data.decode("latin-1", errors="ignore")
+    except Exception:
+        s = data.decode("utf-8", errors="ignore")
+    try:
+        txt = rtf_to_text(s)
+    except Exception:
+        txt = _rtf_to_text_simple(data, keep_newlines=keep_newlines)
+    txt = _squeeze_spaces(txt)
+    return txt if keep_newlines else txt.replace("\n", " ")
+
+def _is_ole(b: bytes) -> bool:
+    return len(b) >= 8 and b[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+
+def _generic_ole_text(data: bytes) -> str:
+    S = SETTINGS.effective
+    MIN_RUN = int(S().get("doc_ole_min_run_chars", 8))
+    MAX_LINE = int(S().get("doc_ole_max_line_chars", 600))
+    MIN_ALPHA_RATIO = float(S().get("doc_ole_min_alpha_ratio", 0.25))
+    DROP_XMLISH = bool(S().get("doc_ole_drop_xmlish", True))
+    DROP_PATHISH = bool(S().get("doc_ole_drop_pathish", True))
+    DROP_SYMBOL_LINES = bool(S().get("doc_ole_drop_symbol_lines", True))
+    DEDUPE_SHORT_REPEATS = bool(S().get("doc_ole_dedupe_short_repeats", True))
+    XMLISH = re.compile(r"^\s*<[^>]+>", re.I)
+    PATHISH = re.compile(r"[\\/].+\.(?:xml|rels|png|jpg|jpeg|gif|bmp|bin|dat)\b", re.I)
+    SYMBOLLINE = re.compile(r"^[\W_]{6,}$")
+    s = data.replace(b"\x00", b"")
+    runs = re.findall(rb"[\t\r\n\x20-\x7E]{%d,}" % MIN_RUN, s)
+    if not runs:
+        return ""
+    def _dec(b: bytes) -> str:
+        try:
+            return b.decode("cp1252", errors="ignore")
+        except Exception:
+            return b.decode("latin-1", errors="ignore")
+    kept: List[str] = []
+    for raw in runs:
+        chunk = _dec(raw).replace("\r", "\n")
+        for ln in re.split(r"\n+", chunk):
+            t = ln.strip()
+            if not t:
+                continue
+            if MAX_LINE > 0 and len(t) > MAX_LINE:
+                t = t[:MAX_LINE].rstrip()
+            t = _squeeze_spaces(t)
+            letters = sum(1 for c in t if c.isalpha())
+            if letters / max(1, len(t)) < MIN_ALPHA_RATIO:
+                continue
+            if DROP_XMLISH and XMLISH.search(t):
+                continue
+            if DROP_PATHISH and PATHISH.search(t):
+                continue
+            if DROP_SYMBOL_LINES and SYMBOLLINE.fullmatch(t):
+                continue
+            if DEDUPE_SHORT_REPEATS:
+                t = re.sub(r"\b(\w{2,4})\1{2,}\b", r"\1\1", t)
+            kept.append(t)
+    out = "\n".join(kept)
+    out = re.sub(r"\n\s*\n\s*\n+", "\n\n", out).strip()
+    return out
+
+def extract_doc_binary(data: bytes) -> Tuple[str, str]:
+    head = (data[:64] or b"").lstrip()
+    is_rtf = head.startswith(b"{\\rtf") or head.startswith(b"{\\RTF}")
+    is_ole = _is_ole(data)
+    _dbg(f"extract_doc_binary: bytes={len(data)} is_rtf={is_rtf} is_ole={is_ole}")
+    if is_rtf:
+        txt = _rtf_to_text_via_lib(data, keep_newlines=True).strip()
+        return (txt + "\n" if txt else ""), "text/plain"
+    if is_ole:
+        txt = _generic_ole_text(data)
+        return (txt + "\n" if txt else ""), "text/plain"
+    try:
+        txt = data.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        txt = data.decode("latin-1", errors="ignore").strip()
+    return (txt + ("\n" if txt else "")), "text/plain"
+
 # ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
 
 # ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
@@ -1783,6 +2068,11 @@ from typing import Tuple, List
 import io, re
 from datetime import datetime, date, time
 from ...core.settings import SETTINGS
+from .excel_ingest_core import (
+    scan_blocks_by_blank_rows,
+    rightmost_nonempty_header,
+    select_indices,
+)
 
 _WS_RE = re.compile(r"[ \t]+")
 def _squeeze_spaces_inline(s: str) -> str:
@@ -1869,11 +2159,47 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
         s = re.sub(r"_+", "_", s).strip("_")
         return s or h
 
+    def _sheet_used_range(ws: Worksheet):
+        from openpyxl.utils import range_boundaries
+        if callable(getattr(ws, "calculate_dimension", None)):
+            dim_ref = ws.calculate_dimension()
+            try:
+                min_c, min_r, max_c, max_r = range_boundaries(dim_ref)
+                return min_c, min_r, max_c, max_r
+            except Exception:
+                pass
+        return 1, 1, ws.max_column or 1, ws.max_row or 1
+
+    def _detect_key_value(ws: Worksheet, min_c, min_r, max_c, max_r) -> bool:
+        if max_c - min_c + 1 != 2:
+            return False
+        textish, valueish, rows = 0, 0, 0
+        for r in range(min_r, min(min_r + INFER_MAX_ROWS - 1, max_r) + 1):
+            a = ws.cell(row=r, column=min_c).value
+            b = ws.cell(row=r, column=min_c + 1).value
+            if a is None and b is None:
+                continue
+            rows += 1
+            if isinstance(a, str):
+                textish += 1
+            if isinstance(b, (int, float, datetime, date, time)):
+                valueish += 1
+        return rows >= 3 and textish / max(1, rows) >= 0.6 and valueish / max(1, rows) >= 0.6
+
+    def _keep_and_rename_phantom(headers: List[str]) -> tuple[List[int], List[str]]:
+        if len(headers) >= 2 and re.fullmatch(r"\d+_\d+$", (headers[1] or "")) and (headers[0] or ""):
+            keep_idx = [0, 1]
+            new_headers = headers[:]
+            new_headers[1] = "value"
+            return keep_idx, new_headers
+        keep_idx = [i for i, h in enumerate(headers) if h and not re.fullmatch(r"\d+_\d+$", h)]
+        new_headers = [headers[i] for i in keep_idx]
+        return keep_idx, new_headers
+
     wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
 
     lines: List[str] = []
 
-    # Named ranges
     try:
         dn_obj = getattr(wb_vals, "defined_names", None)
         if dn_obj and getattr(dn_obj, "definedName", None):
@@ -1918,33 +2244,6 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
     except Exception:
         pass
 
-    def _sheet_used_range(ws: Worksheet):
-        from openpyxl.utils import range_boundaries
-        if callable(getattr(ws, "calculate_dimension", None)):
-            dim_ref = ws.calculate_dimension()
-            try:
-                min_c, min_r, max_c, max_r = range_boundaries(dim_ref)
-                return min_c, min_r, max_c, max_r
-            except Exception:
-                pass
-        return 1, 1, ws.max_column or 1, ws.max_row or 1
-
-    def _detect_key_value(ws: Worksheet, min_c, min_r, max_c, max_r) -> bool:
-        if max_c - min_c + 1 != 2:
-            return False
-        textish, valueish, rows = 0, 0, 0
-        for r in range(min_r, min(min_r + INFER_MAX_ROWS - 1, max_r) + 1):
-            a = ws.cell(row=r, column=min_c).value
-            b = ws.cell(row=r, column=min_c + 1).value
-            if a is None and b is None:
-                continue
-            rows += 1
-            if isinstance(a, str):
-                textish += 1
-            if isinstance(b, (int, float, datetime, date, time)):
-                valueish += 1
-        return rows >= 3 and textish / max(1, rows) >= 0.6 and valueish / max(1, rows) >= 0.6
-
     def _emit_key_values(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
         lines.append(f"# Sheet: {sheet_name}")
         lines.append("## Key/Values")
@@ -1960,7 +2259,6 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
     def _emit_inferred_table(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
         lines.append(f"# Sheet: {sheet_name}")
         lines.append("## Inferred Table")
-
         max_c_eff = min(max_c, min_c + INFER_MAX_COLS - 1)
         max_r_eff = min(max_r, min_r + INFER_MAX_ROWS - 1)
 
@@ -1972,8 +2270,8 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
             if s:
                 header_fill += 1
             headers.append(s)
-        fill_ratio = header_fill / max(1, (max_c_eff - min_c + 1))
 
+        fill_ratio = header_fill / max(1, (max_c_eff - min_c + 1))
         if fill_ratio < INFER_MIN_HEADER_FILL and (min_r + 1) <= max_r_eff:
             headers = []
             hdr_r = min_r + 1
@@ -1984,23 +2282,29 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
             min_r = hdr_r
 
         norm_headers = [normalize_header(h) for h in headers]
+        rmax = rightmost_nonempty_header(norm_headers)
+        if rmax >= 0:
+            norm_headers = norm_headers[:rmax + 1]
+            max_c_eff = min(max_c_eff, min_c + rmax)
+
+        keep_idx, norm_headers = _keep_and_rename_phantom(norm_headers)
         if any(h for h in norm_headers):
             lines.append("headers: " + ", ".join(h for h in norm_headers if h))
 
         for r in range(min_r + 1, max_r_eff + 1):
-            row_cells: List[str] = []
+            row_vals: List[str] = []
             for c in range(min_c, max_c_eff + 1):
                 vv = ws.cell(row=r, column=c).value
-                val_str = fmt_val(vv)
-                if val_str:
-                    row_cells.append(val_str if not EMIT_CELL_ADDR else f"{val_str}")
-            if row_cells:
-                lines.append("row: " + ", ".join(row_cells))
+                row_vals.append(fmt_val(vv))
+            row_vals = select_indices(row_vals, keep_idx)
+            while row_vals and (row_vals[-1] == "" or row_vals[-1] is None):
+                row_vals.pop()
+            if any(v for v in row_vals):
+                lines.append("row: " + ", ".join(row_vals))
         lines.append("")
 
     for sheet_name in wb_vals.sheetnames:
         ws_v: Worksheet = wb_vals[sheet_name]
-
         emitted_any = False
 
         if EMIT_MERGED:
@@ -2040,10 +2344,264 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
 
         if not emitted_any:
             min_c, min_r, max_c, max_r = _sheet_used_range(ws_v)
-            if EMIT_KEYVALUES and _detect_key_value(ws_v, min_c, min_r, max_c, max_r):
-                _emit_key_values(ws_v, sheet_name, min_c, min_r, max_c, max_r)
-            else:
-                _emit_inferred_table(ws_v, sheet_name, min_c, min_r, max_c, max_r)
+            max_c = min(max_c, min_c + INFER_MAX_COLS - 1)
+            for b_min_c, b_min_r, b_max_c, b_max_r in scan_blocks_by_blank_rows(ws_v, min_c, min_r, max_c, max_r):
+                if b_min_r > b_max_r:
+                    continue
+                if EMIT_KEYVALUES and _detect_key_value(ws_v, b_min_c, b_min_r, b_max_c, b_max_r):
+                    _emit_key_values(ws_v, sheet_name, b_min_c, b_min_r, b_max_c, b_max_r)
+                else:
+                    _emit_inferred_table(ws_v, sheet_name, b_min_c, b_min_r, b_max_c, b_max_r)
+
+    text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
+    return (text + "\n" if text else ""), "text/plain"
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest_core.py =====
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest_core.py =====
+from __future__ import annotations
+from typing import List, Tuple
+import re
+
+_PII_HDRS = {"ssn","social_security_number","email","phone","dob"}
+_PHANTOM_RX = re.compile(r"^\d+_\d+$")
+
+def row_blank(ws, r: int, min_c: int, max_c: int) -> bool:
+    for c in range(min_c, max_c + 1):
+        v = ws.cell(row=r, column=c).value
+        if v not in (None, "") and not (isinstance(v, str) and not v.strip()):
+            return False
+    return True
+
+def scan_blocks_by_blank_rows(ws, min_c: int, min_r: int, max_c: int, max_r: int):
+    r = min_r
+    while r <= max_r:
+        while r <= max_r and row_blank(ws, r, min_c, max_c):
+            r += 1
+        if r > max_r:
+            break
+        start = r
+        while r <= max_r and not row_blank(ws, r, min_c, max_c):
+            r += 1
+        end = r - 1
+        yield (min_c, start, max_c, end)
+
+def rightmost_nonempty_header(headers: List[str]) -> int:
+    for i in range(len(headers) - 1, -1, -1):
+        h = headers[i]
+        if h and not h.isspace():
+            return i
+    return -1
+
+def drop_bad_columns(headers: List[str]) -> List[int]:
+    keep = []
+    for i, h in enumerate(headers):
+        hn = (h or "").strip().lower()
+        if not hn:
+            continue
+        if _PHANTOM_RX.fullmatch(hn) or hn in {"0"}:
+            continue
+        if hn in _PII_HDRS:
+            continue
+        keep.append(i)
+    return keep or list(range(len(headers)))
+
+def select_indices(seq: List[str], idxs: List[int]) -> List[str]:
+    out = []
+    for i in idxs:
+        out.append(seq[i] if i < len(seq) else "")
+    return out
+
+# ===== aimodel/file_read/rag/ingest/xls_ingest.py =====
+
+# ===== aimodel/file_read/rag/ingest/xls_ingest.py =====
+from __future__ import annotations
+from typing import Tuple, List
+from datetime import datetime, date, time
+from ...core.settings import SETTINGS
+
+import re
+
+_WS_RE = re.compile(r"[ \t]+")
+def _squeeze_spaces_inline(s: str) -> str:
+    return _WS_RE.sub(" ", (s or "")).strip()
+
+def extract_xls(data: bytes) -> Tuple[str, str]:
+    """
+    Extract text from legacy .xls using xlrd and emit a format compatible with
+    extract_excel() (headers/rows or key/values) so downstream RAG stays consistent.
+    """
+    try:
+        import xlrd  # BSD-licensed
+    except Exception:
+        # If xlrd is not installed, return plaintext to avoid 500s.
+        return (data.decode("utf-8", errors="replace"), "text/plain")
+
+    S = SETTINGS.effective
+
+    # --- formatting/config (mirrors excel_ingest) ---
+    sig = int(S().get("excel_number_sigfigs"))
+    maxp = int(S().get("excel_decimal_max_places"))
+    trim = bool(S().get("excel_trim_trailing_zeros"))
+    drop_midnight = bool(S().get("excel_dates_drop_time_if_midnight"))
+    time_prec = str(S().get("excel_time_precision"))
+    max_chars = int(S().get("excel_value_max_chars"))
+    quote_strings = bool(S().get("excel_quote_strings"))
+
+    INFER_MAX_ROWS = int(S().get("excel_infer_max_rows"))
+    INFER_MAX_COLS = int(S().get("excel_infer_max_cols"))
+    INFER_MIN_HEADER_FILL = float(S().get("excel_infer_min_header_fill_ratio", 0.5))
+    EMIT_KEYVALUES = bool(S().get("excel_emit_key_values"))
+    EMIT_CELL_ADDR = bool(S().get("excel_emit_cell_addresses"))
+    HEADER_NORMALIZE = bool(S().get("excel_header_normalize"))
+
+    def clip(s: str) -> str:
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + "…"
+        return s
+
+    def fmt_number(v) -> str:
+        try:
+            s = format(float(v), f".{sig}g") if sig > 0 else f"{float(v):.{maxp}f}"
+        except Exception:
+            s = str(v)
+        if "e" in s.lower():
+            try:
+                s = f"{float(v):.{maxp}f}"
+            except Exception:
+                pass
+        if trim and "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+
+    def fmt_date(dt: datetime) -> str:
+        if drop_midnight and isinstance(dt, datetime) and dt.time() == time(0, 0, 0):
+            return dt.date().isoformat()
+        return dt.strftime("%Y-%m-%d %H:%M" if time_prec == "minute" else "%Y-%m-%d %H:%M:%S")
+
+    def fmt_time(t: time) -> str:
+        return t.strftime("%H:%M" if time_prec == "minute" else "%H:%M:%S")
+
+    def fmt_val(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return fmt_number(v)
+        if isinstance(v, datetime):
+            return fmt_date(v)
+        if isinstance(v, date):
+            return v.isoformat()
+        if isinstance(v, time):
+            return fmt_time(v)
+        s = str(v)
+        if "\n" in s or "\r" in s:
+            s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+        s = clip(_squeeze_spaces_inline(s))
+        if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
+            return f"\"{s}\""
+        return s
+
+    def normalize_header(h: str) -> str:
+        if not HEADER_NORMALIZE:
+            return h
+        s = (h or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or h
+
+    # --- open workbook ---
+    try:
+        book = xlrd.open_workbook(file_contents=data)
+    except Exception:
+        # Misnamed/garbled file: fail soft
+        return (data.decode("utf-8", errors="replace"), "text/plain")
+
+    datemode = book.datemode
+
+    def xlrd_cell_to_py(cell):
+        # xlrd types: 0 empty, 1 text, 2 number, 3 date, 4 boolean, 5 error, 6 blank
+        ctype, value = cell.ctype, cell.value
+        if ctype == xlrd.XL_CELL_DATE:
+            try:
+                return xlrd.xldate_as_datetime(value, datemode)
+            except Exception:
+                return value
+        if ctype == xlrd.XL_CELL_NUMBER:
+            return float(value)
+        if ctype == xlrd.XL_CELL_BOOLEAN:
+            return bool(value)
+        return value
+
+    lines: List[str] = []
+
+    for sheet in book.sheets():
+        nrows = min(sheet.nrows or 0, INFER_MAX_ROWS)
+        ncols = min(sheet.ncols or 0, INFER_MAX_COLS)
+        if nrows == 0 or ncols == 0:
+            continue
+
+        # header inference
+        headers_raw = []
+        header_fill = 0
+        for c in range(ncols):
+            v = xlrd_cell_to_py(sheet.cell(0, c))
+            s = "" if v is None else str(v).strip()
+            if s:
+                header_fill += 1
+            headers_raw.append(s)
+
+        fill_ratio = header_fill / max(1, ncols)
+        start_row = 1
+        if fill_ratio < INFER_MIN_HEADER_FILL and nrows >= 2:
+            headers_raw = []
+            for c in range(ncols):
+                v = xlrd_cell_to_py(sheet.cell(1, c))
+                s = "" if v is None else str(v).strip()
+                headers_raw.append(s)
+            start_row = 2
+
+        norm_headers = [normalize_header(h) for h in headers_raw]
+
+        lines.append(f"# Sheet: {sheet.name}")
+
+        # key/value mode (two-column heuristic)
+        if EMIT_KEYVALUES and ncols == 2:
+            textish = valueish = rows = 0
+            for r in range(start_row, nrows):
+                a = xlrd_cell_to_py(sheet.cell(r, 0))
+                b = xlrd_cell_to_py(sheet.cell(r, 1))
+                if a is None and b is None:
+                    continue
+                rows += 1
+                if isinstance(a, str):
+                    textish += 1
+                if isinstance(b, (int, float, datetime, date, time)):
+                    valueish += 1
+            if rows >= 3 and textish / max(1, rows) >= 0.6 and valueish / max(1, rows) >= 0.6:
+                lines.append("## Key/Values")
+                for r in range(start_row, nrows):
+                    k = fmt_val(xlrd_cell_to_py(sheet.cell(r, 0)))
+                    v = fmt_val(xlrd_cell_to_py(sheet.cell(r, 1)))
+                    if not k and not v:
+                        continue
+                    lines.append(f"- {k}: {v}" if k else f"- : {v}")
+                lines.append("")
+                continue  # done with this sheet
+
+        # table mode
+        lines.append("## Inferred Table")
+        if any(h for h in norm_headers):
+            lines.append("headers: " + ", ".join(h for h in norm_headers if h))
+
+        for r in range(start_row, nrows):
+            row_vals: List[str] = []
+            for c in range(ncols):
+                val = fmt_val(xlrd_cell_to_py(sheet.cell(r, c)))
+                if val:
+                    row_vals.append(val if not EMIT_CELL_ADDR else f"{val}")
+            if row_vals:
+                lines.append("row: " + ", ".join(row_vals))
+        lines.append("")
 
     text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
     return (text + "\n" if text else ""), "text/plain"
@@ -2270,678 +2828,4 @@ def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Op
         hits_top,
         max_chars=int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
     )
-    print(f"[RAG BLOCK (session-only)] chars={len(block)}")
-    return block
-
-# ===== aimodel/file_read/rag/router_ai.py =====
-
-from __future__ import annotations
-from typing import Tuple, Optional, Any
-import json, re, traceback
-from ..core.settings import SETTINGS
-
-def _dbg(msg: str):
-    print(f"[RAG ROUTER] {msg}")
-
-def _force_json_strict(s: str) -> dict:
-    """Strict JSON parse: try direct, else (optionally) regex from settings. No other fallbacks."""
-    if not s:
-        return {}
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        pass
-
-    rgx = SETTINGS.get("router_rag_json_extract_regex")
-    if isinstance(rgx, str) and rgx:
-        try:
-            m = re.search(rgx, s, re.DOTALL)
-            if m:
-                cand = m.group(0)
-                v = json.loads(cand)
-                return v if isinstance(v, dict) else {}
-        except Exception:
-            pass
-
-    return {}
-
-def _strip_wrappers(text: str) -> str:
-    """All controls via router_rag_* settings; no internal defaults."""
-    t = text or ""
-    if SETTINGS.get("router_rag_trim_whitespace") is True:
-        t = t.strip()
-
-    if SETTINGS.get("router_rag_strip_wrappers_enabled") is not True:
-        return t
-
-    head = t
-    if SETTINGS.get("router_rag_strip_split_on_blank") is True:
-        head = t.split("\n\n", 1)[0]
-
-    pat = SETTINGS.get("router_rag_strip_header_regex")
-    if isinstance(pat, str) and pat:
-        try:
-            rx = re.compile(pat)
-            out = []
-            for ln in head.splitlines():
-                if rx.match(ln):
-                    break
-                out.append(ln)
-            core = " ".join(" ".join(out).split())
-            return core if core else t
-        except Exception:
-            return head
-    return head
-
-def _normalize_keys(d: dict) -> dict:
-    return {str(k).strip().strip('"').strip("'").strip().lower(): v for k, v in d.items()}
-
-def _as_bool(v) -> Optional[bool]:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        s = v.strip().strip('"').strip("'").lower()
-        if s in ("true", "yes", "y", "1"):  return True
-        if s in ("false", "no", "n", "0"):  return False
-    return None
-
-def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
-    try:
-        if not user_text or not user_text.strip():
-            return (False, None)
-
-        core_text = _strip_wrappers(user_text.strip())
-
-        # Prompt must come from settings; supports either $text (Template) or {text} (format)
-        prompt_tpl = SETTINGS.get("router_rag_decide_prompt")
-        if not isinstance(prompt_tpl, str) or ("$text" not in prompt_tpl and "{text}" not in prompt_tpl):
-            _dbg("router_rag_decide_prompt missing/invalid")
-            return (False, None)
-
-        from string import Template
-        if "$text" in prompt_tpl:
-            the_prompt = Template(prompt_tpl).safe_substitute(text=core_text)
-        else:
-            the_prompt = prompt_tpl.format(text=core_text)
-
-        params = {
-            "max_tokens": SETTINGS.get("router_rag_decide_max_tokens"),
-            "temperature": SETTINGS.get("router_rag_decide_temperature"),
-            "top_p": SETTINGS.get("router_rag_decide_top_p"),
-            "stream": False,
-        }
-        stop_list = SETTINGS.get("router_rag_decide_stop")
-        if isinstance(stop_list, list) and stop_list:
-            params["stop"] = stop_list
-        params = {k: v for k, v in params.items() if v is not None}
-
-        raw = llm.create_chat_completion(
-            messages=[{"role": "user", "content": the_prompt}],
-            **params,
-        )
-        text_out = (raw.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-
-        data = _force_json_strict(text_out)
-        if not isinstance(data, dict):
-            return (False, None)
-        data = _normalize_keys(data)
-
-        need_raw = data.get("need")
-        need_bool = _as_bool(need_raw) if not isinstance(need_raw, bool) else need_raw
-        if need_bool is None:
-            need_default = SETTINGS.get("router_rag_default_need_when_invalid")
-            return (bool(need_default) if isinstance(need_default, bool) else False, None)
-
-        need = bool(need_bool)
-        query_field = data.get("query", "")
-        query = _strip_wrappers(str(query_field or "").strip()) if need else None
-        return (need, query)
-
-    except Exception as e:
-        _dbg(f"FATAL {type(e).__name__}: {e}")
-        traceback.print_exc()
-        need_default = SETTINGS.get("router_rag_default_need_when_invalid")
-        return (bool(need_default) if isinstance(need_default, bool) else False, None)
-
-# ===== aimodel/file_read/rag/schemas.py =====
-
-from pydantic import BaseModel, Field
-from typing import Optional, List, Literal, Dict
-
-class SearchReq(BaseModel):
-    query: str
-    sessionId: Optional[str] = None
-    kChat: int = 6
-    kGlobal: int = 4
-    hybrid_alpha: float = 0.5  # 0..1, higher = semantic weight
-
-class ItemRow(BaseModel):
-    id: str
-    sessionId: Optional[str]
-    source: str
-    title: Optional[str]
-    mime: Optional[str]
-    size: Optional[int]
-    createdAt: str
-    meta: Dict[str, str] = Field(default_factory=dict)
-
-class SearchHit(BaseModel):
-    id: str
-    text: str
-    score: float
-    source: Optional[str] = None   # <-- safer
-    title: Optional[str] = None
-    sessionId: Optional[str] = None
-    url: Optional[str] = None
-
-# ===== aimodel/file_read/rag/search.py =====
-
-from __future__ import annotations
-from typing import List, Dict, Optional
-import numpy as np
-from .store import search_vectors
-
-def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]:
-    # results = [list_from_chat, list_from_global]
-    scores: Dict[str, float] = {}
-    lookup: Dict[str, Dict] = {}
-    for lst in results:
-        for rank, r in enumerate(lst, start=1):
-            rid = r["id"]
-            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank)
-            lookup[rid] = r
-    fused = [{"score": s, **lookup[rid]} for rid, s in scores.items()]
-    fused.sort(key=lambda x: x["score"], reverse=True)
-    return fused
-
-def merge_chat_first(chat_hits: List[Dict], global_hits: List[Dict], alpha: float = 0.5) -> List[Dict]:
-    # alpha weights semantic scores; RRF stabilizes positions
-    fused = reciprocal_rank_fusion([chat_hits, global_hits])
-    return fused
-
-# ===== aimodel/file_read/rag/store.py =====
-
-from __future__ import annotations
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-import faiss, json, os, time, hashlib
-import numpy as np
-
-BASE = Path(__file__).resolve().parents[1] / "store" / "rag"
-
-def _ns_dir(session_id: Optional[str]) -> Path:
-    if session_id:
-        return BASE / "by_session" / session_id
-    return BASE / "global"
-
-def _paths(session_id: Optional[str]) -> Tuple[Path, Path]:
-    d = _ns_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "index.faiss", d / "meta.jsonl"
-
-def _norm(x: np.ndarray) -> np.ndarray:
-    x = x.astype("float32")
-    faiss.normalize_L2(x)
-    return x
-
-def _load_index(dim: int, p: Path) -> faiss.Index:
-    if p.exists():
-        return faiss.read_index(str(p))
-    return faiss.IndexFlatIP(dim)
-
-def _save_index(idx: faiss.Index, p: Path) -> None:
-    faiss.write_index(idx, str(p))
-
-def add_vectors(session_id: Optional[str], embeds: np.ndarray, metas: List[Dict], dim: int):
-    idx_path, meta_path = _paths(session_id)
-    idx = _load_index(dim, idx_path)
-
-    # ensure index type
-    if not isinstance(idx, faiss.IndexFlatIP):
-        idx = faiss.IndexFlatIP(dim) if idx.ntotal == 0 else idx
-
-    # normalize vectors
-    embeds = _norm(embeds)
-
-    # ✅ read existing ids to avoid duplicates
-    existing_ids = set()
-    if meta_path.exists():
-        with meta_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    j = json.loads(line)
-                    existing_ids.add(j["id"])
-                except:
-                    pass
-
-    start = idx.ntotal
-    new_embeds = []
-    new_metas = []
-
-    for i, m in enumerate(metas):
-        if m["id"] in existing_ids:
-            continue
-        m["row"] = start + len(new_embeds)
-        new_embeds.append(embeds[i])
-        new_metas.append(m)
-
-    if new_embeds:
-        idx.add(np.vstack(new_embeds))
-        _save_index(idx, idx_path)
-        with meta_path.open("a", encoding="utf-8") as f:
-            for m in new_metas:
-                f.write(json.dumps(m, ensure_ascii=False) + "\n")
-
-def search_vectors(session_id: Optional[str], query_vec: np.ndarray, topk: int, dim: int) -> List[Dict]:
-    idx_path, meta_path = _paths(session_id)
-    if not idx_path.exists() or not meta_path.exists():
-        return []
-
-    idx = _load_index(dim, idx_path)
-
-    # ✅ ensure numpy array for reshape
-    query_vec = np.asarray(query_vec, dtype="float32")
-    q = _norm(query_vec.reshape(1, -1))
-
-    D, I = idx.search(q, topk)
-    out: List[Dict] = []
-    rows: Dict[int, Dict] = {}
-    with meta_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                j = json.loads(line)
-                rows[int(j["row"])] = j
-            except:
-                pass
-    for score, row in zip(D[0].tolist(), I[0].tolist()):
-        if row < 0:
-            continue
-        m = rows.get(row)
-        if not m:
-            continue
-        m = dict(m)
-        m["score"] = float(score)
-        out.append(m)
-    return out
-
-def search_similar(qvec: List[float] | np.ndarray, *, k: int = 5, session_id: Optional[str] = None) -> List[Dict]:
-    """
-    Compatibility wrapper used by retrieve.py.
-    qvec: a single embedding vector (list or np.ndarray)
-    """
-    arr = np.asarray(qvec, dtype="float32")
-    dim = int(arr.shape[-1])
-    return search_vectors(session_id, arr, k, dim)
-
-def add_texts(
-    texts: List[str],
-    metas: List[Dict],
-    *,
-    session_id: Optional[str],
-    embed_fn,  # callable: List[str] -> np.ndarray[float32]
-) -> int:
-    if not texts:
-        return 0
-    vecs = embed_fn(texts)  # should return (n, d) float32
-    if not isinstance(vecs, np.ndarray):
-        vecs = np.asarray(vecs, dtype="float32")
-    dim = int(vecs.shape[-1])
-    add_vectors(session_id, vecs, metas, dim)
-    return len(texts)
-
-# ===== aimodel/file_read/rag/uploads.py =====
-
-from __future__ import annotations
-from typing import Dict, List, Optional, Iterable, Tuple
-from pathlib import Path
-import json, os
-import numpy as np
-import faiss
-
-from .store import _ns_dir  # reuse your namespace layout
-
-_META_FN = "meta.jsonl"
-_INDEX_FN = "index.faiss"
-
-# ---------- Read-only helpers (NO mkdir) ----------
-def _meta_path_ro(session_id: Optional[str]) -> Path:
-    return _ns_dir(session_id) / _META_FN
-
-def _index_path_ro(session_id: Optional[str]) -> Path:
-    return _ns_dir(session_id) / _INDEX_FN
-
-# ---------- Mutating helpers (mkdir when writing) ----------
-def _paths_mut(session_id: Optional[str]) -> Tuple[Path, Path]:
-    d = _ns_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d / _INDEX_FN, d / _META_FN
-
-def _read_meta(meta_path: Path) -> List[dict]:
-    if not meta_path.exists():
-        return []
-    out: List[dict] = []
-    with meta_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                j = json.loads(line)
-                if isinstance(j, dict):
-                    out.append(j)
-            except:
-                pass
-    return out
-
-def _write_meta(meta_path: Path, rows: List[dict]) -> None:
-    tmp = meta_path.with_suffix(".jsonl.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for j in rows:
-            f.write(json.dumps(j, ensure_ascii=False) + "\n")
-    tmp.replace(meta_path)
-
-def _norm(x: np.ndarray) -> np.ndarray:
-    x = x.astype("float32")
-    faiss.normalize_L2(x)
-    return x
-
-def list_sources(session_id: Optional[str], include_global: bool = True) -> List[dict]:
-    def _agg(ns: Optional[str]) -> Dict[str, int]:
-        mp = _meta_path_ro(ns)  # read-only, no mkdir
-        agg: Dict[str, int] = {}
-        for j in _read_meta(mp):
-            src = (j.get("source") or "").strip()
-            if not src:
-                continue
-            agg[src] = agg.get(src, 0) + 1
-        return agg
-
-    rows: List[dict] = []
-    # session first
-    if session_id is not None:
-        for src, n in _agg(session_id).items():
-            rows.append({"source": src, "sessionId": session_id, "chunks": n})
-    if include_global:
-        for src, n in _agg(None).items():
-            rows.append({"source": src, "sessionId": None, "chunks": n})
-    return rows
-
-def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> dict:
-    """
-    Remove all chunks for `source` in the given namespace and REBUILD the FAISS index.
-    `embedder`: callable(List[str]) -> np.ndarray[float32] (same one used on ingest).
-    """
-    idx_path, meta_path = _paths_mut(session_id)  # mutating path (mkdir allowed)
-    rows = _read_meta(meta_path)
-    if not rows:
-        return {"ok": True, "removed": 0, "remaining": 0}
-
-    keep: List[dict] = []
-    removed = 0
-    for j in rows:
-        if str(j.get("source") or "").strip() == source:
-            removed += 1
-        else:
-            keep.append(j)
-
-    if removed == 0:
-        return {"ok": True, "removed": 0, "remaining": len(keep)}
-
-    # Reassign contiguous row ids for the kept entries
-    for i, j in enumerate(keep):
-        j["row"] = i
-
-    if len(keep) == 0:
-        # No rows left: drop index; empty meta file
-        if idx_path.exists():
-            try:
-                idx_path.unlink()
-            except:
-                pass
-        _write_meta(meta_path, [])
-        return {"ok": True, "removed": removed, "remaining": 0}
-
-    # Re-embed kept texts in batches
-    texts = [str(j.get("text") or "") for j in keep]
-    B = 128  # batch size
-    parts: List[np.ndarray] = []
-    for i in range(0, len(texts), B):
-        vec = embedder(texts[i:i + B])
-        if not isinstance(vec, np.ndarray):
-            vec = np.asarray(vec, dtype="float32")
-        parts.append(vec.astype("float32"))
-    embeds = np.vstack(parts)
-    embeds = _norm(embeds)
-
-    dim = int(embeds.shape[-1])
-    new_index = faiss.IndexFlatIP(dim)
-    new_index.add(embeds)
-
-    # Save rebuilt index + meta
-    faiss.write_index(new_index, str(idx_path))
-    _write_meta(meta_path, keep)
-
-    return {"ok": True, "removed": removed, "remaining": len(keep)}
-
-# ===== aimodel/file_read/rag/worker.py =====
-
-
-
-# ===== aimodel/file_read/requirements.txt =====
-
-fastapi==0.116.1
-uvicorn==0.30.6
-pydantic==2.11.7
-starlette==0.47.2
-llama-cpp-python==0.3.4
-ddgs==9.5.4
-httpx==0.27.0
-# HTML parsing / readability (permissive)
-lxml==6.0.1
-readability-lxml==0.8.1
-selectolax==0.3.21
-beautifulsoup4==4.12.3
-
-# RAG
-faiss-cpu==1.8.0.post1
-numpy==1.26.4
-sentence-transformers==3.0.1
-tzlocal==5.2
-openpyxl==3.1.5 
-python-multipart==0.0.20
-
-python-docx==1.1.2
-PyYAML==6.0.2
-toml==0.10.2
-pdfminer.six==20240706
-
-PyPDF2==3.0.1
-pandas==2.2.2
-
-
-
-
-# ===== aimodel/file_read/runtime/__init__.py =====
-
-
-
-# ===== aimodel/file_read/runtime/model_runtime.py =====
-
-# aimodel/file_read/model_runtime.py
-from __future__ import annotations
-import os
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from threading import RLock
-from typing import Any, Dict, Optional, List
-
-from ..adaptive.config.paths import read_settings, write_settings
-
-try:
-    from llama_cpp import Llama
-except Exception as e:
-    raise RuntimeError("llama-cpp-python not installed or GPU libs missing") from e
-
-@dataclass
-class ModelConfig:
-    modelPath: str
-    nCtx: int = 4096
-    nThreads: int = 8
-    nGpuLayers: int = 40
-    nBatch: int = 256
-    ropeFreqBase: Optional[float] = None
-    ropeFreqScale: Optional[float] = None
-
-    @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "ModelConfig":
-        return ModelConfig(
-            modelPath=str(d.get("modelPath","")).strip(),
-            nCtx=int(d.get("nCtx", 4096)),
-            nThreads=int(d.get("nThreads", 8)),
-            nGpuLayers=int(d.get("nGpuLayers", 40)),
-            nBatch=int(d.get("nBatch", 256)),
-            ropeFreqBase=(float(d["ropeFreqBase"]) if d.get("ropeFreqBase") not in (None,"") else None),
-            ropeFreqScale=(float(d["ropeFreqScale"]) if d.get("ropeFreqScale") not in (None,"") else None),
-        )
-
-_runtime_lock = RLock()
-_llm: Optional[Llama] = None
-_cfg: Optional[ModelConfig] = None
-
-def _build_kwargs(cfg: ModelConfig) -> Dict[str, Any]:
-    kw = dict(
-        model_path=cfg.modelPath,
-        n_ctx=cfg.nCtx,
-        n_threads=cfg.nThreads,
-        n_gpu_layers=cfg.nGpuLayers,
-        n_batch=cfg.nBatch,
-    )
-    # advanced optional tuning
-    if cfg.ropeFreqBase is not None:
-        kw["rope_freq_base"] = cfg.ropeFreqBase
-    if cfg.ropeFreqScale is not None:
-        kw["rope_freq_scale"] = cfg.ropeFreqScale
-    return kw
-
-def _close_llm():
-    global _llm
-    try:
-        if _llm is not None:
-            # llama_cpp doesn't expose explicit close; allow GC
-            _llm = None
-    except Exception:
-        _llm = None
-
-def current_model_info() -> Dict[str, Any]:
-    with _runtime_lock:
-        return {
-            "loaded": _llm is not None,
-            "config": asdict(_cfg) if _cfg else None,
-        }
-
-def ensure_ready() -> None:
-    """
-    Lazily load a model based on current settings if nothing is loaded.
-    """
-    global _llm, _cfg
-    with _runtime_lock:
-        if _llm is not None:
-            return
-        s = read_settings()
-        cfg = ModelConfig.from_dict(s)
-        if not cfg.modelPath:
-            raise RuntimeError("No model selected. Load one via /models/load or set LOCALAI_MODEL_PATH.")
-        p = Path(cfg.modelPath)
-        if not p.exists():
-            raise FileNotFoundError(f"Model path not found: {p}")
-        _llm = Llama(**_build_kwargs(cfg))
-        _cfg = cfg
-
-def get_llm() -> Llama:
-    ensure_ready()
-    assert _llm is not None
-    return _llm
-
-def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Load/swap to a new model with given config fields (any subset).
-    Persists to settings.json so the choice survives restarts.
-    """
-    global _llm, _cfg
-    with _runtime_lock:
-        s = read_settings()
-        s.update({k:v for k,v in config_patch.items() if v is not None})
-        cfg = ModelConfig.from_dict(s)
-        if not cfg.modelPath:
-            raise ValueError("modelPath is required")
-        if not Path(cfg.modelPath).exists():
-            raise FileNotFoundError(f"Model not found: {cfg.modelPath}")
-
-        # swap
-        _close_llm()
-        _llm = Llama(**_build_kwargs(cfg))
-        _cfg = cfg
-        write_settings(asdict(cfg))
-        return current_model_info()
-
-def unload_model() -> None:
-    """
-    Unload current model, keep settings as-is.
-    """
-    global _llm
-    with _runtime_lock:
-        _close_llm()
-
-def list_local_models() -> List[Dict[str, Any]]:
-    """
-    Scan modelsDir for .gguf files and return a lightweight listing.
-    """
-    s = read_settings()
-    root = Path(s.get("modelsDir") or "")
-    root.mkdir(parents=True, exist_ok=True)
-    out: List[Dict[str, Any]] = []
-    for p in root.rglob("*.gguf"):
-        try:
-            out.append({
-                "path": str(p.resolve()),
-                "sizeBytes": p.stat().st_size,
-                "name": p.name,
-                "rel": str(p.relative_to(root)),
-            })
-        except Exception:
-            pass
-    # sort largest first (usually higher quant or full precision)
-    out.sort(key=lambda x: x["sizeBytes"], reverse=True)
-    return out
-
-# ===== aimodel/file_read/services/attachments.py =====
-
-from __future__ import annotations
-from typing import Any, Iterable, Optional, List
-
-
-def att_get(att: Any, key: str, default=None):
-    """Safe accessor for dicts OR Pydantic models."""
-    try:
-        return att.get(key, default)          # dict-like
-    except AttributeError:
-        return getattr(att, key, default)     # model-like
-
-
-def join_attachment_names(attachments: Optional[Iterable[Any]]) -> str:
-    if not attachments:
-        return ""
-    names: List[str] = [att_get(a, "name") for a in attachments]  # type: ignore[list-item]
-    names = [n for n in names if n]
-    return ", ".join(names)
-
-# ===== aimodel/file_read/services/cancel.py =====
-
-from __future__ import annotations
-import asyncio
-from threading import Event
-from typing import Dict
-from ..core.settings import SETTINGS
-
-eff = SETTINGS.effective
+    print(f"[RAG BLOCK (session-only)] chars={len(bloc

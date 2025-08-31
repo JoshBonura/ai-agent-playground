@@ -13,7 +13,7 @@ log = logging.getLogger("aimodel.api.generate")
 
 async def run_stream(
     *, llm, messages, out_budget, stop_ev, request,
-    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None,
+    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None, budget_view: Optional[dict] = None,
 ) -> AsyncGenerator[bytes, None]:
     q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
@@ -25,6 +25,7 @@ async def run_stream(
         finish_reason: Optional[str] = None
         err_text: Optional[str] = None
         out_parts: List[str] = []
+        stage: dict = {"queueWaitSec": None, "genSec": None}
 
         try:
             try:
@@ -98,18 +99,103 @@ async def run_stream(
                 pass
         finally:
             try:
-                llm.reset()
-            except Exception:
-                pass
-
-            try:
                 out_text = "".join(out_parts)
+
+                if t_first is not None and t_last is not None:
+                    stage["genSec"] = round(t_last - t_first, 3)
+                if t_start is not None and t_first is not None:
+                    stage["ttftSec"] = round(t_first - t_start, 3)
+                if t_start is not None and t_last is not None:
+                    stage["totalSec"] = round(t_last - t_start, 3)
+
+                if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
+                    stage["queueWaitSec"] = budget_view.get("queueWaitSec")
+
+                engine = None
+                method_used = None
+                try:
+                    td = None
+                    g_last = getattr(llm, "get_last_timings", None)
+                    if callable(g_last):
+                        method_used = "get_last_timings"
+                        td = g_last()
+                    if td is None:
+                        g = getattr(llm, "get_timings", None)
+                        if callable(g):
+                            method_used = "get_timings"
+                            td = g()
+                    if td is None:
+                        if isinstance(getattr(llm, "timings", None), dict):
+                            method_used = "timings_attr"
+                            td = getattr(llm, "timings")
+                        elif isinstance(getattr(llm, "perf", None), dict):
+                            method_used = "perf_attr"
+                            td = getattr(llm, "perf")
+
+                    if isinstance(td, dict):
+                        def fms(v):
+                            try:
+                                return float(v) / 1000.0
+                            except Exception:
+                                return None
+                        def to_i(v):
+                            try:
+                                return int(v)
+                            except Exception:
+                                return None
+                        load_ms = td.get("load_ms") or td.get("loadMs")
+                        prompt_ms = td.get("prompt_ms") or td.get("promptMs") or td.get("prefill_ms")
+                        eval_ms = td.get("eval_ms") or td.get("evalMs") or td.get("decode_ms")
+                        prompt_n = td.get("prompt_n") or td.get("promptN") or td.get("prompt_tokens")
+                        eval_n = td.get("eval_n") or td.get("evalN") or td.get("eval_tokens")
+                        engine = {}
+                        x = fms(load_ms)
+                        if x is not None:
+                            engine["loadSec"] = round(x, 3)
+                        x = fms(prompt_ms)
+                        if x is not None:
+                            engine["promptSec"] = round(x, 3)
+                        x = fms(eval_ms)
+                        if x is not None:
+                            engine["evalSec"] = round(x, 3)
+                        n = to_i(prompt_n)
+                        if n is not None:
+                            engine["promptN"] = n
+                        n = to_i(eval_n)
+                        if n is not None:
+                            engine["evalN"] = n
+                        try:
+                            log.debug("llm timings method=%s keys=%s", method_used, list(td.keys()))
+                        except Exception:
+                            pass
+                    else:
+                        log.debug("llm timings unavailable")
+                except Exception as e:
+                    log.debug("llm timings probe error: %s", e)
+                    engine = None
+                if engine:
+                    stage["engine"] = engine
+
+                if isinstance(budget_view, dict):
+                    ttft_val = float(stage.get("ttftSec") or 0.0)
+                    pack = (budget_view.get("pack") or {})
+                    rag = (budget_view.get("rag") or {})
+                    web_bd = ((budget_view.get("web") or {}).get("breakdown") or {})
+                    pack_sec = float(pack.get("packSec") or 0.0)
+                    trim_sec = float(pack.get("finalTrimSec") or 0.0)
+                    comp_sec = float(pack.get("compressSec") or 0.0)
+                    rag_router = float(rag.get("routerDecideSec") or 0.0)
+                    web_pre = float(web_bd.get("totalWebPreTtftSec") or 0.0)
+                    unattr_ttft = max(0.0, ttft_val - (pack_sec + trim_sec + comp_sec + rag_router + web_pre))
+                    budget_view.setdefault("breakdown", {})
+                    budget_view["breakdown"].update({
+                        "ttftSec": ttft_val,
+                        "preTtftAccountedSec": round(pack_sec + trim_sec + comp_sec + rag_router + web_pre, 6),
+                        "unattributedTtftSec": round(unattr_ttft, 6),
+                    })
+
                 run_json = build_run_json(
-                    request_cfg={
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "max_tokens": out_budget
-                    },
+                    request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
                     out_text=out_text,
                     t_start=t_start,
                     t_first=t_first,
@@ -117,16 +203,23 @@ async def run_stream(
                     stop_set=stop_ev.is_set(),
                     finish_reason=finish_reason,
                     input_tokens_est=input_tokens_est,
+                    budget_view=budget_view,
+                    extra_timings=stage,
+                    error_text=err_text,
                 )
                 if SETTINGS.runjson_emit:
                     q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
             except Exception:
                 pass
-
-            try:
-                q.put_nowait(SENTINEL)
-            except Exception:
-                pass
+            finally:
+                try:
+                    llm.reset()
+                except Exception:
+                    pass
+                try:
+                    q.put_nowait(SENTINEL)
+                except Exception:
+                    pass
 
     disconnect_task = asyncio.create_task(watch_disconnect(request, stop_ev))
     producer = asyncio.create_task(asyncio.to_thread(produce))

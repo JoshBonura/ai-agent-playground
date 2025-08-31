@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Dict, List
-from ..core.memory import get_session
+from ..core.packing_memory_core import get_session
 from ..store import set_summary as store_set_summary
 
 def handle_incoming(session_id: str, incoming: List[Dict[str, str]]):
