@@ -73,7 +73,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         summary_chars=int(eff["router_summary_chars"]),
         max_chars=int(eff["router_max_chars"]),
     )
-    telemetry: Dict[str, Any] = {"web": {}, "rag": {}, "pack": {}}
+    telemetry: Dict[str, Any] = {"web": {}, "rag": {}, "pack": {}, "prepSec": round(time.perf_counter() - t_request_start, 6)}
     ephemeral_once: List[Dict[str, str]] = []
     telemetry["web"]["injectElapsedSec"] = 0.0
     telemetry["web"]["ephemeralBlocks"] = 0
@@ -229,6 +229,20 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     telemetry["pack"]["summaryUsedLLM"] = bool(PACK_TELEMETRY.get("summaryUsedLLM") or False)
     telemetry["pack"]["finalTrimSec"] = float(PACK_TELEMETRY.get("finalTrimSec") or 0.0)
     telemetry["pack"]["compressSec"] = float(PACK_TELEMETRY.get("compressSec") or 0.0)
+    telemetry["pack"]["packInputTokensApprox"] = int(PACK_TELEMETRY.get("packInputTokensApprox") or 0)
+    telemetry["pack"]["packMsgs"] = int(PACK_TELEMETRY.get("packMsgs") or 0)
+    telemetry["pack"]["finalTrimTokensBefore"] = int(PACK_TELEMETRY.get("finalTrimTokensBefore") or 0)
+    telemetry["pack"]["finalTrimTokensAfter"] = int(PACK_TELEMETRY.get("finalTrimTokensAfter") or 0)
+    telemetry["pack"]["finalTrimDroppedMsgs"] = int(PACK_TELEMETRY.get("finalTrimDroppedMsgs") or 0)
+    telemetry["pack"]["finalTrimDroppedApproxTokens"] = int(PACK_TELEMETRY.get("finalTrimDroppedApproxTokens") or 0)
+    telemetry["pack"]["finalTrimSummaryShrunkFromChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkFromChars") or 0)
+    telemetry["pack"]["finalTrimSummaryShrunkToChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkToChars") or 0)
+    telemetry["pack"]["finalTrimSummaryDroppedChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryDroppedChars") or 0)
+    telemetry["pack"]["rollStartTokens"] = int(PACK_TELEMETRY.get("rollStartTokens") or 0)
+    telemetry["pack"]["rollOverageTokens"] = int(PACK_TELEMETRY.get("rollOverageTokens") or 0)
+    telemetry["pack"]["rollPeeledMsgs"] = int(PACK_TELEMETRY.get("rollPeeledMsgs") or 0)
+    telemetry["pack"]["rollNewSummaryChars"] = int(PACK_TELEMETRY.get("rollNewSummaryChars") or 0)
+    telemetry["pack"]["rollNewSummaryTokensApprox"] = int(PACK_TELEMETRY.get("rollNewSummaryTokensApprox") or 0)
     persist_summary(session_id, st["summary"])
     budget_view = analyze_budget(
         llm=llm,
@@ -240,6 +254,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     wb = _web_breakdown(telemetry.get("web", {}))
     telemetry.setdefault("web", {})["breakdown"] = wb
     telemetry["web"]["breakdown"]["unattributedWebSec"] = _web_unattributed(telemetry.get("web", {}), wb)
+    telemetry["web"]["breakdown"]["prepSec"] = float(telemetry.get("prepSec") or 0.0)
     budget_view.setdefault("web", {}).update(telemetry.get("web", {}))
     budget_view.setdefault("rag", {}).update(telemetry.get("rag", {}))
     budget_view.setdefault("pack", {}).update(telemetry.get("pack", {}))

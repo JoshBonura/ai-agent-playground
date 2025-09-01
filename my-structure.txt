@@ -266,6 +266,7 @@ ai-agent-playground/
         __init__.py
         chats.py
         generate_router.py
+        metrics.py
         models.py
         rag.py
         settings.py
@@ -274,7 +275,9 @@ ai-agent-playground/
       core/
         __init__.py
         files.py
-        memory.py
+        logging_init.py
+        packing_memory_core.py
+        packing_ops.py
         schemas.py
         settings.py
         style.py
@@ -294,20 +297,25 @@ ai-agent-playground/
           doc_ingest.py
           excel_ingest.py
           excel_ingest_core.py
+          ingest_stream.py
           xls_ingest.py
       runtime/
         __init__.py
         model_runtime.py
       services/
         attachments.py
+        budget.py
         cancel.py
         context_window.py
         generate_flow.py
+        generate_pipeline.py
+        generate_pipeline_support.py
         packing.py
         prompt_utils.py
         router_text.py
         session_io.py
         streaming_worker.py
+        warmup.py
       store/
         __init__.py
         base.py
@@ -318,7 +326,44 @@ ai-agent-playground/
         override_settings.json
         rag/
           by_session/
+            05060baa-1352-446a-b3b4-932f5fba4c51/
+              index.faiss
+              meta.jsonl
+            31ae0d88-c863-4ef4-a0d6-c8d825ec75cf/
+              index.faiss
+              meta.jsonl
+            3e1100b9-9bf1-450a-ab28-c4dbe2122c1c/
+              index.faiss
+              meta.jsonl
+            46cc85c3-25a6-40f6-841c-c0c58710d9f8/
+              index.faiss
+              meta.jsonl
+            5de64ccf-60c8-4872-b8cf-737436e0dc05/
+            73a5d6e6-feb1-4b52-a924-57a7ec0d47aa/
+              index.faiss
+              meta.jsonl
+            7ef45b13-71f6-420b-871e-2bd7d0bdc7fc/
+              index.faiss
+              meta.jsonl
+            88736b45-962c-4ee1-b56f-dbd381f216dd/
+              index.faiss
+              meta.jsonl
+            91b2ab50-aee3-49ea-8e63-c91a07641763/
+              index.faiss
+              meta.jsonl
+            a174e76c-5091-4f51-8311-ecf7f02add20/
+              index.faiss
+              meta.jsonl
             a5b37b4a-abd5-4435-90ce-aab2d6d18498/
+              index.faiss
+              meta.jsonl
+            cdb51a25-f4c9-4e43-b013-6e0bedcbe5f9/
+              index.faiss
+              meta.jsonl
+            ee174027-26c6-4be9-8fc9-eb98b1073adf/
+              index.faiss
+              meta.jsonl
+            fd1e6ada-ab22-4763-99c5-56b2c447bc6c/
               index.faiss
               meta.jsonl
           global/
@@ -330,6 +375,7 @@ ai-agent-playground/
         duckduckgo.py
         fetch.py
         orchestrator.py
+        orchestrator_common.py
         provider.py
         query_summarizer.py
         router_ai.py
@@ -665,8 +711,6 @@ ai-agent-playground/
         index.css
         main.tsx
         vite-env.d.ts
-        api/
-        app/
         components/
           AssistantMetrics.tsx
           ChatBubble.tsx
@@ -678,6 +722,10 @@ ai-agent-playground/
           MetricsHoverCard.tsx
           MobileDrawer.tsx
           SettingsPanel.tsx
+          Budget/
+            BudgetBar.tsx
+            BudgetBarPanelsCore.tsx
+            BudgetBarPanelsExtras.tsx
           ChatSidebar/
             ChatSidebar.tsx
             SidebarHeader.tsx
@@ -703,6 +751,7 @@ ai-agent-playground/
           useChatState.ts
           useChatStream.ts
           useChatsPager.ts
+          useIngestProgress.ts
           useMetrics.ts
           useMultiSelect.ts
           useRetitle.ts
@@ -733,7 +782,9 @@ ai-agent-playground/
           http.ts
         shared/
           lib/
+            runjson.helpers.ts
             runjson.ts
+            runjson.types.ts
             text.ts
           ui/
             CodeCopyButton.tsx

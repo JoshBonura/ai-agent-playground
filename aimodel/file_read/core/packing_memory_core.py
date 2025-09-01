@@ -19,6 +19,12 @@ PACK_TELEMETRY: Dict[str, object] = {
     "compressSec": 0.0,
     "summaryTokensApprox": 0,
     "summaryUsedLLM": False,
+    "summaryBullets": 0,
+    "summaryAddedChars": 0,
+    "summaryOutTokensApprox": 0,
+    "summaryCompressedFromChars": 0,
+    "summaryCompressedToChars": 0,
+    "summaryCompressedDroppedChars": 0,
 }
 SUMMARY_TEL = PACK_TELEMETRY
 
@@ -118,6 +124,9 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
     PACK_TELEMETRY["summarySec"] = 0.0
     PACK_TELEMETRY["summaryTokensApprox"] = 0
     PACK_TELEMETRY["summaryUsedLLM"] = False
+    PACK_TELEMETRY["summaryBullets"] = 0
+    PACK_TELEMETRY["summaryAddedChars"] = 0
+    PACK_TELEMETRY["summaryOutTokensApprox"] = 0
     use_fast = bool(cfg["use_fast_summary"])
     _log(f"summarize_chunks IN chunks={len(chunks)} FAST={use_fast}")
     if use_fast:
@@ -126,6 +135,9 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
         PACK_TELEMETRY["summarySec"] = float(dt)
         PACK_TELEMETRY["summaryTokensApprox"] = int(approx_tokens(txt))
         PACK_TELEMETRY["summaryUsedLLM"] = False
+        PACK_TELEMETRY["summaryBullets"] = len([l for l in txt.splitlines() if l.strip()])
+        PACK_TELEMETRY["summaryAddedChars"] = len(txt)
+        PACK_TELEMETRY["summaryOutTokensApprox"] = int(approx_tokens(txt))
         _log(f"summarize_chunks OUT (FAST) bullets={len([l for l in txt.splitlines() if l])} chars={len(txt)} dt={dt:.2f}s")
         return txt, False
     text = "\n".join(f'{m.get("role","")}: {m.get("content","")}' for m in chunks)
@@ -168,6 +180,9 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
         PACK_TELEMETRY["summarySec"] = float(dt)
         PACK_TELEMETRY["summaryTokensApprox"] = int(approx_tokens(sys_inst) + approx_tokens(user_prompt) + approx_tokens(txt))
         PACK_TELEMETRY["summaryUsedLLM"] = True
+        PACK_TELEMETRY["summaryBullets"] = len(bullets)
+        PACK_TELEMETRY["summaryAddedChars"] = len(txt)
+        PACK_TELEMETRY["summaryOutTokensApprox"] = int(approx_tokens(txt))
         _log(f"summarize_chunks OUT bullets={len(bullets)} chars={len(txt)} dt={dt:.2f}s")
         return txt, True
     s = " ".join(raw.split())[:160]
@@ -176,6 +191,9 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
     PACK_TELEMETRY["summarySec"] = float(dt)
     PACK_TELEMETRY["summaryTokensApprox"] = int(approx_tokens(sys_inst) + approx_tokens(user_prompt) + approx_tokens(fallback))
     PACK_TELEMETRY["summaryUsedLLM"] = True
+    PACK_TELEMETRY["summaryBullets"] = len([l for l in fallback.splitlines() if l.strip()])
+    PACK_TELEMETRY["summaryAddedChars"] = len(fallback)
+    PACK_TELEMETRY["summaryOutTokensApprox"] = int(approx_tokens(fallback))
     _log(f"summarize_chunks OUT bullets=0 chars={len(fallback)} dt={dt:.2f}s")
     return fallback, True
 
@@ -194,7 +212,7 @@ def _compress_summary_block(s: str) -> str:
         seen.add(norm)
         out.append(ln)
     text = "\n".join(out)
-    _log(f"compress_summary IN chars={len(s)} kept_lines={len(out)}")
+    PACK_TELEMETRY["summaryCompressedFromChars"] = int(len(s or ""))
     if len(text) > max_chars:
         last, total = [], 0
         for ln in reversed(out):
@@ -203,5 +221,8 @@ def _compress_summary_block(s: str) -> str:
             last.append(ln)
             total += len(ln) + 1
         text = "\n".join(reversed(last))
+    PACK_TELEMETRY["summaryCompressedToChars"] = int(len(text))
+    PACK_TELEMETRY["summaryCompressedDroppedChars"] = int(max(0, int(PACK_TELEMETRY["summaryCompressedFromChars"]) - int(PACK_TELEMETRY["summaryCompressedToChars"])))
+    _log(f"compress_summary IN chars={len(s)} kept_lines={len(out)}")
     _log(f"compress_summary OUT chars={len(text)} lines={len(text.splitlines())}")
     return text

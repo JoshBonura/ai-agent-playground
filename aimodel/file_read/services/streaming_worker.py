@@ -22,6 +22,7 @@ async def run_stream(
         t_start = t0_request or time.perf_counter()
         t_first: Optional[float] = None
         t_last: Optional[float] = None
+        t_call: Optional[float] = None
         finish_reason: Optional[str] = None
         err_text: Optional[str] = None
         out_parts: List[str] = []
@@ -29,6 +30,7 @@ async def run_stream(
 
         try:
             try:
+                t_call = time.perf_counter()
                 stream = llm.create_chat_completion(
                     messages=messages,
                     stream=True,
@@ -108,6 +110,11 @@ async def run_stream(
                 if t_start is not None and t_last is not None:
                     stage["totalSec"] = round(t_last - t_start, 3)
 
+                if t_call is not None and t_start is not None:
+                    stage["preModelSec"] = round(t_call - t_start, 6)
+                if t_call is not None and t_first is not None:
+                    stage["modelQueueSec"] = round(t_first - t_call, 6)
+
                 if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
                     stage["queueWaitSec"] = budget_view.get("queueWaitSec")
 
@@ -185,12 +192,21 @@ async def run_stream(
                     trim_sec = float(pack.get("finalTrimSec") or 0.0)
                     comp_sec = float(pack.get("compressSec") or 0.0)
                     rag_router = float(rag.get("routerDecideSec") or 0.0)
+                    rag_block = float(
+                        rag.get("injectBuildSec")
+                        or rag.get("blockBuildSec")
+                        or rag.get("sessionOnlyBuildSec")
+                        or 0.0
+                    )
+                    prep_sec = float(web_bd.get("prepSec") or 0.0)
                     web_pre = float(web_bd.get("totalWebPreTtftSec") or 0.0)
-                    unattr_ttft = max(0.0, ttft_val - (pack_sec + trim_sec + comp_sec + rag_router + web_pre))
+                    model_queue = float(stage.get("modelQueueSec") or 0.0)
+                    pre_accounted = pack_sec + trim_sec + comp_sec + rag_router + rag_block + web_pre + prep_sec + model_queue
+                    unattr_ttft = max(0.0, ttft_val - pre_accounted)
                     budget_view.setdefault("breakdown", {})
                     budget_view["breakdown"].update({
                         "ttftSec": ttft_val,
-                        "preTtftAccountedSec": round(pack_sec + trim_sec + comp_sec + rag_router + web_pre, 6),
+                        "preTtftAccountedSec": round(pre_accounted, 6),
                         "unattributedTtftSec": round(unattr_ttft, 6),
                     })
 

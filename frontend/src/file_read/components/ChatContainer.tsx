@@ -1,5 +1,5 @@
 // frontend/src/file_read/components/ChatContainer.tsx
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import ChatView from "./ChatView/ChatView";
 import ChatComposer from "./ChatComposer";
 import BudgetBar from "./Budget/BudgetBar";
@@ -66,6 +66,15 @@ export default function ChatContainer({
     if (!pinned) requestAnimationFrame(() => forceScrollToBottom("smooth"));
   };
 
+  const runJsonForBar = useMemo<RunJson | null>(() => {
+    if (runJson) return runJson;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m: any = messages[i];
+      if (m?.role === "assistant" && m?.meta?.runJson) return m.meta.runJson as RunJson;
+    }
+    return null;
+  }, [runJson, messages]);
+
   return (
     <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
       <div ref={containerRef} data-chat-scroll className="flex-1 overflow-y-auto min-w-0">
@@ -81,7 +90,7 @@ export default function ChatContainer({
         />
       </div>
 
-      <BudgetBar runJson={runJson ?? null} />
+      <BudgetBar runJson={runJsonForBar ?? null} />
 
       <ChatComposer
         input={input}

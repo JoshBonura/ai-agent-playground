@@ -1,6 +1,14 @@
 // frontend/src/file_read/components/MetricsHoverCard.tsx
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Info, Copy, Check, X } from "lucide-react";
+import type { RunJson } from "../shared/lib/runjson";
+import {
+  getNormalizedBudget,
+  getRagTelemetry,
+  getWebTelemetry,
+  getTimingMetrics,
+  getPackTelemetry,
+} from "../shared/lib/runjson";
 
 type Props = {
   data: unknown;
@@ -31,7 +39,133 @@ export default function MetricsHoverCard({
 
   const json = useMemo(() => {
     try {
-      return JSON.stringify(data, null, 2);
+      const r = (data ?? null) as RunJson | null;
+      if (!r || typeof r !== "object") return JSON.stringify(data, null, 2);
+
+      const nb = getNormalizedBudget(r);
+      const rag = getRagTelemetry(r) as any | null;
+      const web = getWebTelemetry(r) as any | null;
+      const pack = getPackTelemetry(r) as any | null;
+      const timing = getTimingMetrics(r) as any | null;
+
+      const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+      const modelCtx = nb ? num(nb.modelCtx) : null;
+      const clampMargin = nb ? num(nb.clampMargin) : null;
+      const inputTokensEst = nb ? num(nb.inputTokensEst) : null;
+      const outBudgetChosen = nb ? num(nb.outBudgetChosen) : null;
+      const outActual = num(r?.stats?.predictedTokensCount as any);
+      const outShown = outActual || (outBudgetChosen ?? 0);
+
+      const webRouteSec = web?.elapsedSec;
+      const webFetchSec = web?.fetchElapsedSec;
+      const webInjectSec = web?.injectElapsedSec;
+      const webPre =
+        num(web?.breakdown?.totalWebPreTtftSec) ||
+        (num(webRouteSec) + num(webFetchSec) + num(webInjectSec));
+
+      const ragDelta = Math.max(
+        0,
+        num(rag?.ragTokensAdded) ||
+          num(rag?.blockTokens) ||
+          num(rag?.blockTokensApprox) ||
+          num(rag?.sessionOnlyTokensApprox)
+      );
+      const ragPctOfInput =
+        (inputTokensEst && inputTokensEst > 0) ? Math.round((ragDelta / inputTokensEst) * 100) : 0;
+
+      const packPackSec = num(pack?.packSec);
+      const packSummarySec = num(pack?.summarySec);
+      const packFinalTrimSec = num(pack?.finalTrimSec);
+      const packCompressSec = num(pack?.compressSec);
+
+      const preModelSec = num(timing?.preModelSec);
+      const modelQueueSec = num(timing?.modelQueueSec);
+      const genSec = num(timing?.genSec);
+      const ttftSec = num(timing?.ttftSec);
+
+      const breakdown =
+        (r as any)?.budget_view?.breakdown ||
+        (r as any)?.stats?.budget?.breakdown ||
+        null;
+
+      const preAccountedFromBackend = breakdown?.preTtftAccountedSec;
+      const accountedFallback =
+        webPre +
+        num(rag?.routerDecideSec) +
+        num(rag?.injectBuildSec ?? rag?.blockBuildSec ?? rag?.sessionOnlyBuildSec) +
+        packPackSec +
+        packSummarySec +
+        packFinalTrimSec +
+        packCompressSec +
+        preModelSec +
+        modelQueueSec;
+
+      const accounted = Number.isFinite(preAccountedFromBackend)
+        ? preAccountedFromBackend
+        : accountedFallback;
+
+      const unattributed =
+        (breakdown && Number.isFinite(breakdown.unattributedTtftSec))
+          ? breakdown.unattributedTtftSec
+          : Math.max(0, ttftSec - accounted);
+
+      const promptTok = num(r?.stats?.promptTokensCount as any) || (inputTokensEst ?? 0);
+      const decodeTok = num(r?.stats?.predictedTokensCount as any);
+      const encodeTps = modelQueueSec > 0 ? promptTok / modelQueueSec : null;
+      const decodeTps = genSec > 0 ? decodeTok / genSec : null;
+
+      const totalTok =
+        typeof r?.stats?.totalTokensCount === "number"
+          ? (r.stats!.totalTokensCount as number)
+          : (promptTok + decodeTok);
+      const totalSecForOverall =
+        typeof r?.stats?.totalTimeSec === "number"
+          ? (r.stats!.totalTimeSec as number)
+          : num(timing?.totalSec);
+      const overallTps =
+        totalSecForOverall > 0 ? totalTok / totalSecForOverall : null;
+
+      const usedCtx = (inputTokensEst ?? 0) + outShown + (clampMargin ?? 0);
+      const ctxPct = modelCtx && modelCtx > 0 ? Math.max(0, Math.min(100, (usedCtx / modelCtx) * 100)) : null;
+
+      const augmented = {
+        ...r,
+        _derived: {
+          context: {
+            modelCtx,
+            clampMargin,
+            inputTokensEst,
+            outBudgetChosen,
+            outActual,
+            outShown,
+            usedCtx,
+            ctxPct,
+          },
+          rag: {
+            ragDelta,
+            ragPctOfInput,
+          },
+          web: {
+            webPre,
+          },
+          timing: {
+            accountedPreTtftSec: accounted,
+            unattributedPreTtftSec: unattributed,
+            preModelSec,
+            modelQueueSec,
+            genSec,
+            ttftSec,
+          },
+          throughput: {
+            encodeTokPerSec: encodeTps,
+            decodeTokPerSec: decodeTps,
+            overallTokPerSec: overallTps,
+          },
+        },
+      };
+
+      return JSON.stringify(augmented, null, 2);
     } catch {
       return String(data ?? "");
     }
@@ -49,7 +183,6 @@ export default function MetricsHoverCard({
     setOpen(false);
   }
 
-  // Close on ESC
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -63,7 +196,6 @@ export default function MetricsHoverCard({
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
-  // Close on outside click
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
@@ -76,7 +208,6 @@ export default function MetricsHoverCard({
     return () => document.removeEventListener("mousedown", onDown);
   }, [open]);
 
-  // Compute clamped viewport position when opening, and on resize/scroll
   useLayoutEffect(() => {
     function place() {
       if (!open || !btnRef.current) return;
@@ -91,13 +222,11 @@ export default function MetricsHoverCard({
         align === "right" ? btnBox.right - width : btnBox.left;
       left = Math.max(margin, Math.min(left, vw - margin - width));
 
-      // Provisional top below the button; flip above if it would overflow
       let top = btnBox.bottom + margin;
 
-      // We may not know the panel height yet; try to use current, else a max
       let panelH = panelRef.current?.offsetHeight || 0;
       if (!panelH) {
-        panelH = 360 + 44; // body max (360) + header (~44) best-effort
+        panelH = 360 + 44;
       }
 
       if (top + panelH > vh - margin) {

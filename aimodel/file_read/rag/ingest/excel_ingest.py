@@ -1,8 +1,6 @@
-# ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
 from __future__ import annotations
-
 from typing import Tuple, List
-import io, re
+import io, re, hashlib
 from datetime import datetime, date, time
 from ...core.settings import SETTINGS
 from .excel_ingest_core import (
@@ -107,11 +105,15 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
                 pass
         return 1, 1, ws.max_column or 1, ws.max_row or 1
 
+    def _cap_rows(min_r: int, max_r: int) -> int:
+        return max_r if INFER_MAX_ROWS <= 0 else min(max_r, min_r + INFER_MAX_ROWS - 1)
+
     def _detect_key_value(ws: Worksheet, min_c, min_r, max_c, max_r) -> bool:
         if max_c - min_c + 1 != 2:
             return False
+        limit_r = _cap_rows(min_r, max_r)
         textish, valueish, rows = 0, 0, 0
-        for r in range(min_r, min(min_r + INFER_MAX_ROWS - 1, max_r) + 1):
+        for r in range(min_r, limit_r + 1):
             a = ws.cell(row=r, column=min_c).value
             b = ws.cell(row=r, column=min_c + 1).value
             if a is None and b is None:
@@ -136,6 +138,8 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
     wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
 
     lines: List[str] = []
+    ingest_id = hashlib.sha1(data).hexdigest()[:16]
+    lines.append(f"# Ingest-ID: {ingest_id}")
 
     try:
         dn_obj = getattr(wb_vals, "defined_names", None)
@@ -184,7 +188,8 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
     def _emit_key_values(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
         lines.append(f"# Sheet: {sheet_name}")
         lines.append("## Key/Values")
-        for r in range(min_r, min(min_r + INFER_MAX_ROWS - 1, max_r) + 1):
+        limit_r = _cap_rows(min_r, max_r)
+        for r in range(min_r, limit_r + 1):
             k = fmt_val(ws.cell(row=r, column=min_c).value)
             v = fmt_val(ws.cell(row=r, column=min_c + 1).value)
             if not k and not v:
@@ -196,8 +201,9 @@ def extract_excel(data: bytes) -> Tuple[str, str]:
     def _emit_inferred_table(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
         lines.append(f"# Sheet: {sheet_name}")
         lines.append("## Inferred Table")
+        lines.append(f"block: {sheet_name}!R{min_r}-{max_r},C{min_c}-{max_c}")
         max_c_eff = min(max_c, min_c + INFER_MAX_COLS - 1)
-        max_r_eff = min(max_r, min_r + INFER_MAX_ROWS - 1)
+        max_r_eff = _cap_rows(min_r, max_r)
 
         headers: List[str] = []
         header_fill = 0

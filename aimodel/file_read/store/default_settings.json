@@ -277,7 +277,7 @@
   "excel_time_precision": "minute",
   "excel_value_max_chars": 160,
   "excel_quote_strings": true,
-  "excel_infer_max_rows": 50,
+  "excel_infer_max_rows": 100,
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
   "excel_emit_key_values": true,
