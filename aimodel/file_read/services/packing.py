@@ -1,7 +1,7 @@
 # ===== aimodel/file_read/services/packing.py =====
 from __future__ import annotations
 from typing import Tuple, List, Dict, Optional, Any
-from ..rag.retrieve_pipeline import build_rag_block_with_telemetry
+from ..rag.retrieve_pipeline import build_rag_block_with_telemetry, build_rag_block_session_only_with_telemetry
 from ..core.settings import SETTINGS
 from ..core.packing_ops import build_system, pack_messages, roll_summary_if_needed
 
@@ -55,10 +55,12 @@ def pack_with_rollup(
     return packed, new_summary, input_budget
 
 def maybe_inject_rag_block(
-    messages: list[dict], *,
+    messages: list[dict],
+    *,
     session_id: str | None,
     skip_rag: bool = False,
     rag_query: str | None = None,
+    force_session_only: bool = False,  # NEW
 ) -> tuple[list[dict], Optional[Dict[str, Any]], Optional[str]]:
     if skip_rag:
         return messages, None, None
@@ -68,15 +70,26 @@ def maybe_inject_rag_block(
         return messages, None, None
 
     user_q = rag_query or (messages[-1].get("content") or "")
-    block, tel = build_rag_block_with_telemetry(user_q, session_id=session_id)
+
+    # NEW: choose session-only vs global
+    use_session_only = force_session_only or (not SETTINGS.get("rag_global_enabled", True))
+
+    if use_session_only and SETTINGS.get("rag_session_enabled", True):
+        from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
+        block, tel = build_rag_block_session_only_with_telemetry(user_q, session_id=session_id)
+        mode = "session-only"
+    else:
+        from ..rag.retrieve_pipeline import build_rag_block_with_telemetry
+        block, tel = build_rag_block_with_telemetry(user_q, session_id=session_id)
+        mode = "global"
+
     if not block:
         print(f"[RAG INJECT] no hits (session={session_id}) q={(user_q or '')!r}")
         return messages, None, None
 
-    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
+    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)} mode={mode}")
     injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
-
     tel = dict(tel or {})
     tel["injected"] = True
-    tel["mode"] = tel.get("mode") or "global"  # from telemetry
+    tel["mode"] = mode
     return injected, tel, block

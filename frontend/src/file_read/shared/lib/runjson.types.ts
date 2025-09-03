@@ -111,6 +111,8 @@ export type TurnBudgetJson = {
   rag?: RagTelemetry | null;
   web?: WebTelemetry | null;
   pack?: PackTelemetry | null;
+  ephemeral?: boolean;
+  droppedFromSummary?: boolean;
 };
 
 export type BudgetView = {

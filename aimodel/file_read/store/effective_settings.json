@@ -43,7 +43,7 @@
   "default_top_p": 0.95,
   "default_max_tokens": 512,
   "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": false,
+  "default_auto_web": true,
   "default_web_k": 3,
   "web_k_min": 1,
   "web_k_max": 8,
@@ -144,6 +144,8 @@
       "cap": 0.2
     }
   ],
+  "web_ephemeral_only": true,
+  "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
   "query_sum_bypass_short_enabled": true,
   "query_sum_short_max_chars": 32,

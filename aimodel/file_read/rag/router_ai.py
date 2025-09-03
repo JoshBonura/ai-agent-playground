@@ -100,7 +100,8 @@ def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
 
         data = _force_json_strict(text_out)
         if not isinstance(data, dict):
-            return (False, None)
+            need_default = SETTINGS.get("router_rag_default_need_when_invalid")
+            return (bool(need_default) if isinstance(need_default, bool) else False, None)
         data = _normalize_keys(data)
 
         need_raw = data.get("need")
@@ -110,9 +111,15 @@ def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
             return (bool(need_default) if isinstance(need_default, bool) else False, None)
 
         need = bool(need_bool)
+        if not need:
+            return (False, None)
+
         query_field = data.get("query", "")
-        query = _strip_wrappers(str(query_field or "").strip()) if need else None
-        return (need, query)
+        query_clean = _strip_wrappers(str(query_field or "").strip())
+        if not query_clean:
+            query_clean = core_text[:512]
+
+        return (True, query_clean)
 
     except Exception as e:
         _dbg(f"FATAL {type(e).__name__}: {e}")

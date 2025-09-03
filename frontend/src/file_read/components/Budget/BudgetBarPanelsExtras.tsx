@@ -129,6 +129,11 @@ export function WebPanel({ web }: WebPanelProps) {
         {"injectElapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">inject {fmtSec(webInjectSec)}</span>}
         {"blockChars" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">block chars=<b>{webBlockChars}</b></span>}
         {"ephemeralBlocks" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">eph blocks=<b>{webEphemeralBlocks}</b></span>}
+        {web.droppedFromSummary && (
+  <span className="px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800">
+    dropped after turn
+  </span>
+)}
       </div>
       {summarizedQuery && (
         <div className="mt-1 text-[10px] text-gray-500 truncate" title={summarizedQuery}>

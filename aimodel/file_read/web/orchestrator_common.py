@@ -1,4 +1,4 @@
-# aimodel/file_read/web/orchestrator_common.py
+# DEBUG prints added with prefix [WEB][ORCH][COMMON]
 from __future__ import annotations
 from typing import List, Tuple, Optional, Dict, Any
 from urllib.parse import urlparse
@@ -143,6 +143,9 @@ async def _fetch_round(
     per_doc_budget  = _as_int("web_orch_per_doc_char_budget")
     fetch_max_chars = _as_int("web_fetch_max_chars")
     per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
+
+    print(f"[WEB][ORCH][COMMON] _fetch_round use_js={use_js} urls={len(urls)} per_timeout={per_url_timeout_s} max_parallel={max_parallel} per_doc_cap={per_doc_cap}")
+
     results = await fetch_fn(
         urls,
         per_timeout_s=per_url_timeout_s,
@@ -150,4 +153,7 @@ async def _fetch_round(
         max_parallel=max_parallel,
         telemetry=telemetry,
     )
+
+    ok = sum(1 for _, r in results if r)
+    print(f"[WEB][ORCH][COMMON] _fetch_round done ok={ok}/{len(results)}")
     return results
