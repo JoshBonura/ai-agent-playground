@@ -1,4 +1,4 @@
-# ===== aimodel/file_read/rag/ingest/__init__.py =====
+# aimodel/file_read/rag/ingest/__init__.py
 from __future__ import annotations
 from typing import Tuple
 import io, json
@@ -6,7 +6,10 @@ from .xls_ingest import extract_xls
 from .excel_ingest import extract_excel
 from .csv_ingest import extract_csv
 from .common import _utf8, _strip_html, Chunk, chunk_text, build_metas
-from .doc_ingest import extract_docx, extract_doc_binary
+from .docx_ingest import extract_docx
+from .doc_binary_ingest import extract_doc_binary
+from .ppt_ingest import extract_pptx, extract_ppt
+from .pdf_ingest import extract_pdf   # <-- new
 from ...core.settings import SETTINGS
 
 __all__ = ["sniff_and_extract", "Chunk", "chunk_text", "build_metas"]
@@ -21,6 +24,14 @@ def _ing_dbg(*args):
 def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
     name = (filename or "").lower()
     _ing_dbg("route:", name, "bytes=", len(data))
+
+    if name.endswith((".pptx", ".pptm")):
+        _ing_dbg("-> pptx/pptm")
+        return extract_pptx(data)
+
+    if name.endswith(".ppt"):
+        _ing_dbg("-> ppt (ole)")
+        return extract_ppt(data)
 
     if name.endswith((".xlsx", ".xlsm")):
         _ing_dbg("-> excel")
@@ -59,21 +70,10 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
             return _utf8(data), "text/plain"
 
     if name.endswith(".pdf"):
-        _ing_dbg("-> pdf")
-        try:
-            from pdfminer.high_level import extract_text
-            txt = extract_text(io.BytesIO(data)) or ""
-            return txt.strip(), "text/plain"
-        except Exception as e:
-            _ing_dbg("pdfminer err:", repr(e))
-            try:
-                from PyPDF2 import PdfReader
-                r = PdfReader(io.BytesIO(data))
-                pages = [(p.extract_text() or "").strip() for p in r.pages]
-                return "\n\n".join([p for p in pages if p]).strip(), "text/plain"
-            except Exception as e2:
-                _ing_dbg("pypdf2 err:", repr(e2))
-                return _utf8(data), "text/plain"
+        _ing_dbg("-> pdf (delegating to extract_pdf)")
+        print("[ingest] call extract_pdf()", flush=True)  # unconditional marker
+        from .pdf_ingest import extract_pdf
+        return extract_pdf(data)
 
     if name.endswith(".json"):
         _ing_dbg("-> json")
@@ -125,7 +125,6 @@ def sniff_and_extract(filename: str, data: bytes) -> Tuple[str, str]:
         _ing_dbg("-> html/xml")
         return _strip_html(_utf8(data)), "text/plain"
 
-    # plaintext / code-ish
     if name.endswith((
         ".txt", ".log", ".md",
         ".c", ".cpp", ".h", ".hpp",

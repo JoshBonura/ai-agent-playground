@@ -1,5 +1,4 @@
 # aimodel/file_read/services/generate_pipeline.py
-# main generate pipeline orchestrator; no inline comments per request
 from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
@@ -15,7 +14,7 @@ from .budget import analyze_budget
 from .context_window import clamp_out_budget
 from ..web.router_ai import decide_web_and_fetch
 from ..rag.router_ai import decide_rag
-from ..rag.retrieve import build_rag_block_session_only
+from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
 from ..core.packing_memory_core import PACK_TELEMETRY, SUMMARY_TEL
 from .generate_pipeline_support import (
     Prep,
@@ -55,10 +54,12 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         }
         for m in (data.messages or [])
     ]
+    print(f"[PIPE] incoming_msgs={len(incoming)}")
     latest_user = next((m for m in reversed(incoming) if m["role"] == "user"), {})
     latest_user_text = (latest_user.get("content") or "").strip()
     atts = (latest_user.get("attachments") or [])
     has_atts = bool(atts)
+    print(f"[PIPE] latest_user_text_len={len(latest_user_text)} has_atts={has_atts} att_count={len(atts)}")
     if not latest_user_text and has_atts:
         names = [att_get(a, "name") for a in atts]
         names = [n for n in names if n]
@@ -120,14 +121,19 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         telemetry["web"].setdefault("injected", False)
         telemetry["web"].setdefault("injectElapsedSec", 0.0)
     telemetry["web"]["ephemeralBlocks"] = len(ephemeral_once)
+    print(f"[PIPE] has_atts={has_atts} disable_global_rag_on_attachments={bool(eff.get('disable_global_rag_on_attachments'))}")
     if has_atts and bool(eff.get("disable_global_rag_on_attachments")):
         att_names = [att_get(a, "name") for a in atts if att_get(a, "name")]
         query_for_atts = (base_user_text or "").strip() or " ".join(att_names) or "document"
+        print(f"[PIPE] session-only RAG path query_for_atts={query_for_atts!r} att_names={att_names}")
         t0_att = time.perf_counter()
         try:
-            att_block = build_rag_block_session_only(query_for_atts, session_id)
+            att_block, att_tel = build_rag_block_session_only_with_telemetry(query_for_atts, session_id)
         except Exception:
-            att_block = None
+            att_block, att_tel = (None, {})
+        if att_tel:
+            telemetry["rag"].update(att_tel)
+        print(f"[PIPE] session-only RAG built={bool(att_block)} block_chars={len(att_block or '')}")
         if att_block:
             rag_text = str(eff["rag_block_preamble"]) + "\n\n" + att_block
             telemetry["rag"]["sessionOnly"] = True
@@ -154,6 +160,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     )
     telemetry["pack"]["packSec"] = round(time.perf_counter() - t_pack0, 6)
     rag_router_allowed = not (has_atts and bool(eff.get("disable_global_rag_on_attachments")))
+    print(f"[PIPE] rag_router_allowed={rag_router_allowed} auto_rag={auto_rag} ephemeral_once={len(ephemeral_once)}")
     if rag_router_allowed and bool(eff.get("rag_enabled", True)) and not ephemeral_once:
         rag_need = False
         rag_query: Optional[str] = None
@@ -167,6 +174,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         telemetry["rag"]["routerNeeded"] = bool(rag_need)
         if rag_query is not None:
             telemetry["rag"]["routerQuery"] = rag_query
+        print(f"[PIPE] rag_need={rag_need} rag_query={rag_query!r}")
         skip_rag = bool(ephemeral_once) or (not rag_need)
         tokens_before = _tok_count(llm, packed)
         t_inject0 = time.perf_counter()
@@ -220,6 +228,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
             telemetry["rag"]["routerSkippedReason"] = "attachments_disable_global"
         elif not bool(eff.get("rag_enabled", True)):
             telemetry["rag"]["routerSkippedReason"] = "rag_disabled"
+        print(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
     packed, out_budget_adj = _enforce_fit(llm, eff, packed, out_budget_req)
     packed_chars = chars_len(packed)
     telemetry["pack"]["packedChars"] = packed_chars

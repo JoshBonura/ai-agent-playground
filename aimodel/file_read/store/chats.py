@@ -8,6 +8,7 @@ from ..core.settings import SETTINGS
 from ..utils.streaming import strip_runjson
 from .base import chat_path, atomic_write, now_iso
 from .index import load_index, save_index, refresh_index_after_change, ChatMeta
+from ..rag.store import delete_namespace as rag_delete_namespace
 
 
 def _load_chat(session_id: str) -> Dict[str, Any]:
@@ -202,11 +203,21 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
 
 
 def delete_batch(session_ids: List[str]) -> List[str]:
+    # delete chat jsons
     for sid in session_ids:
         try:
             chat_path(sid).unlink(missing_ok=True)
         except Exception:
             pass
+
+    # delete RAG namespaces for those sessions
+    for sid in session_ids:
+        try:
+            rag_delete_namespace(sid)
+        except Exception:
+            pass
+
+    # prune index.json
     idx = load_index()
     keep = [r for r in idx if r["sessionId"] not in set(session_ids)]
     save_index(keep)

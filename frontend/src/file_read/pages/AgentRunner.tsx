@@ -60,6 +60,27 @@ export default function AgentRunner() {
     if (el) el.scrollTop = el.scrollHeight;
   }
 
+async function handleCancelSessions(ids: string[]) {
+  if (!ids?.length) return;
+
+  const currentId = chat.sessionIdRef.current || "";
+  const deletingActive = currentId && ids.includes(currentId);
+
+  if (deletingActive) {
+    // clear out current session instead of making a new one
+    chat.setSessionId("");
+    chat.setInput("");
+    chat.clearMetrics?.();
+    // optional: clear messages too
+    chat.reset();
+    localStorage.removeItem(LS_KEY);
+  }
+
+  setRefreshKey((k) => k + 1);
+  try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+}
+
+
   // 2) Preserve-scroll refresh (use for deletions, etc.)
   async function refreshPreserve() {
     const sid = chat.sessionIdRef.current;
@@ -127,6 +148,7 @@ export default function AgentRunner() {
             refreshKey={refreshKey}
             activeId={chat.sessionIdRef.current}
             onHideSidebar={() => setSidebarOpen(false)}
+            onCancelSessions={handleCancelSessions}
           />
         </div>
       )}

@@ -3,8 +3,10 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import faiss, json, os, time, hashlib
 import numpy as np
+from ..store.base import APP_DIR   
+import shutil
 
-BASE = Path(__file__).resolve().parents[1] / "store" / "rag"
+BASE = APP_DIR / "rag"
 
 def _ns_dir(session_id: Optional[str]) -> Path:
     if session_id:
@@ -125,3 +127,49 @@ def add_texts(
     dim = int(vecs.shape[-1])
     add_vectors(session_id, vecs, metas, dim)
     return len(texts)
+
+def delete_namespace(session_id: str) -> bool:
+    """
+    Hard-delete all RAG data for a given session: the by_session/<sessionId> folder.
+    Returns True if it existed and was removed.
+    """
+    d = _ns_dir(session_id)
+    try:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+            return True
+        return False
+    except Exception:
+        return False
+
+# --- add near the other helpers ---
+def session_has_any_vectors(session_id: Optional[str]) -> bool:
+    """
+    Return True if this session has any indexed vectors stored on disk.
+    We consider the namespace non-empty if the FAISS index exists and ntotal > 0,
+    and the meta.jsonl exists with at least one line.
+    """
+    if not session_id:
+        return False
+
+    idx_path, meta_path = _paths(session_id)
+    if not idx_path.exists() or not meta_path.exists():
+        return False
+
+    try:
+        idx = _load_index(dim=1, p=idx_path)  # dim not used by IndexFlatIP reader
+        if getattr(idx, "ntotal", 0) <= 0:
+            return False
+    except Exception as e:
+        print(f"[RAG STORE] failed to read index for {session_id}: {e}")
+        return False
+
+    try:
+        # quick check: meta file has at least one JSONL line
+        with meta_path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                return True
+        return False
+    except Exception as e:
+        print(f"[RAG STORE] failed to read meta for {session_id}: {e}")
+        return False

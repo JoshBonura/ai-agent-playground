@@ -6,6 +6,7 @@ ai-agent-playground/
   clean-structure-2.txt
   clean-structure-3.txt
   clean-structure-4.txt
+  clean-structure-5.txt
   fs.py
   my-structure.txt
   pc.py
@@ -119,10 +120,11 @@ ai-agent-playground/
         pandas.libs/
         pdfminer/
         pdfminer.six-20240706.dist-info/
-        pillow-11.3.0.dist-info/
+        pillow-10.4.0.dist-info/
         pip/
         pip-25.2.dist-info/
         pkg_resources/
+        pptx/
         primp/
         primp-0.15.0.dist-info/
         pycparser/
@@ -132,11 +134,17 @@ ai-agent-playground/
         pydantic_core/
         pydantic_core-2.33.2.dist-info/
         pypdf2-3.0.1.dist-info/
+        pypdfium2/
+        pypdfium2-4.30.0.dist-info/
+        pypdfium2_raw/
+        pytesseract/
+        pytesseract-0.3.13.dist-info/
         python_dateutil-2.9.0.post0.dist-info/
         python_docx-1.1.2.dist-info/
         python_dotenv-1.1.1.dist-info/
         python_multipart/
         python_multipart-0.0.20.dist-info/
+        python_pptx-0.6.23.dist-info/
         pytz/
         pytz-2025.2.dist-info/
         readability/
@@ -206,6 +214,8 @@ ai-agent-playground/
         wheel-0.45.1.dist-info/
         xlrd/
         xlrd-2.0.2.dist-info/
+        xlsxwriter/
+        xlsxwriter-3.2.5.dist-info/
         yaml/
         ~xml/
     Scripts/
@@ -231,6 +241,8 @@ ai-agent-playground/
       pip3.11.exe
       pip3.exe
       pybabel.exe
+      pypdfium2.exe
+      pytesseract.exe
       python.exe
       pythonw.exe
       runxlrd.py
@@ -243,6 +255,7 @@ ai-agent-playground/
       transformers.exe
       update-tld-names.exe
       uvicorn.exe
+      vba_extract.py
       watchfiles.exe
       websockets.exe
       wheel.exe
@@ -289,15 +302,17 @@ ai-agent-playground/
         store.py
         uploads.py
         worker.py
-        _data/
         ingest/
           __init__.py
           common.py
           csv_ingest.py
-          doc_ingest.py
+          doc_binary_ingest.py
+          docx_ingest.py
           excel_ingest.py
           excel_ingest_core.py
-          ingest_stream.py
+          ocr.py
+          pdf_ingest.py
+          ppt_ingest.py
           xls_ingest.py
       runtime/
         __init__.py
@@ -326,45 +341,15 @@ ai-agent-playground/
         override_settings.json
         rag/
           by_session/
-            05060baa-1352-446a-b3b4-932f5fba4c51/
+            19982f0e-9058-4c4e-b2e9-fe6f178fbdd0/
               index.faiss
               meta.jsonl
-            31ae0d88-c863-4ef4-a0d6-c8d825ec75cf/
+            5142ff3d-c26e-4d7a-b53e-a90190f3a12b/
               index.faiss
               meta.jsonl
-            3e1100b9-9bf1-450a-ab28-c4dbe2122c1c/
-              index.faiss
+            9e3d10ea-1484-435a-83dc-6408f4f1f6ff/
               meta.jsonl
-            46cc85c3-25a6-40f6-841c-c0c58710d9f8/
-              index.faiss
-              meta.jsonl
-            5de64ccf-60c8-4872-b8cf-737436e0dc05/
-            73a5d6e6-feb1-4b52-a924-57a7ec0d47aa/
-              index.faiss
-              meta.jsonl
-            7ef45b13-71f6-420b-871e-2bd7d0bdc7fc/
-              index.faiss
-              meta.jsonl
-            88736b45-962c-4ee1-b56f-dbd381f216dd/
-              index.faiss
-              meta.jsonl
-            91b2ab50-aee3-49ea-8e63-c91a07641763/
-              index.faiss
-              meta.jsonl
-            a174e76c-5091-4f51-8311-ecf7f02add20/
-              index.faiss
-              meta.jsonl
-            a5b37b4a-abd5-4435-90ce-aab2d6d18498/
-              index.faiss
-              meta.jsonl
-            cdb51a25-f4c9-4e43-b013-6e0bedcbe5f9/
-              index.faiss
-              meta.jsonl
-            ee174027-26c6-4be9-8fc9-eb98b1073adf/
-              index.faiss
-              meta.jsonl
-            fd1e6ada-ab22-4763-99c5-56b2c447bc6c/
-              index.faiss
+            dcea3a93-3260-4a46-9028-a04f04accb49/
               meta.jsonl
           global/
             meta.jsonl
@@ -751,7 +736,6 @@ ai-agent-playground/
           useChatState.ts
           useChatStream.ts
           useChatsPager.ts
-          useIngestProgress.ts
           useMetrics.ts
           useMultiSelect.ts
           useRetitle.ts

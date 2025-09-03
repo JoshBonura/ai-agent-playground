@@ -1,7 +1,7 @@
 # ===== aimodel/file_read/services/packing.py =====
 from __future__ import annotations
 from typing import Tuple, List, Dict, Optional, Any
-from ..rag.retrieve import build_rag_block_with_telemetry
+from ..rag.retrieve_pipeline import build_rag_block_with_telemetry
 from ..core.settings import SETTINGS
 from ..core.packing_ops import build_system, pack_messages, roll_summary_if_needed
 

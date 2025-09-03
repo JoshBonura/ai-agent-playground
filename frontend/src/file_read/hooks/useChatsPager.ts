@@ -62,78 +62,73 @@ export function useChatsPager(pageSize = 10, refreshKey?: number) {
     await loadFirst();
   }
 
-  // Only react to refreshKey after mount.
   const didMountRef = useRef(false);
   useEffect(() => {
     if (!didMountRef.current) { didMountRef.current = true; return; }
     if (typeof refreshKey !== "undefined") void refreshFirst();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey]);
 
-  // Surgical sidebar updates + inject if missing.
-useEffect(() => {
-const handler = (evt: Event) => {
-  const detail = (evt as CustomEvent<any>).detail;
-  if (!detail?.sessionId) return;
-
-  const sid = String(detail.sessionId);
-  setChats(prev => {
-    const ix = prev.findIndex(c => c.sessionId === sid);
-    const shouldMoveToTop = typeof detail.lastMessage === "string";
-
-    if (ix === -1) {
-      // Inject only for new activity; skip for title-only patches
-      if (!shouldMoveToTop) return prev;
-      const injected: ChatRow = {
-        sessionId: sid,
-        id: -1, // placeholder if needed by your UI
-        title: detail.title ?? "New Chat",
-        lastMessage: detail.lastMessage ?? "",
-        createdAt: new Date().toISOString(),
-        updatedAt: detail.updatedAt ?? new Date().toISOString(),
-      };
-      return [injected, ...prev];
-    }
-
-    const cur = prev[ix];
-    const patched: ChatRow = {
-      ...cur,
-      lastMessage: detail.lastMessage ?? cur.lastMessage,
-      title: detail.title ?? cur.title,
-      updatedAt: detail.updatedAt ?? cur.updatedAt,
+  useEffect(() => {
+    const handler = (evt: Event) => {
+      const detail = (evt as CustomEvent<any>).detail;
+      if (!detail?.sessionId) return;
+      const sid = String(detail.sessionId);
+      setChats(prev => {
+        const ix = prev.findIndex(c => c.sessionId === sid);
+        const shouldMoveToTop = typeof detail.lastMessage === "string";
+        if (ix === -1) {
+          if (!shouldMoveToTop) return prev;
+          const injected: ChatRow = {
+            sessionId: sid,
+            id: -1,
+            title: detail.title ?? "New Chat",
+            lastMessage: detail.lastMessage ?? "",
+            createdAt: new Date().toISOString(),
+            updatedAt: detail.updatedAt ?? new Date().toISOString(),
+          };
+          return [injected, ...prev];
+        }
+        const cur = prev[ix];
+        const patched: ChatRow = {
+          ...cur,
+          lastMessage: detail.lastMessage ?? cur.lastMessage,
+          title: detail.title ?? cur.title,
+          updatedAt: detail.updatedAt ?? cur.updatedAt,
+        };
+        const rest = prev.filter((_, i) => i !== ix);
+        return shouldMoveToTop ? [patched, ...rest] : [...prev.slice(0, ix), patched, ...prev.slice(ix + 1)];
+      });
     };
+    window.addEventListener("chats:refresh", handler as EventListener);
+    return () => window.removeEventListener("chats:refresh", handler as EventListener);
+  }, []);
 
-    const rest = prev.filter((_, i) => i !== ix);
-    return shouldMoveToTop ? [patched, ...rest] : [...prev.slice(0, ix), patched, ...prev.slice(ix + 1)];
-  });
-};
-
-  window.addEventListener("chats:refresh", handler as EventListener);
-  return () => window.removeEventListener("chats:refresh", handler as EventListener);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, []);
-
-  // Infinite scroll
   useEffect(() => {
     const rootEl = scrollRef.current, sentinel = sentinelRef.current;
     if (!rootEl || !sentinel) return;
     const hasOverflow = rootEl.scrollHeight - rootEl.clientHeight > 8;
     if (!hasOverflow) return;
-
     const io = new IntersectionObserver((entries) => {
       const entry = entries[0];
       if (entry?.isIntersecting) void loadMore();
     }, { root: rootEl, rootMargin: "96px 0px", threshold: 0.01 });
-
     io.observe(sentinel);
     return () => io.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chats.length, page, hasMore, ceiling]);
+
+  function decTotal(count: number) {
+    setTotal(prev => {
+      const next = Math.max(0, prev - count);
+      setTotalPages(Math.max(1, Math.ceil(next / pageSize)));
+      return next;
+    });
+  }
 
   return {
     chats, page, hasMore, total, totalPages,
     initialLoading, loadingMore,
     scrollRef, sentinelRef,
     loadMore, refreshFirst, setChats,
+    decTotal,
   };
 }

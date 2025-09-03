@@ -23,7 +23,7 @@ export default function ChatSidebar({
   const {
     chats, page, hasMore, total, totalPages,
     initialLoading, loadingMore,
-    scrollRef, sentinelRef, loadMore, setChats,
+    scrollRef, sentinelRef, loadMore, setChats, decTotal,
   } = useChatsPager(PAGE_SIZE, refreshKey);
 
   const [isEditing, setIsEditing] = useState(false);
@@ -62,12 +62,12 @@ export default function ChatSidebar({
       const deleted = await deleteChatsBatch(ids);
       if (!deleted.length) return;
       setChats(prev => prev.filter(c => !deleted.includes(c.sessionId)));
+      decTotal(deleted.length);
       setSelected(new Set());
       setIsEditing(false);
 
-      if (deletingActive) {
-        if (fallback) void onOpen(fallback);
-        else void onOpen("");
+      if (deletingActive && fallback) {
+        void onOpen(fallback);
       }
     } finally {
       setDeleting(false);
@@ -87,7 +87,6 @@ export default function ChatSidebar({
         onDelete={onDeleteSelected}
       />
 
-      {/* LIST */}
       <div
         ref={scrollRef}
         className="flex-1 overflow-y-auto p-2 overscroll-contain"
@@ -133,7 +132,6 @@ export default function ChatSidebar({
         )}
       </div>
 
-      {/* FOOTER META */}
       <div className="border-t px-3 py-2 text-[11px] text-gray-500">
         <span className="uppercase tracking-wide">Chats</span>{" "}
         <span className="text-gray-400">

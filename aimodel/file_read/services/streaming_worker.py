@@ -1,4 +1,5 @@
 # aimodel/file_read/services/streaming_worker.py
+# updated to account for retrieve timings in pre-ttft accounting (no "or 0.0" fallbacks)
 from __future__ import annotations
 import asyncio, json, time, logging
 from typing import AsyncGenerator, Optional, List
@@ -183,32 +184,72 @@ async def run_stream(
                 if engine:
                     stage["engine"] = engine
 
+                # ---------- Accurate pre-TTFT accounting (no "or 0.0" fallbacks) ----------
                 if isinstance(budget_view, dict):
-                    ttft_val = float(stage.get("ttftSec") or 0.0)
-                    pack = (budget_view.get("pack") or {})
-                    rag = (budget_view.get("rag") or {})
-                    web_bd = ((budget_view.get("web") or {}).get("breakdown") or {})
-                    pack_sec = float(pack.get("packSec") or 0.0)
-                    trim_sec = float(pack.get("finalTrimSec") or 0.0)
-                    comp_sec = float(pack.get("compressSec") or 0.0)
-                    rag_router = float(rag.get("routerDecideSec") or 0.0)
-                    rag_block = float(
-                        rag.get("injectBuildSec")
-                        or rag.get("blockBuildSec")
-                        or rag.get("sessionOnlyBuildSec")
-                        or 0.0
+                    def _fnum(x) -> float:
+                        try:
+                            return float(x) if x is not None else 0.0
+                        except Exception:
+                            return 0.0
+
+                    ttft_raw = stage.get("ttftSec")
+                    ttft_val = _fnum(ttft_raw)
+
+                    pack   = budget_view.get("pack") or {}
+                    rag    = budget_view.get("rag") or {}
+                    web_bd = ((budget_view.get("web") or {}).get("breakdown")) or {}
+
+                    # packing / trimming
+                    pack_sec = _fnum(pack.get("packSec"))
+                    trim_sec = _fnum(pack.get("finalTrimSec"))
+                    comp_sec = _fnum(pack.get("compressSec"))
+
+                    # rag router decision
+                    rag_router = _fnum(rag.get("routerDecideSec"))
+
+                    # prefer aggregate build timing if present; otherwise sum component steps
+                    build_candidates = (
+                        rag.get("injectBuildSec"),
+                        rag.get("sessionOnlyBuildSec"),
+                        rag.get("blockBuildSec"),
                     )
-                    prep_sec = float(web_bd.get("prepSec") or 0.0)
-                    web_pre = float(web_bd.get("totalWebPreTtftSec") or 0.0)
-                    model_queue = float(stage.get("modelQueueSec") or 0.0)
-                    pre_accounted = pack_sec + trim_sec + comp_sec + rag_router + rag_block + web_pre + prep_sec + model_queue
-                    unattr_ttft = max(0.0, ttft_val - pre_accounted)
+                    first_build = next((v for v in build_candidates if v is not None), None)
+                    rag_build_agg = _fnum(first_build)
+
+                    rag_embed  = _fnum(rag.get("embedSec"))
+                    rag_s_chat = _fnum(rag.get("searchChatSec"))
+                    rag_s_glob = _fnum(rag.get("searchGlobalSec"))
+                    rag_dedupe = _fnum(rag.get("dedupeSec"))
+
+                    if rag_build_agg > 0.0:
+                        rag_pipeline_sec = rag_build_agg
+                    else:
+                        rag_pipeline_sec = rag_embed + rag_s_chat + rag_s_glob + rag_dedupe
+
+                    # web and prep
+                    prep_sec    = _fnum(web_bd.get("prepSec"))
+                    web_pre     = _fnum(web_bd.get("totalWebPreTtftSec"))
+
+                    # queue time between model call and first token
+                    model_queue = _fnum(stage.get("modelQueueSec"))
+
+                    pre_accounted = (
+                        pack_sec + trim_sec + comp_sec
+                        + rag_router + rag_pipeline_sec
+                        + web_pre + prep_sec
+                        + model_queue
+                    )
+                    unattr_ttft = ttft_val - pre_accounted
+                    if unattr_ttft < 0.0:
+                        unattr_ttft = 0.0
+
                     budget_view.setdefault("breakdown", {})
                     budget_view["breakdown"].update({
                         "ttftSec": ttft_val,
                         "preTtftAccountedSec": round(pre_accounted, 6),
                         "unattributedTtftSec": round(unattr_ttft, 6),
                     })
+                # -------------------------------------------------------------------------
 
                 run_json = build_run_json(
                     request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},

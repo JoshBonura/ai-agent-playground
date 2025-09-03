@@ -6,20 +6,15 @@ from .context_window import current_n_ctx, estimate_tokens
 
 @dataclass
 class TurnBudget:
-    # INPUT
     n_ctx: int
     input_tokens_est: Optional[int]
     requested_out_tokens: int
     clamped_out_tokens: int
     clamp_margin: int
     reserved_system_tokens: Optional[int] = None
-
-    # DERIVED
     available_for_out_tokens: Optional[int] = None
     headroom_tokens: Optional[int] = None
     overage_tokens: Optional[int] = None
-
-    # EXPLANATION
     reason: str = "ok"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -39,16 +34,19 @@ def analyze_budget(
     except Exception:
         inp = None
 
-    # available = n_ctx - input - clamp_margin (mirrors clamp_out_budget logic)
+    rst = int(reserved_system_tokens or 0)
+    min_out = 16
+
     if inp is None:
         available = None
-        clamped = requested_out_tokens  # best effort; clamp_out_budget will finalize
+        clamped = requested_out_tokens
         headroom = None
         overage = None
         reason = "input_tokens_unknown"
     else:
-        available = max(16, n_ctx - inp - clamp_margin)
-        clamped = max(16, min(requested_out_tokens, available))
+        available_raw = n_ctx - inp - clamp_margin - rst
+        available = max(min_out, available_raw)
+        clamped = max(min_out, min(requested_out_tokens, available))
         headroom = max(0, available - clamped)
         overage = max(0, requested_out_tokens - available)
         reason = "ok" if overage == 0 else "requested_exceeds_available"

@@ -1,9 +1,8 @@
 # ===== aimodel/file_read/rag/ingest/excel_ingest_core.py =====
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List
 import re
 
-_PII_HDRS = {"ssn","social_security_number","email","phone","dob"}
 _PHANTOM_RX = re.compile(r"^\d+_\d+$")
 
 def row_blank(ws, r: int, min_c: int, max_c: int) -> bool:
@@ -40,8 +39,6 @@ def drop_bad_columns(headers: List[str]) -> List[int]:
         if not hn:
             continue
         if _PHANTOM_RX.fullmatch(hn) or hn in {"0"}:
-            continue
-        if hn in _PII_HDRS:
             continue
         keep.append(i)
     return keep or list(range(len(headers)))

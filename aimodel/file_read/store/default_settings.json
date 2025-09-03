@@ -43,7 +43,7 @@
   "default_top_p": 0.95,
   "default_max_tokens": 512,
   "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": true,
+  "default_auto_web": false,
   "default_web_k": 3,
   "web_k_min": 1,
   "web_k_max": 8,
@@ -81,7 +81,7 @@
   "chat_page_min_size": 1,
   "chat_page_max_size": 100,
   "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
-  "web_fetch_timeout_sec": 6.0,
+  "web_fetch_timeout_sec": 6,
   "web_fetch_max_chars": 2000,
   "web_fetch_max_bytes": 1048576,
   "web_fetch_max_parallel": 4,
@@ -97,8 +97,8 @@
   "web_orch_js_retry_avg_q": 0.55,
   "web_orch_js_retry_low_q": 0.45,
   "web_orch_js_retry_lowish_ratio": 0.5,
-  "web_orch_js_retry_timeout_add": 4.0,
-  "web_orch_js_retry_timeout_cap": 12.0,
+  "web_orch_js_retry_timeout_add": 4,
+  "web_orch_js_retry_timeout_cap": 12,
   "web_orch_js_retry_parallel_delta": -1,
   "web_orch_js_retry_min_parallel": 2,
   "web_block_header": "Web findings for: {query}",
@@ -111,7 +111,7 @@
   "web_orch_bullet_prefix": "- ",
   "web_orch_indent_prefix": "  ",
   "web_orch_www_prefix": "www.",
-  "web_orch_fetch_cap_multiplier": 2.0,
+  "web_orch_fetch_cap_multiplier": 2,
   "__comment_web_orch_scoring": "=== Hit scoring weights ===",
   "web_orch_score_w_exact": 3,
   "web_orch_score_w_substr": 2,
@@ -119,28 +119,28 @@
   "web_orch_score_w_title_part": 1,
   "web_orch_score_w_snip_touch": 1,
   "__comment_web_orch_quality": "=== Content quality params ===",
-  "web_orch_q_len_norm_divisor": 1600.0,
+  "web_orch_q_len_norm_divisor": 1600,
   "web_orch_q_len_weight": 0.55,
   "web_orch_q_diversity_weight": 0.55,
   "web_orch_q_penalties": [
     {
       "token": "<script>",
-      "mult": 50.0,
+      "mult": 50,
       "cap": 0.3
     },
     {
       "token": "function(",
-      "mult": 20.0,
+      "mult": 20,
       "cap": 0.3
     },
     {
       "token": "{",
-      "mult": 5.0,
+      "mult": 5,
       "cap": 0.2
     },
     {
       "token": "}",
-      "mult": 5.0,
+      "mult": 5,
       "cap": 0.2
     }
   ],
@@ -150,8 +150,8 @@
   "query_sum_short_max_words": 3,
   "query_sum_prompt": "Summarize the user's request into a concise web search query.\nKeep only the key entities and terms.\nDo not explain, and do not surround the result in quotation marks or other punctuation.\nYou may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.\nKeep the original word order. Output only the query text.\n\nUser: {text}\nQuery:",
   "query_sum_max_tokens": 24,
-  "query_sum_temperature": 0.0,
-  "query_sum_top_p": 1.0,
+  "query_sum_temperature": 0,
+  "query_sum_top_p": 1,
   "query_sum_stop": [
     "\n",
     "</s>"
@@ -160,8 +160,8 @@
   "query_sum_overlap_jaccard_min": 0.6,
   "__comment_router_decider": "=== Web Router (LLM-based) ===",
   "router_decide_max_tokens": 64,
-  "router_decide_temperature": 0.0,
-  "router_decide_top_p": 1.0,
+  "router_decide_temperature": 0,
+  "router_decide_top_p": 1,
   "router_decide_stop": [
     "</s>"
   ],
@@ -193,37 +193,11 @@
   "retitle_active_backoff_total_ms": 20000,
   "retitle_active_backoff_growth": 1.5,
   "retitle_llm_sys_inst": "You generate ultra-concise chat titles.\nRules: 2–5 words, Title Case, nouns/adjectives only.\nNo articles (a, an, the). No verbs. No punctuation. One line.\nOutput only the title.",
-  "retitle_llm_examples": [
-    {
-      "role": "user",
-      "content": "police station"
-    },
-    {
-      "role": "assistant",
-      "content": "Police Station"
-    },
-    {
-      "role": "user",
-      "content": "fire truck"
-    },
-    {
-      "role": "assistant",
-      "content": "Fire Truck"
-    },
-    {
-      "role": "user",
-      "content": "how do i install node on windows"
-    },
-    {
-      "role": "assistant",
-      "content": "Node Installation Windows"
-    }
-  ],
   "retitle_user_prefix": "",
   "retitle_user_suffix": "",
   "retitle_llm_max_tokens": 12,
   "retitle_llm_temperature": 0.1,
-  "retitle_llm_top_p": 1.0,
+  "retitle_llm_top_p": 1,
   "retitle_llm_stop": [
     "\n",
     "."
@@ -231,19 +205,20 @@
   "retitle_enable_sanitize": true,
   "retitle_sanitize_drop_prefix_regex": "^\\s*(\\\"[^\\\"]*\\\"|'[^']*'|[-*•]+|\\d+\\.)\\s*",
   "retitle_sanitize_strip_quotes": true,
-  "retitle_sanitize_replace_not_allowed_regex": "[^\\w\\s]",
-  "retitle_sanitize_replace_with": " ",
+  "retitle_sanitize_replace_not_allowed_regex": "[^\\w\\s’']",
+  "retitle_sanitize_replace_with": "",
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
+  "retitle_min_user_chars": 15,
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": true,
+  "default_auto_rag": false,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 3,
   "rag_max_chars_per_chunk": 900,
-  "rag_chunk_overlap_chars": 120,
+  "rag_chunk_overlap_chars": 0,
   "rag_min_chars": 300,
   "rag_total_char_budget": 1500,
   "rag_db_path": "corpus.sqlite",
@@ -253,6 +228,15 @@
   "rag_embedding_model": "intfloat/e5-small-v2",
   "rag_default_need_when_invalid": false,
   "rag_block_preamble": "Local knowledge",
+  "rag_tabular_rows_per_table": 8,
+  "rag_prioritize_current_attachment": true,
+  "rag_new_upload_score_boost": 0.35,
+  "rag_rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "rag_rerank_top_m": 8,
+  "rag_min_score_frac": 0.6,
+  "rag_per_source_cap": 2,
+  "rag_nohit_message": "⛔ No relevant local entries found for this query. Do not guess.",
+"rag_min_abs_rerank": -5.0,
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -264,7 +248,7 @@
     "\n⏹ stopped\n"
   ],
   "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2.0,
+  "stream_producer_join_timeout_sec": 2,
   "runjson_emit": true,
   "excel_emit_cells": false,
   "excel_max_cells_per_sheet": 250,
@@ -280,7 +264,7 @@
   "excel_infer_max_rows": 100,
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
-  "excel_emit_key_values": true,
+  "excel_emit_key_values": false,
   "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
   "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
@@ -290,8 +274,8 @@
   "router_rag_strip_split_on_blank": true,
   "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
   "router_rag_decide_max_tokens": 300,
-  "router_rag_decide_temperature": 0.0,
-  "router_rag_decide_top_p": 1.0,
+  "router_rag_decide_temperature": 0,
+  "router_rag_decide_top_p": 1,
   "router_rag_decide_stop": [
     "\n\n"
   ],
@@ -325,5 +309,35 @@
   "web_enabled": false,
   "warmup_web_k": 2,
   "warmup_timeout_sec": 5,
-  "warmup_queries": ["current US president", "S&P 500 today", "weather tomorrow"]
+  "warmup_queries": [
+    "current US president",
+    "S&P 500 today",
+    "weather tomorrow"
+  ],
+  "pptx_use_markdown_headings": true,
+  "pptx_include_notes": true,
+  "pptx_include_tables": true,
+  "pptx_drop_empty_lines": true,
+  "pptx_para_max_chars": 0,
+  "pptx_number_slides": true,
+  "ppt_drop_empty_lines": true,
+  "ppt_dedupe_lines": true,
+  "ppt_min_alpha_ratio": 0.4,
+  "ppt_max_punct_ratio": 0.5,
+  "ppt_max_line_chars": 600,
+  "ppt_token_max_chars": 40,
+  "pdf_ocr_enable": true,
+  "pdf_ocr_when_bad": true,
+  "pdf_ocr_dpi": 300,
+  "pdf_ocr_max_pages": 0,
+  "pdf_ocr_mode": "auto",
+  "ocr_lang": "eng",
+  "ocr_psm": "3",
+  "ocr_oem": "3",
+  "ocr_min_chars_for_ok": 32,
+  "ocr_min_alnum_ratio_for_ok": 0.15,
+  "ocr_min_image_bytes": 16384,
+  "pptx_ocr_images": true,
+  "docx_ocr_images": true,
+  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe"
 }

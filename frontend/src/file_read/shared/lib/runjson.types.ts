@@ -22,6 +22,8 @@ export type RagTelemetry = {
   hitsGlobal?: number;
   dedupeSec?: number;
   blockBuildSec?: number;
+  injectBuildSec?: number;
+  sessionOnlyBuildSec?: number;
   topKRequested?: number;
   blockChars?: number;
   injected?: boolean;
@@ -31,7 +33,12 @@ export type RagTelemetry = {
   packedTokensBefore?: number;
   packedTokensAfter?: number;
   ragTokensAdded?: number;
+  sessionOnlyTokensApprox?: number;
+  sessionOnly?: boolean;
+  routerSkipped?: boolean;
+  routerSkippedReason?: string;
 };
+
 
 export type WebBreakdown = {
   routerSec?: number;

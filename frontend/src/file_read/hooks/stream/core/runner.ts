@@ -148,8 +148,8 @@ export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
           } catch {}
         }, delayMs);
       };
-      pokeForTitle(1000);
       pokeForTitle(3000);
+      pokeForTitle(8000);
     }
   } catch (e: any) {
     const localAbort =
