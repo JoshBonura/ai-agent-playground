@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
 import time
-
 from ..core.settings import SETTINGS
 from .store import search_vectors
 from .retrieve_tabular import make_rag_block_tabular
@@ -11,7 +10,7 @@ from .rerank import rerank_hits, cap_per_source, min_score_fraction
 
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10  # cap how many hits we dump at each stage
+PRINT_MAX = 10  
 
 
 def _get_embedder():
@@ -235,21 +234,17 @@ def _build_rag_block_core(
         print("[RAG SEARCH] no hits")
         return None, tel
 
-    # Preference boost
     all_hits = _rescore_for_preferred_sources(all_hits, preferred_sources=preferred_sources)
     _print_hits("After preference boost", all_hits)
 
-    # Keep a safe copy BEFORE pruning
     pre_prune_hits = list(all_hits)
 
-    # --- Rerank (guarded) ---
     t_rr = time.perf_counter()
     top_m_cfg = SETTINGS.get("rag_rerank_top_m")
     try:
         top_m = int(top_m_cfg) if top_m_cfg not in (None, "", False) else None
     except Exception:
         top_m = None
-    # clamp to available hits if provided
     if isinstance(top_m, int):
         top_m = max(1, min(top_m, len(all_hits)))
 
@@ -257,7 +252,6 @@ def _build_rag_block_core(
         all_hits = rerank_hits(q, all_hits, top_m=top_m)
     except Exception as e:
         print(f"[RAG] rerank error: {e}; skipping rerank")
-        # keep pre-prune ordering
         pass
 
     tel.rerankSec = round(time.perf_counter() - t_rr, 6)
@@ -265,7 +259,6 @@ def _build_rag_block_core(
     tel.keptAfterRerank = len(all_hits)
     _print_hits(f"After rerank (top_m={top_m})", all_hits)
 
-    # --- Min-score fraction first (robust) ---
     frac_cfg = SETTINGS.get("rag_min_score_frac")
     try:
         frac = float(frac_cfg) if frac_cfg not in (None, "", False) else None
@@ -283,7 +276,6 @@ def _build_rag_block_core(
             _print_hits("Dropped by minScoreFrac", dropped)
     tel.keptAfterMinFrac = len(all_hits)
 
-    # --- Per-source cap AFTER min-frac ---
     cap_cfg = SETTINGS.get("rag_per_source_cap")
     try:
         cap_val = int(cap_cfg) if cap_cfg not in (None, "", False) else 0
@@ -299,7 +291,6 @@ def _build_rag_block_core(
             _print_hits("Dropped by per-source cap", dropped)
     tel.keptAfterCap = len(all_hits)
 
-    # SAFETY NET
     if not all_hits:
         best = sorted(pre_prune_hits, key=_primary_score, reverse=True)[:1]
         all_hits = best
@@ -307,13 +298,11 @@ def _build_rag_block_core(
         print("[RAG] pruning yielded 0 hits; falling back to best pre-prune hit")
         _print_hits("Fallback best pre-prune", all_hits)
 
-    # Final selection
     t3 = time.perf_counter()
     hits_top = _dedupe_and_sort(all_hits, k=k)
     tel.dedupeSec = round(time.perf_counter() - t3, 6)
     _print_hits(f"Final top-k (k={k})", hits_top)
 
-    # Build block
     t4 = time.perf_counter()
     block = build_block_for_hits(hits_top, preferred_sources=preferred_sources)
     tel.blockBuildSec = round(time.perf_counter() - t4, 6)

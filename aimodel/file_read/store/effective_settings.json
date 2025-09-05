@@ -212,8 +212,9 @@
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
+  "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
@@ -302,20 +303,6 @@
   "doc_ole_drop_pathish": true,
   "doc_ole_drop_symbol_lines": true,
   "doc_ole_dedupe_short_repeats": true,
-  "warmup_enabled": true,
-  "warmup_on_start": true,
-  "warmup_on_interval_sec": 600,
-  "warmup_jitter_sec": 8,
-  "warmup_llm_enabled": true,
-  "warmup_web_enabled": false,
-  "web_enabled": false,
-  "warmup_web_k": 2,
-  "warmup_timeout_sec": 5,
-  "warmup_queries": [
-    "current US president",
-    "S&P 500 today",
-    "weather tomorrow"
-  ],
   "pptx_use_markdown_headings": true,
   "pptx_include_notes": true,
   "pptx_include_tables": true,
@@ -341,5 +328,14 @@
   "ocr_min_image_bytes": 16384,
   "pptx_ocr_images": true,
   "docx_ocr_images": true,
-  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe"
+  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe",
+  "style_sys": "You are a helpful assistant. Always follow the user's explicit instructions carefully and exactly. Do not repeat yourself. Stay coherent and complete.",
+  "style_patterns": {
+    "talk_like": "\\btalk\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "respond_like": "\\brespond\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "be": "\\bbe\\s+(?P<style>[^.;\\n]+)",
+    "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
+  },
+  "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
+  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:"
 }

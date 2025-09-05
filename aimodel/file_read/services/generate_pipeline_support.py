@@ -1,5 +1,4 @@
 # aimodel/file_read/services/generate_pipeline_support.py
-# utility helpers for generate pipeline; no inline comments per request
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional

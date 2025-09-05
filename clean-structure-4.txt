@@ -1,4 +1,864 @@
- 1000.0)
+ in tel_items if it.get("ok"))
+        telemetry.update({
+            "totalSec": round(time.perf_counter() - t_total0, 6),
+            "requested": len(urls),
+            "ok": ok_cnt,
+            "miss": len(urls) - ok_cnt,
+            "items": tel_items,
+            "settings": {
+                "userAgent": _ua(),
+                "defaultTimeoutSec": _timeout(),
+                "defaultCapChars": _max_chars(),
+                "defaultCapBytes": _max_bytes(),
+                "maxParallel": _max_parallel() if max_parallel is None else int(max_parallel),
+            },
+        })
+
+    return results
+
+# ===== aimodel/file_read/web/orchestrator.py =====
+
+# DEBUG prints added with prefix [WEB][ORCH]
+from __future__ import annotations
+from typing import List, Tuple, Optional, Dict, Any
+import time
+
+from ..core.settings import SETTINGS
+from .duckduckgo import DuckDuckGoProvider
+from .provider import SearchHit
+from .orchestrator_common import (
+    _as_int, _as_float, _as_bool, _as_str,
+    condense_doc, content_quality_score,
+    _dedupe_by_host, score_hit, _head_tail,
+    _fetch_round,
+)
+
+def _host_only(u: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(u).hostname or "").lower()
+        return h or ""
+    except Exception:
+        return ""
+
+async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    tel: Dict[str, Any] = {"query": (query or "").strip()}
+    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
+    total_char_budget   = _as_int("web_orch_total_char_budget")
+    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
+    max_parallel        = _as_int("web_orch_max_parallel_fetch")
+    overfetch_factor    = _as_float("web_orch_overfetch_factor")
+    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
+    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
+    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
+    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
+    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
+    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
+    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
+    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
+    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
+    header_tpl          = _as_str("web_block_header")
+    sep_str             = _as_str("web_orch_block_separator")
+    min_block_reserve   = _as_int("web_orch_min_block_reserve")
+    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
+    per_timeout = (float(per_url_timeout_s) if per_url_timeout_s is not None else _as_float("web_fetch_timeout_sec"))
+    start_time = time.perf_counter()
+
+    print(f"[WEB][ORCH] build_web_block query={tel['query']!r} k={cfg_k} overfetch_factor={overfetch_factor} max_parallel={max_parallel} per_doc_budget={per_doc_budget} total_char_budget={total_char_budget}")
+
+    provider = DuckDuckGoProvider()
+    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
+    tel["search"] = {"requestedK": cfg_k, "overfetch": overfetch}
+    t0 = time.perf_counter()
+    try:
+        hits: List[SearchHit] = await provider.search(query, k=overfetch, telemetry=tel["search"])
+    except Exception as e:
+        print(f"[WEB][ORCH] SEARCH ERROR type={type(e).__name__} msg={e}")
+        tel["error"] = {"stage": "search", "type": type(e).__name__, "msg": str(e)}
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return None, tel
+    tel["search"]["elapsedSecTotal"] = round(time.perf_counter() - t0, 6)
+
+    print(f"[WEB][ORCH] search hits={len(hits)} dt={tel['search']['elapsedSecTotal']}s")
+    if hits:
+        preview = [
+            f"{(h.title or '')[:60]!r} @ {_host_only(h.url or '')}"
+            for h in hits[:min(6, len(hits))]
+        ]
+        print(f"[WEB][ORCH] hits preview: {preview}")
+
+    if not hits:
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return None, tel
+
+    seen_urls = set()
+    scored: List[Tuple[int, SearchHit]] = []
+    for idx, h in enumerate(hits):
+        u = (h.url or "").strip()
+        if not u:
+            continue
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        s = score_hit(h, query)
+        scored.append((s, h))
+    tel["scoring"] = {"inputHits": len(hits), "scored": len(scored)}
+    print(f"[WEB][ORCH] scored={len(scored)} (unique urls), top score={max((s for s,_ in scored), default=-1)}")
+
+    if not scored:
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return None, tel
+
+    top_hits = _dedupe_by_host(scored, cfg_k)
+    tel["scoring"]["picked"] = len(top_hits)
+    urls = [h.url for h in top_hits]
+    meta = [(h.title or h.url, h.url) for h in top_hits]
+
+    print(f"[WEB][ORCH] picked hosts={[_host_only(u) for u in urls]}")
+
+    t_f = time.perf_counter()
+    tel["fetch1"] = {}
+    results = await _fetch_round(
+        urls, meta, per_url_timeout_s=per_timeout, max_parallel=max_parallel, use_js=False, telemetry=tel["fetch1"]
+    )
+    dt_f = time.perf_counter() - t_f
+    tel["fetch1"]["roundSec"] = round(dt_f, 6)
+
+    texts: List[Tuple[str, str, str]] = []
+    quality_scores: List[float] = []
+    for original_url, res in results:
+        if not res:
+            continue
+        final_url, status, text = res
+        title = next((t for (t, u) in meta if u == original_url), final_url)
+        qscore = content_quality_score(text or "")
+        quality_scores.append(qscore)
+        if text:
+            texts.append((title, final_url, text))
+    tel["fetch1"]["docs"] = {"ok": len(texts), "qAvg": (sum(quality_scores)/len(quality_scores) if quality_scores else 0.0)}
+
+    print(f"[WEB][ORCH] fetch1 ok={tel['fetch1']['docs']['ok']} qAvg={round(tel['fetch1']['docs']['qAvg'],4) if quality_scores else 0.0} dt={tel['fetch1']['roundSec']}s")
+
+    try_js = False
+    if enable_js_retry and quality_scores:
+        avg_q = sum(quality_scores) / len(quality_scores)
+        lowish = sum(1 for q in quality_scores if q < js_low_q_thresh)
+        if avg_q < js_avg_q_thresh or (lowish / max(1, len(quality_scores))) >= js_lowish_ratio:
+            try_js = True
+        tel["jsRetry"] = {
+            "considered": True,
+            "triggered": try_js,
+            "avgQ": round(avg_q, 4),
+            "lowishRatio": round((lowish / max(1, len(quality_scores))), 4),
+            "thresholds": {"avg": js_avg_q_thresh, "low": js_low_q_thresh, "ratio": js_lowish_ratio},
+        }
+    else:
+        tel["jsRetry"] = {"considered": bool(enable_js_retry), "triggered": False}
+
+    print(f"[WEB][ORCH] jsRetry considered={tel['jsRetry']['considered']} triggered={tel['jsRetry']['triggered']} details={tel['jsRetry']}")
+
+    if try_js:
+        js_timeout   = min(per_timeout + js_timeout_add, js_timeout_cap)
+        js_parallel  = max(js_min_parallel, max_parallel + js_parallel_delta)
+        tel["fetch2"] = {"timeoutSec": js_timeout, "maxParallel": js_parallel}
+        results_js = await _fetch_round(
+            urls, meta, per_url_timeout_s=js_timeout, max_parallel=js_parallel, use_js=True, telemetry=tel["fetch2"]
+        )
+        texts_js: List[Tuple[str, str, str]] = []
+        for original_url, res in results_js:
+            if not res:
+                continue
+            final_url, status, text = res
+            title = next((t for (t, u) in meta if u == original_url), final_url)
+            if text:
+                texts_js.append((title, final_url, text))
+        if texts_js:
+            print(f"[WEB][ORCH] fetch2(js) replaced docs ok={len(texts_js)} (prev {len(texts)})")
+            texts = texts_js
+        else:
+            print("[WEB][ORCH] fetch2(js) produced no better docs; keeping fetch1 results")
+
+    if not texts:
+        print("[WEB][ORCH] no texts after fetch; aborting")
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return None, tel
+
+    # Preview top few docs’ first 120 chars for sanity
+    previews = []
+    for t, u, body in texts[:min(3, len(texts))]:
+        previews.append({"title": (t or "")[:80], "host": _host_only(u), "bodyPreview": (body or "").strip().replace("\n"," ")[:120]})
+    print(f"[WEB][ORCH] doc previews (top 3): {previews}")
+
+    texts.sort(key=lambda t: content_quality_score(t[2]), reverse=True)
+    chunks: List[str] = []
+    for title, final_url, text in texts:
+        chunk = condense_doc(title, final_url, text, max_chars=per_doc_budget)
+        chunks.append(chunk)
+
+    header = header_tpl.format(query=query)
+    sep = _as_str("web_orch_block_separator")
+    available = max(_as_int("web_orch_min_block_reserve"), total_char_budget - len(header) - len(sep))
+    block_parts: List[str] = []
+    used = 0
+    for idx, ch in enumerate(chunks):
+        cl = len(ch)
+        sep_len = (len(sep) if block_parts else 0)
+        if used + cl + sep_len > available:
+            shrunk = _head_tail(ch, max(min_chunk_after, available - used - sep_len))
+            if len(shrunk) > min_chunk_after:
+                block_parts.append(shrunk)
+                used += len(shrunk) + sep_len
+            print(f"[WEB][ORCH] assembly hit budget; idx={idx} used={used} available={available} added_shrunk={len(block_parts[-1]) if block_parts else 0}")
+            break
+        block_parts.append(ch)
+        used += cl + sep_len
+
+    print(f"[WEB][ORCH] assembly chunksPicked={len(block_parts)} available={available} headerChars={len(header)}")
+
+    body = sep.join(block_parts)
+    block = f"{header}{sep}{body}" if body else header
+
+    tel["assembly"] = {
+        "chunksPicked": len(block_parts),
+        "chars": len(block),
+        "available": available,
+        "headerChars": len(header),
+    }
+    tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+
+    print(f"[WEB][ORCH] DONE chars={tel['assembly']['chars']} elapsed={tel['elapsedSec']}s")
+    return block, tel
+
+# ===== aimodel/file_read/web/orchestrator_common.py =====
+
+# DEBUG prints added with prefix [WEB][ORCH][COMMON]
+from __future__ import annotations
+from typing import List, Tuple, Optional, Dict, Any
+from urllib.parse import urlparse
+import re
+
+from ..core.settings import SETTINGS
+from .provider import SearchHit
+from .fetch import fetch_many
+
+def _req(key: str):
+    return SETTINGS[key]
+
+def _as_int(key: str) -> int: return int(_req(key))
+def _as_float(key: str) -> float: return float(_req(key))
+def _as_bool(key: str) -> bool: return bool(_req(key))
+def _as_str(key: str) -> str:
+    v = _req(key)
+    return "" if v is None else str(v)
+
+def _clean_ws(s: str) -> str:
+    return " ".join((s or "").split())
+
+def _host(url: str) -> str:
+    h = (urlparse(url).hostname or "").lower()
+    pref = _as_str("web_orch_www_prefix")
+    return h[len(pref):] if pref and h.startswith(pref) else h
+
+def _tokens(s: str) -> List[str]:
+    return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
+
+def _head_tail(text: str, max_chars: int) -> str:
+    text = text or ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return _clean_ws(text)
+    head_frac      = _as_float("web_orch_head_fraction")
+    tail_min_chars = _as_int("web_orch_tail_min_chars")
+    ellipsis       = _as_str("web_orch_ellipsis")
+    head = int(max_chars * head_frac)
+    tail = max_chars - head
+    if tail < tail_min_chars:
+        head = max(1, max_chars - tail_min_chars)
+        tail = tail_min_chars
+    return _clean_ws(text[:head] + ellipsis + text[-tail:])
+
+def condense_doc(title: str, url: str, text: str, *, max_chars: int) -> str:
+    body = _head_tail(text or "", max_chars)
+    safe_title = _clean_ws(title or url)
+    bullet = _as_str("web_orch_bullet_prefix") or "- "
+    indent = _as_str("web_orch_indent_prefix") or "  "
+    return f"{bullet}{safe_title}\n{indent}{url}\n{indent}{body}"
+
+def score_hit(hit: SearchHit, query: str) -> int:
+    w_exact      = _as_int("web_orch_score_w_exact")
+    w_substr     = _as_int("web_orch_score_w_substr")
+    w_title_full = _as_int("web_orch_score_w_title_full")
+    w_title_part = _as_int("web_orch_score_w_title_part")
+    w_snip_touch = _as_int("web_orch_score_w_snip_touch")
+    score = 0
+    q = (query or "").strip().lower()
+    title = (hit.title or "").strip()
+    snippet = (hit.snippet or "").strip()
+    title_l = title.lower()
+    snip_l  = snippet.lower()
+    if q:
+        if title_l == q:
+            score += w_exact
+        elif q in title_l:
+            score += w_substr
+    qtoks = _tokens(q)
+    if qtoks:
+        cov_title = sum(1 for t in qtoks if t in title_l)
+        if cov_title == len(qtoks) and len(qtoks) > 0:
+            score += w_title_full
+        elif cov_title > 0:
+            score += w_title_part
+        cov_snip = sum(1 for t in qtoks if t in snip_l)
+        if cov_snip > 0:
+            score += w_snip_touch
+    return score
+
+def _type_ratio(text: str, sub: str) -> float:
+    if not text:
+        return 1.0
+    cnt = text.lower().count(sub)
+    return float(cnt) / max(1, len(text))
+
+def content_quality_score(text: str) -> float:
+    if not text:
+        return 0.0
+    t = text.strip()
+    n = len(t)
+    len_div     = _as_float("web_orch_q_len_norm_divisor")
+    w_len       = _as_float("web_orch_q_len_weight")
+    w_div       = _as_float("web_orch_q_diversity_weight")
+    length_score = min(1.0, n / len_div) if len_div > 0 else 0.0
+    toks = _tokens(t)
+    if not toks:
+        return 0.1 * length_score
+    uniq = len(set(toks))
+    diversity = uniq / max(1.0, float(len(toks)))
+    pen = 0.0
+    for rule in _req("web_orch_q_penalties"):
+        token = str(rule.get("token") or "")
+        mult  = float(rule.get("mult") or 0.0)
+        cap   = float(rule.get("cap") or 1.0)
+        pen += min(cap, _type_ratio(t, token) * mult)
+    raw = (w_len * length_score) + (w_div * diversity) - pen
+    return max(0.0, min(1.0, raw))
+
+def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
+    picked: List[SearchHit] = []
+    seen_hosts = set()
+    for s, h in sorted(scored_hits, key=lambda x: x[0], reverse=True):
+        u = (h.url or "").strip()
+        if not u:
+            continue
+        host = _host(u)
+        if host in seen_hosts:
+            continue
+        seen_hosts.add(host)
+        picked.append(h)
+        if len(picked) >= k:
+            break
+    return picked
+
+async def _fetch_round(
+    urls: List[str],
+    meta: List[Tuple[str, str]],
+    per_url_timeout_s: float,
+    max_parallel: int,
+    use_js: bool = False,
+    telemetry: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
+    fetch_fn = fetch_many
+    if use_js:
+        try:
+            from . import fetch as _fetch_mod  # type: ignore
+            fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
+        except Exception:
+            fetch_fn = fetch_many
+    cap_mult        = _as_float("web_orch_fetch_cap_multiplier")
+    per_doc_budget  = _as_int("web_orch_per_doc_char_budget")
+    fetch_max_chars = _as_int("web_fetch_max_chars")
+    per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
+
+    print(f"[WEB][ORCH][COMMON] _fetch_round use_js={use_js} urls={len(urls)} per_timeout={per_url_timeout_s} max_parallel={max_parallel} per_doc_cap={per_doc_cap}")
+
+    results = await fetch_fn(
+        urls,
+        per_timeout_s=per_url_timeout_s,
+        cap_chars=per_doc_cap,
+        max_parallel=max_parallel,
+        telemetry=telemetry,
+    )
+
+    ok = sum(1 for _, r in results if r)
+    print(f"[WEB][ORCH][COMMON] _fetch_round done ok={ok}/{len(results)}")
+    return results
+
+# ===== aimodel/file_read/web/provider.py =====
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Optional
+
+@dataclass
+class SearchHit:
+    title: str
+    url: str
+    snippet: Optional[str] = None
+    rank: int = 0
+
+class SearchProvider:
+    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
+        raise NotImplementedError
+
+# ===== aimodel/file_read/web/query_summarizer.py =====
+
+# aimodel/file_read/web/query_summarizer.py
+from __future__ import annotations
+from typing import Any, Iterable, Dict, Tuple
+import re, time
+
+from ..core.settings import SETTINGS
+from ..utils.streaming import safe_token_count_messages
+
+def _tokens(s: str) -> set[str]:
+    return set(re.findall(r"\w+", (s or "").lower()))
+
+def _as_list(v) -> list:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    return [v]
+
+def summarize_query(llm: Any, user_text: str) -> Tuple[str, Dict[str, Any]]:
+    telemetry: Dict[str, Any] = {}
+    txt = (user_text or "").strip()
+
+    bypass_enabled = SETTINGS.get("query_sum_bypass_short_enabled")
+    short_chars = SETTINGS.get("query_sum_short_max_chars")
+    short_words = SETTINGS.get("query_sum_short_max_words")
+    if bypass_enabled is True and isinstance(short_chars, int) and isinstance(short_words, int):
+        if len(txt) <= short_chars and len(txt.split()) <= short_words:
+            telemetry.update({"bypass": True})
+            return txt, telemetry
+    telemetry.update({"bypass": False})
+
+    prompt = SETTINGS.get("query_sum_prompt")
+    if isinstance(prompt, str) and "{text}" in prompt:
+        params = {}
+        max_tokens = SETTINGS.get("query_sum_max_tokens")
+        if isinstance(max_tokens, int):
+            params["max_tokens"] = max_tokens
+        temperature = SETTINGS.get("query_sum_temperature")
+        if isinstance(temperature, (int, float)):
+            params["temperature"] = float(temperature)
+        top_p = SETTINGS.get("query_sum_top_p")
+        if isinstance(top_p, (int, float)):
+            params["top_p"] = float(top_p)
+        stops = _as_list(SETTINGS.get("query_sum_stop"))
+        if stops:
+            params["stop"] = [str(s) for s in stops if isinstance(s, str)]
+        params["stream"] = False
+
+        t_start = time.perf_counter()
+        out = llm.create_chat_completion(
+            messages=[{"role": "user", "content": prompt.format(text=txt)}],
+            **params,
+        )
+        elapsed = time.perf_counter() - t_start
+        result = (out["choices"][0]["message"]["content"] or "").strip()
+        in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": prompt.format(text=txt)}]) or 0
+        out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": result}]) or 0
+        telemetry.update({
+            "elapsedSec": round(elapsed, 4),
+            "inputTokens": in_tokens,
+            "outputTokens": out_tokens,
+        })
+    else:
+        return txt, telemetry
+
+    overlap_enabled = SETTINGS.get("query_sum_overlap_check_enabled")
+    j_min = SETTINGS.get("query_sum_overlap_jaccard_min")
+    if overlap_enabled is True and isinstance(j_min, (int, float)):
+        src_toks = _tokens(txt)
+        out_toks = _tokens(result)
+        if not result or not out_toks:
+            telemetry.update({"overlapRetained": True, "overlapScore": 0.0})
+            return txt, telemetry
+        jaccard = (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
+        telemetry.update({"overlapScore": round(jaccard, 4)})
+        if jaccard < float(j_min):
+            telemetry.update({"overlapRetained": True})
+            return txt, telemetry
+        telemetry.update({"overlapRetained": False})
+        return result, telemetry
+
+    return result, telemetry
+
+# ===== aimodel/file_read/web/router_ai.py =====
+
+# aimodel/file_read/web/router_ai.py
+from __future__ import annotations
+from typing import Tuple, Optional, Any, Dict
+import json, re, time
+from ..core.settings import SETTINGS
+from ..utils.streaming import safe_token_count_messages
+
+_DECIDE_PROMPT = (
+    "You are a router deciding whether answering the text requires the public web.\n"
+    "Respond with JSON only in exactly this schema:\n"
+    "{{\"need\": true|false, \"query\": \"<text or empty>\"}}\n\n"
+    "Decision principle:\n"
+    "- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n"
+    "- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n"
+    "- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n"
+    "- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n"
+    "- When uncertain whether real-time state is required, prefer need=true.\n\n"
+    "Text:\n{text}\n"
+    "JSON:"
+)
+
+def _force_json(s: str) -> dict:
+    """
+    Try very hard to extract a JSON object like:
+      {"need": true|false, "query": "..."}
+    …even if the model wrapped it in prose or ```json fences.
+    """
+    if not s:
+        return {}
+
+    raw = s.strip()
+
+    # Strip common code-fence wrappers
+    # ```json\n{...}\n```  OR  ```\n{...}\n```
+    try:
+        cf = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+        if cf:
+            raw = cf.group(1).strip()
+    except Exception:
+        pass
+
+    # 1) Try direct parse
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        pass
+
+    # 2) Try to find a minimal JSON object that *mentions* "need"
+    #    This avoids the nested-brace problem while being specific enough.
+    try:
+        m = None
+        for m in re.finditer(r"\{[^{}]*\"need\"\s*:\s*(?:true|false|\"true\"|\"false\")[^{}]*\}", raw, re.IGNORECASE):
+            pass
+        if m:
+            frag = m.group(0)
+            v = json.loads(frag)
+            return v if isinstance(v, dict) else {}
+    except Exception:
+        pass
+
+    # 3) Fallback: grab the last {...} blob and attempt to parse
+    try:
+        last = None
+        for last in re.finditer(r"\{[\s\S]*\}", raw):
+            pass
+        if last:
+            frag = last.group(0)
+            v = json.loads(frag)
+            return v if isinstance(v, dict) else {}
+    except Exception:
+        pass
+
+    return {}
+
+
+def _strip_wrappers(text: str) -> str:
+    t = (text or "")
+    if SETTINGS.get("router_trim_whitespace") is True:
+        t = t.strip()
+    if SETTINGS.get("router_strip_wrappers_enabled") is not True:
+        return t
+    head = t
+    if SETTINGS.get("router_strip_split_on_blank") is True:
+        head = t.split("\n\n", 1)[0]
+    pat = SETTINGS.get("router_strip_header_regex")
+    if isinstance(pat, str) and pat:
+        try:
+            rx = re.compile(pat)
+            out = []
+            for ln in head.splitlines():
+                if rx.match(ln):
+                    break
+                out.append(ln)
+            core = " ".join(" ".join(out).split())
+            return core if core else t
+        except Exception:
+            return head
+    return head
+
+def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    telemetry: Dict[str, Any] = {}
+    try:
+        if not user_text or not user_text.strip():
+            return (False, None, telemetry)
+
+        t_start = time.perf_counter()
+        t_raw = user_text.strip()
+        core_text = _strip_wrappers(t_raw)
+
+        the_prompt = _DECIDE_PROMPT.format(text=core_text)
+        params = {
+            "max_tokens": SETTINGS.get("router_decide_max_tokens"),
+            "temperature": SETTINGS.get("router_decide_temperature"),
+            "top_p": SETTINGS.get("router_decide_top_p"),
+            "stream": False,
+        }
+        stop_list = SETTINGS.get("router_decide_stop")
+        if isinstance(stop_list, list) and stop_list:
+            params["stop"] = stop_list
+        params = {k: v for k, v in params.items() if v is not None}
+
+        raw_out_obj = llm.create_chat_completion(
+            messages=[{"role": "user", "content": the_prompt}],
+            **params,
+        )
+        text_out = (raw_out_obj.get("choices", [{}])[0]
+                                  .get("message", {})
+                                  .get("content") or "").strip()
+
+        # NEW: keep raw router output for debugging
+        telemetry["rawRouterOut"] = text_out[:2000]  # cap for safety
+
+        data = _force_json(text_out) or {}
+
+        # Coerce 'need' with string tolerance
+        need_val = data.get("need", None)
+        if isinstance(need_val, str):
+            nv = need_val.strip().lower()
+            if nv in ("true", "yes", "y", "1"):
+                need_val = True
+            elif nv in ("false", "no", "n", "0"):
+                need_val = False
+
+        if isinstance(need_val, bool):
+            need = need_val
+            parsed_ok = True
+        else:
+            parsed_ok = False
+            need_default = SETTINGS.get("router_default_need_when_invalid")
+            # If you want ingestion to proceed when parsing fails, set this to true in settings.
+            need = bool(need_default) if isinstance(need_default, bool) else False
+
+        # Extract query (safe) and strip wrappers
+        query_field = data.get("query", "")
+        try:
+            query = _strip_wrappers(str(query_field or "").strip())
+        except Exception:
+            query = ""
+
+        if not need:
+            query = None  # ignore query when we decided 'no web'
+
+        t_elapsed = time.perf_counter() - t_start
+        in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": the_prompt}]) or 0
+        out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": text_out}]) or 0
+
+        telemetry.update({
+            "needed": bool(need),
+            "routerQuery": query if need else None,
+            "elapsedSec": round(t_elapsed, 4),
+            "inputTokens": in_tokens,
+            "outputTokens": out_tokens,
+            "parsedOk": parsed_ok,
+        })
+
+        return (need, query, telemetry)
+
+    except Exception:
+        return (False, None, telemetry)
+
+
+async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple[Optional[str], Dict[str, Any]]:
+    telemetry: Dict[str, Any] = {}
+    need, proposed_q, tel_decide = decide_web(llm, (user_text or "").strip())
+    telemetry.update(tel_decide)
+    if not need:
+        return None, telemetry
+
+    from .query_summarizer import summarize_query
+    from .orchestrator import build_web_block
+
+    base_query = _strip_wrappers((proposed_q or user_text).strip())
+    try:
+        q_summary, tel_sum = summarize_query(llm, base_query)
+        q_summary = _strip_wrappers((q_summary or "").strip()) or base_query
+        telemetry["summarizer"] = tel_sum
+        telemetry["summarizedQuery"] = q_summary
+    except Exception:
+        q_summary = base_query
+
+    t_start = time.perf_counter()
+    try:
+        block_res = await build_web_block(q_summary, k=k)
+        if isinstance(block_res, tuple):
+            block, tel_orch = block_res
+            telemetry["orchestrator"] = tel_orch or {}
+        else:
+            block = block_res
+    except Exception:
+        block = None
+    t_elapsed = time.perf_counter() - t_start
+
+    telemetry.update({
+        "fetchElapsedSec": round(t_elapsed, 4),
+        "blockChars": len(block) if block else 0,
+    })
+
+    return (block or None, telemetry)
+
+# ===== aimodel/file_read/workers/retitle_worker.py =====
+
+# aimodel/file_read/retitle_worker.py
+from __future__ import annotations
+import asyncio, logging, re
+from typing import Dict, List, Optional, Tuple
+
+from ..runtime.model_runtime import get_llm
+from ..store.index import load_index, save_index
+from ..store.base import now_iso
+from ..services.cancel import is_active, GEN_SEMAPHORE
+from ..store.chats import _load_chat
+from ..core.settings import SETTINGS
+
+def S(key: str):
+    return SETTINGS[key]
+
+_PENDING: Dict[str, dict] = {}
+_ENQUEUED: set[str] = set()
+_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=int(S("retitle_queue_maxsize")))
+_lock = asyncio.Lock()
+
+def _preview(s: str) -> str:
+    n = int(S("retitle_preview_chars"))
+    ell = S("retitle_preview_ellipsis")
+    s = (s or "")
+    return (s[:n] + ell) if len(s) > n else s
+
+def _is_substantial(text: str) -> bool:
+    t = (text or "").strip()
+    min_chars = int(S("retitle_min_substantial_chars"))
+    require_alpha = bool(S("retitle_require_alpha"))
+    if len(t) < min_chars:
+        return False
+    return (re.search(r"[A-Za-z]", t) is not None) if require_alpha else True
+
+def _pick_source(messages: List[dict]) -> Optional[str]:
+    if not messages:
+        print("[retitle] no messages to pick from")
+        return None
+
+    min_user_len = int(S("retitle_min_user_chars"))
+    print(f"[retitle] min_user_len={min_user_len}, total_msgs={len(messages)}")
+
+    # 1. Prefer last substantial user message
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            txt = (m.get("content") or "").strip()
+            print(f"[retitle] check user msg len={len(txt)} preview={txt[:40]!r}")
+            if len(txt) >= min_user_len and _is_substantial(txt):
+                print("[retitle] PICK user message")
+                return txt
+
+    # 2. Fallback to last substantial assistant message
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            txt = (m.get("content") or "").strip()
+            print(f"[retitle] check assistant msg len={len(txt)} preview={txt[:40]!r}")
+            if _is_substantial(txt):
+                print("[retitle] PICK assistant message")
+                return txt
+
+    print("[retitle] no suitable message found")
+    return None
+
+def _sanitize_title(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    s = re.sub(r"(?i)^(?:how\s+to|steps?\s+to|guide\s+to|tutorial:\s*|to)\s+", "", s).strip()
+    drop_prefix_re = S("retitle_sanitize_drop_prefix_regex")
+    if drop_prefix_re:
+        s = re.sub(drop_prefix_re, "", s)
+    if bool(S("retitle_sanitize_strip_quotes")):
+        s = s.strip().strip('"').strip("'").strip()
+    replace_not_allowed_re = S("retitle_sanitize_replace_not_allowed_regex")
+    replace_with = S("retitle_sanitize_replace_with")
+    if replace_not_allowed_re:
+        s = re.sub(replace_not_allowed_re, replace_with, s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[.:;,\-\s]+$", "", s)
+    s = re.sub(r"(?i)^(?:a|an|the)\s+", "", s).strip()
+    max_words = int(S("retitle_sanitize_max_words"))
+    max_chars = int(S("retitle_sanitize_max_chars"))
+    if max_words > 0:
+        words = s.split()
+        s = " ".join(words[:max_words])
+    if max_chars > 0 and len(s) > max_chars:
+        s = s[:max_chars].rstrip()
+    return s
+
+def _make_title(llm, src: str) -> str:
+    sys = S("retitle_llm_sys_inst")
+    hard = ("You generate a concise chat title.\n"
+            "Return ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). "
+            "No trailing punctuation. Max 6 words.")
+    sys = f"{hard}\n\n{sys}" if sys else hard
+
+    user_text = f"{S('retitle_user_prefix')}{src}{S('retitle_user_suffix')}"
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user_text},
+    ]
+
+    out = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=int(S("retitle_llm_max_tokens")),
+        temperature=float(S("retitle_llm_temperature")),
+        top_p=float(S("retitle_llm_top_p")),
+        stream=False,
+        stop=S("retitle_llm_stop"),
+    )
+    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
+    raw = re.sub(r"(?i)^(?:how\s+to|to)\s+", "", raw).strip()
+    raw = re.sub(r"^`{1,3}|`{1,3}$", "", raw).strip()
+    raw = re.sub(r"[.:;,\-\s]+$", "", raw)
+    return raw
+
+async def start_worker():
+    while True:
+        sid = await _queue.get()
+        try:
+            await _process_session(sid)
+        except Exception:
+            logging.exception("Retitle worker failed")
+        finally:
+            _queue.task_done()
+
+def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
+    msgs = snapshot.get("messages") or []
+    job_seq = int(snapshot.get("job_seq") or 0)
+    return msgs, job_seq
+
+async def _process_session(session_id: str):
+    if not bool(S("retitle_enable")):
+        return
+    await asyncio.sleep(int(S("retitle_grace_ms")) / 1000.0)
+    waited = 0
+    backoff = int(S("retitle_active_backoff_start_ms"))
+    backoff_max = int(S("retitle_active_backoff_max_ms"))
+    backoff_total = int(S("retitle_active_backoff_total_ms"))
+    growth = float(S("retitle_active_backoff_growth"))
+    while is_active(session_id) and waited < backoff_total:
+        await asyncio.sleep(backoff / 1000.0)
         waited += backoff
         backoff = min(int(backoff * growth), backoff_max)
     async with _lock:
@@ -483,6 +1343,8 @@ export function RagPanel({
   inputTokensEst,
 }: RagPanelProps) {
   const routerNeeded = rag?.routerNeeded;
+  const routerSkipped = rag?.routerSkipped;
+  const routerSkippedReason = rag?.routerSkippedReason;
   const routerDecideSec = rag?.routerDecideSec;
   const embedSec = rag?.embedSec;
   const searchChatSec = rag?.searchChatSec;
@@ -498,12 +1360,16 @@ export function RagPanel({
     <div className="mt-2 text-[11px] text-gray-700">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
         <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-          RAG: <b>{ragWasInjected ? "injected" : "skipped"}</b>{" "}
-          {rag?.mode ? `(${rag.mode})` : rag?.sessionOnly ? "(session-only)" : ""}
+          RAG: <b>{ragWasInjected ? "injected" : "skipped"}</b> {rag?.mode ? `(${rag.mode})` : rag?.sessionOnly ? "(session-only)" : ""}
         </span>
         {"routerNeeded" in rag && (
           <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
             router: <b>{routerNeeded ? "yes" : "no"}</b>
+          </span>
+        )}
+        {routerSkipped && (
+          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
+            skipped {routerSkippedReason ? `(${routerSkippedReason})` : ""}
           </span>
         )}
         {"routerDecideSec" in rag && (
@@ -540,29 +1406,20 @@ export function RagPanel({
         {hitsGlobal != null && (
           <span className="px-1.5 py-0.5 rounded bg-gray-100 border">global=<b>{hitsGlobal}</b></span>
         )}
-
-        {(rag.ragTokensAdded != null ||
-          rag.blockTokens != null ||
-          rag.blockTokensApprox != null ||
-          rag.sessionOnlyTokensApprox != null) && (
+        {(rag.ragTokensAdded != null || rag.blockTokens != null || rag.blockTokensApprox != null || rag.sessionOnlyTokensApprox != null) && (
           <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
             +RAG tokens=<b>{ragDelta}</b>
             {inputTokensEst ? ` (${ragPctOfInput}% of input)` : ""}
           </span>
         )}
-
         {blockChars != null && (
           <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
             block chars=<b>{blockChars}</b>
           </span>
         )}
       </div>
-
       {routerQuery && (
-        <div
-          className="mt-1 text-[10px] text-gray-500 truncate"
-          title={routerQuery}
-        >
+        <div className="mt-1 text-[10px] text-gray-500 truncate" title={routerQuery}>
           query: {routerQuery}
         </div>
       )}
@@ -589,42 +1446,21 @@ export function WebPanel({ web }: WebPanelProps) {
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
         <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
           WEB: <b>{webWasInjected ? "injected" : "skipped"}</b>
-          {webNeeded !== undefined ? (
-            <> (router: <b>{webNeeded ? "need" : "no"}</b>)</>
-          ) : null}
+          {webNeeded !== undefined ? <> (router: <b>{webNeeded ? "need" : "no"}</b>)</> : null}
         </span>
-        {"elapsedSec" in web && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            route {fmtSec(webRouteSec)}
-          </span>
-        )}
-        {"fetchElapsedSec" in web && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            fetch {fmtSec(webFetchSec)}
-          </span>
-        )}
-        {"injectElapsedSec" in web && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            inject {fmtSec(webInjectSec)}
-          </span>
-        )}
-        {"blockChars" in web && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            block chars=<b>{webBlockChars}</b>
-          </span>
-        )}
-        {"ephemeralBlocks" in web && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            eph blocks=<b>{webEphemeralBlocks}</b>
-          </span>
-        )}
+        {"elapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">route {fmtSec(webRouteSec)}</span>}
+        {"fetchElapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">fetch {fmtSec(webFetchSec)}</span>}
+        {"injectElapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">inject {fmtSec(webInjectSec)}</span>}
+        {"blockChars" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">block chars=<b>{webBlockChars}</b></span>}
+        {"ephemeralBlocks" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">eph blocks=<b>{webEphemeralBlocks}</b></span>}
+        {web.droppedFromSummary && (
+  <span className="px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800">
+    dropped after turn
+  </span>
+)}
       </div>
-
       {summarizedQuery && (
-        <div
-          className="mt-1 text-[10px] text-gray-500 truncate"
-          title={summarizedQuery}
-        >
+        <div className="mt-1 text-[10px] text-gray-500 truncate" title={summarizedQuery}>
           query: {summarizedQuery}
         </div>
       )}
@@ -664,77 +1500,21 @@ export function TimingPanel({
   return (
     <div className="mt-2 text-[11px] text-gray-700">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-          ttft {fmtSec(timing.ttftSec ?? undefined)}
-        </span>
-        {"queueWaitSec" in timing && timing.queueWaitSec != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            queue {fmtSec(timing.queueWaitSec)}
-          </span>
-        )}
-        {"genSec" in timing && timing.genSec != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            gen {fmtSec(timing.genSec)}
-          </span>
-        )}
-        {"totalSec" in timing && timing.totalSec != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            total {fmtSec(timing.totalSec)}
-          </span>
-        )}
-        {!!enginePromptSec && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            prefill {fmtSec(enginePromptSec)}
-          </span>
-        )}
-        {!!engineEvalSec && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            eval {fmtSec(engineEvalSec)}
-          </span>
-        )}
-        {!!engineLoadSec && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            load {fmtSec(engineLoadSec)}
-          </span>
-        )}
-        {enginePromptN != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            promptN={enginePromptN}
-          </span>
-        )}
-        {engineEvalN != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            evalN={engineEvalN}
-          </span>
-        )}
-        {!!preModelSec && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            pre-model {fmtSec(preModelSec)}
-          </span>
-        )}
-        {!!modelQueueSec && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            model-queue {fmtSec(modelQueueSec)}
-          </span>
-        )}
-        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-          unattributed {fmtSec(unattributed)}
-        </span>
-        {encodeTps != null && (
-          <span className="px-1.5 py-0.5 rounded bg-green-50 border border-green-200 text-green-800">
-            encode <b>{fmtTps(encodeTps)}</b> tok/s
-          </span>
-        )}
-        {decodeTps != null && (
-          <span className="px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-800">
-            decode <b>{fmtTps(decodeTps)}</b> tok/s
-          </span>
-        )}
-        {overallTps != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-50 border">
-            overall <b>{fmtTps(overallTps)}</b> tok/s
-          </span>
-        )}
+        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">ttft {fmtSec(timing.ttftSec ?? undefined)}</span>
+        {"queueWaitSec" in timing && timing.queueWaitSec != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">queue {fmtSec(timing.queueWaitSec)}</span>}
+        {"genSec" in timing && timing.genSec != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">gen {fmtSec(timing.genSec)}</span>}
+        {"totalSec" in timing && timing.totalSec != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">total {fmtSec(timing.totalSec)}</span>}
+        {!!enginePromptSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">prefill {fmtSec(enginePromptSec)}</span>}
+        {!!engineEvalSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">eval {fmtSec(engineEvalSec)}</span>}
+        {!!engineLoadSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">load {fmtSec(engineLoadSec)}</span>}
+        {enginePromptN != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">promptN={enginePromptN}</span>}
+        {engineEvalN != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">evalN={engineEvalN}</span>}
+        {!!preModelSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">pre-model {fmtSec(preModelSec)}</span>}
+        {!!modelQueueSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">model-queue {fmtSec(modelQueueSec)}</span>}
+        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">unattributed {fmtSec(unattributed)}</span>
+        {encodeTps != null && <span className="px-1.5 py-0.5 rounded bg-green-50 border border-green-200 text-green-800">encode <b>{fmtTps(encodeTps)}</b> tok/s</span>}
+        {decodeTps != null && <span className="px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-800">decode <b>{fmtTps(decodeTps)}</b> tok/s</span>}
+        {overallTps != null && <span className="px-1.5 py-0.5 rounded bg-gray-50 border">overall <b>{fmtTps(overallTps)}</b> tok/s</span>}
       </div>
     </div>
   );
@@ -1983,16 +2763,9 @@ export default function MarkdownMessage({ text }: Props) {
 # ===== frontend/src/file_read/components/MetricsHoverCard.tsx =====
 
 // frontend/src/file_read/components/MetricsHoverCard.tsx
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Info, Copy, Check, X } from "lucide-react";
-import type { RunJson } from "../shared/lib/runjson";
-import {
-  getNormalizedBudget,
-  getRagTelemetry,
-  getWebTelemetry,
-  getTimingMetrics,
-  getPackTelemetry,
-} from "../shared/lib/runjson";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Info } from "lucide-react";
+import MetricsHoverCardPanel from "./MetricsHoverCardPanel";
 
 type Props = {
   data: unknown;
@@ -2010,219 +2783,28 @@ export default function MetricsHoverCard({
   compact = true,
 }: Props) {
   const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-
   const btnRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-
-  const [panelStyle, setPanelStyle] = useState<{
-    top: number;
-    left: number;
-    width: number;
-  } | null>(null);
-
-  const json = useMemo(() => {
-    try {
-      const r = (data ?? null) as RunJson | null;
-      if (!r || typeof r !== "object") return JSON.stringify(data, null, 2);
-
-      const nb = getNormalizedBudget(r);
-      const rag = getRagTelemetry(r) as any | null;
-      const web = getWebTelemetry(r) as any | null;
-      const pack = getPackTelemetry(r) as any | null;
-      const timing = getTimingMetrics(r) as any | null;
-
-      const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-
-      const modelCtx = nb ? num(nb.modelCtx) : null;
-      const clampMargin = nb ? num(nb.clampMargin) : null;
-      const inputTokensEst = nb ? num(nb.inputTokensEst) : null;
-      const outBudgetChosen = nb ? num(nb.outBudgetChosen) : null;
-      const outActual = num(r?.stats?.predictedTokensCount as any);
-      const outShown = outActual || (outBudgetChosen ?? 0);
-
-      const webRouteSec = web?.elapsedSec;
-      const webFetchSec = web?.fetchElapsedSec;
-      const webInjectSec = web?.injectElapsedSec;
-      const webPre =
-        num(web?.breakdown?.totalWebPreTtftSec) ||
-        (num(webRouteSec) + num(webFetchSec) + num(webInjectSec));
-
-      const ragDelta = Math.max(
-        0,
-        num(rag?.ragTokensAdded) ||
-          num(rag?.blockTokens) ||
-          num(rag?.blockTokensApprox) ||
-          num(rag?.sessionOnlyTokensApprox)
-      );
-      const ragPctOfInput =
-        (inputTokensEst && inputTokensEst > 0) ? Math.round((ragDelta / inputTokensEst) * 100) : 0;
-
-      const packPackSec = num(pack?.packSec);
-      const packSummarySec = num(pack?.summarySec);
-      const packFinalTrimSec = num(pack?.finalTrimSec);
-      const packCompressSec = num(pack?.compressSec);
-
-      const preModelSec = num(timing?.preModelSec);
-      const modelQueueSec = num(timing?.modelQueueSec);
-      const genSec = num(timing?.genSec);
-      const ttftSec = num(timing?.ttftSec);
-
-      const breakdown =
-        (r as any)?.budget_view?.breakdown ||
-        (r as any)?.stats?.budget?.breakdown ||
-        null;
-
-      const preAccountedFromBackend = breakdown?.preTtftAccountedSec;
-      const accountedFallback =
-        webPre +
-        num(rag?.routerDecideSec) +
-        num(rag?.injectBuildSec ?? rag?.blockBuildSec ?? rag?.sessionOnlyBuildSec) +
-        packPackSec +
-        packSummarySec +
-        packFinalTrimSec +
-        packCompressSec +
-        preModelSec +
-        modelQueueSec;
-
-      const accounted = Number.isFinite(preAccountedFromBackend)
-        ? preAccountedFromBackend
-        : accountedFallback;
-
-      const unattributed =
-        (breakdown && Number.isFinite(breakdown.unattributedTtftSec))
-          ? breakdown.unattributedTtftSec
-          : Math.max(0, ttftSec - accounted);
-
-      const promptTok = num(r?.stats?.promptTokensCount as any) || (inputTokensEst ?? 0);
-      const decodeTok = num(r?.stats?.predictedTokensCount as any);
-      const encodeTps = modelQueueSec > 0 ? promptTok / modelQueueSec : null;
-      const decodeTps = genSec > 0 ? decodeTok / genSec : null;
-
-      const totalTok =
-        typeof r?.stats?.totalTokensCount === "number"
-          ? (r.stats!.totalTokensCount as number)
-          : (promptTok + decodeTok);
-      const totalSecForOverall =
-        typeof r?.stats?.totalTimeSec === "number"
-          ? (r.stats!.totalTimeSec as number)
-          : num(timing?.totalSec);
-      const overallTps =
-        totalSecForOverall > 0 ? totalTok / totalSecForOverall : null;
-
-      const usedCtx = (inputTokensEst ?? 0) + outShown + (clampMargin ?? 0);
-      const ctxPct = modelCtx && modelCtx > 0 ? Math.max(0, Math.min(100, (usedCtx / modelCtx) * 100)) : null;
-
-      const augmented = {
-        ...r,
-        _derived: {
-          context: {
-            modelCtx,
-            clampMargin,
-            inputTokensEst,
-            outBudgetChosen,
-            outActual,
-            outShown,
-            usedCtx,
-            ctxPct,
-          },
-          rag: {
-            ragDelta,
-            ragPctOfInput,
-          },
-          web: {
-            webPre,
-          },
-          timing: {
-            accountedPreTtftSec: accounted,
-            unattributedPreTtftSec: unattributed,
-            preModelSec,
-            modelQueueSec,
-            genSec,
-            ttftSec,
-          },
-          throughput: {
-            encodeTokPerSec: encodeTps,
-            decodeTokPerSec: decodeTps,
-            overallTokPerSec: overallTps,
-          },
-        },
-      };
-
-      return JSON.stringify(augmented, null, 2);
-    } catch {
-      return String(data ?? "");
-    }
-  }, [data]);
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(json);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {}
-  }
-
-  function close() {
-    setOpen(false);
-  }
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close();
-        btnRef.current?.focus();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (panelRef.current?.contains(t)) return;
-      if (btnRef.current?.contains(t)) return;
-      close();
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+  const [panelStyle, setPanelStyle] = useState<{ top: number; left: number; width: number } | null>(null);
 
   useLayoutEffect(() => {
     function place() {
       if (!open || !btnRef.current) return;
-
       const margin = 8;
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const width = Math.min(maxWidthPx, vw - margin * 2);
-
       const btnBox = btnRef.current.getBoundingClientRect();
-      let left =
-        align === "right" ? btnBox.right - width : btnBox.left;
+      let left = align === "right" ? btnBox.right - width : btnBox.left;
       left = Math.max(margin, Math.min(left, vw - margin - width));
-
       let top = btnBox.bottom + margin;
-
       let panelH = panelRef.current?.offsetHeight || 0;
-      if (!panelH) {
-        panelH = 360 + 44;
-      }
-
-      if (top + panelH > vh - margin) {
-        top = Math.max(margin, btnBox.top - margin - panelH);
-      }
-
+      if (!panelH) panelH = 360 + 44;
+      if (top + panelH > vh - margin) top = Math.max(margin, btnBox.top - margin - panelH);
       setPanelStyle({ top, left, width });
     }
-
     place();
     if (!open) return;
-
     const onReflow = () => place();
     window.addEventListener("resize", onReflow);
     window.addEventListener("scroll", onReflow, true);
@@ -2232,815 +2814,32 @@ export default function MetricsHoverCard({
     };
   }, [open, align, maxWidthPx]);
 
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+        btnRef.current?.focus();
+      }
+    };
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (btnRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+
   return (
     <div className="relative inline-block">
       <button
         ref={btnRef}
         type="button"
-        className={`inline-flex items-center justify-center rounded border bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition ${
-          compact ? "h-7 w-7" : "h-8 w-8"
-        }`}
-        title="Show run JSON"
-        aria-haspopup="dialog"
-        aria-expanded={open ? "true" : "false"}
-        onClick={() => setOpen((v) => !v)}
-        onMouseEnter={() => setOpen(true)}
-      >
-        <Info className={compact ? "w-4 h-4" : "w-5 h-5"} />
-      </button>
-
-      {open && panelStyle && (
-        <div
-          ref={panelRef}
-          role="dialog"
-          aria-label={title}
-          className="fixed z-50"
-          style={{
-            top: panelStyle.top,
-            left: panelStyle.left,
-            width: panelStyle.width,
-          }}
-          onMouseLeave={close}
-        >
-          <div className="rounded-xl border bg-white shadow-xl overflow-hidden">
-            <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
-              <div className="text-xs font-semibold text-gray-700">{title}</div>
-              <div className="flex items-center gap-1">
-                <button
-                  className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
-                  onClick={copy}
-                  title="Copy JSON"
-                >
-                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                </button>
-                <button
-                  className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
-                  onClick={close}
-                  title="Close"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            <div className="p-3">
-              <pre className="m-0 p-0 text-xs leading-relaxed overflow-auto" style={{ maxHeight: 360 }}>
-                <code>{json}</code>
-              </pre>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/MobileDrawer.tsx =====
-
-import { useState } from "react";
-import { PanelLeftOpen } from "lucide-react";
-import ChatSidebar from "./ChatSidebar/ChatSidebar";
-
-export default function MobileDrawer({ ...props }) {
-  const {
-    onOpenSession, onNewChat, refreshKey, activeId,
-    openMobileDrawer, closeMobileDrawer,
-  } = props;
-
-  const [mounted, setMounted] = useState(false);
-
-  return (
-    <>
-      {/* Mobile top bar */}
-      <div className="md:hidden fixed top-0 left-0 right-0 z-40 bg-white border-b">
-        <div className="h-14 flex items-center justify-between px-3">
-          <button
-            className="inline-flex items-center justify-center h-9 w-9 rounded-lg border hover:bg-gray-50"
-            onClick={() => { setMounted(true); openMobileDrawer(); }}  // ⬅️ mount on open
-            aria-label="Open sidebar"
-            title="Open sidebar"
-          >
-            <PanelLeftOpen className="w-4 h-4" />
-          </button>
-          <div className="font-semibold">Local AI Model</div>
-          <div className="w-9" />
-        </div>
-      </div>
-
-      {/* Backdrop */}
-      <div
-        id="mobile-backdrop"
-        className="md:hidden fixed inset-0 z-40 bg-black/40 hidden"
-        onClick={() => { setMounted(false); closeMobileDrawer(); }}  // ⬅️ unmount on close
-      />
-
-      {/* Drawer */}
-      <aside
-        id="mobile-drawer"
-        role="dialog"
-        aria-modal="true"
-        className="md:hidden fixed inset-y-0 left-0 z-50 w-80 max-w-[85vw] bg-white border-r shadow-xl hidden animate-[slideIn_.2s_ease-out]"
-      >
-        <div className="h-14 flex items-center justify-between px-3 border-b">
-          <div className="font-medium">Chats</div>
-          <button
-            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
-            onClick={() => { setMounted(false); closeMobileDrawer(); }}  // ⬅️ unmount on close
-            aria-label="Close sidebar"
-          >
-            <span className="rotate-45 text-xl leading-none">+</span>
-          </button>
-        </div>
-
-        {mounted && (                                             // ⬅️ only mount when open
-          <ChatSidebar
-            onOpen={async (id) => { await onOpenSession(id); setMounted(false); closeMobileDrawer(); }}
-            onNew={async () => { await onNewChat(); setMounted(false); closeMobileDrawer(); }}
-            refreshKey={refreshKey}
-            activeId={activeId}
-          />
-        )}
-      </aside>
-
-      <style>{`@keyframes slideIn{from{transform:translateX(-12px);opacity:.0}to{transform:translateX(0);opacity:1}}`}</style>
-    </>
-  );
-}
-
-# ===== frontend/src/file_read/components/SettingsPanel.tsx =====
-
-import { useEffect, useMemo, useState } from "react";
-import { useSettings } from "../hooks/useSettings";
-
-export default function SettingsPanel({ sessionId, onClose }: { sessionId?: string; onClose?: () => void }) {
-  const { loading, error, effective, overrides, defaults, adaptive, saveOverrides, runAdaptive, reload } =
-    useSettings(sessionId);
-
-  const [tab, setTab] = useState<"effective"|"overrides"|"adaptive"|"defaults">("effective");
-  const [draft, setDraft] = useState(() => JSON.stringify(overrides ?? {}, null, 2));
-  const [saveBusy, setSaveBusy] = useState(false);
-  const [saveErr, setSaveErr] = useState<string | null>(null);
-
-  useEffect(() => { setDraft(JSON.stringify(overrides ?? {}, null, 2)); }, [overrides]);
-
-  const view = useMemo(() => {
-    switch (tab) {
-      case "effective": return effective;
-      case "adaptive":  return adaptive;
-      case "defaults":  return defaults;
-      case "overrides": return null;
-    }
-  }, [tab, effective, adaptive, defaults]);
-
-  async function onSave(method: "patch" | "put") {
-    setSaveErr(null); setSaveBusy(true);
-    try {
-      const parsed = draft.trim() ? JSON.parse(draft) : {};
-      await saveOverrides(parsed, method);
-    } catch (e: any) {
-      setSaveErr(e?.message || "Invalid JSON or save failed");
-    } finally {
-      setSaveBusy(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
-      <div className="w-full max-w-4xl rounded-2xl bg-white shadow-xl border">
-        {/* header */}
-        <div className="px-4 py-3 border-b flex items-center gap-2">
-          <div className="font-semibold">Settings</div>
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
-              onClick={() => runAdaptive()}
-              title="Recompute adaptive with current context"
-            >
-              Recompute Adaptive
-            </button>
-            <button
-              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
-              onClick={() => reload()}
-              title="Reload"
-            >
-              Reload
-            </button>
-            <button
-              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
-              onClick={onClose}
-              title="Close"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-
-        {/* tabs */}
-        <div className="px-4 py-2 border-b">
-          {(["effective","overrides","adaptive","defaults"] as const).map(key => (
-            <button
-              key={key}
-              onClick={() => setTab(key)}
-              className={`text-xs mr-2 px-3 py-1.5 rounded ${tab===key ? "bg-black text-white" : "border hover:bg-gray-50"}`}
-            >
-              {key}
-            </button>
-          ))}
-        </div>
-
-        {/* body */}
-        <div className="p-4">
-          {loading && <div className="text-sm text-gray-500">Loading…</div>}
-          {error && <div className="text-sm text-red-600">{error}</div>}
-
-          {tab !== "overrides" && (
-            <pre className="text-xs bg-gray-50 border rounded p-3 overflow-auto max-h-[60vh]">
-              {JSON.stringify(view ?? {}, null, 2)}
-            </pre>
-          )}
-
-          {tab === "overrides" && (
-            <div className="space-y-2">
-              <div className="text-xs text-gray-600">
-                Edit <code>user_overrides</code> JSON. Use <b>Patch</b> to merge or <b>Replace</b> to overwrite.
-              </div>
-              <textarea
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                className="w-full h-[50vh] border rounded p-2 font-mono text-xs"
-                spellCheck={false}
-              />
-              <div className="flex items-center gap-2">
-                <button
-                  className={`text-xs px-3 py-1.5 rounded ${saveBusy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"}`}
-                  disabled={saveBusy}
-                  onClick={() => onSave("patch")}
-                  title="Deep-merge with existing overrides"
-                >
-                  Save (Patch)
-                </button>
-                <button
-                  className={`text-xs px-3 py-1.5 rounded border ${saveBusy ? "opacity-60 cursor-not-allowed" : "hover:bg-gray-50"}`}
-                  disabled={saveBusy}
-                  onClick={() => onSave("put")}
-                  title="Replace overrides entirely"
-                >
-                  Save (Replace)
-                </button>
-                {saveErr && <div className="text-xs text-red-600 ml-2">{saveErr}</div>}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/data/chatApi.ts =====
-
-import type { Attachment, ChatRow, ChatMessageRow} from "../types/chat";
-import { request } from "../services/http";
-
-// Spring Page<T> type
-export type PageResp<T> = {
-  content: T[];
-  totalElements: number;
-  totalPages: number;
-  size: number;
-  number: number;      // current page index (0-based)
-  first: boolean;
-  last: boolean;
-  empty: boolean;
-};
-
-export function createChat(sessionId: string, title: string) {
-  return request<ChatRow>("/api/chats", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, title }),
-  });
-}
-
-export function updateChatLast(sessionId: string, lastMessage: string, title?: string) {
-  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lastMessage, title: title || "" }),
-  });
-}
-
-// Legacy (unused after pagination in sidebar)
-export function listChats() {
-  return request<ChatRow[]>("/api/chats");
-}
-
-// NEW: paginated list
-export function listChatsPage(page = 0, size = 30, ceiling?: string) {
-  const qs = new URLSearchParams({ page: String(page), size: String(size) });
-  if (ceiling) qs.set("ceiling", ceiling);
-  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
-}
-
-export function listMessages(sessionId: string) {
-  return request<ChatMessageRow[]>(`/api/chats/${encodeURIComponent(sessionId)}/messages`);
-}
-
-export async function appendMessage(
-  sessionId: string,
-  role: "user" | "assistant",
-  content: string,
-  attachments?: Attachment[]
-) {
-  const body: any = { role, content };
-  if (attachments && attachments.length) body.attachments = attachments;
-
-  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
-
-export async function deleteChatsBatch(sessionIds: string[]) {
-  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionIds }),
-  });
-  return data.deleted;
-}
-
-export function deleteMessage(sessionId: string, messageId: string | number) {
-  return request<{ deleted: number }>(
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
-    { method: "DELETE" }
-  );
-}
-
-/** Delete a batch of messages. Backend returns { deleted: number[] } */
-export function deleteMessagesBatch(sessionId: string, messageIds: (number | string)[]) {
-  const ids = messageIds
-    .map((id) => (typeof id === "string" ? Number(id) : id))
-    .filter((n) => Number.isFinite(n)) as number[];
-
-  return request<{ deleted: number[] }>(  // <-- number[]
-    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
-    {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messageIds: ids }),
-    }
-  );
-}
-
-# ===== frontend/src/file_read/data/ragApi.ts =====
-
-// frontend/src/file_read/data/ragApi.ts
-import { request, API_BASE } from "../services/http";
-
-export function uploadRag(file: File, sessionId?: string, forceGlobal = false) {
-  const form = new FormData();
-  form.append("file", file);
-  if (sessionId && !forceGlobal) form.append("sessionId", sessionId);
-
-  return request<{ ok: boolean; added: number }>(
-    "/api/rag/upload",
-    { method: "POST", body: form }
-  );
-}
-
-export function uploadRagWithProgress(
-  file: File,
-  sessionId: string,
-  onProgress: (pct: number) => void,
-  signal?: AbortSignal
-): Promise<{ ok: boolean; added: number }> {
-  return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("sessionId", sessionId);
-
-    const xhr = new XMLHttpRequest();
-    const url = `${API_BASE}/api/rag/upload`.replace(/([^:]\/)\/+/g, "$1");
-    xhr.open("POST", url);
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try { resolve(JSON.parse(xhr.responseText)); }
-        catch { resolve({ ok: true, added: 0 }); }
-      } else {
-        reject(new Error(`Upload failed (${xhr.status})`));
-      }
-    };
-
-    // treat abort as a silent resolution, not an error
-    xhr.onabort = () => resolve({ ok: false, added: 0 });
-    xhr.onerror = () => reject(new Error("Network error"));
-
-    if (signal) {
-      if (signal.aborted) { xhr.abort(); return resolve({ ok: false, added: 0 }); }
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    }
-
-    xhr.send(form);
-  });
-}
-
-
-export function searchRag(query: string, opts?: {
-  sessionId?: string;
-  kChat?: number;
-  kGlobal?: number;
-  alpha?: number; // hybrid_alpha
-}) {
-  const body = {
-    query,
-    sessionId: opts?.sessionId ?? undefined,
-    kChat: opts?.kChat ?? 6,
-    kGlobal: opts?.kGlobal ?? 4,
-    hybrid_alpha: opts?.alpha ?? 0.5,
-  };
-
-  return request<{
-    hits: Array<{
-      id?: string;
-      score: number;
-      source?: string;
-      title?: string;
-      text: string;
-      sessionId?: string | null;
-    }>;
-  }>(
-    "/api/rag/search",   // ✅ relative path, request() adds API_BASE
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }
-  );
-}
-
-export type UploadRow = {
-  source: string;
-  sessionId?: string | null;
-  chunks: number;
-};
-
-export async function listUploads(sessionId?: string, scope: "all" | "session" = "all") {
-  const p = new URLSearchParams();
-  if (sessionId) p.set("sessionId", sessionId);
-  if (scope) p.set("scope", scope);
-
-  return request<{ uploads: UploadRow[] }>(
-    `/api/rag/uploads?${p.toString()}`,
-    { method: "GET" }
-  );
-}
-
-export async function deleteUploadHard(source: string, sessionId?: string) {
-  return request<{ ok: boolean; removed: number; remaining: number }>(
-    `/api/rag/uploads/delete-hard`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, sessionId }),
-    }
-  );
-}
-
-# ===== frontend/src/file_read/data/settingsApi.ts =====
-
-// frontend/src/file_read/data/settingsApi.ts
-import { request } from "../services/http";
-
-export function getDefaults() {
-  return request<Record<string, any>>("/api/settings/defaults");
-}
-
-export function getAdaptive(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<Record<string, any>>(`/api/settings/adaptive${qs}`);
-}
-
-export function getOverrides() {
-  return request<Record<string, any>>("/api/settings/overrides");
-}
-
-export function getEffective(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<Record<string, any>>(`/api/settings/effective${qs}`);
-}
-
-export function putOverrides(overrides: Record<string, any>) {
-  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(overrides), // ← send raw object
-  });
-}
-
-export function patchOverrides(patch: Record<string, any>) {
-  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch), // ← send raw object
-  });
-}
-
-export function recomputeAdaptive(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<{ ok: boolean; adaptive: any }>(
-    `/api/settings/adaptive/recompute${qs}`,
-    { method: "POST" }
-  );
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/buffer.ts =====
-
-// frontend/src/file_read/hooks/stream/core/buffer.ts
-import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
-import { extractRunJsonFromBuffer } from "../../../shared/lib/runjson";
-import { STOP_SENTINEL_AT_END } from "./constants";
-
-export type BufferStep = {
-  cleanText: string;
-  delta: string;
-  metrics?: { json?: RunJson; flat?: GenMetrics };
-};
-
-export function processChunk(prevClean: string, rawBufIn: string): BufferStep {
-  let rawBuf = rawBufIn;
-  if (STOP_SENTINEL_AT_END.test(rawBuf)) {
-    rawBuf = rawBuf.replace(STOP_SENTINEL_AT_END, "");
-  }
-  const { clean, json, flat } = extractRunJsonFromBuffer(rawBuf);
-  const delta = clean.slice(prevClean.length);
-  return { cleanText: clean, delta, metrics: json || flat ? { json, flat } : undefined };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/cancel.ts =====
-
-import { postCancel } from "./network";
-import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
-
-type Deps = {
-  getVisibleSid: () => string;
-  setLoadingFor: (sid: string, v: boolean) => void;
-  setQueuedFor: (sid: string, v: boolean) => void;
-  getController: () => AbortController | null;
-  getReader: () => ReadableStreamDefaultReader<Uint8Array> | null;
-  setCancelForSid: (sid: string | null) => void;
-  isActiveSid: (sid: string) => boolean;
-  dropJobsForSid: (sid: string) => void;
-};
-
-export function createCanceller(d: Deps) {
-  async function cancelBySessionId(id: string) {
-    // Mark as canceled so read loop can react, but DO NOT abort fetch yet.
-    d.setCancelForSid(id);
-
-    // Tell the backend to stop gracefully (flush metrics + close).
-    postCancel(id).catch(() => {});
-
-    if (d.isActiveSid(id)) {
-      // Drop any queued jobs for this session, but keep loading true —
-      // runStreamOnce will turn loading off in its finally after the stream ends.
-      d.dropJobsForSid(id);
-      d.setQueuedFor(id, false);
-
-      // Safety net: if server doesn’t flush within timeout, hard-abort.
-      window.setTimeout(() => {
-        if (d.isActiveSid(id)) {
-          try { d.getReader()?.cancel(); } catch {}
-          try { d.getController()?.abort(); } catch {}
-        }
-      }, STOP_FLUSH_TIMEOUT_MS + 500);
-    } else {
-      // Not active: just clear queued jobs and cancel flag.
-      d.dropJobsForSid(id);
-      d.setQueuedFor(id, false);
-      d.setCancelForSid(null);
-    }
-  }
-
-  async function stopVisible() {
-    const id = d.getVisibleSid();
-    await cancelBySessionId(id);
-  }
-
-  return { cancelBySessionId, stopVisible };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/constants.ts =====
-
-// frontend/src/file_read/hooks/stream/core/constants.ts
-export const STOP_SENTINEL_AT_END = /(?:\r?\n)?\u23F9 stopped(?:\r?\n)?$/u;
-export const STOP_FLUSH_TIMEOUT_MS = 3500;
-
-# ===== frontend/src/file_read/hooks/stream/core/controller.ts =====
-
-import { appendMessage } from "../../../data/chatApi";
-import type { StreamController, StreamCoreOpts } from "./types";
-import { createScheduler, type QueueItem } from "./queue";
-import { createCanceller } from "./cancel";
-import { runStreamOnce } from "./runner";
-import type { Attachment } from "../../../types/chat";
-
-export function createStreamController(opts: StreamCoreOpts): StreamController {
-  let cancelForSid: string | null = null;
-  let controllerRef: AbortController | null = null;
-  let readerRef: ReadableStreamDefaultReader<Uint8Array> | null = null;
-
-  const scheduler = createScheduler(async (job: QueueItem) => {
-    try { opts.setQueuedFor(job.sid, false); } catch {}
-    await runStreamOnce(job, {
-      opts,
-      getCancelForSid: () => cancelForSid,
-      clearCancelIf: (sid) => { if (cancelForSid === sid) cancelForSid = null; },
-      setController: (c) => { controllerRef = c; },
-      setReader: (r) => { readerRef = r; },
-    });
-  });
-
-  const canceller = createCanceller({
-    getVisibleSid: opts.getSessionId,
-    setLoadingFor: opts.setLoadingFor,
-    setQueuedFor: opts.setQueuedFor,
-    getController: () => controllerRef,
-    getReader: () => readerRef,
-    setCancelForSid: (sid) => { cancelForSid = sid; },
-    isActiveSid: scheduler.isActiveSid,
-    dropJobsForSid: scheduler.dropJobsForSid,
-  });
-
-  async function send(override?: string, attachments?: Attachment[]) {
-    const prompt = (override ?? "").trim();
-    const atts = (attachments ?? []).filter(Boolean);
-    if (!prompt && atts.length === 0) return; // allow attachments-only, but not truly empty
-
-    await opts.ensureChatCreated();
-    const sid = opts.getSessionId();
-
-    const userCid = crypto.randomUUID();
-    const asstCid = crypto.randomUUID();
-
-    // optimistic bubbles
-    opts.setMessagesFor(sid, (prev) => [
-      ...prev,
-      { id: userCid, serverId: null, role: "user", text: prompt, attachments: atts.length ? atts : undefined },
-      { id: asstCid, serverId: null, role: "assistant", text: "" },
-    ]);
-    opts.setInput("");
-
-    // persist user
-    appendMessage(sid, "user", prompt, atts.length ? atts : undefined)
-      .then((row) => {
-        if (row?.id != null) {
-          opts.setServerIdFor(sid, userCid, Number(row.id));
-          try {
-            window.dispatchEvent(
-              new CustomEvent("chats:refresh", {
-                detail: {
-                  sessionId: sid,
-                  lastMessage: prompt,
-                  updatedAt: new Date().toISOString(),
-                },
-              })
-            );
-          } catch {}
-        }
-      })
-      .catch(() => {});
-
-    // enqueue generation with attachments
-    try { opts.setQueuedFor(sid, true); } catch {}
-    scheduler.enqueue({ sid, prompt, asstId: asstCid, attachments: atts.length ? atts : undefined });
-  }
-
-  async function stop() { await canceller.stopVisible(); }
-  async function cancelBySessionId(id: string) { await canceller.cancelBySessionId(id); }
-  function dispose() {
-    try { controllerRef?.abort(); } catch {}
-    try { readerRef?.cancel(); } catch {}
-    controllerRef = null; readerRef = null;
-  }
-
-  return { send, stop, cancelBySessionId, dispose };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/network.ts =====
-
-// frontend/src/file_read/hooks/stream/core/network.ts
-import { API_BASE } from "../../../services/http";
-
-export async function postStream(body: unknown, signal: AbortSignal) {
-  const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-  return res.body.getReader();
-}
-
-export async function postCancel(sessionId: string) {
-  try {
-    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, {
-      method: "POST",
-    });
-  } catch {
-    /* best-effort */
-  }
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/queue.ts =====
-
-// frontend/src/file_read/hooks/stream/core/queue.ts
-import type { Attachment } from "../../../types/chat";
-
-export type QueueItem = {
-  sid: string;
-  prompt: string;              // may be empty when attachments-only
-  asstId: string;              // client id of the assistant bubble to stream into
-  attachments?: Attachment[];  // optional attachments for this turn
-};
-
-export type RunJob = (job: QueueItem) => Promise<void>;
-
-export function createScheduler(runJob: RunJob) {
-  const q: QueueItem[] = [];
-  let active: { sid: string } | null = null;
-
-  async function startNext() {
-    if (active || q.length === 0) return;
-    const job = q.shift()!;
-    active = { sid: job.sid };
-    try {
-      await runJob(job);
-    } finally {
-      active = null;
-      if (q.length) void startNext();
-    }
-  }
-
-  return {
-    enqueue(job: QueueItem) {
-      q.push(job);
-      void startNext();
-    },
-    isActiveSid: (sid: string) => active?.sid === sid,
-    dropJobsForSid(sid: string) {
-      for (let i = q.length - 1; i >= 0; i--) {
-        if (q[i].sid === sid) q.splice(i, 1);
-      }
-    },
-    getActiveSid: () => active?.sid ?? null,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/stream/core/runner.ts =====
-
-// frontend/src/file_read/hooks/stream/core/runner.ts
-import { postStream } from "./network";
-import { ensureAssistantPlaceholder, snapshotPendingAssistant } from "./updater";
-import type { ChatMsg } from "../../../types/chat";
-import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
-import { readStreamLoop } from "./runner_stream";
-import {
-  pinLiveMetricsToSession,
-  pinLiveMetricsToBubble,
-  pinFallbackToSessionAndBubble,
-} from "./runner_metrics";
-import { persistAssistantTurn } from "./runner_persist";
-import type { QueueItem } from "./queue";
-import { listChatsPage } from "../../../data/chatApi";
-
-
-export type RunnerDeps = {
-  opts: {
-    ensureChatCreated: () => Promise<void>;
-    getSessionId: () => string;
-    getMessagesFor: (sid: string) => ChatMsg[];
-    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
-    setInput: (v: string) => void;
-    setLoadingFor: (sid: string, v: boolean) => void;
-    setQueuedFor: (sid: string, v: boolean) => void;
-    resetMetricsFor: (sid: string) => void;
-    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
-    onRetitle: (sid: string, finalText: string) => Promise<void>;
-    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
-  };
-  getCancelForSid: () => string | null;
-  clearCancelIf: (sid: string) => void;
-  setController: (c: AbortController | null) => void;
-  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
-};
-
-expo
+        className={`inline-flex items-ce

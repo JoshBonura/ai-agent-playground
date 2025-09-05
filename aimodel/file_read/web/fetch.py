@@ -8,18 +8,17 @@ import httpx
 try:
     from readability import Document
 except Exception:
-    Document = None  # type: ignore
+    Document = None  
 
 try:
     from bs4 import BeautifulSoup
 except Exception:
-    BeautifulSoup = None  # type: ignore
+    BeautifulSoup = None 
 
 try:
     from selectolax.parser import HTMLParser
 except Exception:
-    HTMLParser = None  # type: ignore
-
+    HTMLParser = None  
 from ..core.settings import SETTINGS
 
 

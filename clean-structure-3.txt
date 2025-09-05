@@ -1,4 +1,833 @@
-tr) -> ChatMeta:
+s") or 0)
+    telemetry["pack"]["rollOverageTokens"] = int(PACK_TELEMETRY.get("rollOverageTokens") or 0)
+
+    persist_summary(session_id, st["summary"])
+
+    budget_view = analyze_budget(
+        llm=llm,
+        messages=packed,
+        requested_out_tokens=out_budget_adj,
+        clamp_margin=int(eff["clamp_margin"]),
+        reserved_system_tokens=int(eff.get("reserved_system_tokens") or 0),
+    ).to_dict()
+
+    wb = _web_breakdown(telemetry.get("web", {}))
+    telemetry.setdefault("web", {})["breakdown"] = wb
+    telemetry["web"]["breakdown"]["unattributedWebSec"] = _web_unattributed(telemetry.get("web", {}), wb)
+    telemetry["web"]["breakdown"]["prepSec"] = float(telemetry.get("prepSec") or 0.0)
+
+    budget_view.setdefault("web", {}).update(telemetry.get("web", {}))
+    budget_view.setdefault("rag", {}).update(telemetry.get("rag", {}))
+    budget_view.setdefault("pack", {}).update(telemetry.get("pack", {}))
+
+    out_budget, input_tokens_est = clamp_out_budget(
+        llm=llm, messages=packed, requested_out=out_budget_adj, margin=int(eff["clamp_margin"])
+    )
+    budget_view.setdefault("request", {})
+    budget_view["request"]["outBudgetRequested"] = out_budget_adj
+    budget_view["request"]["temperature"] = temperature
+    budget_view["request"]["top_p"] = top_p
+
+    return Prep(
+        llm=llm,
+        session_id=session_id,
+        packed=packed,
+        st=st,
+        out_budget=out_budget,
+        input_tokens_est=input_tokens_est,
+        budget_view=budget_view,
+        temperature=temperature,
+        top_p=top_p,
+        t_request_start=t_request_start,
+    )
+
+# ===== aimodel/file_read/services/generate_pipeline_support.py =====
+
+# aimodel/file_read/services/generate_pipeline_support.py
+# utility helpers for generate pipeline; no inline comments per request
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+from ..utils.streaming import safe_token_count_messages
+
+@dataclass
+class Prep:
+    llm: Any
+    session_id: str
+    packed: List[Dict[str, str]]
+    st: Dict[str, Any]
+    out_budget: int
+    input_tokens_est: Optional[int]
+    budget_view: Dict[str, Any]
+    temperature: float
+    top_p: float
+    t_request_start: float
+
+def _bool(v, default: bool = False) -> bool:
+    try:
+        return bool(v)
+    except Exception:
+        return bool(default)
+
+def _tok_count(llm, messages: List[Dict[str, str]]) -> Optional[int]:
+    try:
+        return int(safe_token_count_messages(llm, messages))
+    except Exception:
+        return None
+
+def _approx_block_tokens(llm, role: str, text: str) -> Optional[int]:
+    return _tok_count(llm, [{"role": role, "content": text}])
+
+def _diff_find_inserted_block(before: List[Dict[str, str]], after: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    if len(after) - len(before) != 1:
+        return None
+    i = 0
+    while i < len(before) and before[i] == after[i]:
+        i += 1
+    if i < len(after):
+        return after[i]
+    return None
+
+def _dump_msgs(label: str, msgs: List[Dict[str, str]], head_chars: int = 180):
+    return
+
+def _web_breakdown(web: Dict[str, Any]) -> Dict[str, float]:
+    w = web or {}
+    orch = w.get("orchestrator") or {}
+    router = float(w.get("elapsedSec") or 0.0)
+    summarize = float((w.get("summarizer") or {}).get("elapsedSec") or 0.0)
+    inject = float(w.get("injectElapsedSec") or 0.0)
+    search_total = 0.0
+    s1 = (orch.get("search") or {})
+    for k in ("elapsedSecTotal", "elapsedSec"):
+        if isinstance(s1.get(k), (int, float)):
+            search_total = float(s1[k])
+            break
+    fetch1 = float((orch.get("fetch1") or {}).get("totalSec") or 0.0)
+    fetch2 = float((orch.get("fetch2") or {}).get("totalSec") or 0.0)
+    orch_elapsed = float(orch.get("elapsedSec") or w.get("fetchElapsedSec") or 0.0)
+    assemble = orch_elapsed - (search_total + fetch1 + fetch2)
+    if assemble < 0:
+        assemble = 0.0
+    total_pre_ttft = router + summarize + orch_elapsed + inject
+    return {
+        "routerSec": round(router, 6),
+        "summarizeSec": round(summarize, 6),
+        "searchSec": round(search_total, 6),
+        "fetchSec": round(fetch1, 6),
+        "jsFetchSec": round(fetch2, 6),
+        "assembleSec": round(assemble, 6),
+        "orchestratorSec": round(orch_elapsed, 6),
+        "injectSec": round(inject, 6),
+        "totalWebPreTtftSec": round(total_pre_ttft, 6),
+    }
+
+def _web_unattributed(web: Dict[str, Any], breakdown: Dict[str, float]) -> float:
+    total = float((web or {}).get("fetchElapsedSec") or 0.0)
+    explained = float(breakdown.get("searchSec", 0.0)) + float(breakdown.get("fetchSec", 0.0)) + float(breakdown.get("jsFetchSec", 0.0)) + float(breakdown.get("assembleSec", 0.0))
+    ua = total - explained
+    return round(ua if ua > 0 else 0.0, 6)
+
+def _enforce_fit(llm, eff: Dict[str, Any], packed: List[Dict[str, str]], out_budget_req: int) -> tuple[list[dict], int]:
+    tok = _tok_count(llm, packed) or 0
+    capacity = int(eff["model_ctx"]) - int(eff["clamp_margin"])
+    def drop_one(px):
+        keep_head = 2 if len(px) >= 2 and isinstance(px[1].get("content"), str) and px[1]["content"].startswith(eff["summary_header_prefix"]) else 1
+        if len(px) > keep_head + 1:
+            px.pop(keep_head)
+            return True
+        return False
+    def remove_ephemeral_blocks(px):
+        i = 0
+        removed = False
+        while i < len(px):
+            m = px[i]
+            if m.get("_ephemeral") is True:
+                px.pop(i)
+                removed = True
+            else:
+                i += 1
+        return removed
+    if tok + out_budget_req > capacity:
+        if remove_ephemeral_blocks(packed):
+            tok = _tok_count(llm, packed) or 0
+    while tok + out_budget_req > capacity and drop_one(packed):
+        tok = _tok_count(llm, packed) or 0
+    if tok >= capacity:
+        ob2 = 0
+    else:
+        ob2 = min(out_budget_req, max(0, capacity - tok))
+    return packed, ob2
+
+# ===== aimodel/file_read/services/packing.py =====
+
+# ===== aimodel/file_read/services/packing.py =====
+from __future__ import annotations
+from typing import Tuple, List, Dict, Optional, Any
+from ..rag.retrieve_pipeline import build_rag_block_with_telemetry, build_rag_block_session_only_with_telemetry
+from ..core.settings import SETTINGS
+from ..core.packing_ops import build_system, pack_messages, roll_summary_if_needed
+
+def build_system_text() -> str:
+    eff = SETTINGS.effective()
+    base = build_system(
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
+    )
+    guidance = str(eff["packing_guidance"])
+    return base + guidance
+
+def pack_with_rollup(
+    *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
+    ephemeral: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[List[Dict[str, str]], str, int]:
+    eff = SETTINGS.effective()
+
+    packed, input_budget = pack_messages(
+        style=str(eff["pack_style"]),
+        short=bool(eff["pack_short"]),
+        bullets=bool(eff["pack_bullets"]),
+        summary=summary,
+        recent=recent,
+        max_ctx=max_ctx,
+        out_budget=out_budget,
+    )
+
+    packed, new_summary = roll_summary_if_needed(
+        packed=packed,
+        recent=recent,
+        summary=summary,
+        input_budget=input_budget,
+        system_text=system_text,
+    )
+
+    if ephemeral:
+        last_user_idx = None
+        for i in range(len(packed) - 1, -1, -1):
+            m = packed[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user_idx = i
+                break
+        eph = list(ephemeral)
+        if last_user_idx is not None:
+            packed = packed[:last_user_idx] + eph + packed[last_user_idx:]
+        else:
+            packed = packed + eph
+
+    return packed, new_summary, input_budget
+
+def maybe_inject_rag_block(
+    messages: list[dict],
+    *,
+    session_id: str | None,
+    skip_rag: bool = False,
+    rag_query: str | None = None,
+    force_session_only: bool = False,  # NEW
+) -> tuple[list[dict], Optional[Dict[str, Any]], Optional[str]]:
+    if skip_rag:
+        return messages, None, None
+    if not SETTINGS.get("rag_enabled", True):
+        return messages, None, None
+    if not messages or messages[-1].get("role") != "user":
+        return messages, None, None
+
+    user_q = rag_query or (messages[-1].get("content") or "")
+
+    # NEW: choose session-only vs global
+    use_session_only = force_session_only or (not SETTINGS.get("rag_global_enabled", True))
+
+    if use_session_only and SETTINGS.get("rag_session_enabled", True):
+        from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
+        block, tel = build_rag_block_session_only_with_telemetry(user_q, session_id=session_id)
+        mode = "session-only"
+    else:
+        from ..rag.retrieve_pipeline import build_rag_block_with_telemetry
+        block, tel = build_rag_block_with_telemetry(user_q, session_id=session_id)
+        mode = "global"
+
+    if not block:
+        print(f"[RAG INJECT] no hits (session={session_id}) q={(user_q or '')!r}")
+        return messages, None, None
+
+    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)} mode={mode}")
+    injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
+    tel = dict(tel or {})
+    tel["injected"] = True
+    tel["mode"] = mode
+    return injected, tel, block
+
+# ===== aimodel/file_read/services/prompt_utils.py =====
+
+from __future__ import annotations
+import json
+from datetime import datetime
+from typing import Dict, List
+
+
+def now_str() -> str:
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+def chars_len(msgs: List[object]) -> int:
+    total = 0
+    for m in msgs:
+        if isinstance(m, dict):
+            c = m.get("content")
+        else:
+            c = m
+        if isinstance(c, str):
+            total += len(c)
+        elif c is None:
+            continue
+        else:
+            try:
+                total += len(json.dumps(c, ensure_ascii=False))
+            except Exception:
+                pass
+    return total
+
+
+def dump_full_prompt(
+    messages: List[Dict[str, object]],
+    *,
+    params: Dict[str, object],
+    session_id: str,
+) -> None:
+    try:
+        print(f"[{now_str()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
+        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
+        print(f"[{now_str()}] PROMPT DUMP END   session={session_id}")
+    except Exception as e:
+        print(f"[{now_str()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
+
+# ===== aimodel/file_read/services/router_text.py =====
+
+from __future__ import annotations
+from typing import Optional, List
+from ..core.settings import SETTINGS
+
+
+def compose_router_text(
+    recent,
+    latest_user_text: str,
+    summary: str,
+    *,
+    tail_turns: Optional[int] = None,
+    summary_chars: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> str:
+    eff = SETTINGS.effective()
+    tt = int(eff["router_tail_turns"]) if tail_turns is None else int(tail_turns)
+    sc = int(eff["router_summary_chars"]) if summary_chars is None else int(summary_chars)
+    mc = int(eff["router_max_chars"]) if max_chars is None else int(max_chars)
+    context_label = eff["router_context_label"]
+    summary_label = eff["router_summary_label"]
+
+    parts: List[str] = []
+    if latest_user_text:
+        parts.append((latest_user_text or "").strip())
+
+    try:
+        recent_list = list(recent)
+    except Exception:
+        recent_list = []
+
+    tail_src = recent_list[-tt:] if tt > 0 else []
+    tail_lines: List[str] = []
+    for m in reversed(tail_src):
+        if not isinstance(m, dict):
+            continue
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        role = (m.get("role") or "user").strip()
+        tail_lines.append(f"{role}: {c}")
+
+    if tail_lines:
+        parts.append(context_label + "\n" + "\n".join(tail_lines))
+
+    if summary:
+        s = summary.strip()
+        if sc > 0 and len(s) > sc:
+            s = s[-sc:]
+        parts.append(summary_label + "\n" + s)
+
+    out = "\n\n".join(parts).strip()
+    if len(out) > mc:
+        out = out[:mc].rstrip()
+    return out
+
+# ===== aimodel/file_read/services/session_io.py =====
+
+from __future__ import annotations
+from typing import Dict, List
+from ..core.packing_memory_core import get_session
+from ..store import set_summary as store_set_summary
+
+def handle_incoming(session_id: str, incoming: List[Dict[str, str]]):
+    st = get_session(session_id)
+    st.setdefault("_ephemeral_web", [])
+    for m in incoming:
+        st["recent"].append(m)
+    return st
+
+def persist_summary(session_id: str, summary: str):
+    try:
+        store_set_summary(session_id, summary)
+    except Exception:
+        pass
+
+# ===== aimodel/file_read/services/streaming_worker.py =====
+
+# aimodel/file_read/services/streaming_worker.py
+# updated to account for retrieve timings in pre-ttft accounting (no "or 0.0" fallbacks)
+from __future__ import annotations
+import asyncio, json, time, logging
+from typing import AsyncGenerator, Optional, List
+
+from ..core.settings import SETTINGS
+from ..utils.streaming import (
+    RUNJSON_START, RUNJSON_END,
+    build_run_json, watch_disconnect,
+)
+
+log = logging.getLogger("aimodel.api.generate")
+
+async def run_stream(
+    *, llm, messages, out_budget, stop_ev, request,
+    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None, budget_view: Optional[dict] = None,
+) -> AsyncGenerator[bytes, None]:
+    q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
+    SENTINEL = object()
+
+    def produce():
+        t_start = t0_request or time.perf_counter()
+        t_first: Optional[float] = None
+        t_last: Optional[float] = None
+        t_call: Optional[float] = None
+        finish_reason: Optional[str] = None
+        err_text: Optional[str] = None
+        out_parts: List[str] = []
+        stage: dict = {"queueWaitSec": None, "genSec": None}
+
+        try:
+            try:
+                t_call = time.perf_counter()
+                stream = llm.create_chat_completion(
+                    messages=messages,
+                    stream=True,
+                    max_tokens=out_budget,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=SETTINGS.stream_top_k,
+                    repeat_penalty=SETTINGS.stream_repeat_penalty,
+                    stop=SETTINGS.stream_stop_strings,
+                )
+            except ValueError as ve:
+                if "exceed context window" in str(ve).lower():
+                    retry_tokens = max(
+                        SETTINGS.stream_retry_min_tokens,
+                        int(out_budget * SETTINGS.stream_retry_fraction)
+                    )
+                    log.warning(
+                        "generate: context overflow, retrying with max_tokens=%d",
+                        retry_tokens
+                    )
+                    stream = llm.create_chat_completion(
+                        messages=messages,
+                        stream=True,
+                        max_tokens=retry_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=SETTINGS.stream_top_k,
+                        repeat_penalty=SETTINGS.stream_repeat_penalty,
+                        stop=SETTINGS.stream_stop_strings,
+                    )
+                else:
+                    raise
+
+            for chunk in stream:
+                if stop_ev.is_set():
+                    break
+
+                try:
+                    fr = chunk["choices"][0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                except Exception:
+                    pass
+
+                piece = chunk["choices"][0]["delta"].get("content", "")
+                if not piece:
+                    continue
+
+                now = time.perf_counter()
+                if t_first is None:
+                    t_first = now
+                t_last = now
+                out_parts.append(piece)
+
+                while not stop_ev.is_set():
+                    try:
+                        q.put_nowait(piece)
+                        break
+                    except asyncio.QueueFull:
+                        time.sleep(SETTINGS.stream_backpressure_sleep_sec)
+
+        except Exception as e:
+            err_text = str(e)
+            log.exception("generate: llm stream error: %s", e)
+            try:
+                q.put_nowait(f"[aimodel] error: {e}")
+            except Exception:
+                pass
+        finally:
+            try:
+                out_text = "".join(out_parts)
+
+                if t_first is not None and t_last is not None:
+                    stage["genSec"] = round(t_last - t_first, 3)
+                if t_start is not None and t_first is not None:
+                    stage["ttftSec"] = round(t_first - t_start, 3)
+                if t_start is not None and t_last is not None:
+                    stage["totalSec"] = round(t_last - t_start, 3)
+
+                if t_call is not None and t_start is not None:
+                    stage["preModelSec"] = round(t_call - t_start, 6)
+                if t_call is not None and t_first is not None:
+                    stage["modelQueueSec"] = round(t_first - t_call, 6)
+
+                if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
+                    stage["queueWaitSec"] = budget_view.get("queueWaitSec")
+
+                engine = None
+                method_used = None
+                try:
+                    td = None
+                    g_last = getattr(llm, "get_last_timings", None)
+                    if callable(g_last):
+                        method_used = "get_last_timings"
+                        td = g_last()
+                    if td is None:
+                        g = getattr(llm, "get_timings", None)
+                        if callable(g):
+                            method_used = "get_timings"
+                            td = g()
+                    if td is None:
+                        if isinstance(getattr(llm, "timings", None), dict):
+                            method_used = "timings_attr"
+                            td = getattr(llm, "timings")
+                        elif isinstance(getattr(llm, "perf", None), dict):
+                            method_used = "perf_attr"
+                            td = getattr(llm, "perf")
+
+                    if isinstance(td, dict):
+                        def fms(v):
+                            try:
+                                return float(v) / 1000.0
+                            except Exception:
+                                return None
+                        def to_i(v):
+                            try:
+                                return int(v)
+                            except Exception:
+                                return None
+                        load_ms = td.get("load_ms") or td.get("loadMs")
+                        prompt_ms = td.get("prompt_ms") or td.get("promptMs") or td.get("prefill_ms")
+                        eval_ms = td.get("eval_ms") or td.get("evalMs") or td.get("decode_ms")
+                        prompt_n = td.get("prompt_n") or td.get("promptN") or td.get("prompt_tokens")
+                        eval_n = td.get("eval_n") or td.get("evalN") or td.get("eval_tokens")
+                        engine = {}
+                        x = fms(load_ms)
+                        if x is not None:
+                            engine["loadSec"] = round(x, 3)
+                        x = fms(prompt_ms)
+                        if x is not None:
+                            engine["promptSec"] = round(x, 3)
+                        x = fms(eval_ms)
+                        if x is not None:
+                            engine["evalSec"] = round(x, 3)
+                        n = to_i(prompt_n)
+                        if n is not None:
+                            engine["promptN"] = n
+                        n = to_i(eval_n)
+                        if n is not None:
+                            engine["evalN"] = n
+                        try:
+                            log.debug("llm timings method=%s keys=%s", method_used, list(td.keys()))
+                        except Exception:
+                            pass
+                    else:
+                        log.debug("llm timings unavailable")
+                except Exception as e:
+                    log.debug("llm timings probe error: %s", e)
+                    engine = None
+                if engine:
+                    stage["engine"] = engine
+
+                # ---------- Accurate pre-TTFT accounting (no "or 0.0" fallbacks) ----------
+                if isinstance(budget_view, dict):
+                    def _fnum(x) -> float:
+                        try:
+                            return float(x) if x is not None else 0.0
+                        except Exception:
+                            return 0.0
+
+                    ttft_raw = stage.get("ttftSec")
+                    ttft_val = _fnum(ttft_raw)
+
+                    pack   = budget_view.get("pack") or {}
+                    rag    = budget_view.get("rag") or {}
+                    web_bd = ((budget_view.get("web") or {}).get("breakdown")) or {}
+
+                    # packing / trimming
+                    pack_sec = _fnum(pack.get("packSec"))
+                    trim_sec = _fnum(pack.get("finalTrimSec"))
+                    comp_sec = _fnum(pack.get("compressSec"))
+
+                    # rag router decision
+                    rag_router = _fnum(rag.get("routerDecideSec"))
+
+                    # prefer aggregate build timing if present; otherwise sum component steps
+                    build_candidates = (
+                        rag.get("injectBuildSec"),
+                        rag.get("sessionOnlyBuildSec"),
+                        rag.get("blockBuildSec"),
+                    )
+                    first_build = next((v for v in build_candidates if v is not None), None)
+                    rag_build_agg = _fnum(first_build)
+
+                    rag_embed  = _fnum(rag.get("embedSec"))
+                    rag_s_chat = _fnum(rag.get("searchChatSec"))
+                    rag_s_glob = _fnum(rag.get("searchGlobalSec"))
+                    rag_dedupe = _fnum(rag.get("dedupeSec"))
+
+                    if rag_build_agg > 0.0:
+                        rag_pipeline_sec = rag_build_agg
+                    else:
+                        rag_pipeline_sec = rag_embed + rag_s_chat + rag_s_glob + rag_dedupe
+
+                    # web and prep
+                    prep_sec    = _fnum(web_bd.get("prepSec"))
+                    web_pre     = _fnum(web_bd.get("totalWebPreTtftSec"))
+
+                    # queue time between model call and first token
+                    model_queue = _fnum(stage.get("modelQueueSec"))
+
+                    pre_accounted = (
+                        pack_sec + trim_sec + comp_sec
+                        + rag_router + rag_pipeline_sec
+                        + web_pre + prep_sec
+                        + model_queue
+                    )
+                    unattr_ttft = ttft_val - pre_accounted
+                    if unattr_ttft < 0.0:
+                        unattr_ttft = 0.0
+
+                    budget_view.setdefault("breakdown", {})
+                    budget_view["breakdown"].update({
+                        "ttftSec": ttft_val,
+                        "preTtftAccountedSec": round(pre_accounted, 6),
+                        "unattributedTtftSec": round(unattr_ttft, 6),
+                    })
+                # -------------------------------------------------------------------------
+
+                run_json = build_run_json(
+                    request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
+                    out_text=out_text,
+                    t_start=t_start,
+                    t_first=t_first,
+                    t_last=t_last,
+                    stop_set=stop_ev.is_set(),
+                    finish_reason=finish_reason,
+                    input_tokens_est=input_tokens_est,
+                    budget_view=budget_view,
+                    extra_timings=stage,
+                    error_text=err_text,
+                )
+                if SETTINGS.runjson_emit:
+                    q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
+            except Exception:
+                pass
+            finally:
+                try:
+                    llm.reset()
+                except Exception:
+                    pass
+                try:
+                    q.put_nowait(SENTINEL)
+                except Exception:
+                    pass
+
+    disconnect_task = asyncio.create_task(watch_disconnect(request, stop_ev))
+    producer = asyncio.create_task(asyncio.to_thread(produce))
+
+    try:
+        while True:
+            item = await q.get()
+            if item is SENTINEL:
+                break
+            yield (item if isinstance(item, bytes) else item.encode("utf-8"))
+        if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
+            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")
+    finally:
+        stop_ev.set()
+        disconnect_task.cancel()
+        try:
+            await asyncio.wait_for(producer, timeout=SETTINGS.stream_producer_join_timeout_sec)
+        except Exception:
+            pass
+
+# ===== aimodel/file_read/store/__init__.py =====
+
+from .chats import (
+    ChatMessageRow,
+    upsert_on_first_message, update_last, append_message,
+    delete_message, delete_messages_batch, list_messages,
+    list_paged, delete_batch,
+    merge_chat, merge_chat_new, edit_message, set_summary, get_summary,  # ← add these
+)
+from .index import ChatMeta
+
+__all__ = [
+    # chats
+    "ChatMessageRow",
+    "upsert_on_first_message", "update_last", "append_message",
+    "delete_message", "delete_messages_batch", "list_messages",
+    "list_paged", "delete_batch",
+    "merge_chat", "merge_chat_new", "edit_message",  # ← add these
+    # index
+    "ChatMeta",
+    # pending
+    "set_summary", "get_summary"
+]
+
+# ===== aimodel/file_read/store/base.py =====
+
+from __future__ import annotations
+import json, os, shutil, tempfile, threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+from ..adaptive.config.paths import app_data_dir
+
+# -------- Directories & Paths --------
+APP_DIR = app_data_dir()
+CHATS_DIR = APP_DIR / "chats"
+INDEX_PATH = APP_DIR / "index.json"
+PENDING_PATH = APP_DIR / "pending.json"              # NEW
+OLD_PENDING_DELETES = APP_DIR / "pending_deletes.json"  # NEW
+
+# -------- Lock for safe writes --------
+_lock = threading.RLock()
+
+# -------- Helpers --------
+def now_iso() -> str:
+    """UTC timestamp in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+def atomic_write(path: Path, data: Dict[str, Any] | List[Any]):
+    """Safely write JSON to a temp file then move into place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=path.name, dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.move(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+def ensure_dirs():
+    """Ensure app/chats directories exist and index.json is initialized."""
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    if not INDEX_PATH.exists():
+        atomic_write(INDEX_PATH, [])
+
+def chat_path(session_id: str) -> Path:
+    """Return path to chat file for a session ID."""
+    return CHATS_DIR / f"{session_id}.json"
+
+# -------- Exports --------
+__all__ = [
+    "APP_DIR",
+    "CHATS_DIR",
+    "INDEX_PATH",
+    "PENDING_PATH",          # NEW
+    "OLD_PENDING_DELETES",   # NEW
+    "_lock",
+    "now_iso",
+    "atomic_write",
+    "ensure_dirs",
+    "chat_path",
+]
+
+# ===== aimodel/file_read/store/chats.py =====
+
+# ===== aimodel/file_read/store/chats.py =====
+from __future__ import annotations
+import json
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Any
+
+from ..core.settings import SETTINGS
+from ..utils.streaming import strip_runjson
+from .base import chat_path, atomic_write, now_iso
+from .index import load_index, save_index, refresh_index_after_change, ChatMeta
+from ..rag.store import delete_namespace as rag_delete_namespace
+
+
+def _load_chat(session_id: str) -> Dict[str, Any]:
+    p = chat_path(session_id)
+    if not p.exists():
+        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+        if "summary" not in data:
+            data["summary"] = ""  # backfill older files
+        return data
+
+
+@dataclass
+class ChatMessageRow:
+    id: int
+    sessionId: str
+    role: str
+    content: str
+    createdAt: str
+    attachments: Optional[List[Dict]] = None   # ✅ added
+
+def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
+    if not atts:
+        return None
+    out = []
+    for a in atts:
+        # convert dataclass/typed object to dict
+        if isinstance(a, dict):
+            out.append({
+                "name": a.get("name"),
+                "source": a.get("source"),
+                "sessionId": a.get("sessionId"),
+            })
+        else:
+            try:
+                out.append({
+                    "name": getattr(a, "name", None),
+                    "source": getattr(a, "source", None),
+                    "sessionId": getattr(a, "sessionId", None),
+                })
+            except Exception:
+                continue
+    return out or None
+
+def upsert_on_first_message(session_id: str, title: str) -> ChatMeta:
     idx = load_index()
     existing = next((r for r in idx if r["sessionId"] == session_id), None)
     now = now_iso()
@@ -312,7 +1141,7 @@ __all__ = [
   "default_top_p": 0.95,
   "default_max_tokens": 512,
   "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": false,
+  "default_auto_web": true,
   "default_web_k": 3,
   "web_k_min": 1,
   "web_k_max": 8,
@@ -413,6 +1242,8 @@ __all__ = [
       "cap": 0.2
     }
   ],
+  "web_ephemeral_only": true,
+  "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
   "query_sum_bypass_short_enabled": true,
   "query_sum_short_max_chars": 32,
@@ -480,14 +1311,14 @@ __all__ = [
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 3,
   "rag_max_chars_per_chunk": 900,
-  "rag_chunk_overlap_chars": 120,
+  "rag_chunk_overlap_chars": 0,
   "rag_min_chars": 300,
   "rag_total_char_budget": 1500,
   "rag_db_path": "corpus.sqlite",
@@ -497,6 +1328,15 @@ __all__ = [
   "rag_embedding_model": "intfloat/e5-small-v2",
   "rag_default_need_when_invalid": false,
   "rag_block_preamble": "Local knowledge",
+  "rag_tabular_rows_per_table": 8,
+  "rag_prioritize_current_attachment": true,
+  "rag_new_upload_score_boost": 0.35,
+  "rag_rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "rag_rerank_top_m": 8,
+  "rag_min_score_frac": 0.6,
+  "rag_per_source_cap": 2,
+  "rag_nohit_message": "⛔ No relevant local entries found for this query. Do not guess.",
+  "rag_min_abs_rerank": -5,
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -524,7 +1364,7 @@ __all__ = [
   "excel_infer_max_rows": 100,
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
-  "excel_emit_key_values": true,
+  "excel_emit_key_values": false,
   "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
   "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
@@ -560,20 +1400,6 @@ __all__ = [
   "doc_ole_drop_pathish": true,
   "doc_ole_drop_symbol_lines": true,
   "doc_ole_dedupe_short_repeats": true,
-  "warmup_enabled": true,
-  "warmup_on_start": true,
-  "warmup_on_interval_sec": 600,
-  "warmup_jitter_sec": 8,
-  "warmup_llm_enabled": true,
-  "warmup_web_enabled": false,
-  "web_enabled": false,
-  "warmup_web_k": 2,
-  "warmup_timeout_sec": 5,
-  "warmup_queries": [
-    "current US president",
-    "S&P 500 today",
-    "weather tomorrow"
-  ],
   "pptx_use_markdown_headings": true,
   "pptx_include_notes": true,
   "pptx_include_tables": true,
@@ -649,7 +1475,7 @@ __all__ = [
   "default_top_p": 0.95,
   "default_max_tokens": 512,
   "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": false,
+  "default_auto_web": true,
   "default_web_k": 3,
   "web_k_min": 1,
   "web_k_max": 8,
@@ -750,6 +1576,8 @@ __all__ = [
       "cap": 0.2
     }
   ],
+  "web_ephemeral_only": true,
+  "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
   "query_sum_bypass_short_enabled": true,
   "query_sum_short_max_chars": 32,
@@ -817,14 +1645,14 @@ __all__ = [
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 3,
   "rag_max_chars_per_chunk": 900,
-  "rag_chunk_overlap_chars": 120,
+  "rag_chunk_overlap_chars": 0,
   "rag_min_chars": 300,
   "rag_total_char_budget": 1500,
   "rag_db_path": "corpus.sqlite",
@@ -834,6 +1662,15 @@ __all__ = [
   "rag_embedding_model": "intfloat/e5-small-v2",
   "rag_default_need_when_invalid": false,
   "rag_block_preamble": "Local knowledge",
+  "rag_tabular_rows_per_table": 8,
+  "rag_prioritize_current_attachment": true,
+  "rag_new_upload_score_boost": 0.35,
+  "rag_rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "rag_rerank_top_m": 8,
+  "rag_min_score_frac": 0.6,
+  "rag_per_source_cap": 2,
+  "rag_nohit_message": "⛔ No relevant local entries found for this query. Do not guess.",
+  "rag_min_abs_rerank": -5,
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -861,7 +1698,7 @@ __all__ = [
   "excel_infer_max_rows": 100,
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
-  "excel_emit_key_values": true,
+  "excel_emit_key_values": false,
   "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
   "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
@@ -897,20 +1734,6 @@ __all__ = [
   "doc_ole_drop_pathish": true,
   "doc_ole_drop_symbol_lines": true,
   "doc_ole_dedupe_short_repeats": true,
-  "warmup_enabled": true,
-  "warmup_on_start": true,
-  "warmup_on_interval_sec": 600,
-  "warmup_jitter_sec": 8,
-  "warmup_llm_enabled": true,
-  "warmup_web_enabled": false,
-  "web_enabled": false,
-  "warmup_web_k": 2,
-  "warmup_timeout_sec": 5,
-  "warmup_queries": [
-    "current US president",
-    "S&P 500 today",
-    "weather tomorrow"
-  ],
   "pptx_use_markdown_headings": true,
   "pptx_include_notes": true,
   "pptx_include_tables": true,
@@ -1028,7 +1851,7 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "default_top_p": 0.95,
   "default_max_tokens": 512,
   "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": false,
+  "default_auto_web": true,
   "default_web_k": 3,
   "web_k_min": 1,
   "web_k_max": 8,
@@ -1129,6 +1952,8 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
       "cap": 0.2
     }
   ],
+  "web_ephemeral_only": true,
+  "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
   "query_sum_bypass_short_enabled": true,
   "query_sum_short_max_chars": 32,
@@ -1196,14 +2021,14 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
   "rag_enabled": true,
   "rag_top_k": 3,
   "rag_max_chars_per_chunk": 900,
-  "rag_chunk_overlap_chars": 120,
+  "rag_chunk_overlap_chars": 0,
   "rag_min_chars": 300,
   "rag_total_char_budget": 1500,
   "rag_db_path": "corpus.sqlite",
@@ -1213,6 +2038,15 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "rag_embedding_model": "intfloat/e5-small-v2",
   "rag_default_need_when_invalid": false,
   "rag_block_preamble": "Local knowledge",
+  "rag_tabular_rows_per_table": 8,
+  "rag_prioritize_current_attachment": true,
+  "rag_new_upload_score_boost": 0.35,
+  "rag_rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "rag_rerank_top_m": 8,
+  "rag_min_score_frac": 0.6,
+  "rag_per_source_cap": 2,
+  "rag_nohit_message": "⛔ No relevant local entries found for this query. Do not guess.",
+  "rag_min_abs_rerank": -5,
   "__comment_streaming": "=== Streaming worker tuning ===",
   "stream_queue_maxsize": 64,
   "stream_backpressure_sleep_sec": 0.005,
@@ -1240,7 +2074,7 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "excel_infer_max_rows": 100,
   "excel_infer_max_cols": 26,
   "excel_infer_min_header_fill_ratio": 0.5,
-  "excel_emit_key_values": true,
+  "excel_emit_key_values": false,
   "excel_emit_cell_addresses": false,
   "excel_header_normalize": true,
   "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
@@ -1276,20 +2110,6 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "doc_ole_drop_pathish": true,
   "doc_ole_drop_symbol_lines": true,
   "doc_ole_dedupe_short_repeats": true,
-  "warmup_enabled": true,
-  "warmup_on_start": true,
-  "warmup_on_interval_sec": 600,
-  "warmup_jitter_sec": 8,
-  "warmup_llm_enabled": true,
-  "warmup_web_enabled": false,
-  "web_enabled": false,
-  "warmup_web_k": 2,
-  "warmup_timeout_sec": 5,
-  "warmup_queries": [
-    "current US president",
-    "S&P 500 today",
-    "weather tomorrow"
-  ],
   "pptx_use_markdown_headings": true,
   "pptx_include_notes": true,
   "pptx_include_tables": true,
@@ -1905,817 +2725,4 @@ async def fetch_many(
     results = await asyncio.gather(*tasks)
 
     if telemetry is not None:
-        ok_cnt = sum(1 for it in tel_items if it.get("ok"))
-        telemetry.update({
-            "totalSec": round(time.perf_counter() - t_total0, 6),
-            "requested": len(urls),
-            "ok": ok_cnt,
-            "miss": len(urls) - ok_cnt,
-            "items": tel_items,
-            "settings": {
-                "userAgent": _ua(),
-                "defaultTimeoutSec": _timeout(),
-                "defaultCapChars": _max_chars(),
-                "defaultCapBytes": _max_bytes(),
-                "maxParallel": _max_parallel() if max_parallel is None else int(max_parallel),
-            },
-        })
-
-    return results
-
-# ===== aimodel/file_read/web/orchestrator.py =====
-
-# aimodel/file_read/web/orchestrator.py
-from __future__ import annotations
-from typing import List, Tuple, Optional, Dict, Any
-import time
-
-from ..core.settings import SETTINGS
-from .duckduckgo import DuckDuckGoProvider
-from .provider import SearchHit
-from .orchestrator_common import (
-    _as_int, _as_float, _as_bool, _as_str,
-    condense_doc, content_quality_score,
-    _dedupe_by_host, score_hit, _head_tail,
-    _fetch_round,
-)
-
-async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
-    tel: Dict[str, Any] = {"query": (query or "").strip()}
-    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
-    total_char_budget   = _as_int("web_orch_total_char_budget")
-    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
-    max_parallel        = _as_int("web_orch_max_parallel_fetch")
-    overfetch_factor    = _as_float("web_orch_overfetch_factor")
-    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
-    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
-    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
-    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
-    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
-    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
-    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
-    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
-    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
-    header_tpl          = _as_str("web_block_header")
-    sep_str             = _as_str("web_orch_block_separator")
-    min_block_reserve   = _as_int("web_orch_min_block_reserve")
-    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
-    per_timeout = (float(per_url_timeout_s) if per_url_timeout_s is not None else _as_float("web_fetch_timeout_sec"))
-    start_time = time.perf_counter()
-
-    provider = DuckDuckGoProvider()
-    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
-    tel["search"] = {"requestedK": cfg_k, "overfetch": overfetch}
-    t0 = time.perf_counter()
-    try:
-        hits: List[SearchHit] = await provider.search(query, k=overfetch, telemetry=tel["search"])
-    except Exception as e:
-        tel["error"] = {"stage": "search", "type": type(e).__name__, "msg": str(e)}
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        return None, tel
-    tel["search"]["elapsedSecTotal"] = round(time.perf_counter() - t0, 6)
-    if not hits:
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        return None, tel
-
-    seen_urls = set()
-    scored: List[Tuple[int, SearchHit]] = []
-    for idx, h in enumerate(hits):
-        u = (h.url or "").strip()
-        if not u:
-            continue
-        if u in seen_urls:
-            continue
-        seen_urls.add(u)
-        s = score_hit(h, query)
-        scored.append((s, h))
-    tel["scoring"] = {"inputHits": len(hits), "scored": len(scored)}
-    if not scored:
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        return None, tel
-
-    top_hits = _dedupe_by_host(scored, cfg_k)
-    tel["scoring"]["picked"] = len(top_hits)
-    urls = [h.url for h in top_hits]
-    meta = [(h.title or h.url, h.url) for h in top_hits]
-
-    t_f = time.perf_counter()
-    tel["fetch1"] = {}
-    results = await _fetch_round(
-        urls, meta, per_url_timeout_s=per_timeout, max_parallel=max_parallel, use_js=False, telemetry=tel["fetch1"]
-    )
-    dt_f = time.perf_counter() - t_f
-    tel["fetch1"]["roundSec"] = round(dt_f, 6)
-
-    texts: List[Tuple[str, str, str]] = []
-    quality_scores: List[float] = []
-    for original_url, res in results:
-        if not res:
-            continue
-        final_url, status, text = res
-        title = next((t for (t, u) in meta if u == original_url), final_url)
-        tl = len(text or "")
-        qscore = content_quality_score(text or "")
-        quality_scores.append(qscore)
-        if text:
-            texts.append((title, final_url, text))
-    tel["fetch1"]["docs"] = {"ok": len(texts), "qAvg": (sum(quality_scores)/len(quality_scores) if quality_scores else 0.0)}
-
-    try_js = False
-    if enable_js_retry and quality_scores:
-        avg_q = sum(quality_scores) / len(quality_scores)
-        lowish = sum(1 for q in quality_scores if q < js_low_q_thresh)
-        if avg_q < js_avg_q_thresh or (lowish / max(1, len(quality_scores))) >= js_lowish_ratio:
-            try_js = True
-        tel["jsRetry"] = {
-            "considered": True,
-            "triggered": try_js,
-            "avgQ": round(avg_q, 4),
-            "lowishRatio": round((lowish / max(1, len(quality_scores))), 4),
-            "thresholds": {"avg": js_avg_q_thresh, "low": js_low_q_thresh, "ratio": js_lowish_ratio},
-        }
-    else:
-        tel["jsRetry"] = {"considered": bool(enable_js_retry), "triggered": False}
-
-    if try_js:
-        js_timeout   = min(per_timeout + js_timeout_add, js_timeout_cap)
-        js_parallel  = max(js_min_parallel, max_parallel + js_parallel_delta)
-        tel["fetch2"] = {"timeoutSec": js_timeout, "maxParallel": js_parallel}
-        results_js = await _fetch_round(
-            urls, meta, per_url_timeout_s=js_timeout, max_parallel=js_parallel, use_js=True, telemetry=tel["fetch2"]
-        )
-        texts_js: List[Tuple[str, str, str]] = []
-        for original_url, res in results_js:
-            if not res:
-                continue
-            final_url, status, text = res
-            title = next((t for (t, u) in meta if u == original_url), final_url)
-            tl = len(text or "")
-            qscore = content_quality_score(text or "")
-            if text:
-                texts_js.append((title, final_url, text))
-        if texts_js:
-            texts = texts_js
-
-    if not texts:
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        return None, tel
-
-    texts.sort(key=lambda t: content_quality_score(t[2]), reverse=True)
-    chunks: List[str] = []
-    for title, final_url, text in texts:
-        chunk = condense_doc(title, final_url, text, max_chars=per_doc_budget)
-        chunks.append(chunk)
-
-    header = header_tpl.format(query=query)
-    sep = _as_str("web_orch_block_separator")
-    available = max(_as_int("web_orch_min_block_reserve"), total_char_budget - len(header) - len(sep))
-    block_parts: List[str] = []
-    used = 0
-    for idx, ch in enumerate(chunks):
-        cl = len(ch)
-        sep_len = (len(sep) if block_parts else 0)
-        if used + cl + sep_len > available:
-            shrunk = _head_tail(ch, max(min_chunk_after, available - used - sep_len))
-            if len(shrunk) > min_chunk_after:
-                block_parts.append(shrunk)
-                used += len(shrunk) + sep_len
-            break
-        block_parts.append(ch)
-        used += cl + sep_len
-    body = sep.join(block_parts)
-    block = f"{header}{sep}{body}" if body else header
-
-    tel["assembly"] = {
-        "chunksPicked": len(block_parts),
-        "chars": len(block),
-        "available": available,
-        "headerChars": len(header),
-    }
-    tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-    return block, tel
-
-# ===== aimodel/file_read/web/orchestrator_common.py =====
-
-# aimodel/file_read/web/orchestrator_common.py
-from __future__ import annotations
-from typing import List, Tuple, Optional, Dict, Any
-from urllib.parse import urlparse
-import re
-
-from ..core.settings import SETTINGS
-from .provider import SearchHit
-from .fetch import fetch_many
-
-def _req(key: str):
-    return SETTINGS[key]
-
-def _as_int(key: str) -> int: return int(_req(key))
-def _as_float(key: str) -> float: return float(_req(key))
-def _as_bool(key: str) -> bool: return bool(_req(key))
-def _as_str(key: str) -> str:
-    v = _req(key)
-    return "" if v is None else str(v)
-
-def _clean_ws(s: str) -> str:
-    return " ".join((s or "").split())
-
-def _host(url: str) -> str:
-    h = (urlparse(url).hostname or "").lower()
-    pref = _as_str("web_orch_www_prefix")
-    return h[len(pref):] if pref and h.startswith(pref) else h
-
-def _tokens(s: str) -> List[str]:
-    return [t for t in re.findall(r"\w+", (s or "").lower()) if t]
-
-def _head_tail(text: str, max_chars: int) -> str:
-    text = text or ""
-    if max_chars <= 0 or len(text) <= max_chars:
-        return _clean_ws(text)
-    head_frac      = _as_float("web_orch_head_fraction")
-    tail_min_chars = _as_int("web_orch_tail_min_chars")
-    ellipsis       = _as_str("web_orch_ellipsis")
-    head = int(max_chars * head_frac)
-    tail = max_chars - head
-    if tail < tail_min_chars:
-        head = max(1, max_chars - tail_min_chars)
-        tail = tail_min_chars
-    return _clean_ws(text[:head] + ellipsis + text[-tail:])
-
-def condense_doc(title: str, url: str, text: str, *, max_chars: int) -> str:
-    body = _head_tail(text or "", max_chars)
-    safe_title = _clean_ws(title or url)
-    bullet = _as_str("web_orch_bullet_prefix") or "- "
-    indent = _as_str("web_orch_indent_prefix") or "  "
-    return f"{bullet}{safe_title}\n{indent}{url}\n{indent}{body}"
-
-def score_hit(hit: SearchHit, query: str) -> int:
-    w_exact      = _as_int("web_orch_score_w_exact")
-    w_substr     = _as_int("web_orch_score_w_substr")
-    w_title_full = _as_int("web_orch_score_w_title_full")
-    w_title_part = _as_int("web_orch_score_w_title_part")
-    w_snip_touch = _as_int("web_orch_score_w_snip_touch")
-    score = 0
-    q = (query or "").strip().lower()
-    title = (hit.title or "").strip()
-    snippet = (hit.snippet or "").strip()
-    title_l = title.lower()
-    snip_l  = snippet.lower()
-    if q:
-        if title_l == q:
-            score += w_exact
-        elif q in title_l:
-            score += w_substr
-    qtoks = _tokens(q)
-    if qtoks:
-        cov_title = sum(1 for t in qtoks if t in title_l)
-        if cov_title == len(qtoks) and len(qtoks) > 0:
-            score += w_title_full
-        elif cov_title > 0:
-            score += w_title_part
-        cov_snip = sum(1 for t in qtoks if t in snip_l)
-        if cov_snip > 0:
-            score += w_snip_touch
-    return score
-
-def _type_ratio(text: str, sub: str) -> float:
-    if not text:
-        return 1.0
-    cnt = text.lower().count(sub)
-    return float(cnt) / max(1, len(text))
-
-def content_quality_score(text: str) -> float:
-    if not text:
-        return 0.0
-    t = text.strip()
-    n = len(t)
-    len_div     = _as_float("web_orch_q_len_norm_divisor")
-    w_len       = _as_float("web_orch_q_len_weight")
-    w_div       = _as_float("web_orch_q_diversity_weight")
-    length_score = min(1.0, n / len_div) if len_div > 0 else 0.0
-    toks = _tokens(t)
-    if not toks:
-        return 0.1 * length_score
-    uniq = len(set(toks))
-    diversity = uniq / max(1.0, float(len(toks)))
-    pen = 0.0
-    for rule in _req("web_orch_q_penalties"):
-        token = str(rule.get("token") or "")
-        mult  = float(rule.get("mult") or 0.0)
-        cap   = float(rule.get("cap") or 1.0)
-        pen += min(cap, _type_ratio(t, token) * mult)
-    raw = (w_len * length_score) + (w_div * diversity) - pen
-    return max(0.0, min(1.0, raw))
-
-def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
-    picked: List[SearchHit] = []
-    seen_hosts = set()
-    for s, h in sorted(scored_hits, key=lambda x: x[0], reverse=True):
-        u = (h.url or "").strip()
-        if not u:
-            continue
-        host = _host(u)
-        if host in seen_hosts:
-            continue
-        seen_hosts.add(host)
-        picked.append(h)
-        if len(picked) >= k:
-            break
-    return picked
-
-async def _fetch_round(
-    urls: List[str],
-    meta: List[Tuple[str, str]],
-    per_url_timeout_s: float,
-    max_parallel: int,
-    use_js: bool = False,
-    telemetry: Optional[Dict[str, Any]] = None,
-) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
-    fetch_fn = fetch_many
-    if use_js:
-        try:
-            from . import fetch as _fetch_mod  # type: ignore
-            fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
-        except Exception:
-            fetch_fn = fetch_many
-    cap_mult        = _as_float("web_orch_fetch_cap_multiplier")
-    per_doc_budget  = _as_int("web_orch_per_doc_char_budget")
-    fetch_max_chars = _as_int("web_fetch_max_chars")
-    per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
-    results = await fetch_fn(
-        urls,
-        per_timeout_s=per_url_timeout_s,
-        cap_chars=per_doc_cap,
-        max_parallel=max_parallel,
-        telemetry=telemetry,
-    )
-    return results
-
-# ===== aimodel/file_read/web/provider.py =====
-
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Optional
-
-@dataclass
-class SearchHit:
-    title: str
-    url: str
-    snippet: Optional[str] = None
-    rank: int = 0
-
-class SearchProvider:
-    async def search(self, query: str, k: int = 3) -> List[SearchHit]:
-        raise NotImplementedError
-
-# ===== aimodel/file_read/web/query_summarizer.py =====
-
-# aimodel/file_read/web/query_summarizer.py
-from __future__ import annotations
-from typing import Any, Iterable, Dict, Tuple
-import re, time
-
-from ..core.settings import SETTINGS
-from ..utils.streaming import safe_token_count_messages
-
-def _tokens(s: str) -> set[str]:
-    return set(re.findall(r"\w+", (s or "").lower()))
-
-def _as_list(v) -> list:
-    if v is None:
-        return []
-    if isinstance(v, (list, tuple)):
-        return list(v)
-    return [v]
-
-def summarize_query(llm: Any, user_text: str) -> Tuple[str, Dict[str, Any]]:
-    telemetry: Dict[str, Any] = {}
-    txt = (user_text or "").strip()
-
-    bypass_enabled = SETTINGS.get("query_sum_bypass_short_enabled")
-    short_chars = SETTINGS.get("query_sum_short_max_chars")
-    short_words = SETTINGS.get("query_sum_short_max_words")
-    if bypass_enabled is True and isinstance(short_chars, int) and isinstance(short_words, int):
-        if len(txt) <= short_chars and len(txt.split()) <= short_words:
-            telemetry.update({"bypass": True})
-            return txt, telemetry
-    telemetry.update({"bypass": False})
-
-    prompt = SETTINGS.get("query_sum_prompt")
-    if isinstance(prompt, str) and "{text}" in prompt:
-        params = {}
-        max_tokens = SETTINGS.get("query_sum_max_tokens")
-        if isinstance(max_tokens, int):
-            params["max_tokens"] = max_tokens
-        temperature = SETTINGS.get("query_sum_temperature")
-        if isinstance(temperature, (int, float)):
-            params["temperature"] = float(temperature)
-        top_p = SETTINGS.get("query_sum_top_p")
-        if isinstance(top_p, (int, float)):
-            params["top_p"] = float(top_p)
-        stops = _as_list(SETTINGS.get("query_sum_stop"))
-        if stops:
-            params["stop"] = [str(s) for s in stops if isinstance(s, str)]
-        params["stream"] = False
-
-        t_start = time.perf_counter()
-        out = llm.create_chat_completion(
-            messages=[{"role": "user", "content": prompt.format(text=txt)}],
-            **params,
-        )
-        elapsed = time.perf_counter() - t_start
-        result = (out["choices"][0]["message"]["content"] or "").strip()
-        in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": prompt.format(text=txt)}]) or 0
-        out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": result}]) or 0
-        telemetry.update({
-            "elapsedSec": round(elapsed, 4),
-            "inputTokens": in_tokens,
-            "outputTokens": out_tokens,
-        })
-    else:
-        return txt, telemetry
-
-    overlap_enabled = SETTINGS.get("query_sum_overlap_check_enabled")
-    j_min = SETTINGS.get("query_sum_overlap_jaccard_min")
-    if overlap_enabled is True and isinstance(j_min, (int, float)):
-        src_toks = _tokens(txt)
-        out_toks = _tokens(result)
-        if not result or not out_toks:
-            telemetry.update({"overlapRetained": True, "overlapScore": 0.0})
-            return txt, telemetry
-        jaccard = (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
-        telemetry.update({"overlapScore": round(jaccard, 4)})
-        if jaccard < float(j_min):
-            telemetry.update({"overlapRetained": True})
-            return txt, telemetry
-        telemetry.update({"overlapRetained": False})
-        return result, telemetry
-
-    return result, telemetry
-
-# ===== aimodel/file_read/web/router_ai.py =====
-
-# aimodel/file_read/web/router_ai.py
-from __future__ import annotations
-from typing import Tuple, Optional, Any, Dict
-import json, re, time
-from ..core.settings import SETTINGS
-from ..utils.streaming import safe_token_count_messages
-
-_DECIDE_PROMPT = (
-    "You are a router deciding whether answering the text requires the public web.\n"
-    "Respond with JSON only in exactly this schema:\n"
-    "{{\"need\": true|false, \"query\": \"<text or empty>\"}}\n\n"
-    "Decision principle:\n"
-    "- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n"
-    "- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n"
-    "- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n"
-    "- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n"
-    "- When uncertain whether real-time state is required, prefer need=true.\n\n"
-    "Text:\n{text}\n"
-    "JSON:"
-)
-
-def _force_json(s: str) -> dict:
-    """
-    Try very hard to extract a JSON object like:
-      {"need": true|false, "query": "..."}
-    …even if the model wrapped it in prose or ```json fences.
-    """
-    if not s:
-        return {}
-
-    raw = s.strip()
-
-    # Strip common code-fence wrappers
-    # ```json\n{...}\n```  OR  ```\n{...}\n```
-    try:
-        cf = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-        if cf:
-            raw = cf.group(1).strip()
-    except Exception:
-        pass
-
-    # 1) Try direct parse
-    try:
-        v = json.loads(raw)
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        pass
-
-    # 2) Try to find a minimal JSON object that *mentions* "need"
-    #    This avoids the nested-brace problem while being specific enough.
-    try:
-        m = None
-        for m in re.finditer(r"\{[^{}]*\"need\"\s*:\s*(?:true|false|\"true\"|\"false\")[^{}]*\}", raw, re.IGNORECASE):
-            pass
-        if m:
-            frag = m.group(0)
-            v = json.loads(frag)
-            return v if isinstance(v, dict) else {}
-    except Exception:
-        pass
-
-    # 3) Fallback: grab the last {...} blob and attempt to parse
-    try:
-        last = None
-        for last in re.finditer(r"\{[\s\S]*\}", raw):
-            pass
-        if last:
-            frag = last.group(0)
-            v = json.loads(frag)
-            return v if isinstance(v, dict) else {}
-    except Exception:
-        pass
-
-    return {}
-
-
-def _strip_wrappers(text: str) -> str:
-    t = (text or "")
-    if SETTINGS.get("router_trim_whitespace") is True:
-        t = t.strip()
-    if SETTINGS.get("router_strip_wrappers_enabled") is not True:
-        return t
-    head = t
-    if SETTINGS.get("router_strip_split_on_blank") is True:
-        head = t.split("\n\n", 1)[0]
-    pat = SETTINGS.get("router_strip_header_regex")
-    if isinstance(pat, str) and pat:
-        try:
-            rx = re.compile(pat)
-            out = []
-            for ln in head.splitlines():
-                if rx.match(ln):
-                    break
-                out.append(ln)
-            core = " ".join(" ".join(out).split())
-            return core if core else t
-        except Exception:
-            return head
-    return head
-
-def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    telemetry: Dict[str, Any] = {}
-    try:
-        if not user_text or not user_text.strip():
-            return (False, None, telemetry)
-
-        t_start = time.perf_counter()
-        t_raw = user_text.strip()
-        core_text = _strip_wrappers(t_raw)
-
-        the_prompt = _DECIDE_PROMPT.format(text=core_text)
-        params = {
-            "max_tokens": SETTINGS.get("router_decide_max_tokens"),
-            "temperature": SETTINGS.get("router_decide_temperature"),
-            "top_p": SETTINGS.get("router_decide_top_p"),
-            "stream": False,
-        }
-        stop_list = SETTINGS.get("router_decide_stop")
-        if isinstance(stop_list, list) and stop_list:
-            params["stop"] = stop_list
-        params = {k: v for k, v in params.items() if v is not None}
-
-        raw_out_obj = llm.create_chat_completion(
-            messages=[{"role": "user", "content": the_prompt}],
-            **params,
-        )
-        text_out = (raw_out_obj.get("choices", [{}])[0]
-                                  .get("message", {})
-                                  .get("content") or "").strip()
-
-        # NEW: keep raw router output for debugging
-        telemetry["rawRouterOut"] = text_out[:2000]  # cap for safety
-
-        data = _force_json(text_out) or {}
-
-        # Coerce 'need' with string tolerance
-        need_val = data.get("need", None)
-        if isinstance(need_val, str):
-            nv = need_val.strip().lower()
-            if nv in ("true", "yes", "y", "1"):
-                need_val = True
-            elif nv in ("false", "no", "n", "0"):
-                need_val = False
-
-        if isinstance(need_val, bool):
-            need = need_val
-            parsed_ok = True
-        else:
-            parsed_ok = False
-            need_default = SETTINGS.get("router_default_need_when_invalid")
-            # If you want ingestion to proceed when parsing fails, set this to true in settings.
-            need = bool(need_default) if isinstance(need_default, bool) else False
-
-        # Extract query (safe) and strip wrappers
-        query_field = data.get("query", "")
-        try:
-            query = _strip_wrappers(str(query_field or "").strip())
-        except Exception:
-            query = ""
-
-        if not need:
-            query = None  # ignore query when we decided 'no web'
-
-        t_elapsed = time.perf_counter() - t_start
-        in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": the_prompt}]) or 0
-        out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": text_out}]) or 0
-
-        telemetry.update({
-            "needed": bool(need),
-            "routerQuery": query if need else None,
-            "elapsedSec": round(t_elapsed, 4),
-            "inputTokens": in_tokens,
-            "outputTokens": out_tokens,
-            "parsedOk": parsed_ok,
-        })
-
-        return (need, query, telemetry)
-
-    except Exception:
-        return (False, None, telemetry)
-
-
-async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple[Optional[str], Dict[str, Any]]:
-    telemetry: Dict[str, Any] = {}
-    need, proposed_q, tel_decide = decide_web(llm, (user_text or "").strip())
-    telemetry.update(tel_decide)
-    if not need:
-        return None, telemetry
-
-    from .query_summarizer import summarize_query
-    from .orchestrator import build_web_block
-
-    base_query = _strip_wrappers((proposed_q or user_text).strip())
-    try:
-        q_summary, tel_sum = summarize_query(llm, base_query)
-        q_summary = _strip_wrappers((q_summary or "").strip()) or base_query
-        telemetry["summarizer"] = tel_sum
-        telemetry["summarizedQuery"] = q_summary
-    except Exception:
-        q_summary = base_query
-
-    t_start = time.perf_counter()
-    try:
-        block_res = await build_web_block(q_summary, k=k)
-        if isinstance(block_res, tuple):
-            block, tel_orch = block_res
-            telemetry["orchestrator"] = tel_orch or {}
-        else:
-            block = block_res
-    except Exception:
-        block = None
-    t_elapsed = time.perf_counter() - t_start
-
-    telemetry.update({
-        "fetchElapsedSec": round(t_elapsed, 4),
-        "blockChars": len(block) if block else 0,
-    })
-
-    return (block or None, telemetry)
-
-# ===== aimodel/file_read/workers/retitle_worker.py =====
-
-# aimodel/file_read/retitle_worker.py
-from __future__ import annotations
-import asyncio, logging, re
-from typing import Dict, List, Optional, Tuple
-
-from ..runtime.model_runtime import get_llm
-from ..store.index import load_index, save_index
-from ..store.base import now_iso
-from ..services.cancel import is_active, GEN_SEMAPHORE
-from ..store.chats import _load_chat
-from ..core.settings import SETTINGS
-
-def S(key: str):
-    return SETTINGS[key]
-
-_PENDING: Dict[str, dict] = {}
-_ENQUEUED: set[str] = set()
-_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=int(S("retitle_queue_maxsize")))
-_lock = asyncio.Lock()
-
-def _preview(s: str) -> str:
-    n = int(S("retitle_preview_chars"))
-    ell = S("retitle_preview_ellipsis")
-    s = (s or "")
-    return (s[:n] + ell) if len(s) > n else s
-
-def _is_substantial(text: str) -> bool:
-    t = (text or "").strip()
-    min_chars = int(S("retitle_min_substantial_chars"))
-    require_alpha = bool(S("retitle_require_alpha"))
-    if len(t) < min_chars:
-        return False
-    return (re.search(r"[A-Za-z]", t) is not None) if require_alpha else True
-
-def _pick_source(messages: List[dict]) -> Optional[str]:
-    if not messages:
-        print("[retitle] no messages to pick from")
-        return None
-
-    min_user_len = int(S("retitle_min_user_chars"))
-    print(f"[retitle] min_user_len={min_user_len}, total_msgs={len(messages)}")
-
-    # 1. Prefer last substantial user message
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            txt = (m.get("content") or "").strip()
-            print(f"[retitle] check user msg len={len(txt)} preview={txt[:40]!r}")
-            if len(txt) >= min_user_len and _is_substantial(txt):
-                print("[retitle] PICK user message")
-                return txt
-
-    # 2. Fallback to last substantial assistant message
-    for m in reversed(messages):
-        if m.get("role") == "assistant":
-            txt = (m.get("content") or "").strip()
-            print(f"[retitle] check assistant msg len={len(txt)} preview={txt[:40]!r}")
-            if _is_substantial(txt):
-                print("[retitle] PICK assistant message")
-                return txt
-
-    print("[retitle] no suitable message found")
-    return None
-
-def _sanitize_title(s: str) -> str:
-    if not s:
-        return ""
-    s = s.strip()
-    s = re.sub(r"(?i)^(?:how\s+to|steps?\s+to|guide\s+to|tutorial:\s*|to)\s+", "", s).strip()
-    drop_prefix_re = S("retitle_sanitize_drop_prefix_regex")
-    if drop_prefix_re:
-        s = re.sub(drop_prefix_re, "", s)
-    if bool(S("retitle_sanitize_strip_quotes")):
-        s = s.strip().strip('"').strip("'").strip()
-    replace_not_allowed_re = S("retitle_sanitize_replace_not_allowed_regex")
-    replace_with = S("retitle_sanitize_replace_with")
-    if replace_not_allowed_re:
-        s = re.sub(replace_not_allowed_re, replace_with, s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = re.sub(r"[.:;,\-\s]+$", "", s)
-    s = re.sub(r"(?i)^(?:a|an|the)\s+", "", s).strip()
-    max_words = int(S("retitle_sanitize_max_words"))
-    max_chars = int(S("retitle_sanitize_max_chars"))
-    if max_words > 0:
-        words = s.split()
-        s = " ".join(words[:max_words])
-    if max_chars > 0 and len(s) > max_chars:
-        s = s[:max_chars].rstrip()
-    return s
-
-def _make_title(llm, src: str) -> str:
-    sys = S("retitle_llm_sys_inst")
-    hard = ("You generate a concise chat title.\n"
-            "Return ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). "
-            "No trailing punctuation. Max 6 words.")
-    sys = f"{hard}\n\n{sys}" if sys else hard
-
-    user_text = f"{S('retitle_user_prefix')}{src}{S('retitle_user_suffix')}"
-    messages = [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": user_text},
-    ]
-
-    out = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=int(S("retitle_llm_max_tokens")),
-        temperature=float(S("retitle_llm_temperature")),
-        top_p=float(S("retitle_llm_top_p")),
-        stream=False,
-        stop=S("retitle_llm_stop"),
-    )
-    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
-    raw = re.sub(r"(?i)^(?:how\s+to|to)\s+", "", raw).strip()
-    raw = re.sub(r"^`{1,3}|`{1,3}$", "", raw).strip()
-    raw = re.sub(r"[.:;,\-\s]+$", "", raw)
-    return raw
-
-async def start_worker():
-    while True:
-        sid = await _queue.get()
-        try:
-            await _process_session(sid)
-        except Exception:
-            logging.exception("Retitle worker failed")
-        finally:
-            _queue.task_done()
-
-def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
-    msgs = snapshot.get("messages") or []
-    job_seq = int(snapshot.get("job_seq") or 0)
-    return msgs, job_seq
-
-async def _process_session(session_id: str):
-    if not bool(S("retitle_enable")):
-        return
-    await asyncio.sleep(int(S("retitle_grace_ms")) / 1000.0)
-    waited = 0
-    backoff = int(S("retitle_active_backoff_start_ms"))
-    backoff_max = int(S("retitle_active_backoff_max_ms"))
-    backoff_total = int(S("retitle_active_backoff_total_ms"))
-    growth = float(S("retitle_active_backoff_growth"))
-    while is_active(session_id) and waited < backoff_total:
-        await asyncio.sleep(backoff /
+        ok_cnt = sum(1 for it

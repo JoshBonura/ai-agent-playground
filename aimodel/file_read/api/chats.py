@@ -35,7 +35,6 @@ from ..store import (
 
 router = APIRouter()
 
-# ---------- Routes ----------
 @router.post("/api/chats")
 async def api_create_chat(body: Dict[str, str]):
     session_id = (body.get("sessionId") or "").strip()

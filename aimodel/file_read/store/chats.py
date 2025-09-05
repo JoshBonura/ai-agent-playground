@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import strip_runjson
 from .base import chat_path, atomic_write, now_iso
@@ -18,7 +17,7 @@ def _load_chat(session_id: str) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
         if "summary" not in data:
-            data["summary"] = ""  # backfill older files
+            data["summary"] = "" 
         return data
 
 
@@ -29,14 +28,13 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
-    attachments: Optional[List[Dict]] = None   # ✅ added
+    attachments: Optional[List[Dict]] = None   
 
 def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
     if not atts:
         return None
     out = []
     for a in atts:
-        # convert dataclass/typed object to dict
         if isinstance(a, dict):
             out.append({
                 "name": a.get("name"),
@@ -108,13 +106,11 @@ def append_message(session_id: str, role: str, content: str, attachments: Option
     }
     norm_atts = _normalize_attachments(attachments)
     if norm_atts:
-        msg["attachments"] = norm_atts   # ✅ now JSON-serializable
+        msg["attachments"] = norm_atts   
 
     data["messages"].append(msg)
     data["seq"] = seq
     _save_chat(session_id, data)
-
-    # update index meta as before...
     ...
     return ChatMessageRow(
         id=seq,
@@ -171,7 +167,7 @@ def list_messages(session_id: str) -> List[ChatMessageRow]:
             role=m["role"],
             content=m["content"],
             createdAt=m.get("createdAt"),
-            attachments=m.get("attachments", []),  # ✅ safe default
+            attachments=m.get("attachments", []),  
         ))
     return rows
 
@@ -203,21 +199,18 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
 
 
 def delete_batch(session_ids: List[str]) -> List[str]:
-    # delete chat jsons
     for sid in session_ids:
         try:
             chat_path(sid).unlink(missing_ok=True)
         except Exception:
             pass
 
-    # delete RAG namespaces for those sessions
     for sid in session_ids:
         try:
             rag_delete_namespace(sid)
         except Exception:
             pass
 
-    # prune index.json
     idx = load_index()
     keep = [r for r in idx if r["sessionId"] not in set(session_ids)]
     save_index(keep)
@@ -282,7 +275,6 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
         if int(m.get("id", -1)) == int(message_id):
             m["content"] = new_content
             m["updatedAt"] = now_iso()
-            # normalize attachments
             if "attachments" in m and m["attachments"] is not None:
                 norm = []
                 for a in m["attachments"]:

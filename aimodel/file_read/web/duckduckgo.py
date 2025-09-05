@@ -5,12 +5,9 @@ import asyncio, time
 from urllib.parse import urlparse
 
 try:
-    from ddgs import DDGS  # type: ignore
+    from ddgs import DDGS  
 except Exception:
-    try:
-        from duckduckgo_search import DDGS  # type: ignore
-    except Exception:
-        DDGS = None  # type: ignore
+    DDGS = None 
 
 from ..core.settings import SETTINGS
 from .provider import SearchHit

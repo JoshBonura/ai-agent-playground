@@ -46,7 +46,6 @@ def _docx_image_blobs(doc) -> List[bytes]:
             except Exception:
                 pass
 
-        # run-level embedded images (floating, etc.)
         for p in doc.paragraphs:
             for r in p.runs:
                 for d in getattr(r._element, "xpath", lambda *_: [])(".//a:blip"):

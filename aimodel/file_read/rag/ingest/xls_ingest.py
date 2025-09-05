@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Tuple, List
 from datetime import datetime, date, time
 from ...core.settings import SETTINGS
-
 import re
 
 _WS_RE = re.compile(r"[ \t]+")
@@ -11,19 +10,13 @@ def _squeeze_spaces_inline(s: str) -> str:
     return _WS_RE.sub(" ", (s or "")).strip()
 
 def extract_xls(data: bytes) -> Tuple[str, str]:
-    """
-    Extract text from legacy .xls using xlrd and emit a format compatible with
-    extract_excel() (headers/rows or key/values) so downstream RAG stays consistent.
-    """
     try:
-        import xlrd  # BSD-licensed
+        import xlrd  
     except Exception:
-        # If xlrd is not installed, return plaintext to avoid 500s.
         return (data.decode("utf-8", errors="replace"), "text/plain")
 
     S = SETTINGS.effective
 
-    # --- formatting/config (mirrors excel_ingest) ---
     sig = int(S().get("excel_number_sigfigs"))
     maxp = int(S().get("excel_decimal_max_places"))
     trim = bool(S().get("excel_trim_trailing_zeros"))
@@ -93,17 +86,14 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
         s = re.sub(r"_+", "_", s).strip("_")
         return s or h
 
-    # --- open workbook ---
     try:
         book = xlrd.open_workbook(file_contents=data)
     except Exception:
-        # Misnamed/garbled file: fail soft
         return (data.decode("utf-8", errors="replace"), "text/plain")
 
     datemode = book.datemode
 
     def xlrd_cell_to_py(cell):
-        # xlrd types: 0 empty, 1 text, 2 number, 3 date, 4 boolean, 5 error, 6 blank
         ctype, value = cell.ctype, cell.value
         if ctype == xlrd.XL_CELL_DATE:
             try:
@@ -124,7 +114,6 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
         if nrows == 0 or ncols == 0:
             continue
 
-        # header inference
         headers_raw = []
         header_fill = 0
         for c in range(ncols):
@@ -148,7 +137,6 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
 
         lines.append(f"# Sheet: {sheet.name}")
 
-        # key/value mode (two-column heuristic)
         if EMIT_KEYVALUES and ncols == 2:
             textish = valueish = rows = 0
             for r in range(start_row, nrows):
@@ -170,9 +158,8 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
                         continue
                     lines.append(f"- {k}: {v}" if k else f"- : {v}")
                 lines.append("")
-                continue  # done with this sheet
-
-        # table mode
+                continue 
+            
         lines.append("## Inferred Table")
         if any(h for h in norm_headers):
             lines.append("headers: " + ", ".join(h for h in norm_headers if h))

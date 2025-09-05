@@ -17,7 +17,6 @@ def get_budget(sessionId: Optional[str] = Query(default=None), maxTokens: Option
     llm = get_llm()
     eff = SETTINGS.effective(session_id=sid)
 
-    # Rebuild the packed prompt (no streaming)
     msgs = [{"role": m.role, "content": m.content} for m in list_messages(sid)]
     summary = get_summary(sid)
     system_text = build_system_text()

@@ -88,13 +88,11 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
 
     i = 0
     while i < n:
-        # skip blank blocks
         while i < n and _row_blank_csv(rows[i]):
             i += 1
         if i >= n:
             break
 
-        # start of a non-blank block
         start = i
         while i < n and not _row_blank_csv(rows[i]):
             i += 1
@@ -102,7 +100,6 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
         if start > end:
             continue
 
-        # headers
         headers_raw = (rows[start] if start < n else [])[:max_cols]
         norm_headers = [normalize_header(fmt_val(h)) for h in headers_raw]
         rmax = rightmost_nonempty_header(norm_headers)
@@ -112,20 +109,17 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
         keep_idx = keep_headers(norm_headers)
         kept_headers = [norm_headers[j] for j in keep_idx]
 
-        # size limits
         total_rows_block = (end - start + 1)
         use_rows = total_rows_block if max_rows <= 0 else min(total_rows_block, max_rows + 1)
         total_cols_block = len(kept_headers)
         if max_cols > 0:
             total_cols_block = min(total_cols_block, max_cols)
 
-        # table header
         lines.append(f"## Table: CSV!R{start+1}-{start+use_rows},C1-{max(total_cols_block,1)}")
         if any(kept_headers):
             lines.append("headers: " + ", ".join(h for h in kept_headers if h))
         lines.append("")
 
-        # rows
         data_start = start + 1
         data_end = min(end, start + use_rows - 1)
         usable_cols_for_slice = min(len(norm_headers), max_cols if max_cols > 0 else len(norm_headers))

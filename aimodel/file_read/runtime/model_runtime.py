@@ -1,11 +1,9 @@
 # aimodel/file_read/model_runtime.py
 from __future__ import annotations
-import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Optional, List
-
 from ..adaptive.config.paths import read_settings, write_settings
 
 try:

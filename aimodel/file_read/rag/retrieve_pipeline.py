@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import List, Tuple, Dict, Any, Optional
 import time
-
 from ..core.settings import SETTINGS
 from .store import search_vectors
 from .rerank import rerank_hits, cap_per_source, min_score_fraction

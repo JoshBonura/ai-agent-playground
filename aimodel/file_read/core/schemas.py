@@ -12,7 +12,7 @@ class Attachment(BaseModel):
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
-    attachments: Optional[List[Attachment]] = None  # ✅ new
+    attachments: Optional[List[Attachment]] = None  
 
 class MergeChatReq(BaseModel):
     sourceId: str
@@ -51,12 +51,10 @@ class ChatBody(BaseModel):
     sessionId: Optional[str] = None
     messages: Optional[List[ChatMessage]] = None
 
-    # ↓ make optional; defaults come from effective settings
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
 
-    # ↓ also optional; defaults come from settings
     autoWeb: Optional[bool] = None
     webK: Optional[int] = None
     autoRag: Optional[bool] = None   

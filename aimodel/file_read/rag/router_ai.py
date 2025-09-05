@@ -1,7 +1,7 @@
 # ===== aimodel/file_read/rag/router_ai.py =====
 from __future__ import annotations
 from typing import Tuple, Optional, Any
-import json, re, traceback, time
+import json, re, traceback
 from ..core.settings import SETTINGS
 
 def _dbg(msg: str):

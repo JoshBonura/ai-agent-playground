@@ -1,60 +1,4 @@
-()
-    _dbg("final_len=", len(final))
-    return final
-
-# ===== aimodel/file_read/rag/ingest/pdf_ingest.py =====
-
-# aimodel/file_read/rag/ingest/pdf_ingest.py
-from __future__ import annotations
-from typing import Tuple
-import io
-from ...core.settings import SETTINGS
-from .ocr import is_bad_text, ocr_pdf
-from .common import _utf8
-
-def _dbg(*args):
-    try:
-        if bool(SETTINGS.effective().get("ingest_debug", False)):
-            print("[pdf_ingest]", *args, flush=True)
-    except Exception:
-        pass
-
-def extract_pdf(data: bytes) -> Tuple[str, str]:
-    print("[pdf_ingest] ENTER extract_pdf", flush=True)
-
-    S = SETTINGS.effective
-    OCR_ENABLED = bool(S().get("pdf_ocr_enable", False))
-    OCR_MODE = str(S().get("pdf_ocr_mode", "auto")).lower()   # auto | force | never
-    WHEN_BAD  = bool(S().get("pdf_ocr_when_bad", True))
-    DPI       = int(S().get("pdf_ocr_dpi", 300))
-    MAX_PAGES = int(S().get("pdf_ocr_max_pages", 0))
-
-    # Unconditional config echo so we KNOW what the server is using
-    print(f"[pdf_ingest] cfg ocr_enabled={OCR_ENABLED} mode={OCR_MODE} when_bad={WHEN_BAD} dpi={DPI} max_pages={MAX_PAGES}", flush=True)
-
-    def _do_ocr() -> str:
-        print("[pdf_ingest] OCR_CALL begin", flush=True)  # <-- undeniable marker
-        txt = (ocr_pdf(data) or "").strip()
-        print(f"[pdf_ingest] OCR_CALL end text_len={len(txt)} preview={repr(txt[:120])}", flush=True)
-        return txt
-
-    # FORCE: run OCR up front
-    if OCR_ENABLED and OCR_MODE == "force":
-        _dbg("mode=force -> OCR first")
-        ocr_txt = _do_ocr()
-        if ocr_txt:
-            print("[pdf_ingest] EXIT (force OCR success)", flush=True)
-            return ocr_txt, "text/plain"
-        _dbg("mode=force -> OCR empty, trying text extract")
-
-    # Try embedded text (pdfminer)
-    txt = ""
-    try:
-        from pdfminer.high_level import extract_text
-        txt = (extract_text(io.BytesIO(data)) or "").strip()
-        print(f"[pdf_ingest] pdfminer text_len={len(txt)} preview={repr(txt[:120])}", flush=True)
-    except Exception as e:
-        print(f"[pdf_ingest] pdfminer ERROR {repr(e)}", flush=True)
+gest] pdfminer ERROR {repr(e)}", flush=True)
         txt = ""
 
     # AUTO: OCR if missing/weak text
@@ -440,19 +384,135 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
     text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
     return (text + "\n" if text else ""), "text/plain"
 
+# ===== aimodel/file_read/rag/rerank.py =====
+
+from __future__ import annotations
+from typing import List, Dict, Any, Optional, Tuple
+from ..core.settings import SETTINGS
+
+_RERANKER = None
+_RERANKER_NAME = None
+
+def _load_reranker():
+    """Lazy-load a sentence-transformers cross-encoder for reranking."""
+    global _RERANKER, _RERANKER_NAME
+    model_name = SETTINGS.get("rag_rerank_model")
+    if not model_name:
+        return None
+    if _RERANKER is not None and _RERANKER_NAME == model_name:
+        return _RERANKER
+    try:
+        from sentence_transformers import CrossEncoder
+        _RERANKER = CrossEncoder(model_name)
+        _RERANKER_NAME = model_name
+        return _RERANKER
+    except Exception as e:
+        print(f"[RAG RERANK] failed to load reranker {model_name}: {e}")
+        _RERANKER = None
+        _RERANKER_NAME = None
+        return None
+
+def rerank_hits(query: str, hits: List[dict], *, top_m: Optional[int] = None) -> List[dict]:
+    """
+    Cross-encoder reranking (dense pair scoring: (query, hit_text)).
+    Keeps structure of each hit; adds 'rerankScore'.
+    """
+    if not hits:
+        return hits
+    model = _load_reranker()
+    if model is None:
+        return hits
+
+    pairs = [(query, (h.get("text") or "")) for h in hits]
+    try:
+        scores = model.predict(pairs)
+    except Exception as e:
+        print(f"[RAG RERANK] predict failed: {e}")
+        return hits
+
+    out: List[dict] = []
+    for h, s in zip(hits, scores):
+        hh = dict(h)
+        hh["rerankScore"] = float(s)
+        out.append(hh)
+
+    out.sort(key=lambda x: x.get("rerankScore", 0.0), reverse=True)
+    if isinstance(top_m, int) and top_m > 0:
+        out = out[:top_m]
+    return out
+
+def cap_per_source(hits: List[dict], per_source_cap: int) -> List[dict]:
+    if per_source_cap is None or per_source_cap <= 0:
+        return hits
+    bucket: dict[str, int] = {}
+    out: List[dict] = []
+    for h in hits:
+        src = str(h.get("source") or "")
+        seen = bucket.get(src, 0)
+        if seen < per_source_cap:
+            out.append(h)
+            bucket[src] = seen + 1
+    return out
+
+def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
+    """
+    Keep hits whose score is within the top `frac` of the range, robust for negative logits.
+    If all scores equal or list empty, returns hits unchanged.
+    """
+    if not hits:
+        return hits
+    # collect numeric scores
+    vals = []
+    for h in hits:
+        try:
+            v = float(h.get(key) or 0.0)
+        except Exception:
+            v = 0.0
+        vals.append(v)
+
+    s_min = min(vals)
+    s_max = max(vals)
+    if s_max == s_min:
+        # all same -> nothing to filter
+        return hits
+
+    kept = []
+    for h, v in zip(hits, vals):
+        # min-max normalize to [0,1], then compare against frac
+        norm = (v - s_min) / (s_max - s_min)
+        if norm >= float(frac):
+            kept.append(h)
+    return kept
+
 # ===== aimodel/file_read/rag/retrieve.py =====
 
 # ===== aimodel/file_read/rag/retrieve.py =====
 from __future__ import annotations
-from dataclasses import asdict, dataclass
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
+from ..retrieve_core import (
+    build_rag_block,
+    build_rag_block_with_telemetry,
+    build_rag_block_session_only,
+    build_rag_block_session_only_with_telemetry,
+)
+
+# ===== aimodel/file_read/rag/retrieve_common.py =====
+
+# aimodel/file_read/rag/retrieve_common.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any, Optional
 import time
 
 from ..core.settings import SETTINGS
-from .store import search_vectors
+from .retrieve_tabular import make_rag_block_tabular
 
 _EMBEDDER = None
 _EMBEDDER_NAME = None
+PRINT_MAX = 10  # cap how many hits we dump at each stage
+
+
+# ========= Embedding helpers =========
 
 def _get_embedder():
     global _EMBEDDER, _EMBEDDER_NAME
@@ -462,7 +522,11 @@ def _get_embedder():
         print(f"[RAG] sentence_transformers unavailable: {e}")
         return None, None
 
-    model_name = str(SETTINGS.get("rag_embedding_model", "intfloat/e5-small-v2"))
+    model_name = SETTINGS.get("rag_embedding_model")
+    if not model_name:
+        print("[RAG] no rag_embedding_model configured")
+        return None, None
+
     if _EMBEDDER is None or _EMBEDDER_NAME != model_name:
         try:
             _EMBEDDER = SentenceTransformer(model_name)
@@ -472,6 +536,7 @@ def _get_embedder():
             _EMBEDDER = None
             _EMBEDDER_NAME = None
     return _EMBEDDER, _EMBEDDER_NAME
+
 
 def _embed_query(q: str) -> List[float]:
     q = (q or "").strip()
@@ -487,8 +552,24 @@ def _embed_query(q: str) -> List[float]:
         print(f"[RAG] embedding encode failed: {e}")
         return []
 
+
+# ========= Scoring / ordering =========
+
+def _primary_score(h: Dict[str, Any]) -> float:
+    s = h.get("rerankScore")
+    if s is not None:
+        try:
+            return float(s)
+        except Exception:
+            pass
+    try:
+        return float(h.get("score") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
-    hits_sorted = sorted(hits, key=lambda h: float(h.get("score", 0.0)), reverse=True)
+    hits_sorted = sorted(hits, key=_primary_score, reverse=True)
     seen: set[Tuple[str, str]] = set()
     out: List[dict] = []
     for h in hits_sorted:
@@ -502,62 +583,25 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
             break
     return out
 
-def _first_nonempty(*vals: Any) -> str:
-    for v in vals:
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
 
-def _excelish_header(h: Dict[str, Any]) -> Optional[str]:
-    meta = h.get("meta") or {}
-    mime = _first_nonempty(h.get("mime"), meta.get("mime"))
-    if mime not in {"text/excel+row", "text/excel+lines", "text/excel+cells"}:
-        return None
-
-    src = _first_nonempty(h.get("source"), meta.get("source"))
-    sheet = _first_nonempty(h.get("sheet"), meta.get("sheet"))
-    table = _first_nonempty(h.get("table"), meta.get("table"))
-    row_id = _first_nonempty(h.get("row_id"), meta.get("row_id"))
-    idx = _first_nonempty(str(h.get("chunkIndex") or ""), str(meta.get("chunkIndex") or ""))
-
-    parts = [src]
-    if sheet:
-        parts.append(f"{sheet}")
-    if table:
-        parts.append(f"tbl {table}")
-    if row_id:
-        parts.append(f"row {row_id}")
-    elif idx:
-        parts.append(f"chunk {idx}")
-
-    label = " — ".join(parts) if parts else None
-    return f"- {label}" if label else None
+# ========= Block rendering =========
 
 def _default_header(h: Dict[str, Any]) -> str:
     src = str(h.get("source") or "")
     idx = h.get("chunkIndex")
     return f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
 
+
 def _render_header(h: Dict[str, Any]) -> str:
-    eh = _excelish_header(h)
-    return eh if eh else _default_header(h)
+    return _default_header(h)
 
-def _trim_to_budget(lines: List[str], total_budget: int) -> str:
-    out = []
-    used = 0
-    for i, ln in enumerate(lines):
-        need = len(ln) + (1 if i > 0 else 0)
-        if used + need > total_budget:
-            break
-        if i > 0:
-            pass
-        out.append(ln)
-        used += need
-    return "\n".join(out)
 
-def make_rag_block(hits: List[dict], *, max_chars: int = 800) -> str:
-    lines = ["Local knowledge:"]
-    total_budget = int(SETTINGS.get("rag_total_char_budget", 2200))
+def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
+    preamble = str(SETTINGS.get("rag_block_preamble") or "")
+    preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
+    total_budget = int(SETTINGS.get("rag_total_char_budget"))
+
+    lines = [preamble]
     used = len(lines[0]) + 1
 
     for h in hits:
@@ -585,6 +629,63 @@ def make_rag_block(hits: List[dict], *, max_chars: int = 800) -> str:
 
     return "\n".join(lines)
 
+
+def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[str]] = None) -> str:
+    block = make_rag_block_tabular(hits_top, preferred_sources=preferred_sources)
+    if block is None:
+        block = make_rag_block_generic(
+            hits_top,
+            max_chars=int(SETTINGS.get("rag_max_chars_per_chunk")),
+        )
+    return block or ""
+
+
+# ========= Preference boost / debug =========
+
+def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
+    if not preferred_sources:
+        return hits
+    boost = float(SETTINGS.get("rag_new_upload_score_boost"))
+    pref = set(s.strip().lower() for s in preferred_sources if s)
+    out = []
+    for h in hits:
+        sc = float(h.get("score") or 0.0)
+        src = str(h.get("source") or "").strip().lower()
+        if src in pref:
+            sc *= (1.0 + boost)
+        hh = dict(h)
+        hh["score"] = sc
+        out.append(hh)
+    return out
+
+
+def _fmt_hit(h: Dict[str, Any]) -> str:
+    return (
+        f"id={h.get('id')!s} src={h.get('source')!s} "
+        f"chunk={h.get('chunkIndex')!s} row={h.get('row')!s} "
+        f"score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
+    )
+
+
+def _print_hits(label: str, hits: List[Dict[str, Any]], limit: int = PRINT_MAX) -> None:
+    print(f"[RAG DEBUG] {label}: count={len(hits)}")
+    for i, h in enumerate(hits[:limit]):
+        print(f"[RAG DEBUG]   {i+1:02d}: {_fmt_hit(h)}")
+    if len(hits) > limit:
+        print(f"[RAG DEBUG]   … (+{len(hits)-limit} more)")
+
+
+def _nohit_block(q: str) -> str:
+    preamble = str(SETTINGS.get("rag_block_preamble") or "Local knowledge")
+    preamble = preamble if preamble.endswith(":") else preamble + ":"
+    msg = str(SETTINGS.get("rag_nohit_message") or "⛔ No relevant local entries found for this query. Do not guess.")
+    if q:
+        return f"{preamble}\n- {msg}\n- query={q!r}"
+    return f"{preamble}\n- {msg}"
+
+
+# ========= Telemetry =========
+
 @dataclass
 class RagTelemetry:
     embedSec: float = 0.0
@@ -592,13 +693,223 @@ class RagTelemetry:
     searchGlobalSec: float = 0.0
     hitsChat: int = 0
     hitsGlobal: int = 0
+    rerankSec: float = 0.0
+    usedReranker: bool = False
+    keptAfterRerank: int = 0
+    capPerSource: int = 0
+    keptAfterCap: int = 0
+    minScoreFrac: float = 0.0
+    keptAfterMinFrac: int = 0
+    fallbackUsed: bool = False
     dedupeSec: float = 0.0
     blockBuildSec: float = 0.0
     topKRequested: int = 0
     blockChars: int = 0
     mode: str = "global"
 
-def _build_rag_block_core(query: str, *, session_id: str | None, k: int, session_only: bool) -> Tuple[Optional[str], RagTelemetry]:
+# ===== aimodel/file_read/rag/retrieve_core.py =====
+
+# aimodel/file_read/rag/retrieve_core.py
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Any, Optional
+import time
+
+from ..core.settings import SETTINGS
+from .store import search_vectors
+from .retrieve_tabular import make_rag_block_tabular
+from .rerank import rerank_hits, cap_per_source, min_score_fraction
+
+_EMBEDDER = None
+_EMBEDDER_NAME = None
+PRINT_MAX = 10  # cap how many hits we dump at each stage
+
+
+def _get_embedder():
+    global _EMBEDDER, _EMBEDDER_NAME
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as e:
+        print(f"[RAG] sentence_transformers unavailable: {e}")
+        return None, None
+
+    model_name = SETTINGS.get("rag_embedding_model")
+    if not model_name:
+        print("[RAG] no rag_embedding_model configured")
+        return None, None
+
+    if _EMBEDDER is None or _EMBEDDER_NAME != model_name:
+        try:
+            _EMBEDDER = SentenceTransformer(model_name)
+            _EMBEDDER_NAME = model_name
+        except Exception as e:
+            print(f"[RAG] failed to load embedding model {model_name}: {e}")
+            _EMBEDDER = None
+            _EMBEDDER_NAME = None
+    return _EMBEDDER, _EMBEDDER_NAME
+
+
+def _embed_query(q: str) -> List[float]:
+    q = (q or "").strip()
+    if not q:
+        return []
+    model, _ = _get_embedder()
+    if model is None:
+        return []
+    try:
+        arr = model.encode([q], normalize_embeddings=True, convert_to_numpy=True)
+        return arr[0].tolist()
+    except Exception as e:
+        print(f"[RAG] embedding encode failed: {e}")
+        return []
+
+
+def _primary_score(h: Dict[str, Any]) -> float:
+    s = h.get("rerankScore")
+    if s is not None:
+        try:
+            return float(s)
+        except Exception:
+            pass
+    try:
+        return float(h.get("score") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
+    hits_sorted = sorted(hits, key=_primary_score, reverse=True)
+    seen: set[Tuple[str, str]] = set()
+    out: List[dict] = []
+    for h in hits_sorted:
+        kid = str(h.get("id") or "")
+        key = (kid, "") if kid else (str(h.get("source") or ""), str(h.get("chunkIndex") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+        if len(out) >= k:
+            break
+    return out
+
+
+def _default_header(h: Dict[str, Any]) -> str:
+    src = str(h.get("source") or "")
+    idx = h.get("chunkIndex")
+    return f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
+
+
+def _render_header(h: Dict[str, Any]) -> str:
+    return _default_header(h)
+
+
+def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
+    preamble = str(SETTINGS.get("rag_block_preamble") or "")
+    preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
+    total_budget = int(SETTINGS.get("rag_total_char_budget"))
+
+    lines = [preamble]
+    used = len(lines[0]) + 1
+
+    for h in hits:
+        head = _render_header(h)
+        body = (h.get("text") or "").strip()
+
+        head_cost = len(head) + 1
+        if used + head_cost >= total_budget:
+            break
+        lines.append(head)
+        used += head_cost
+
+        if body:
+            snippet = body[:max_chars]
+            snippet_line = "  " + snippet
+            snippet_cost = len(snippet_line) + 1
+            if used + snippet_cost > total_budget:
+                remain = max(0, total_budget - used - 1)
+                if remain > 0:
+                    lines.append(("  " + snippet)[:remain])
+                    used += remain + 1
+                break
+            lines.append(snippet_line)
+            used += snippet_cost
+
+    return "\n".join(lines)
+
+
+@dataclass
+class RagTelemetry:
+    embedSec: float = 0.0
+    searchChatSec: float = 0.0
+    searchGlobalSec: float = 0.0
+    hitsChat: int = 0
+    hitsGlobal: int = 0
+    rerankSec: float = 0.0
+    usedReranker: bool = False
+    keptAfterRerank: int = 0
+    capPerSource: int = 0
+    keptAfterCap: int = 0
+    minScoreFrac: float = 0.0
+    keptAfterMinFrac: int = 0
+    fallbackUsed: bool = False
+    dedupeSec: float = 0.0
+    blockBuildSec: float = 0.0
+    topKRequested: int = 0
+    blockChars: int = 0
+    mode: str = "global"
+
+
+def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
+    if not preferred_sources:
+        return hits
+    boost = float(SETTINGS.get("rag_new_upload_score_boost"))
+    pref = set(s.strip().lower() for s in preferred_sources if s)
+    out = []
+    for h in hits:
+        sc = float(h.get("score") or 0.0)
+        src = str(h.get("source") or "").strip().lower()
+        if src in pref:
+            sc *= (1.0 + boost)
+        hh = dict(h)
+        hh["score"] = sc
+        out.append(hh)
+    return out
+
+
+def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[str]] = None) -> str:
+    block = make_rag_block_tabular(hits_top, preferred_sources=preferred_sources)
+    if block is None:
+        block = make_rag_block_generic(
+            hits_top,
+            max_chars=int(SETTINGS.get("rag_max_chars_per_chunk")),
+        )
+    return block or ""
+
+
+def _fmt_hit(h: Dict[str, Any]) -> str:
+    return (
+        f"id={h.get('id')!s} src={h.get('source')!s} "
+        f"chunk={h.get('chunkIndex')!s} row={h.get('row')!s} "
+        f"score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
+    )
+
+
+def _print_hits(label: str, hits: List[Dict[str, Any]], limit: int = PRINT_MAX) -> None:
+    print(f"[RAG DEBUG] {label}: count={len(hits)}")
+    for i, h in enumerate(hits[:limit]):
+        print(f"[RAG DEBUG]   {i+1:02d}: {_fmt_hit(h)}")
+    if len(hits) > limit:
+        print(f"[RAG DEBUG]   … (+{len(hits)-limit} more)")
+
+
+def _build_rag_block_core(
+    query: str,
+    *,
+    session_id: str | None,
+    k: int,
+    session_only: bool,
+    preferred_sources: Optional[List[str]] = None,
+) -> Tuple[Optional[str], RagTelemetry]:
     tel = RagTelemetry(topKRequested=k, mode=("session-only" if session_only else "global"))
     q = (query or "").strip()
     print(f"[RAG SEARCH] q={q!r} session={session_id} k={k} session_only={session_only}")
@@ -613,13 +924,11 @@ def _build_rag_block_core(query: str, *, session_id: str | None, k: int, session
 
     d = len(qvec)
 
-    hits_chat: List[dict] = []
-    hits_glob: List[dict] = []
-
     t1 = time.perf_counter()
     hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
     tel.searchChatSec = round(time.perf_counter() - t1, 6)
 
+    hits_glob: List[dict] = []
     if not session_only:
         t2 = time.perf_counter()
         hits_glob = search_vectors(None, qvec, k, dim=d) or []
@@ -628,55 +937,509 @@ def _build_rag_block_core(query: str, *, session_id: str | None, k: int, session
     tel.hitsChat = len(hits_chat)
     tel.hitsGlobal = len(hits_glob)
 
-    all_hits = hits_chat + ([] if session_only else hits_glob)
+    _print_hits("ANN hits (chat)", hits_chat)
+    if not session_only:
+        _print_hits("ANN hits (global)", hits_glob)
 
+    all_hits = hits_chat + ([] if session_only else hits_glob)
     if not all_hits:
         print("[RAG SEARCH] no hits")
         return None, tel
 
+    # Preference boost
+    all_hits = _rescore_for_preferred_sources(all_hits, preferred_sources=preferred_sources)
+    _print_hits("After preference boost", all_hits)
+
+    # Keep a safe copy BEFORE pruning
+    pre_prune_hits = list(all_hits)
+
+    # --- Rerank (guarded) ---
+    t_rr = time.perf_counter()
+    top_m_cfg = SETTINGS.get("rag_rerank_top_m")
+    try:
+        top_m = int(top_m_cfg) if top_m_cfg not in (None, "", False) else None
+    except Exception:
+        top_m = None
+    # clamp to available hits if provided
+    if isinstance(top_m, int):
+        top_m = max(1, min(top_m, len(all_hits)))
+
+    try:
+        all_hits = rerank_hits(q, all_hits, top_m=top_m)
+    except Exception as e:
+        print(f"[RAG] rerank error: {e}; skipping rerank")
+        # keep pre-prune ordering
+        pass
+
+    tel.rerankSec = round(time.perf_counter() - t_rr, 6)
+    tel.usedReranker = any("rerankScore" in h for h in all_hits)
+    tel.keptAfterRerank = len(all_hits)
+    _print_hits(f"After rerank (top_m={top_m})", all_hits)
+
+    # --- Min-score fraction first (robust) ---
+    frac_cfg = SETTINGS.get("rag_min_score_frac")
+    try:
+        frac = float(frac_cfg) if frac_cfg not in (None, "", False) else None
+    except Exception:
+        frac = None
+
+    tel.minScoreFrac = float(frac) if isinstance(frac, (int, float)) else 0.0
+    if isinstance(frac, (int, float)):
+        key = "rerankScore" if any("rerankScore" in h for h in all_hits) else "score"
+        before = list(all_hits)
+        all_hits = min_score_fraction(all_hits, key, float(frac))
+        _print_hits(f"After minScoreFrac={frac} on key={key}", all_hits)
+        dropped = [h for h in before if h not in all_hits]
+        if dropped:
+            _print_hits("Dropped by minScoreFrac", dropped)
+    tel.keptAfterMinFrac = len(all_hits)
+
+    # --- Per-source cap AFTER min-frac ---
+    cap_cfg = SETTINGS.get("rag_per_source_cap")
+    try:
+        cap_val = int(cap_cfg) if cap_cfg not in (None, "", False) else 0
+    except Exception:
+        cap_val = 0
+    tel.capPerSource = cap_val
+    if cap_val and cap_val > 0:
+        before = list(all_hits)
+        all_hits = cap_per_source(all_hits, cap_val)
+        _print_hits(f"After per-source cap={cap_val}", all_hits)
+        dropped = [h for h in before if h not in all_hits]
+        if dropped:
+            _print_hits("Dropped by per-source cap", dropped)
+    tel.keptAfterCap = len(all_hits)
+
+    # SAFETY NET
+    if not all_hits:
+        best = sorted(pre_prune_hits, key=_primary_score, reverse=True)[:1]
+        all_hits = best
+        tel.fallbackUsed = True
+        print("[RAG] pruning yielded 0 hits; falling back to best pre-prune hit")
+        _print_hits("Fallback best pre-prune", all_hits)
+
+    # Final selection
     t3 = time.perf_counter()
     hits_top = _dedupe_and_sort(all_hits, k=k)
     tel.dedupeSec = round(time.perf_counter() - t3, 6)
+    _print_hits(f"Final top-k (k={k})", hits_top)
 
+    # Build block
     t4 = time.perf_counter()
-    block = make_rag_block(
-        hits_top,
-        max_chars=int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
-    )
+    block = build_block_for_hits(hits_top, preferred_sources=preferred_sources)
     tel.blockBuildSec = round(time.perf_counter() - t4, 6)
     tel.blockChars = len(block or "")
-    print(f"[RAG BLOCK] chars={tel.blockChars}")
+    preview = (block or "")[:400].replace("\n", "\\n")
+    print(f"[RAG BLOCK] chars={tel.blockChars} preview=\"{preview}\"")
+    print(f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}")
+
     return block, tel
 
-def build_rag_block(query: str, session_id: str | None = None) -> str | None:
-    if not bool(SETTINGS.get("rag_enabled", True)):
+
+def build_rag_block(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> str | None:
+    if not bool(SETTINGS.get("rag_enabled")):
         return None
-    k = int(SETTINGS.get("rag_top_k", 4))
-    block, _ = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False)
+    k = int(SETTINGS.get("rag_top_k"))
+    block, _ = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
     return block
 
-def build_rag_block_with_telemetry(query: str, session_id: str | None = None) -> Tuple[Optional[str], Dict[str, Any]]:
-    if not bool(SETTINGS.get("rag_enabled", True)):
+
+def build_rag_block_with_telemetry(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not bool(SETTINGS.get("rag_enabled")):
         return None, {}
-    k = int(SETTINGS.get("rag_top_k", 4))
-    block, tel = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False)
+    k = int(SETTINGS.get("rag_top_k"))
+    block, tel = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
     return block, asdict(tel)
 
-def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None) -> Optional[str]:
-    if not bool(SETTINGS.get("rag_enabled", True)):
+
+def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Optional[str]:
+    if not bool(SETTINGS.get("rag_enabled")):
         return None
     if k is None:
-        k = int(SETTINGS.get("attachments_retrieve_top_k", SETTINGS.get("rag_top_k", 4)))
-    block, _ = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True)
+        k = int(SETTINGS.get("attachments_retrieve_top_k"))
+    block, _ = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
     return block
 
-def build_rag_block_session_only_with_telemetry(query: str, session_id: Optional[str], *, k: Optional[int] = None) -> Tuple[Optional[str], Dict[str, Any]]:
-    if not bool(SETTINGS.get("rag_enabled", True)):
+
+def build_rag_block_session_only_with_telemetry(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not bool(SETTINGS.get("rag_enabled")):
         return None, {}
     if k is None:
-        k = int(SETTINGS.get("attachments_retrieve_top_k", SETTINGS.get("rag_top_k", 4)))
-    block, tel = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True)
+        k = int(SETTINGS.get("attachments_retrieve_top_k"))
+    block, tel = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
     return block, asdict(tel)
+
+# ===== aimodel/file_read/rag/retrieve_pipeline.py =====
+
+# ===== aimodel/file_read/rag/retrieve_pipeline.py =====
+from __future__ import annotations
+from dataclasses import asdict
+from typing import List, Tuple, Dict, Any, Optional
+import time
+
+from ..core.settings import SETTINGS
+from .store import search_vectors
+from .rerank import rerank_hits, cap_per_source, min_score_fraction
+from .retrieve_common import (
+    RagTelemetry,
+    _embed_query,
+    _primary_score,
+    _dedupe_and_sort,
+    _rescore_for_preferred_sources,
+    _print_hits,
+    build_block_for_hits,
+    _nohit_block,
+)
+
+def _mk_preview(text: Optional[str], limit: int = 400) -> str:
+    t = (text or "")[:limit]
+    return t.replace("\n", "\\n")
+
+def _build_rag_block_core(
+    query: str,
+    *,
+    session_id: str | None,
+    k: int,
+    session_only: bool,
+    preferred_sources: Optional[List[str]] = None,
+) -> Tuple[Optional[str], RagTelemetry]:
+    tel = RagTelemetry(topKRequested=k, mode=("session-only" if session_only else "global"))
+    q = (query or "").strip()
+    print(f"[RAG SEARCH] q={q!r} session={session_id} k={k} session_only={session_only}")
+
+    t0 = time.perf_counter()
+    qvec = _embed_query(q)
+    tel.embedSec = round(time.perf_counter() - t0, 6)
+    if not qvec:
+        print("[RAG SEARCH] no qvec")
+        return None, tel
+
+    d = len(qvec)
+
+    t1 = time.perf_counter()
+    hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
+    tel.searchChatSec = round(time.perf_counter() - t1, 6)
+
+    hits_glob: List[dict] = []
+    if not session_only:
+        t2 = time.perf_counter()
+        hits_glob = search_vectors(None, qvec, k, dim=d) or []
+        tel.searchGlobalSec = round(time.perf_counter() - t2, 6)
+
+    tel.hitsChat = len(hits_chat)
+    tel.hitsGlobal = len(hits_glob)
+
+    _print_hits("ANN hits (chat)", hits_chat)
+    if not session_only:
+        _print_hits("ANN hits (global)", hits_glob)
+
+    all_hits = hits_chat + ([] if session_only else hits_glob)
+    if not all_hits:
+        print("[RAG SEARCH] no hits")
+        return None, tel
+
+    all_hits = _rescore_for_preferred_sources(all_hits, preferred_sources=preferred_sources)
+    _print_hits("After preference boost", all_hits)
+
+    pre_prune_hits = list(all_hits)
+
+    t_rr = time.perf_counter()
+    top_m_cfg = SETTINGS.get("rag_rerank_top_m")
+    try:
+        top_m = int(top_m_cfg) if top_m_cfg not in (None, "", False) else None
+    except Exception:
+        top_m = None
+    if isinstance(top_m, int):
+        top_m = max(1, min(top_m, len(all_hits)))
+
+    try:
+        all_hits = rerank_hits(q, all_hits, top_m=top_m)
+    except Exception as e:
+        print(f"[RAG] rerank error: {e}; skipping rerank")
+        pass
+
+    tel.rerankSec = round(time.perf_counter() - t_rr, 6)
+    tel.usedReranker = any("rerankScore" in h for h in all_hits)
+    tel.keptAfterRerank = len(all_hits)
+    _print_hits(f"After rerank (top_m={top_m})", all_hits)
+
+    min_abs = SETTINGS.get("rag_min_abs_rerank")
+    try:
+        min_abs = float(min_abs) if min_abs not in (None, "", False) else None
+    except Exception:
+        min_abs = None
+    if isinstance(min_abs, float):
+        before = list(all_hits)
+        all_hits = [h for h in all_hits if float(h.get("rerankScore") or -1e12) >= min_abs]
+        if len(all_hits) != len(before):
+            _print_hits(f"After abs rerank cutoff >= {min_abs}", all_hits)
+
+    frac_cfg = SETTINGS.get("rag_min_score_frac")
+    try:
+        frac = float(frac_cfg) if frac_cfg not in (None, "", False) else None
+    except Exception:
+        frac = None
+    tel.minScoreFrac = float(frac) if isinstance(frac, (int, float)) else 0.0
+    if isinstance(frac, (int, float)):
+        key = "rerankScore" if any("rerankScore" in h for h in all_hits) else "score"
+        before = list(all_hits)
+        all_hits = min_score_fraction(all_hits, key, float(frac))
+        _print_hits(f"After minScoreFrac={frac} on key={key}", all_hits)
+        dropped = [h for h in before if h not in all_hits]
+        if dropped:
+            _print_hits("Dropped by minScoreFrac", dropped)
+    tel.keptAfterMinFrac = len(all_hits)
+
+    cap_cfg = SETTINGS.get("rag_per_source_cap")
+    try:
+        cap_val = int(cap_cfg) if cap_cfg not in (None, "", False) else 0
+    except Exception:
+        cap_val = 0
+    tel.capPerSource = cap_val
+    if cap_val and cap_val > 0:
+        before = list(all_hits)
+        all_hits = cap_per_source(all_hits, cap_val)
+        _print_hits(f"After per-source cap={cap_val}", all_hits)
+        dropped = [h for h in before if h not in all_hits]
+        if dropped:
+            _print_hits("Dropped by per-source cap", dropped)
+    tel.keptAfterCap = len(all_hits)
+
+    if not all_hits:
+        if pre_prune_hits:
+            all_hits = sorted(pre_prune_hits, key=_primary_score, reverse=True)[:1]
+            tel.fallbackUsed = True
+            print("[RAG] pruning yielded 0; keeping best pre-prune (low-confidence fallback)")
+            _print_hits("Fallback best pre-prune", all_hits)
+        else:
+            tel.fallbackUsed = False
+            print("[RAG] no ANN hits; returning no-hit block")
+            block = _nohit_block(q)
+            tel.blockChars = len(block or "")
+            preview = _mk_preview(block)
+            print(f'[RAG BLOCK] chars={tel.blockChars} preview="{preview}"')
+            print(f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}")
+            return block, tel
+
+    t3 = time.perf_counter()
+    hits_top = _dedupe_and_sort(all_hits, k=k)
+    tel.dedupeSec = round(time.perf_counter() - t3, 6)
+    _print_hits(f"Final top-k (k={k})", hits_top)
+
+    t4 = time.perf_counter()
+    block = build_block_for_hits(hits_top, preferred_sources=preferred_sources)
+    tel.blockBuildSec = round(time.perf_counter() - t4, 6)
+    tel.blockChars = len(block or "")
+    preview = _mk_preview(block)
+    print(f'[RAG BLOCK] chars={tel.blockChars} preview="{preview}"')
+    print(f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}")
+
+    return block, tel
+
+def build_rag_block(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> str | None:
+    if not bool(SETTINGS.get("rag_enabled")):
+        return None
+    k = int(SETTINGS.get("rag_top_k"))
+    block, _ = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
+    return block
+
+def build_rag_block_with_telemetry(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not bool(SETTINGS.get("rag_enabled")):
+        return None, {}
+    k = int(SETTINGS.get("rag_top_k"))
+    block, tel = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
+    return block, asdict(tel)
+
+def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Optional[str]:
+    if not bool(SETTINGS.get("rag_enabled")):
+        return None
+    if k is None:
+        k = int(SETTINGS.get("attachments_retrieve_top_k"))
+    block, _ = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
+    return block
+
+def build_rag_block_session_only_with_telemetry(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not bool(SETTINGS.get("rag_enabled")):
+        return None, {}
+    if k is None:
+        k = int(SETTINGS.get("attachments_retrieve_top_k"))
+    block, tel = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
+    return block, asdict(tel)
+
+# ===== aimodel/file_read/rag/retrieve_tabular.py =====
+
+from __future__ import annotations
+from typing import List, Dict, Any, Optional, Tuple
+import re, os
+
+from ..core.settings import SETTINGS
+
+_TABLE_RE = re.compile(r"^##\s*Table:\s*(?P<sheet>[^!]+)!\s*R(?P<r1>\d+)-(?P<r2>\d+),C(?P<c1>\d+)-(?P<c2>\d+)", re.MULTILINE)
+_ROW_RE = re.compile(r"^#{0,3}\s*Row\s+(?P<row>\d+)\s+—\s+(?P<sheet>[^\r\n]+)", re.MULTILINE)
+
+
+def is_csv_source(src: str) -> bool:
+    try:
+        _, ext = os.path.splitext(src.lower())
+        return ext in {".csv", ".tsv"}
+    except Exception:
+        return False
+
+
+def is_xlsx_source(src: str) -> bool:
+    try:
+        _, ext = os.path.splitext(src.lower())
+        return ext in {".xlsx", ".xlsm", ".xls"}
+    except Exception:
+        return False
+
+
+def _capture_table_block(text: str) -> Optional[str]:
+    m = _TABLE_RE.search(text or "")
+    if not m:
+        return None
+    start = m.start()
+    end = len(text)
+    nxt = re.search(r"^\s*$", text[m.end():], re.MULTILINE)
+    if nxt:
+        end = m.end() + nxt.start()
+    return text[start:end].strip()
+
+
+def _capture_row_block(text: str, row_num: int, sheet: str) -> Optional[str]:
+    if not text:
+        return None
+    pat = re.compile(rf"^#{0,3}\s*Row\s+{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)", re.MULTILINE | re.DOTALL)
+    m = pat.search(text)
+    if not m:
+        pat2 = re.compile(rf"^\s*{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)", re.MULTILINE | re.DOTALL)
+        m = pat2.search(text)
+        if not m:
+            return None
+    head = f"### Row {row_num} — {sheet}"
+    body = (m.group("body") or "").strip()
+    if not body:
+        return head
+    return f"{head}\n{body}"
+
+
+def _collect_tabular_hits(hits: List[dict]) -> Dict[str, Any]:
+    headers: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]] = {}
+    rows: List[Dict[str, Any]] = []
+    for h in hits:
+        src = str(h.get("source") or "")
+        body = (h.get("text") or "").strip()
+
+        for mt in _TABLE_RE.finditer(body):
+            sheet = mt.group("sheet").strip()
+            r1 = int(mt.group("r1")); r2 = int(mt.group("r2"))
+            c1 = int(mt.group("c1")); c2 = int(mt.group("c2"))
+            key = (src, sheet, r1, r2, c1, c2)
+            if key not in headers:
+                tb = _capture_table_block(body)
+                headers[key] = {
+                    "source": src, "sheet": sheet,
+                    "r1": r1, "r2": r2, "c1": c1, "c2": c2,
+                    "text": tb or "", "score": float(h.get("score") or 0.0)
+                }
+            else:
+                headers[key]["score"] = max(headers[key]["score"], float(h.get("score") or 0.0))
+
+        for mr in _ROW_RE.finditer(body):
+            rn = int(mr.group("row"))
+            sheet = mr.group("sheet").strip()
+            rows.append({"source": src, "sheet": sheet, "row": rn, "hit": h, "score": float(h.get("score") or 0.0)})
+    return {"headers": headers, "rows": rows}
+
+
+def _pair_rows_with_headers(collected: Dict[str, Any]) -> Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]]:
+    headers = collected["headers"]
+    rows = collected["rows"]
+    groups: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]] = {}
+    for r in rows:
+        src = r["source"]; sheet = r["sheet"]; rown = r["row"]
+        match_key = None
+        for key in headers.keys():
+            s, sh, r1, r2, c1, c2 = key
+            if s == src and sh == sheet and r1 <= rown <= r2:
+                match_key = key
+                break
+        if not match_key:
+            continue
+        g = groups.setdefault(match_key, {"header": headers[match_key], "rows": []})
+        g["rows"].append(r)
+    return groups
+
+
+def _render_tabular_groups(
+    groups: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]],
+    preferred_sources: Optional[List[str]] = None
+) -> List[str]:
+    total_budget = int(SETTINGS.get("rag_total_char_budget"))
+    max_row_snippets = int(SETTINGS.get("rag_tabular_rows_per_table"))
+    per_row_max = int(SETTINGS.get("rag_max_chars_per_chunk"))
+    preamble = str(SETTINGS.get("rag_block_preamble") or "")
+    preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
+
+    pref = set(s.strip().lower() for s in (preferred_sources or []) if s)
+    boost = float(SETTINGS.get("rag_new_upload_score_boost"))
+
+    lines: List[str] = [preamble]
+    used = len(lines[0]) + 1
+
+    def _group_score(key):
+        base = groups[key]["header"]["score"]
+        src = str(groups[key]["header"]["source"] or "").strip().lower()
+        return base * (1.0 + boost) if src in pref else base
+
+    keys_sorted = sorted(groups.keys(), key=_group_score, reverse=True)
+
+    for key in keys_sorted:
+        hdr = groups[key]["header"]
+        hdr_text = (hdr.get("text") or "").strip()
+        if not hdr_text:
+            hdr_text = f"## Table: {hdr['sheet']}!R{hdr['r1']}-{hdr['r2']},C{hdr['c1']}-{hdr['c2']}"
+        hdr_cost = len(hdr_text) + 1
+        if used + hdr_cost > total_budget:
+            break
+        lines.append(hdr_text)
+        used += hdr_cost
+
+        row_list = sorted(groups[key]["rows"], key=lambda r: r["score"], reverse=True)[:max_row_snippets]
+        for r in row_list:
+            body = (r["hit"].get("text") or "")
+            row_block = _capture_row_block(body, r["row"], r["sheet"]) or ""
+            if not row_block:
+                continue
+            row_snip = row_block[:per_row_max].strip()
+            row_cost = len(row_snip) + 1
+            if used + row_cost > total_budget:
+                break
+            lines.append(row_snip)
+            used += row_cost
+
+        if used >= total_budget:
+            break
+
+    return lines
+
+
+def make_rag_block_tabular(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> Optional[str]:
+    if not hits:
+        return None
+    # Only keep sources that look like CSV/Excel to avoid mixing generic text
+    tabular_hits = [
+        h for h in hits
+        if is_xlsx_source(str(h.get("source") or "")) or is_csv_source(str(h.get("source") or ""))
+    ]
+    if not tabular_hits:
+        return None
+    collected = _collect_tabular_hits(tabular_hits)
+    groups = _pair_rows_with_headers(collected)
+    if not groups:
+        return None
+    lines = _render_tabular_groups(groups, preferred_sources=preferred_sources)
+    return "\n".join(lines)
 
 # ===== aimodel/file_read/rag/router_ai.py =====
 
@@ -782,7 +1545,8 @@ def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
 
         data = _force_json_strict(text_out)
         if not isinstance(data, dict):
-            return (False, None)
+            need_default = SETTINGS.get("router_rag_default_need_when_invalid")
+            return (bool(need_default) if isinstance(need_default, bool) else False, None)
         data = _normalize_keys(data)
 
         need_raw = data.get("need")
@@ -792,9 +1556,15 @@ def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
             return (bool(need_default) if isinstance(need_default, bool) else False, None)
 
         need = bool(need_bool)
+        if not need:
+            return (False, None)
+
         query_field = data.get("query", "")
-        query = _strip_wrappers(str(query_field or "").strip()) if need else None
-        return (need, query)
+        query_clean = _strip_wrappers(str(query_field or "").strip())
+        if not query_clean:
+            query_clean = core_text[:512]
+
+        return (True, query_clean)
 
     except Exception as e:
         _dbg(f"FATAL {type(e).__name__}: {e}")
@@ -1002,6 +1772,38 @@ def delete_namespace(session_id: str) -> bool:
             return True
         return False
     except Exception:
+        return False
+
+# --- add near the other helpers ---
+def session_has_any_vectors(session_id: Optional[str]) -> bool:
+    """
+    Return True if this session has any indexed vectors stored on disk.
+    We consider the namespace non-empty if the FAISS index exists and ntotal > 0,
+    and the meta.jsonl exists with at least one line.
+    """
+    if not session_id:
+        return False
+
+    idx_path, meta_path = _paths(session_id)
+    if not idx_path.exists() or not meta_path.exists():
+        return False
+
+    try:
+        idx = _load_index(dim=1, p=idx_path)  # dim not used by IndexFlatIP reader
+        if getattr(idx, "ntotal", 0) <= 0:
+            return False
+    except Exception as e:
+        print(f"[RAG STORE] failed to read index for {session_id}: {e}")
+        return False
+
+    try:
+        # quick check: meta file has at least one JSONL line
+        with meta_path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                return True
+        return False
+    except Exception as e:
+        print(f"[RAG STORE] failed to read meta for {session_id}: {e}")
         return False
 
 # ===== aimodel/file_read/rag/uploads.py =====
@@ -1348,6 +2150,10 @@ def list_local_models() -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x["sizeBytes"], reverse=True)
     return out
 
+# ===== aimodel/file_read/services/__init__.py =====
+
+
+
 # ===== aimodel/file_read/services/attachments.py =====
 
 from __future__ import annotations
@@ -1379,20 +2185,15 @@ from .context_window import current_n_ctx, estimate_tokens
 
 @dataclass
 class TurnBudget:
-    # INPUT
     n_ctx: int
     input_tokens_est: Optional[int]
     requested_out_tokens: int
     clamped_out_tokens: int
     clamp_margin: int
     reserved_system_tokens: Optional[int] = None
-
-    # DERIVED
     available_for_out_tokens: Optional[int] = None
     headroom_tokens: Optional[int] = None
     overage_tokens: Optional[int] = None
-
-    # EXPLANATION
     reason: str = "ok"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1412,16 +2213,19 @@ def analyze_budget(
     except Exception:
         inp = None
 
-    # available = n_ctx - input - clamp_margin (mirrors clamp_out_budget logic)
+    rst = int(reserved_system_tokens or 0)
+    min_out = 16
+
     if inp is None:
         available = None
-        clamped = requested_out_tokens  # best effort; clamp_out_budget will finalize
+        clamped = requested_out_tokens
         headroom = None
         overage = None
         reason = "input_tokens_unknown"
     else:
-        available = max(16, n_ctx - inp - clamp_margin)
-        clamped = max(16, min(requested_out_tokens, available))
+        available_raw = n_ctx - inp - clamp_margin - rst
+        available = max(min_out, available_raw)
+        clamped = max(min_out, min(requested_out_tokens, available))
         headroom = max(0, available - clamped)
         overage = max(0, requested_out_tokens - available)
         reason = "ok" if overage == 0 else "requested_exceeds_available"
@@ -1469,13 +2273,14 @@ def cancel_event(session_id: str) -> Event:
 
 # ===== aimodel/file_read/services/context_window.py =====
 
+# aimodel/file_read/services/context_window.py
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple, Any
 from ..utils.streaming import safe_token_count_messages
 from ..runtime.model_runtime import current_model_info
 from ..core.settings import SETTINGS
 
-def estimate_tokens(llm, messages: List[Dict[str,str]]) -> Optional[int]:
+def estimate_tokens(llm, messages: List[Dict[str, str]]) -> Optional[int]:
     try:
         return safe_token_count_messages(llm, messages)
     except Exception:
@@ -1491,8 +2296,8 @@ def current_n_ctx() -> int:
         return int(eff["nctx_fallback"])
 
 def clamp_out_budget(
-    *, llm, messages: List[Dict[str,str]], requested_out: int, margin: int = 32
-) -> Tuple[int, int]:
+    *, llm, messages: List[Dict[str, str]], requested_out: int, margin: int = 32, reserved_system_tokens: Optional[int] = None
+) -> Tuple[int, Optional[int]]:
     eff = SETTINGS.effective()
     inp_est = estimate_tokens(llm, messages)
     try:
@@ -1500,68 +2305,53 @@ def clamp_out_budget(
     except Exception:
         prompt_est = int(eff["token_estimate_fallback"])
     n_ctx = current_n_ctx()
-    available = max(int(eff["min_out_tokens"]), n_ctx - prompt_est - margin)
-    safe_out = max(int(eff["min_out_tokens"]), min(requested_out, available))
+    rst = int(reserved_system_tokens or 0)
+    min_out = int(eff.get("min_out_tokens", 16))
+    available = max(min_out, n_ctx - prompt_est - margin - rst)
+    safe_out = max(min_out, min(requested_out, available))
     return safe_out, (inp_est if inp_est is not None else None)
 
 def compute_budget_view(
     llm,
     messages: List[Dict[str, str]],
     requested_out: Optional[int] = None,
+    clamp_margin: Optional[int] = None,
+    reserved_system_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Returns a structured snapshot of the token budget for this request.
-    Uses your existing safe_token_count + nCtx logic to stay consistent
-    with clamp_out_budget().
-    """
     eff = SETTINGS.effective()
     n_ctx = current_n_ctx()
-    margin = int(eff.get("clamp_margin", 32))
+    margin = int(clamp_margin if clamp_margin is not None else eff.get("clamp_margin", 32))
+    rst = int(reserved_system_tokens if reserved_system_tokens is not None else eff.get("reserved_system_tokens", 0))
     min_out = int(eff.get("min_out_tokens", 16))
     default_out = int(eff.get("out_budget", 512))
-    req_out = int(requested_out or default_out)
+    req_out = int(requested_out if requested_out is not None else default_out)
 
-    # input estimate (with fallback identical to clamp_out_budget)
     inp_opt = estimate_tokens(llm, messages)
     if inp_opt is None:
         try:
-            from ..utils.streaming import safe_token_count_messages
             prompt_est = safe_token_count_messages(llm, messages)
         except Exception:
             prompt_est = int(eff["token_estimate_fallback"])
     else:
         prompt_est = int(inp_opt)
 
-    # capacity available for output per current policy (same formula as clamp_out_budget)
-    available = max(min_out, n_ctx - prompt_est - margin)
-
-    # chosen output budget (respect requested/default but never exceed available)
+    available = max(min_out, n_ctx - prompt_est - margin - rst)
     out_budget_chosen = max(min_out, min(req_out, available))
-
-    # diagnostics
-    over_by_tokens = max(0, (prompt_est + req_out + margin) - n_ctx)
-    usable_ctx = max(0, n_ctx - margin)
+    over_by_tokens = max(0, (prompt_est + req_out + margin + rst) - n_ctx)
+    usable_ctx = max(0, n_ctx - margin - rst)
 
     return {
-        # model/window
         "modelCtx": n_ctx,
         "clampMargin": margin,
         "usableCtx": usable_ctx,
-
-        # input side
+        "reservedSystemTokens": rst,
         "inputTokensEst": prompt_est,
-
-        # output side
         "outBudgetChosen": out_budget_chosen,
         "outBudgetDefault": default_out,
         "outBudgetRequested": req_out,
-        "outBudgetMaxAllowed": max(min_out, available),
-
-        # heads-up flags
-        "overByTokens": over_by_tokens,   # >0 means request (req_out) would overflow if granted
+        "outBudgetMaxAllowed": available,
+        "overByTokens": over_by_tokens,
         "minOutTokens": min_out,
-
-        # timing slot (filled by caller/streaming_worker if they measure queue wait)
         "queueWaitSec": None,
     }
 
@@ -1676,34 +2466,26 @@ async def cancel_session_alias(session_id: str) -> Dict[str, bool]:
 # ===== aimodel/file_read/services/generate_pipeline.py =====
 
 # aimodel/file_read/services/generate_pipeline.py
-# main generate pipeline orchestrator; no inline comments per request
 from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 from ..core.settings import SETTINGS
 from ..runtime.model_runtime import ensure_ready, get_llm
 from ..core.schemas import ChatBody
-from .session_io import handle_incoming, persist_summary
-from .packing import build_system_text, pack_with_rollup, maybe_inject_rag_block
+from .session_io import handle_incoming
+from .packing import build_system_text, pack_with_rollup
 from .prompt_utils import chars_len
 from .router_text import compose_router_text
 from .attachments import att_get
-from .budget import analyze_budget
-from .context_window import clamp_out_budget
 from ..web.router_ai import decide_web_and_fetch
-from ..rag.router_ai import decide_rag
-from ..rag.retrieve import build_rag_block_session_only
-from ..core.packing_memory_core import PACK_TELEMETRY, SUMMARY_TEL
+from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
 from .generate_pipeline_support import (
     Prep,
     _bool,
-    _tok_count,
     _approx_block_tokens,
-    _diff_find_inserted_block,
-    _web_breakdown,
-    _web_unattributed,
-    _enforce_fit,
 )
+from ..core.packing_memory_core import PACK_TELEMETRY
+from .generate_pipeline_part2 import _finish_prepare_generation_with_telemetry
 
 async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     ensure_ready()
@@ -1712,6 +2494,11 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     eff0 = SETTINGS.effective()
     session_id = data.sessionId or eff0["default_session_id"]
     eff = SETTINGS.effective(session_id=session_id)
+
+    rag_global_enabled = bool(eff.get("rag_global_enabled", True))
+    rag_session_enabled = bool(eff.get("rag_session_enabled", True))
+    force_session_only = bool(eff.get("rag_force_session_only")) or (not rag_global_enabled)
+
     temperature = float(eff["default_temperature"] if getattr(data, "temperature") is None else data.temperature)
     top_p = float(eff["default_top_p"] if getattr(data, "top_p") is None else data.top_p)
     out_budget_req = int(eff["default_max_tokens"] if getattr(data, "max_tokens") is None else data.max_tokens)
@@ -1724,6 +2511,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     if getattr(data, "autoRag") is not None:
         auto_rag = _bool(data.autoRag)
     model_ctx = int(eff["model_ctx"])
+
     incoming = [
         {
             "role": m.role,
@@ -1732,15 +2520,20 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         }
         for m in (data.messages or [])
     ]
+    print(f"[PIPE] incoming_msgs={len(incoming)}")
     latest_user = next((m for m in reversed(incoming) if m["role"] == "user"), {})
     latest_user_text = (latest_user.get("content") or "").strip()
     atts = (latest_user.get("attachments") or [])
     has_atts = bool(atts)
+    print(f"[PIPE] latest_user_text_len={len(latest_user_text)} has_atts={has_atts} att_count={len(atts)}")
+
     if not latest_user_text and has_atts:
         names = [att_get(a, "name") for a in atts]
         names = [n for n in names if n]
         latest_user_text = "User uploaded: " + (", ".join(names) if names else "files")
+
     st = handle_incoming(session_id, incoming)
+
     base_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
     router_text = compose_router_text(
         st.get("recent", []),
@@ -1750,10 +2543,12 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         summary_chars=int(eff["router_summary_chars"]),
         max_chars=int(eff["router_max_chars"]),
     )
+
     telemetry: Dict[str, Any] = {"web": {}, "rag": {}, "pack": {}, "prepSec": round(time.perf_counter() - t_request_start, 6)}
     ephemeral_once: List[Dict[str, str]] = []
     telemetry["web"]["injectElapsedSec"] = 0.0
     telemetry["web"]["ephemeralBlocks"] = 0
+
     try:
         web_block: Optional[str] = None
         web_tel: Dict[str, Any] = {}
@@ -1774,37 +2569,67 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         if (need_flag is True) and (not injected_candidate):
             try:
                 from ..web.orchestrator import build_web_block
-                fb = await build_web_block(router_text, k=web_k)
+                fb, fb_tel = await build_web_block(router_text, k=web_k)
+                print(f"[PIPE][WEB] orchestrator block preview: {fb[:200]!r}" if fb else "[PIPE][WEB] orchestrator returned no block")
+                print(f"[PIPE][WEB] orchestrator telemetry: {fb_tel}")
                 if fb and fb.strip():
                     web_block = fb
                     injected_candidate = True
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[PIPE][WEB] orchestrator fallback error: {e}")
         if injected_candidate:
             t0_inject = time.perf_counter()
             web_text = str(eff["web_block_preamble"]) + "\n\n" + web_block.strip()
+
+            max_chars = int(eff.get("web_inject_max_chars") or 0)
+            if max_chars > 0 and len(web_text) > max_chars:
+                web_text = web_text[:max_chars]
+
             telemetry["web"]["blockChars"] = len(web_text)
             tok = _approx_block_tokens(llm, "assistant", web_text)
             if tok is not None:
                 telemetry["web"]["blockTokensApprox"] = tok
             telemetry["web"]["injected"] = True
-            ephemeral_once.append({"role": "assistant", "content": web_text, "_ephemeral": True})
+
+            ephemeral_only = bool(eff.get("web_ephemeral_only", True))
+            telemetry["web"]["ephemeral"] = ephemeral_only
+            telemetry["web"]["droppedFromSummary"] = ephemeral_only
+
+            PACK_TELEMETRY["ignore_ephemeral_in_summary"] = ephemeral_only
+
+            ephemeral_once.append({
+                "role": "assistant",
+                "content": web_text,
+                "_ephemeral": True if ephemeral_only else False,
+                "_source": "web"
+            })
+
             telemetry["web"]["injectElapsedSec"] = round(time.perf_counter() - t0_inject, 6)
         else:
             telemetry["web"]["injected"] = False
             telemetry["web"]["injectElapsedSec"] = 0.0
-    except Exception:
+    except Exception as e:
+        print(f"[PIPE][WEB] error: {e}")
         telemetry["web"].setdefault("injected", False)
         telemetry["web"].setdefault("injectElapsedSec", 0.0)
+
     telemetry["web"]["ephemeralBlocks"] = len(ephemeral_once)
+    print(f"[PIPE] has_atts={has_atts} disable_global_rag_on_attachments={bool(eff.get('disable_global_rag_on_attachments'))}")
+
     if has_atts and bool(eff.get("disable_global_rag_on_attachments")):
         att_names = [att_get(a, "name") for a in atts if att_get(a, "name")]
         query_for_atts = (base_user_text or "").strip() or " ".join(att_names) or "document"
+        print(f"[PIPE] session-only RAG path query_for_atts={query_for_atts!r} att_names={att_names}")
         t0_att = time.perf_counter()
         try:
-            att_block = build_rag_block_session_only(query_for_atts, session_id)
+            att_block, att_tel = build_rag_block_session_only_with_telemetry(query_for_atts, session_id)
+            print(f"[PIPE][RAG] session-only query: {query_for_atts!r}")
+            print(f"[PIPE][RAG] session-only block preview: {att_block[:200]!r}" if att_block else "[PIPE][RAG] no session-only block")
         except Exception:
-            att_block = None
+            att_block, att_tel = (None, {})
+        if att_tel:
+            telemetry["rag"].update(att_tel)
+        print(f"[PIPE] session-only RAG built={bool(att_block)} block_chars={len(att_block or '')}")
         if att_block:
             rag_text = str(eff["rag_block_preamble"]) + "\n\n" + att_block
             telemetry["rag"]["sessionOnly"] = True
@@ -1819,6 +2644,7 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
             telemetry["rag"]["sessionOnly"] = False
             telemetry["rag"].setdefault("injected", False)
         telemetry["rag"]["sessionOnlyBuildSec"] = round(time.perf_counter() - t0_att, 6)
+
     system_text = build_system_text()
     t_pack0 = time.perf_counter()
     packed, st["summary"], _ = pack_with_rollup(
@@ -1830,30 +2656,83 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         ephemeral=ephemeral_once,
     )
     telemetry["pack"]["packSec"] = round(time.perf_counter() - t_pack0, 6)
-    rag_router_allowed = not (has_atts and bool(eff.get("disable_global_rag_on_attachments")))
-    if rag_router_allowed and bool(eff.get("rag_enabled", True)) and not ephemeral_once:
+
+    return await _finish_prepare_generation_with_telemetry(
+        llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
+        force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
+        telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
+    )
+
+# ===== aimodel/file_read/services/generate_pipeline_part2.py =====
+
+# aimodel/file_read/services/generate_pipeline_part2.py
+from __future__ import annotations
+import time
+from typing import Any, Dict, Optional, List
+from .prompt_utils import chars_len
+from .generate_pipeline_support import (
+    Prep, _tok_count, _approx_block_tokens, _diff_find_inserted_block,
+    _web_breakdown, _web_unattributed, _enforce_fit
+)
+from ..rag.router_ai import decide_rag
+from .packing import maybe_inject_rag_block
+from .session_io import persist_summary
+from .budget import analyze_budget
+from ..core.packing_memory_core import PACK_TELEMETRY
+from .context_window import clamp_out_budget
+
+async def _finish_prepare_generation_with_telemetry(
+    llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
+    force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
+    telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
+) -> Prep:
+    must_inject_session = bool(
+        force_session_only and rag_session_enabled and not has_atts and not telemetry.get("web", {}).get("ephemeralBlocks")
+    )
+
+    rag_router_allowed = ((rag_session_enabled or rag_global_enabled) and not (
+        has_atts and bool(eff["disable_global_rag_on_attachments"])
+    )) or must_inject_session
+
+    ephemeral_once: List[Dict[str, str]] = []
+    if rag_router_allowed and bool(eff["rag_enabled"]) and not ephemeral_once:
         rag_need = False
         rag_query: Optional[str] = None
-        t_router0 = time.perf_counter()
-        if auto_rag:
-            try:
-                rag_need, rag_query = decide_rag(llm, router_text)
-            except Exception:
-                rag_need, rag_query = (False, None)
-        telemetry["rag"]["routerDecideSec"] = round(time.perf_counter() - t_router0, 6)
-        telemetry["rag"]["routerNeeded"] = bool(rag_need)
-        if rag_query is not None:
+
+        if must_inject_session:
+            rag_need = True
+            rag_query = (latest_user_text or base_user_text or "").strip()
+            telemetry["rag"]["routerDecideSec"] = 0.0
+            telemetry["rag"]["routerNeeded"] = True
+            telemetry["rag"]["routerForcedSession"] = True
             telemetry["rag"]["routerQuery"] = rag_query
+        else:
+            t_router0 = time.perf_counter()
+            if auto_rag:
+                try:
+                    rag_need, rag_query = decide_rag(llm, router_text)
+                except Exception:
+                    rag_need, rag_query = (False, None)
+            telemetry["rag"]["routerDecideSec"] = round(time.perf_counter() - t_router0, 6)
+            telemetry["rag"]["routerNeeded"] = bool(rag_need)
+            if rag_query is not None:
+                telemetry["rag"]["routerQuery"] = rag_query
+
         skip_rag = bool(ephemeral_once) or (not rag_need)
         tokens_before = _tok_count(llm, packed)
         t_inject0 = time.perf_counter()
+
+        print(f"[PIPE][RAG] router query: {rag_query!r} skip_rag={skip_rag}")
         res = maybe_inject_rag_block(
             packed,
             session_id=session_id,
             skip_rag=skip_rag,
             rag_query=rag_query,
+            force_session_only=force_session_only,
         )
+
         telemetry["rag"]["injectBuildSec"] = round(time.perf_counter() - t_inject0, 6)
+
         if isinstance(res, tuple):
             packed2 = res[0]
             tel = res[1] if len(res) > 1 and isinstance(res[1], dict) else {}
@@ -1862,25 +2741,29 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
             packed2 = res
             tel = {}
             block_text = None
+
         if tel:
             telemetry["rag"].update(tel)
         if block_text:
+            print(f"[PIPE][RAG] injected block preview: {block_text[:200]!r}")
             telemetry["rag"]["blockChars"] = len(block_text)
             tok = _approx_block_tokens(llm, "user", block_text)
             if tok is not None:
                 telemetry["rag"]["blockTokensApprox"] = tok
             telemetry["rag"]["injected"] = True
-            telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or "global"
+            telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
         else:
             inserted = _diff_find_inserted_block(packed, packed2)
             if inserted and isinstance(inserted.get("content"), str):
+                print(f"[PIPE][RAG] diff-inserted block preview: {inserted['content'][:200]!r}")
                 text = inserted["content"]
                 telemetry["rag"]["blockChars"] = len(text)
                 tok = _approx_block_tokens(llm, "user", text)
                 if tok is not None:
                     telemetry["rag"]["blockTokensApprox"] = tok
                 telemetry["rag"]["injected"] = True
-                telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or "global"
+                telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
+
         tokens_after = _tok_count(llm, packed2)
         if tokens_before is not None:
             telemetry["rag"]["packedTokensBefore"] = tokens_before
@@ -1891,12 +2774,14 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         packed = packed2
     else:
         telemetry["rag"]["routerSkipped"] = True
-        if ephemeral_once:
+        if telemetry.get("web", {}).get("ephemeralBlocks"):
             telemetry["rag"]["routerSkippedReason"] = "ephemeral_block_present"
         elif not rag_router_allowed:
-            telemetry["rag"]["routerSkippedReason"] = "attachments_disable_global"
-        elif not bool(eff.get("rag_enabled", True)):
+            telemetry["rag"]["routerSkippedReason"] = "attachments_disable_global_or_rag_disabled"
+        elif not bool(eff["rag_enabled"]):
             telemetry["rag"]["routerSkippedReason"] = "rag_disabled"
+        print(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
+
     packed, out_budget_adj = _enforce_fit(llm, eff, packed, out_budget_req)
     packed_chars = chars_len(packed)
     telemetry["pack"]["packedChars"] = packed_chars
@@ -1915,869 +2800,4 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
     telemetry["pack"]["finalTrimSummaryShrunkFromChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkFromChars") or 0)
     telemetry["pack"]["finalTrimSummaryShrunkToChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkToChars") or 0)
     telemetry["pack"]["finalTrimSummaryDroppedChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryDroppedChars") or 0)
-    telemetry["pack"]["rollStartTokens"] = int(PACK_TELEMETRY.get("rollStartTokens") or 0)
-    telemetry["pack"]["rollOverageTokens"] = int(PACK_TELEMETRY.get("rollOverageTokens") or 0)
-    telemetry["pack"]["rollPeeledMsgs"] = int(PACK_TELEMETRY.get("rollPeeledMsgs") or 0)
-    telemetry["pack"]["rollNewSummaryChars"] = int(PACK_TELEMETRY.get("rollNewSummaryChars") or 0)
-    telemetry["pack"]["rollNewSummaryTokensApprox"] = int(PACK_TELEMETRY.get("rollNewSummaryTokensApprox") or 0)
-    persist_summary(session_id, st["summary"])
-    budget_view = analyze_budget(
-        llm=llm,
-        messages=packed,
-        requested_out_tokens=out_budget_adj,
-        clamp_margin=int(eff["clamp_margin"]),
-        reserved_system_tokens=int(eff.get("reserved_system_tokens") or 0),
-    ).to_dict()
-    wb = _web_breakdown(telemetry.get("web", {}))
-    telemetry.setdefault("web", {})["breakdown"] = wb
-    telemetry["web"]["breakdown"]["unattributedWebSec"] = _web_unattributed(telemetry.get("web", {}), wb)
-    telemetry["web"]["breakdown"]["prepSec"] = float(telemetry.get("prepSec") or 0.0)
-    budget_view.setdefault("web", {}).update(telemetry.get("web", {}))
-    budget_view.setdefault("rag", {}).update(telemetry.get("rag", {}))
-    budget_view.setdefault("pack", {}).update(telemetry.get("pack", {}))
-    out_budget, input_tokens_est = clamp_out_budget(
-        llm=llm, messages=packed, requested_out=out_budget_adj, margin=int(eff["clamp_margin"])
-    )
-    budget_view.setdefault("request", {})
-    budget_view["request"]["outBudgetRequested"] = out_budget_adj
-    budget_view["request"]["temperature"] = temperature
-    budget_view["request"]["top_p"] = top_p
-    return Prep(
-        llm=llm,
-        session_id=session_id,
-        packed=packed,
-        st=st,
-        out_budget=out_budget,
-        input_tokens_est=input_tokens_est,
-        budget_view=budget_view,
-        temperature=temperature,
-        top_p=top_p,
-        t_request_start=t_request_start,
-    )
-
-# ===== aimodel/file_read/services/generate_pipeline_support.py =====
-
-# aimodel/file_read/services/generate_pipeline_support.py
-# utility helpers for generate pipeline; no inline comments per request
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-from ..utils.streaming import safe_token_count_messages
-
-@dataclass
-class Prep:
-    llm: Any
-    session_id: str
-    packed: List[Dict[str, str]]
-    st: Dict[str, Any]
-    out_budget: int
-    input_tokens_est: Optional[int]
-    budget_view: Dict[str, Any]
-    temperature: float
-    top_p: float
-    t_request_start: float
-
-def _bool(v, default: bool = False) -> bool:
-    try:
-        return bool(v)
-    except Exception:
-        return bool(default)
-
-def _tok_count(llm, messages: List[Dict[str, str]]) -> Optional[int]:
-    try:
-        return int(safe_token_count_messages(llm, messages))
-    except Exception:
-        return None
-
-def _approx_block_tokens(llm, role: str, text: str) -> Optional[int]:
-    return _tok_count(llm, [{"role": role, "content": text}])
-
-def _diff_find_inserted_block(before: List[Dict[str, str]], after: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    if len(after) - len(before) != 1:
-        return None
-    i = 0
-    while i < len(before) and before[i] == after[i]:
-        i += 1
-    if i < len(after):
-        return after[i]
-    return None
-
-def _dump_msgs(label: str, msgs: List[Dict[str, str]], head_chars: int = 180):
-    return
-
-def _web_breakdown(web: Dict[str, Any]) -> Dict[str, float]:
-    w = web or {}
-    orch = w.get("orchestrator") or {}
-    router = float(w.get("elapsedSec") or 0.0)
-    summarize = float((w.get("summarizer") or {}).get("elapsedSec") or 0.0)
-    inject = float(w.get("injectElapsedSec") or 0.0)
-    search_total = 0.0
-    s1 = (orch.get("search") or {})
-    for k in ("elapsedSecTotal", "elapsedSec"):
-        if isinstance(s1.get(k), (int, float)):
-            search_total = float(s1[k])
-            break
-    fetch1 = float((orch.get("fetch1") or {}).get("totalSec") or 0.0)
-    fetch2 = float((orch.get("fetch2") or {}).get("totalSec") or 0.0)
-    orch_elapsed = float(orch.get("elapsedSec") or w.get("fetchElapsedSec") or 0.0)
-    assemble = orch_elapsed - (search_total + fetch1 + fetch2)
-    if assemble < 0:
-        assemble = 0.0
-    total_pre_ttft = router + summarize + orch_elapsed + inject
-    return {
-        "routerSec": round(router, 6),
-        "summarizeSec": round(summarize, 6),
-        "searchSec": round(search_total, 6),
-        "fetchSec": round(fetch1, 6),
-        "jsFetchSec": round(fetch2, 6),
-        "assembleSec": round(assemble, 6),
-        "orchestratorSec": round(orch_elapsed, 6),
-        "injectSec": round(inject, 6),
-        "totalWebPreTtftSec": round(total_pre_ttft, 6),
-    }
-
-def _web_unattributed(web: Dict[str, Any], breakdown: Dict[str, float]) -> float:
-    total = float((web or {}).get("fetchElapsedSec") or 0.0)
-    explained = float(breakdown.get("searchSec", 0.0)) + float(breakdown.get("fetchSec", 0.0)) + float(breakdown.get("jsFetchSec", 0.0)) + float(breakdown.get("assembleSec", 0.0))
-    ua = total - explained
-    return round(ua if ua > 0 else 0.0, 6)
-
-def _enforce_fit(llm, eff: Dict[str, Any], packed: List[Dict[str, str]], out_budget_req: int) -> tuple[list[dict], int]:
-    tok = _tok_count(llm, packed) or 0
-    capacity = int(eff["model_ctx"]) - int(eff["clamp_margin"])
-    def drop_one(px):
-        keep_head = 2 if len(px) >= 2 and isinstance(px[1].get("content"), str) and px[1]["content"].startswith(eff["summary_header_prefix"]) else 1
-        if len(px) > keep_head + 1:
-            px.pop(keep_head)
-            return True
-        return False
-    def remove_ephemeral_blocks(px):
-        i = 0
-        removed = False
-        while i < len(px):
-            m = px[i]
-            if m.get("_ephemeral") is True:
-                px.pop(i)
-                removed = True
-            else:
-                i += 1
-        return removed
-    if tok + out_budget_req > capacity:
-        if remove_ephemeral_blocks(packed):
-            tok = _tok_count(llm, packed) or 0
-    while tok + out_budget_req > capacity and drop_one(packed):
-        tok = _tok_count(llm, packed) or 0
-    if tok >= capacity:
-        ob2 = 0
-    else:
-        ob2 = min(out_budget_req, max(0, capacity - tok))
-    return packed, ob2
-
-# ===== aimodel/file_read/services/packing.py =====
-
-# ===== aimodel/file_read/services/packing.py =====
-from __future__ import annotations
-from typing import Tuple, List, Dict, Optional, Any
-from ..rag.retrieve import build_rag_block_with_telemetry
-from ..core.settings import SETTINGS
-from ..core.packing_ops import build_system, pack_messages, roll_summary_if_needed
-
-def build_system_text() -> str:
-    eff = SETTINGS.effective()
-    base = build_system(
-        style=str(eff["pack_style"]),
-        short=bool(eff["pack_short"]),
-        bullets=bool(eff["pack_bullets"]),
-    )
-    guidance = str(eff["packing_guidance"])
-    return base + guidance
-
-def pack_with_rollup(
-    *, system_text: str, summary: str, recent, max_ctx: int, out_budget: int,
-    ephemeral: Optional[List[Dict[str, str]]] = None,
-) -> Tuple[List[Dict[str, str]], str, int]:
-    eff = SETTINGS.effective()
-
-    packed, input_budget = pack_messages(
-        style=str(eff["pack_style"]),
-        short=bool(eff["pack_short"]),
-        bullets=bool(eff["pack_bullets"]),
-        summary=summary,
-        recent=recent,
-        max_ctx=max_ctx,
-        out_budget=out_budget,
-    )
-
-    packed, new_summary = roll_summary_if_needed(
-        packed=packed,
-        recent=recent,
-        summary=summary,
-        input_budget=input_budget,
-        system_text=system_text,
-    )
-
-    if ephemeral:
-        last_user_idx = None
-        for i in range(len(packed) - 1, -1, -1):
-            m = packed[i]
-            if isinstance(m, dict) and m.get("role") == "user":
-                last_user_idx = i
-                break
-        eph = list(ephemeral)
-        if last_user_idx is not None:
-            packed = packed[:last_user_idx] + eph + packed[last_user_idx:]
-        else:
-            packed = packed + eph
-
-    return packed, new_summary, input_budget
-
-def maybe_inject_rag_block(
-    messages: list[dict], *,
-    session_id: str | None,
-    skip_rag: bool = False,
-    rag_query: str | None = None,
-) -> tuple[list[dict], Optional[Dict[str, Any]], Optional[str]]:
-    if skip_rag:
-        return messages, None, None
-    if not SETTINGS.get("rag_enabled", True):
-        return messages, None, None
-    if not messages or messages[-1].get("role") != "user":
-        return messages, None, None
-
-    user_q = rag_query or (messages[-1].get("content") or "")
-    block, tel = build_rag_block_with_telemetry(user_q, session_id=session_id)
-    if not block:
-        print(f"[RAG INJECT] no hits (session={session_id}) q={(user_q or '')!r}")
-        return messages, None, None
-
-    print(f"[RAG INJECT] injecting (session={session_id}) chars={len(block)}")
-    injected = messages[:-1] + [{"role": "user", "content": block}, messages[-1]]
-
-    tel = dict(tel or {})
-    tel["injected"] = True
-    tel["mode"] = tel.get("mode") or "global"  # from telemetry
-    return injected, tel, block
-
-# ===== aimodel/file_read/services/prompt_utils.py =====
-
-from __future__ import annotations
-import json
-from datetime import datetime
-from typing import Dict, List
-
-
-def now_str() -> str:
-    return datetime.now().isoformat(timespec="milliseconds")
-
-
-def chars_len(msgs: List[object]) -> int:
-    total = 0
-    for m in msgs:
-        if isinstance(m, dict):
-            c = m.get("content")
-        else:
-            c = m
-        if isinstance(c, str):
-            total += len(c)
-        elif c is None:
-            continue
-        else:
-            try:
-                total += len(json.dumps(c, ensure_ascii=False))
-            except Exception:
-                pass
-    return total
-
-
-def dump_full_prompt(
-    messages: List[Dict[str, object]],
-    *,
-    params: Dict[str, object],
-    session_id: str,
-) -> None:
-    try:
-        print(f"[{now_str()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
-        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
-        print(f"[{now_str()}] PROMPT DUMP END   session={session_id}")
-    except Exception as e:
-        print(f"[{now_str()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
-
-# ===== aimodel/file_read/services/router_text.py =====
-
-from __future__ import annotations
-from typing import Optional, List
-from ..core.settings import SETTINGS
-
-
-def compose_router_text(
-    recent,
-    latest_user_text: str,
-    summary: str,
-    *,
-    tail_turns: Optional[int] = None,
-    summary_chars: Optional[int] = None,
-    max_chars: Optional[int] = None,
-) -> str:
-    eff = SETTINGS.effective()
-    tt = int(eff["router_tail_turns"]) if tail_turns is None else int(tail_turns)
-    sc = int(eff["router_summary_chars"]) if summary_chars is None else int(summary_chars)
-    mc = int(eff["router_max_chars"]) if max_chars is None else int(max_chars)
-    context_label = eff["router_context_label"]
-    summary_label = eff["router_summary_label"]
-
-    parts: List[str] = []
-    if latest_user_text:
-        parts.append((latest_user_text or "").strip())
-
-    try:
-        recent_list = list(recent)
-    except Exception:
-        recent_list = []
-
-    tail_src = recent_list[-tt:] if tt > 0 else []
-    tail_lines: List[str] = []
-    for m in reversed(tail_src):
-        if not isinstance(m, dict):
-            continue
-        c = (m.get("content") or "").strip()
-        if not c:
-            continue
-        role = (m.get("role") or "user").strip()
-        tail_lines.append(f"{role}: {c}")
-
-    if tail_lines:
-        parts.append(context_label + "\n" + "\n".join(tail_lines))
-
-    if summary:
-        s = summary.strip()
-        if sc > 0 and len(s) > sc:
-            s = s[-sc:]
-        parts.append(summary_label + "\n" + s)
-
-    out = "\n\n".join(parts).strip()
-    if len(out) > mc:
-        out = out[:mc].rstrip()
-    return out
-
-# ===== aimodel/file_read/services/session_io.py =====
-
-from __future__ import annotations
-from typing import Dict, List
-from ..core.packing_memory_core import get_session
-from ..store import set_summary as store_set_summary
-
-def handle_incoming(session_id: str, incoming: List[Dict[str, str]]):
-    st = get_session(session_id)
-    st.setdefault("_ephemeral_web", [])
-    for m in incoming:
-        st["recent"].append(m)
-    return st
-
-def persist_summary(session_id: str, summary: str):
-    try:
-        store_set_summary(session_id, summary)
-    except Exception:
-        pass
-
-# ===== aimodel/file_read/services/streaming_worker.py =====
-
-# aimodel/file_read/services/streaming_worker.py
-from __future__ import annotations
-import asyncio, json, time, logging
-from typing import AsyncGenerator, Optional, List
-
-from ..core.settings import SETTINGS
-from ..utils.streaming import (
-    RUNJSON_START, RUNJSON_END,
-    build_run_json, watch_disconnect,
-)
-
-log = logging.getLogger("aimodel.api.generate")
-
-async def run_stream(
-    *, llm, messages, out_budget, stop_ev, request,
-    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None, budget_view: Optional[dict] = None,
-) -> AsyncGenerator[bytes, None]:
-    q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
-    SENTINEL = object()
-
-    def produce():
-        t_start = t0_request or time.perf_counter()
-        t_first: Optional[float] = None
-        t_last: Optional[float] = None
-        t_call: Optional[float] = None
-        finish_reason: Optional[str] = None
-        err_text: Optional[str] = None
-        out_parts: List[str] = []
-        stage: dict = {"queueWaitSec": None, "genSec": None}
-
-        try:
-            try:
-                t_call = time.perf_counter()
-                stream = llm.create_chat_completion(
-                    messages=messages,
-                    stream=True,
-                    max_tokens=out_budget,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=SETTINGS.stream_top_k,
-                    repeat_penalty=SETTINGS.stream_repeat_penalty,
-                    stop=SETTINGS.stream_stop_strings,
-                )
-            except ValueError as ve:
-                if "exceed context window" in str(ve).lower():
-                    retry_tokens = max(
-                        SETTINGS.stream_retry_min_tokens,
-                        int(out_budget * SETTINGS.stream_retry_fraction)
-                    )
-                    log.warning(
-                        "generate: context overflow, retrying with max_tokens=%d",
-                        retry_tokens
-                    )
-                    stream = llm.create_chat_completion(
-                        messages=messages,
-                        stream=True,
-                        max_tokens=retry_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=SETTINGS.stream_top_k,
-                        repeat_penalty=SETTINGS.stream_repeat_penalty,
-                        stop=SETTINGS.stream_stop_strings,
-                    )
-                else:
-                    raise
-
-            for chunk in stream:
-                if stop_ev.is_set():
-                    break
-
-                try:
-                    fr = chunk["choices"][0].get("finish_reason")
-                    if fr:
-                        finish_reason = fr
-                except Exception:
-                    pass
-
-                piece = chunk["choices"][0]["delta"].get("content", "")
-                if not piece:
-                    continue
-
-                now = time.perf_counter()
-                if t_first is None:
-                    t_first = now
-                t_last = now
-                out_parts.append(piece)
-
-                while not stop_ev.is_set():
-                    try:
-                        q.put_nowait(piece)
-                        break
-                    except asyncio.QueueFull:
-                        time.sleep(SETTINGS.stream_backpressure_sleep_sec)
-
-        except Exception as e:
-            err_text = str(e)
-            log.exception("generate: llm stream error: %s", e)
-            try:
-                q.put_nowait(f"[aimodel] error: {e}")
-            except Exception:
-                pass
-        finally:
-            try:
-                out_text = "".join(out_parts)
-
-                if t_first is not None and t_last is not None:
-                    stage["genSec"] = round(t_last - t_first, 3)
-                if t_start is not None and t_first is not None:
-                    stage["ttftSec"] = round(t_first - t_start, 3)
-                if t_start is not None and t_last is not None:
-                    stage["totalSec"] = round(t_last - t_start, 3)
-
-                if t_call is not None and t_start is not None:
-                    stage["preModelSec"] = round(t_call - t_start, 6)
-                if t_call is not None and t_first is not None:
-                    stage["modelQueueSec"] = round(t_first - t_call, 6)
-
-                if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
-                    stage["queueWaitSec"] = budget_view.get("queueWaitSec")
-
-                engine = None
-                method_used = None
-                try:
-                    td = None
-                    g_last = getattr(llm, "get_last_timings", None)
-                    if callable(g_last):
-                        method_used = "get_last_timings"
-                        td = g_last()
-                    if td is None:
-                        g = getattr(llm, "get_timings", None)
-                        if callable(g):
-                            method_used = "get_timings"
-                            td = g()
-                    if td is None:
-                        if isinstance(getattr(llm, "timings", None), dict):
-                            method_used = "timings_attr"
-                            td = getattr(llm, "timings")
-                        elif isinstance(getattr(llm, "perf", None), dict):
-                            method_used = "perf_attr"
-                            td = getattr(llm, "perf")
-
-                    if isinstance(td, dict):
-                        def fms(v):
-                            try:
-                                return float(v) / 1000.0
-                            except Exception:
-                                return None
-                        def to_i(v):
-                            try:
-                                return int(v)
-                            except Exception:
-                                return None
-                        load_ms = td.get("load_ms") or td.get("loadMs")
-                        prompt_ms = td.get("prompt_ms") or td.get("promptMs") or td.get("prefill_ms")
-                        eval_ms = td.get("eval_ms") or td.get("evalMs") or td.get("decode_ms")
-                        prompt_n = td.get("prompt_n") or td.get("promptN") or td.get("prompt_tokens")
-                        eval_n = td.get("eval_n") or td.get("evalN") or td.get("eval_tokens")
-                        engine = {}
-                        x = fms(load_ms)
-                        if x is not None:
-                            engine["loadSec"] = round(x, 3)
-                        x = fms(prompt_ms)
-                        if x is not None:
-                            engine["promptSec"] = round(x, 3)
-                        x = fms(eval_ms)
-                        if x is not None:
-                            engine["evalSec"] = round(x, 3)
-                        n = to_i(prompt_n)
-                        if n is not None:
-                            engine["promptN"] = n
-                        n = to_i(eval_n)
-                        if n is not None:
-                            engine["evalN"] = n
-                        try:
-                            log.debug("llm timings method=%s keys=%s", method_used, list(td.keys()))
-                        except Exception:
-                            pass
-                    else:
-                        log.debug("llm timings unavailable")
-                except Exception as e:
-                    log.debug("llm timings probe error: %s", e)
-                    engine = None
-                if engine:
-                    stage["engine"] = engine
-
-                if isinstance(budget_view, dict):
-                    ttft_val = float(stage.get("ttftSec") or 0.0)
-                    pack = (budget_view.get("pack") or {})
-                    rag = (budget_view.get("rag") or {})
-                    web_bd = ((budget_view.get("web") or {}).get("breakdown") or {})
-                    pack_sec = float(pack.get("packSec") or 0.0)
-                    trim_sec = float(pack.get("finalTrimSec") or 0.0)
-                    comp_sec = float(pack.get("compressSec") or 0.0)
-                    rag_router = float(rag.get("routerDecideSec") or 0.0)
-                    rag_block = float(
-                        rag.get("injectBuildSec")
-                        or rag.get("blockBuildSec")
-                        or rag.get("sessionOnlyBuildSec")
-                        or 0.0
-                    )
-                    prep_sec = float(web_bd.get("prepSec") or 0.0)
-                    web_pre = float(web_bd.get("totalWebPreTtftSec") or 0.0)
-                    model_queue = float(stage.get("modelQueueSec") or 0.0)
-                    pre_accounted = pack_sec + trim_sec + comp_sec + rag_router + rag_block + web_pre + prep_sec + model_queue
-                    unattr_ttft = max(0.0, ttft_val - pre_accounted)
-                    budget_view.setdefault("breakdown", {})
-                    budget_view["breakdown"].update({
-                        "ttftSec": ttft_val,
-                        "preTtftAccountedSec": round(pre_accounted, 6),
-                        "unattributedTtftSec": round(unattr_ttft, 6),
-                    })
-
-                run_json = build_run_json(
-                    request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
-                    out_text=out_text,
-                    t_start=t_start,
-                    t_first=t_first,
-                    t_last=t_last,
-                    stop_set=stop_ev.is_set(),
-                    finish_reason=finish_reason,
-                    input_tokens_est=input_tokens_est,
-                    budget_view=budget_view,
-                    extra_timings=stage,
-                    error_text=err_text,
-                )
-                if SETTINGS.runjson_emit:
-                    q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
-            except Exception:
-                pass
-            finally:
-                try:
-                    llm.reset()
-                except Exception:
-                    pass
-                try:
-                    q.put_nowait(SENTINEL)
-                except Exception:
-                    pass
-
-    disconnect_task = asyncio.create_task(watch_disconnect(request, stop_ev))
-    producer = asyncio.create_task(asyncio.to_thread(produce))
-
-    try:
-        while True:
-            item = await q.get()
-            if item is SENTINEL:
-                break
-            yield (item if isinstance(item, bytes) else item.encode("utf-8"))
-        if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
-            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")
-    finally:
-        stop_ev.set()
-        disconnect_task.cancel()
-        try:
-            await asyncio.wait_for(producer, timeout=SETTINGS.stream_producer_join_timeout_sec)
-        except Exception:
-            pass
-
-# ===== aimodel/file_read/services/warmup.py =====
-
-# place at: aimodel/file_read/runtime/warmup.py  (or services/warmup.py if you chose Option B)
-
-from __future__ import annotations
-import asyncio, time
-from typing import Optional, Dict, Any
-
-from ..core.settings import SETTINGS
-from ..runtime.model_runtime import ensure_ready, get_llm
-from ..services.cancel import GEN_SEMAPHORE
-
-_warmup_task: Optional[asyncio.Task] = None
-
-async def _warmup_llm_once() -> Dict[str, Any]:
-    t0 = time.perf_counter()
-    ensure_ready()
-    try:
-        got = await asyncio.wait_for(GEN_SEMAPHORE.acquire(), timeout=0.01)
-    except asyncio.TimeoutError:
-        return {"llmSec": 0.0, "skipped": True}
-    if not got:
-        return {"llmSec": 0.0, "skipped": True}
-    try:
-        llm = get_llm()
-        llm.create_chat_completion(messages=[{"role":"user","content":"ok"}], max_tokens=1, temperature=0.0, stream=False)
-        return {"llmSec": round(time.perf_counter() - t0, 4), "skipped": False}
-    except Exception:
-        return {"llmSec": round(time.perf_counter() - t0, 4), "error": True}
-    finally:
-        try:
-            GEN_SEMAPHORE.release()
-        except Exception:
-            pass
-
-async def _warmup_web_once() -> Dict[str, Any]:
-    tel: Dict[str, Any] = {"queries": []}
-    if not bool(SETTINGS.get("web_enabled", True)):
-        tel["skipped"] = True
-        return tel
-    k           = int(SETTINGS.get("warmup_web_k", 2))
-    timeout_sec = float(SETTINGS.get("warmup_timeout_sec", 6))
-    queries     = list(SETTINGS.get("warmup_queries") or [])
-    try:
-        from ..web.router_ai import decide_web_and_fetch
-    except Exception:
-        tel["error"] = "web_stack_unavailable"
-        return tel
-    llm = get_llm()
-    t0 = time.perf_counter()
-    for q in queries[:3]:
-        try:
-            block, web_tel = await asyncio.wait_for(decide_web_and_fetch(llm, q, k=k), timeout=timeout_sec)
-            tel["queries"].append({"q": q, "chars": len(block or ""), **(web_tel or {})})
-        except Exception:
-            tel["queries"].append({"q": q, "error": True})
-    tel["totalFetchSec"] = round(time.perf_counter() - t0, 4)
-    return tel
-
-async def warmup_once() -> Dict[str, Any]:
-    eff = SETTINGS.effective()
-    out: Dict[str, Any] = {}
-    if bool(eff.get("warmup_llm_enabled", True)):
-        out["llm"] = await _warmup_llm_once()
-    if bool(eff.get("warmup_web_enabled", False)):
-        out["web"] = await _warmup_web_once()
-    return out
-
-async def warmup_periodic(stop_ev: asyncio.Event) -> None:
-    eff = SETTINGS.effective()
-    interval = max(60, int(eff.get("warmup_on_interval_sec", 900)))
-    jitter   = min(15, max(0, int(eff.get("warmup_jitter_sec", 5))))
-    while not stop_ev.is_set():
-        try:
-            await warmup_once()
-        except Exception:
-            pass
-        try:
-            delay = interval + (asyncio.get_running_loop().time() % (jitter or 1))
-            await asyncio.wait_for(stop_ev.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            continue
-
-def start_warmup_runner(loop: asyncio.AbstractEventLoop) -> asyncio.Event:
-    stop_ev = asyncio.Event()
-    if bool(SETTINGS.get("warmup_enabled", True)):
-        loop.create_task(warmup_periodic(stop_ev), name="warmup_periodic")
-    return stop_ev
-
-def stop_warmup_runner(stop_ev: Optional[asyncio.Event]) -> None:
-    if stop_ev is not None:
-        stop_ev.set()
-
-# ===== aimodel/file_read/store/__init__.py =====
-
-from .chats import (
-    ChatMessageRow,
-    upsert_on_first_message, update_last, append_message,
-    delete_message, delete_messages_batch, list_messages,
-    list_paged, delete_batch,
-    merge_chat, merge_chat_new, edit_message, set_summary, get_summary,  # ← add these
-)
-from .index import ChatMeta
-
-__all__ = [
-    # chats
-    "ChatMessageRow",
-    "upsert_on_first_message", "update_last", "append_message",
-    "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch",
-    "merge_chat", "merge_chat_new", "edit_message",  # ← add these
-    # index
-    "ChatMeta",
-    # pending
-    "set_summary", "get_summary"
-]
-
-# ===== aimodel/file_read/store/base.py =====
-
-from __future__ import annotations
-import json, os, shutil, tempfile, threading
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List
-from ..adaptive.config.paths import app_data_dir
-
-# -------- Directories & Paths --------
-APP_DIR = app_data_dir()
-CHATS_DIR = APP_DIR / "chats"
-INDEX_PATH = APP_DIR / "index.json"
-PENDING_PATH = APP_DIR / "pending.json"              # NEW
-OLD_PENDING_DELETES = APP_DIR / "pending_deletes.json"  # NEW
-
-# -------- Lock for safe writes --------
-_lock = threading.RLock()
-
-# -------- Helpers --------
-def now_iso() -> str:
-    """UTC timestamp in ISO 8601 format."""
-    return datetime.now(timezone.utc).isoformat()
-
-def atomic_write(path: Path, data: Dict[str, Any] | List[Any]):
-    """Safely write JSON to a temp file then move into place."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=path.name, dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        shutil.move(tmp_path, path)
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-
-def ensure_dirs():
-    """Ensure app/chats directories exist and index.json is initialized."""
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CHATS_DIR.mkdir(parents=True, exist_ok=True)
-    if not INDEX_PATH.exists():
-        atomic_write(INDEX_PATH, [])
-
-def chat_path(session_id: str) -> Path:
-    """Return path to chat file for a session ID."""
-    return CHATS_DIR / f"{session_id}.json"
-
-# -------- Exports --------
-__all__ = [
-    "APP_DIR",
-    "CHATS_DIR",
-    "INDEX_PATH",
-    "PENDING_PATH",          # NEW
-    "OLD_PENDING_DELETES",   # NEW
-    "_lock",
-    "now_iso",
-    "atomic_write",
-    "ensure_dirs",
-    "chat_path",
-]
-
-# ===== aimodel/file_read/store/chats.py =====
-
-# ===== aimodel/file_read/store/chats.py =====
-from __future__ import annotations
-import json
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
-
-from ..core.settings import SETTINGS
-from ..utils.streaming import strip_runjson
-from .base import chat_path, atomic_write, now_iso
-from .index import load_index, save_index, refresh_index_after_change, ChatMeta
-from ..rag.store import delete_namespace as rag_delete_namespace
-
-
-def _load_chat(session_id: str) -> Dict[str, Any]:
-    p = chat_path(session_id)
-    if not p.exists():
-        return {"sessionId": session_id, "messages": [], "seq": 0, "summary": ""}
-    with p.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-        if "summary" not in data:
-            data["summary"] = ""  # backfill older files
-        return data
-
-
-@dataclass
-class ChatMessageRow:
-    id: int
-    sessionId: str
-    role: str
-    content: str
-    createdAt: str
-    attachments: Optional[List[Dict]] = None   # ✅ added
-
-def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
-    if not atts:
-        return None
-    out = []
-    for a in atts:
-        # convert dataclass/typed object to dict
-        if isinstance(a, dict):
-            out.append({
-                "name": a.get("name"),
-                "source": a.get("source"),
-                "sessionId": a.get("sessionId"),
-            })
-        else:
-            try:
-                out.append({
-                    "name": getattr(a, "name", None),
-                    "source": getattr(a, "source", None),
-                    "sessionId": getattr(a, "sessionId", None),
-                })
-            except Exception:
-                continue
-    return out or None
-
-def upsert_on_first_message(session_id: str, title: s
+    telemetry["pack"]["rollStartTokens"] = int(PACK_TELEMETRY.get("rollStartToken

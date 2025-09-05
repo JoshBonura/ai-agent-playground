@@ -1,5 +1,5 @@
 # aimodel/file_read/services/streaming_worker.py
-# updated to account for retrieve timings in pre-ttft accounting (no "or 0.0" fallbacks)
+
 from __future__ import annotations
 import asyncio, json, time, logging
 from typing import AsyncGenerator, Optional, List
@@ -184,7 +184,6 @@ async def run_stream(
                 if engine:
                     stage["engine"] = engine
 
-                # ---------- Accurate pre-TTFT accounting (no "or 0.0" fallbacks) ----------
                 if isinstance(budget_view, dict):
                     def _fnum(x) -> float:
                         try:
@@ -199,15 +198,13 @@ async def run_stream(
                     rag    = budget_view.get("rag") or {}
                     web_bd = ((budget_view.get("web") or {}).get("breakdown")) or {}
 
-                    # packing / trimming
                     pack_sec = _fnum(pack.get("packSec"))
                     trim_sec = _fnum(pack.get("finalTrimSec"))
                     comp_sec = _fnum(pack.get("compressSec"))
 
-                    # rag router decision
                     rag_router = _fnum(rag.get("routerDecideSec"))
 
-                    # prefer aggregate build timing if present; otherwise sum component steps
+
                     build_candidates = (
                         rag.get("injectBuildSec"),
                         rag.get("sessionOnlyBuildSec"),
@@ -226,11 +223,9 @@ async def run_stream(
                     else:
                         rag_pipeline_sec = rag_embed + rag_s_chat + rag_s_glob + rag_dedupe
 
-                    # web and prep
                     prep_sec    = _fnum(web_bd.get("prepSec"))
                     web_pre     = _fnum(web_bd.get("totalWebPreTtftSec"))
 
-                    # queue time between model call and first token
                     model_queue = _fnum(stage.get("modelQueueSec"))
 
                     pre_accounted = (
@@ -249,7 +244,6 @@ async def run_stream(
                         "preTtftAccountedSec": round(pre_accounted, 6),
                         "unattributedTtftSec": round(unattr_ttft, 6),
                     })
-                # -------------------------------------------------------------------------
 
                 run_json = build_run_json(
                     request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},

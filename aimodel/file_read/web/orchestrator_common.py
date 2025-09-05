@@ -144,8 +144,6 @@ async def _fetch_round(
     fetch_max_chars = _as_int("web_fetch_max_chars")
     per_doc_cap     = min(int(per_doc_budget * cap_mult), fetch_max_chars)
 
-    print(f"[WEB][ORCH][COMMON] _fetch_round use_js={use_js} urls={len(urls)} per_timeout={per_url_timeout_s} max_parallel={max_parallel} per_doc_cap={per_doc_cap}")
-
     results = await fetch_fn(
         urls,
         per_timeout_s=per_url_timeout_s,
@@ -155,5 +153,4 @@ async def _fetch_round(
     )
 
     ok = sum(1 for _, r in results if r)
-    print(f"[WEB][ORCH][COMMON] _fetch_round done ok={ok}/{len(results)}")
     return results

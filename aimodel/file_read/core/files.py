@@ -4,11 +4,10 @@ from pathlib import Path
 import json, os
 from typing import Any
 
-# Base dirs
+
 CORE_DIR = Path(__file__).resolve().parent
 STORE_DIR = CORE_DIR.parent / "store"
 
-# Paths (overridable via env)
 EFFECTIVE_SETTINGS_FILE = Path(
     os.getenv("EFFECTIVE_SETTINGS_PATH", str(STORE_DIR / "effective_settings.json"))
 )

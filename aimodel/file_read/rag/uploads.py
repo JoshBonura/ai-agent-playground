@@ -1,23 +1,21 @@
 from __future__ import annotations
-from typing import Dict, List, Optional, Iterable, Tuple
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-import json, os
+import json
 import numpy as np
 import faiss
 
-from .store import _ns_dir  # reuse your namespace layout
+from .store import _ns_dir  
 
 _META_FN = "meta.jsonl"
 _INDEX_FN = "index.faiss"
 
-# ---------- Read-only helpers (NO mkdir) ----------
 def _meta_path_ro(session_id: Optional[str]) -> Path:
     return _ns_dir(session_id) / _META_FN
 
 def _index_path_ro(session_id: Optional[str]) -> Path:
     return _ns_dir(session_id) / _INDEX_FN
 
-# ---------- Mutating helpers (mkdir when writing) ----------
 def _paths_mut(session_id: Optional[str]) -> Tuple[Path, Path]:
     d = _ns_dir(session_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -54,7 +52,7 @@ def _norm(x: np.ndarray) -> np.ndarray:
 
 def list_sources(session_id: Optional[str], include_global: bool = True) -> List[dict]:
     def _agg(ns: Optional[str]) -> Dict[str, int]:
-        mp = _meta_path_ro(ns)  # read-only, no mkdir
+        mp = _meta_path_ro(ns)  
         agg: Dict[str, int] = {}
         for j in _read_meta(mp):
             src = (j.get("source") or "").strip()
@@ -74,11 +72,7 @@ def list_sources(session_id: Optional[str], include_global: bool = True) -> List
     return rows
 
 def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> dict:
-    """
-    Remove all chunks for `source` in the given namespace and REBUILD the FAISS index.
-    `embedder`: callable(List[str]) -> np.ndarray[float32] (same one used on ingest).
-    """
-    idx_path, meta_path = _paths_mut(session_id)  # mutating path (mkdir allowed)
+    idx_path, meta_path = _paths_mut(session_id) 
     rows = _read_meta(meta_path)
     if not rows:
         return {"ok": True, "removed": 0, "remaining": 0}
@@ -94,12 +88,10 @@ def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> d
     if removed == 0:
         return {"ok": True, "removed": 0, "remaining": len(keep)}
 
-    # Reassign contiguous row ids for the kept entries
     for i, j in enumerate(keep):
         j["row"] = i
 
     if len(keep) == 0:
-        # No rows left: drop index; empty meta file
         if idx_path.exists():
             try:
                 idx_path.unlink()
@@ -108,7 +100,6 @@ def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> d
         _write_meta(meta_path, [])
         return {"ok": True, "removed": removed, "remaining": 0}
 
-    # Re-embed kept texts in batches
     texts = [str(j.get("text") or "") for j in keep]
     B = 128  # batch size
     parts: List[np.ndarray] = []
@@ -124,7 +115,6 @@ def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> d
     new_index = faiss.IndexFlatIP(dim)
     new_index.add(embeds)
 
-    # Save rebuilt index + meta
     faiss.write_index(new_index, str(idx_path))
     _write_meta(meta_path, keep)
 

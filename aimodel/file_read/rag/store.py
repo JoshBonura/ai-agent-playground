@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
-import faiss, json, os, time, hashlib
+import faiss, json
 import numpy as np
 from ..store.base import APP_DIR   
 import shutil
@@ -35,14 +35,11 @@ def add_vectors(session_id: Optional[str], embeds: np.ndarray, metas: List[Dict]
     idx_path, meta_path = _paths(session_id)
     idx = _load_index(dim, idx_path)
 
-    # ensure index type
     if not isinstance(idx, faiss.IndexFlatIP):
         idx = faiss.IndexFlatIP(dim) if idx.ntotal == 0 else idx
 
-    # normalize vectors
     embeds = _norm(embeds)
 
-    # ✅ read existing ids to avoid duplicates
     existing_ids = set()
     if meta_path.exists():
         with meta_path.open("r", encoding="utf-8") as f:
@@ -78,7 +75,6 @@ def search_vectors(session_id: Optional[str], query_vec: np.ndarray, topk: int, 
 
     idx = _load_index(dim, idx_path)
 
-    # ✅ ensure numpy array for reshape
     query_vec = np.asarray(query_vec, dtype="float32")
     q = _norm(query_vec.reshape(1, -1))
 
@@ -117,11 +113,11 @@ def add_texts(
     metas: List[Dict],
     *,
     session_id: Optional[str],
-    embed_fn,  # callable: List[str] -> np.ndarray[float32]
+    embed_fn,  
 ) -> int:
     if not texts:
         return 0
-    vecs = embed_fn(texts)  # should return (n, d) float32
+    vecs = embed_fn(texts) 
     if not isinstance(vecs, np.ndarray):
         vecs = np.asarray(vecs, dtype="float32")
     dim = int(vecs.shape[-1])
@@ -129,10 +125,6 @@ def add_texts(
     return len(texts)
 
 def delete_namespace(session_id: str) -> bool:
-    """
-    Hard-delete all RAG data for a given session: the by_session/<sessionId> folder.
-    Returns True if it existed and was removed.
-    """
     d = _ns_dir(session_id)
     try:
         if d.exists():
@@ -142,13 +134,7 @@ def delete_namespace(session_id: str) -> bool:
     except Exception:
         return False
 
-# --- add near the other helpers ---
 def session_has_any_vectors(session_id: Optional[str]) -> bool:
-    """
-    Return True if this session has any indexed vectors stored on disk.
-    We consider the namespace non-empty if the FAISS index exists and ntotal > 0,
-    and the meta.jsonl exists with at least one line.
-    """
     if not session_id:
         return False
 
@@ -157,7 +143,7 @@ def session_has_any_vectors(session_id: Optional[str]) -> bool:
         return False
 
     try:
-        idx = _load_index(dim=1, p=idx_path)  # dim not used by IndexFlatIP reader
+        idx = _load_index(dim=1, p=idx_path)  
         if getattr(idx, "ntotal", 0) <= 0:
             return False
     except Exception as e:
@@ -165,7 +151,6 @@ def session_has_any_vectors(session_id: Optional[str]) -> bool:
         return False
 
     try:
-        # quick check: meta file has at least one JSONL line
         with meta_path.open("r", encoding="utf-8") as f:
             for _ in f:
                 return True

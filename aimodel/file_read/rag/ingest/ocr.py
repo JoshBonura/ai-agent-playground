@@ -1,13 +1,12 @@
 # aimodel/file_read/rag/ingest/ocr.py
 from __future__ import annotations
-from typing import Tuple, List
+from typing import List
 import io, re
 import pytesseract
 from PIL import Image
 import pypdfium2 as pdfium
 from ...core.settings import SETTINGS
 
-# Allow overriding the tesseract binary path via settings
 _cmd = str(SETTINGS.effective().get("tesseract_cmd", "")).strip()
 if _cmd:
     pytesseract.pytesseract.tesseract_cmd = _cmd
@@ -43,10 +42,9 @@ def ocr_pdf(data: bytes) -> str:
     max_pages = int(S().get("pdf_ocr_max_pages", 0))
     lang = str(S().get("ocr_lang", "eng"))
     oem = str(S().get("ocr_oem", "3"))
-    # default PSM, but we’ll also try a few alternates for image-only pages
     psm_default = str(S().get("ocr_psm", "6"))
-    try_psm = [psm_default, "4", "7", "3"]  # single block, column, single line, auto
-    min_side = 1200  # upscale tiny rasters
+    try_psm = [psm_default, "4", "7", "3"]  
+    min_side = 1200  
 
     def _dbg(*args):
         try:
@@ -72,28 +70,24 @@ def ocr_pdf(data: bytes) -> str:
             pil = page.render(scale=dpi/72, rotation=0).to_pil().convert("L")
             base_w, base_h = pil.width, pil.height
 
-            # Prepare a couple of preprocess variants
             variants = []
 
-            # 1) raw gray (possibly upscaled)
             img1 = pil
             if min(base_w, base_h) < min_side:
                 f = max(1.0, min_side / float(min(base_w, base_h)))
                 img1 = pil.resize((int(base_w * f), int(base_h * f)))
             variants.append(("gray", img1))
 
-            # 2) light binarization
             img2 = img1.point(lambda x: 255 if x > 180 else 0)
             variants.append(("bin180", img2))
 
-            # 3) inverted (helps white-on-black)
             img3 = img1.point(lambda x: 255 - x)
             variants.append(("inv", img3))
 
             got = ""
             for tag, imgv in variants:
                 for psm in try_psm:
-                    cfg = f"--oem {oem} --psm {psm}"   # <-- string (not a set!)
+                    cfg = f"--oem {oem} --psm {psm}"   
                     txt = pytesseract.image_to_string(imgv, lang=lang, config=cfg) or ""
                     txt = txt.strip()
                     _dbg(f"page={i+1}/{limit}", f"{tag} {imgv.width}x{imgv.height}", f"psm={psm}", f"len={len(txt)}", f"prev={repr(txt[:80])}")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 import re, os
-
 from ..core.settings import SETTINGS
 
 _TABLE_RE = re.compile(r"^##\s*Table:\s*(?P<sheet>[^!]+)!\s*R(?P<r1>\d+)-(?P<r2>\d+),C(?P<c1>\d+)-(?P<c2>\d+)", re.MULTILINE)

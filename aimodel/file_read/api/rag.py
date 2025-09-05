@@ -12,7 +12,6 @@ from ..rag.store import add_vectors, search_vectors
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
-# ---- embedding model (sync, cached) ----
 _st_model: SentenceTransformer | None = None
 _st_lock = RLock()
 
@@ -126,8 +125,7 @@ async def api_delete_upload_hard(body: dict[str, str]):
     if not source:
         return {"error": "source required"}
 
-    # use the same model as ingest/search
-    model = _get_st_model()  # you already have this in rag.py
+    model = _get_st_model() 
     def _embed(texts: List[str]):
         arr = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
         return arr.astype("float32")

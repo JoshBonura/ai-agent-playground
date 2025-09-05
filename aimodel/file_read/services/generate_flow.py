@@ -4,7 +4,6 @@ from typing import AsyncGenerator, AsyncIterator, Dict
 from dataclasses import asdict
 from fastapi.responses import StreamingResponse
 import time
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import RUNJSON_START, RUNJSON_END
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active

@@ -1,12 +1,11 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Optional
 from ..core.settings import SETTINGS
 
 _RERANKER = None
 _RERANKER_NAME = None
 
 def _load_reranker():
-    """Lazy-load a sentence-transformers cross-encoder for reranking."""
     global _RERANKER, _RERANKER_NAME
     model_name = SETTINGS.get("rag_rerank_model")
     if not model_name:
@@ -25,10 +24,6 @@ def _load_reranker():
         return None
 
 def rerank_hits(query: str, hits: List[dict], *, top_m: Optional[int] = None) -> List[dict]:
-    """
-    Cross-encoder reranking (dense pair scoring: (query, hit_text)).
-    Keeps structure of each hit; adds 'rerankScore'.
-    """
     if not hits:
         return hits
     model = _load_reranker()
@@ -67,13 +62,8 @@ def cap_per_source(hits: List[dict], per_source_cap: int) -> List[dict]:
     return out
 
 def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
-    """
-    Keep hits whose score is within the top `frac` of the range, robust for negative logits.
-    If all scores equal or list empty, returns hits unchanged.
-    """
     if not hits:
         return hits
-    # collect numeric scores
     vals = []
     for h in hits:
         try:
@@ -85,12 +75,10 @@ def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
     s_min = min(vals)
     s_max = max(vals)
     if s_max == s_min:
-        # all same -> nothing to filter
         return hits
 
     kept = []
     for h, v in zip(hits, vals):
-        # min-max normalize to [0,1], then compare against frac
         norm = (v - s_min) / (s_max - s_min)
         if norm >= float(frac):
             kept.append(h)

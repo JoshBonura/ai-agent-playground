@@ -2,17 +2,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
-import time
-
 from ..core.settings import SETTINGS
 from .retrieve_tabular import make_rag_block_tabular
 
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10  # cap how many hits we dump at each stage
-
-
-# ========= Embedding helpers =========
+PRINT_MAX = 10 
 
 def _get_embedder():
     global _EMBEDDER, _EMBEDDER_NAME
@@ -52,9 +47,6 @@ def _embed_query(q: str) -> List[float]:
         print(f"[RAG] embedding encode failed: {e}")
         return []
 
-
-# ========= Scoring / ordering =========
-
 def _primary_score(h: Dict[str, Any]) -> float:
     s = h.get("rerankScore")
     if s is not None:
@@ -66,7 +58,6 @@ def _primary_score(h: Dict[str, Any]) -> float:
         return float(h.get("score") or 0.0)
     except Exception:
         return 0.0
-
 
 def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
     hits_sorted = sorted(hits, key=_primary_score, reverse=True)
@@ -82,9 +73,6 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
         if len(out) >= k:
             break
     return out
-
-
-# ========= Block rendering =========
 
 def _default_header(h: Dict[str, Any]) -> str:
     src = str(h.get("source") or "")
@@ -139,9 +127,6 @@ def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[
         )
     return block or ""
 
-
-# ========= Preference boost / debug =========
-
 def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
     if not preferred_sources:
         return hits
@@ -182,9 +167,6 @@ def _nohit_block(q: str) -> str:
     if q:
         return f"{preamble}\n- {msg}\n- query={q!r}"
     return f"{preamble}\n- {msg}"
-
-
-# ========= Telemetry =========
 
 @dataclass
 class RagTelemetry:

@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Query, Body
 from typing import Dict, Any, Optional
-
 from ..core.settings import SETTINGS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])

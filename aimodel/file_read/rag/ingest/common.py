@@ -11,7 +11,7 @@ class Chunk:
     text: str
     meta: Dict[str, str]
 
-# --- Small helpers kept for legacy imports (ingest.__init__ depends on these) ---
+
 def _utf8(data: bytes) -> str:
 
     return (data or b"").decode("utf-8", errors="ignore")
@@ -20,18 +20,14 @@ def _strip_html(txt: str) -> str:
 
     if not txt:
         return ""
-    # drop scripts/styles
+
     txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", txt)
-    # common block/line breaks
     txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
     txt = re.sub(r"(?is)</p>", "\n\n", txt)
-    # strip tags
     txt = re.sub(r"(?is)<.*?>", " ", txt)
-    # collapse whitespace
     txt = re.sub(r"[ \t]+", " ", txt)
     return txt.strip()
 
-# --- Section & paragraph aware chunking for table/text docs -------------------
 _HDR_RE = re.compile(r"^(#{1,3})\s+.*$", flags=re.MULTILINE)
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
 
@@ -43,7 +39,6 @@ def _split_sections(text: str) -> List[str]:
     starts = [m.start() for m in _HDR_RE.finditer(text)]
     if not starts:
         return [text]
-    # ensure beginning is a split point
     if 0 not in starts:
         starts = [0] + starts
     sections: List[str] = []
@@ -104,7 +99,7 @@ def _pack_with_budget(pieces: List[str], *, max_chars: int) -> List[str]:
         if cur_len == 0:
             cur, cur_len = [p], plen
             continue
-        if cur_len + 2 + plen <= max_chars:  # 2 for "\n\n" when joining
+        if cur_len + 2 + plen <= max_chars:  
             cur.append(p)
             cur_len += 2 + plen
         else:
@@ -164,6 +159,6 @@ def build_metas(session_id: Optional[str], filename: str, chunks: List[Chunk], *
             "mime": "text/plain",
             "size": str(size),
             "chunkIndex": str(i),
-            "text": c.text,  # stored for RAG snippet display
+            "text": c.text,  
         })
     return out

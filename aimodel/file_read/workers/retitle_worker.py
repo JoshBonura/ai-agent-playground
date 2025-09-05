@@ -1,8 +1,6 @@
-# aimodel/file_read/retitle_worker.py
 from __future__ import annotations
 import asyncio, logging, re
 from typing import Dict, List, Optional, Tuple
-
 from ..runtime.model_runtime import get_llm
 from ..store.index import load_index, save_index
 from ..store.base import now_iso
@@ -34,38 +32,24 @@ def _is_substantial(text: str) -> bool:
 
 def _pick_source(messages: List[dict]) -> Optional[str]:
     if not messages:
-        print("[retitle] no messages to pick from")
         return None
-
     min_user_len = int(S("retitle_min_user_chars"))
-    print(f"[retitle] min_user_len={min_user_len}, total_msgs={len(messages)}")
-
-    # 1. Prefer last substantial user message
     for m in reversed(messages):
         if m.get("role") == "user":
             txt = (m.get("content") or "").strip()
-            print(f"[retitle] check user msg len={len(txt)} preview={txt[:40]!r}")
             if len(txt) >= min_user_len and _is_substantial(txt):
-                print("[retitle] PICK user message")
                 return txt
-
-    # 2. Fallback to last substantial assistant message
     for m in reversed(messages):
         if m.get("role") == "assistant":
             txt = (m.get("content") or "").strip()
-            print(f"[retitle] check assistant msg len={len(txt)} preview={txt[:40]!r}")
             if _is_substantial(txt):
-                print("[retitle] PICK assistant message")
                 return txt
-
-    print("[retitle] no suitable message found")
     return None
 
 def _sanitize_title(s: str) -> str:
     if not s:
         return ""
     s = s.strip()
-    s = re.sub(r"(?i)^(?:how\s+to|steps?\s+to|guide\s+to|tutorial:\s*|to)\s+", "", s).strip()
     drop_prefix_re = S("retitle_sanitize_drop_prefix_regex")
     if drop_prefix_re:
         s = re.sub(drop_prefix_re, "", s)
@@ -76,8 +60,6 @@ def _sanitize_title(s: str) -> str:
     if replace_not_allowed_re:
         s = re.sub(replace_not_allowed_re, replace_with, s)
     s = re.sub(r"\s+", " ", s).strip()
-    s = re.sub(r"[.:;,\-\s]+$", "", s)
-    s = re.sub(r"(?i)^(?:a|an|the)\s+", "", s).strip()
     max_words = int(S("retitle_sanitize_max_words"))
     max_chars = int(S("retitle_sanitize_max_chars"))
     if max_words > 0:
@@ -88,18 +70,14 @@ def _sanitize_title(s: str) -> str:
     return s
 
 def _make_title(llm, src: str) -> str:
-    sys = S("retitle_llm_sys_inst")
-    hard = ("You generate a concise chat title.\n"
-            "Return ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). "
-            "No trailing punctuation. Max 6 words.")
-    sys = f"{hard}\n\n{sys}" if sys else hard
-
+    hard = SETTINGS.get("retitle_llm_hard_prefix") or ""
+    sys_extra = SETTINGS.get("retitle_llm_sys_inst") or ""
+    sys = f"{hard}\n\n{sys_extra}".strip()
     user_text = f"{S('retitle_user_prefix')}{src}{S('retitle_user_suffix')}"
     messages = [
         {"role": "system", "content": sys},
         {"role": "user", "content": user_text},
     ]
-
     out = llm.create_chat_completion(
         messages=messages,
         max_tokens=int(S("retitle_llm_max_tokens")),
@@ -109,7 +87,9 @@ def _make_title(llm, src: str) -> str:
         stop=S("retitle_llm_stop"),
     )
     raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
-    raw = re.sub(r"(?i)^(?:how\s+to|to)\s+", "", raw).strip()
+    strip_regex = SETTINGS.get("retitle_strip_regex")
+    if strip_regex:
+        raw = re.sub(strip_regex, "", raw).strip()
     raw = re.sub(r"^`{1,3}|`{1,3}$", "", raw).strip()
     raw = re.sub(r"[.:;,\-\s]+$", "", raw)
     return raw
@@ -153,12 +133,10 @@ async def _process_session(session_id: str):
     except Exception:
         cur_seq = job_seq
     if cur_seq > job_seq:
-        print(f"[retitle] SKIP (stale) session={session_id} job_seq={job_seq} current_seq={cur_seq}")
         return
     src = _pick_source(messages) or ""
     if not src.strip():
         return
-    print(f"[retitle] START session={session_id} job_seq={job_seq} src={_preview(src)!r}")
     async with GEN_SEMAPHORE:
         llm = get_llm()
         try:
@@ -171,11 +149,7 @@ async def _process_session(session_id: str):
                 llm.reset()
             except Exception:
                 pass
-    if bool(S("retitle_enable_sanitize")):
-        title = _sanitize_title(title_raw)
-    else:
-        title = title_raw
-    print(f"[retitle] FINISH session={session_id} -> {title!r}")
+    title = _sanitize_title(title_raw) if bool(S("retitle_enable_sanitize")) else title_raw
     if not title:
         return
     idx = load_index()

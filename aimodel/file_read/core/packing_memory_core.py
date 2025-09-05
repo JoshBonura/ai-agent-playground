@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple
 from collections import deque
 
 from ..runtime.model_runtime import get_llm
-from .style import STYLE_SYS
+from .style import get_style_sys
 from ..store import get_summary as store_get_summary
 from ..store import list_messages as store_list_messages
 from ..utils.streaming import strip_runjson
@@ -28,30 +28,11 @@ PACK_TELEMETRY: Dict[str, object] = {
 }
 SUMMARY_TEL = PACK_TELEMETRY
 
-def _now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-def _log(msg: str) -> None:
-    print(f"[{_now()}] {msg}")
-
-def _snapshot(cfg: Dict) -> str:
-    keys = [
-        "model_ctx", "out_budget", "reserved_system_tokens", "min_input_budget",
-        "chars_per_token", "prompt_per_message_overhead",
-        "summary_max_chars", "use_fast_summary",
-    ]
-    parts = []
-    for k in keys:
-        if k in cfg:
-            parts.append(f"{k}={cfg[k]}")
-    return ", ".join(parts)
-
 class _SettingsCache:
     def __init__(self) -> None:
         self.path: Path = EFFECTIVE_SETTINGS_FILE
         self._mtime: float | None = None
         self._data: Dict = {}
-        _log(f"settings path = {self.path}")
 
     def get(self) -> Dict:
         try:
@@ -61,7 +42,6 @@ class _SettingsCache:
         if self._mtime != m or not self._data:
             self._data = load_json_file(self.path, default={})
             self._mtime = m
-            _log(f"settings reload ok file={self.path.name} snapshot: {_snapshot(self._data)}")
         return self._data
 
 _SETTINGS = _SettingsCache()
@@ -77,29 +57,26 @@ def count_prompt_tokens(msgs: List[Dict[str, str]]) -> int:
 
 def get_session(session_id: str):
     cfg = _SETTINGS.get()
-    _log(f"get_session IN session={session_id} (settings: {_snapshot(cfg)})")
     st = SESSIONS.setdefault(session_id, {
         "summary": "",
         "recent": deque(maxlen=int(cfg["recent_maxlen"])),
-        "style": STYLE_SYS,
+        "style": get_style_sys(),
         "short": False,
         "bullets": False,
     })
     if not st["summary"]:
         try:
             st["summary"] = store_get_summary(session_id) or ""
-            _log(f"get_session loaded summary len={len(st['summary'])}")
-        except Exception as e:
-            _log(f"get_session summary load error {e}")
+        except Exception:
+            pass
     if not st["recent"]:
         try:
             rows = store_list_messages(session_id)
             tail = rows[-st["recent"].maxlen:]
             for m in tail:
                 st["recent"].append({"role": m.role, "content": strip_runjson(m.content)})
-            _log(f"get_session hydrated recent={len(st['recent'])}")
-        except Exception as e:
-            _log(f"get_session hydrate error {e}")
+        except Exception:
+            pass
     return st
 
 def _heuristic_bullets(chunks: List[Dict[str,str]], cfg: Dict) -> str:
@@ -128,7 +105,6 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
     PACK_TELEMETRY["summaryAddedChars"] = 0
     PACK_TELEMETRY["summaryOutTokensApprox"] = 0
     use_fast = bool(cfg["use_fast_summary"])
-    _log(f"summarize_chunks IN chunks={len(chunks)} FAST={use_fast}")
     if use_fast:
         txt = _heuristic_bullets(chunks, cfg)
         dt = time.time() - t0
@@ -138,7 +114,6 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
         PACK_TELEMETRY["summaryBullets"] = len([l for l in txt.splitlines() if l.strip()])
         PACK_TELEMETRY["summaryAddedChars"] = len(txt)
         PACK_TELEMETRY["summaryOutTokensApprox"] = int(approx_tokens(txt))
-        _log(f"summarize_chunks OUT (FAST) bullets={len([l for l in txt.splitlines() if l])} chars={len(txt)} dt={dt:.2f}s")
         return txt, False
     text = "\n".join(f'{m.get("role","")}: {m.get("content","")}' for m in chunks)
     sys_inst = cfg["summary_sys_inst"]
@@ -183,7 +158,6 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
         PACK_TELEMETRY["summaryBullets"] = len(bullets)
         PACK_TELEMETRY["summaryAddedChars"] = len(txt)
         PACK_TELEMETRY["summaryOutTokensApprox"] = int(approx_tokens(txt))
-        _log(f"summarize_chunks OUT bullets={len(bullets)} chars={len(txt)} dt={dt:.2f}s")
         return txt, True
     s = " ".join(raw.split())[:160]
     fallback = (cfg["bullet_prefix"] + s) if s else cfg["bullet_prefix"].strip()
@@ -194,7 +168,6 @@ def summarize_chunks(chunks: List[Dict[str,str]]) -> Tuple[str, bool]:
     PACK_TELEMETRY["summaryBullets"] = len([l for l in fallback.splitlines() if l.strip()])
     PACK_TELEMETRY["summaryAddedChars"] = len(fallback)
     PACK_TELEMETRY["summaryOutTokensApprox"] = int(approx_tokens(fallback))
-    _log(f"summarize_chunks OUT bullets=0 chars={len(fallback)} dt={dt:.2f}s")
     return fallback, True
 
 def _compress_summary_block(s: str) -> str:
@@ -223,6 +196,4 @@ def _compress_summary_block(s: str) -> str:
         text = "\n".join(reversed(last))
     PACK_TELEMETRY["summaryCompressedToChars"] = int(len(text))
     PACK_TELEMETRY["summaryCompressedDroppedChars"] = int(max(0, int(PACK_TELEMETRY["summaryCompressedFromChars"]) - int(PACK_TELEMETRY["summaryCompressedToChars"])))
-    _log(f"compress_summary IN chars={len(s)} kept_lines={len(out)}")
-    _log(f"compress_summary OUT chars={len(text)} lines={len(text.splitlines())}")
     return text

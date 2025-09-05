@@ -1,53 +1,24 @@
-# aimodel/file_read/web/router_ai.py
 from __future__ import annotations
 from typing import Tuple, Optional, Any, Dict
 import json, re, time
 from ..core.settings import SETTINGS
 from ..utils.streaming import safe_token_count_messages
 
-_DECIDE_PROMPT = (
-    "You are a router deciding whether answering the text requires the public web.\n"
-    "Respond with JSON only in exactly this schema:\n"
-    "{{\"need\": true|false, \"query\": \"<text or empty>\"}}\n\n"
-    "Decision principle:\n"
-    "- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n"
-    "- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n"
-    "- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n"
-    "- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n"
-    "- When uncertain whether real-time state is required, prefer need=true.\n\n"
-    "Text:\n{text}\n"
-    "JSON:"
-)
-
 def _force_json(s: str) -> dict:
-    """
-    Try very hard to extract a JSON object like:
-      {"need": true|false, "query": "..."}
-    …even if the model wrapped it in prose or ```json fences.
-    """
     if not s:
         return {}
-
     raw = s.strip()
-
-    # Strip common code-fence wrappers
-    # ```json\n{...}\n```  OR  ```\n{...}\n```
     try:
         cf = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
         if cf:
             raw = cf.group(1).strip()
     except Exception:
         pass
-
-    # 1) Try direct parse
     try:
         v = json.loads(raw)
         return v if isinstance(v, dict) else {}
     except Exception:
         pass
-
-    # 2) Try to find a minimal JSON object that *mentions* "need"
-    #    This avoids the nested-brace problem while being specific enough.
     try:
         m = None
         for m in re.finditer(r"\{[^{}]*\"need\"\s*:\s*(?:true|false|\"true\"|\"false\")[^{}]*\}", raw, re.IGNORECASE):
@@ -58,8 +29,6 @@ def _force_json(s: str) -> dict:
             return v if isinstance(v, dict) else {}
     except Exception:
         pass
-
-    # 3) Fallback: grab the last {...} blob and attempt to parse
     try:
         last = None
         for last in re.finditer(r"\{[\s\S]*\}", raw):
@@ -70,9 +39,7 @@ def _force_json(s: str) -> dict:
             return v if isinstance(v, dict) else {}
     except Exception:
         pass
-
     return {}
-
 
 def _strip_wrappers(text: str) -> str:
     t = (text or "")
@@ -103,12 +70,13 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
     try:
         if not user_text or not user_text.strip():
             return (False, None, telemetry)
-
         t_start = time.perf_counter()
         t_raw = user_text.strip()
         core_text = _strip_wrappers(t_raw)
-
-        the_prompt = _DECIDE_PROMPT.format(text=core_text)
+        prompt_tpl = SETTINGS.get("router_decide_prompt")
+        if not isinstance(prompt_tpl, str) or not prompt_tpl.strip():
+            return (False, None, telemetry)
+        the_prompt = _safe_prompt_format(prompt_tpl, text=core_text)
         params = {
             "max_tokens": SETTINGS.get("router_decide_max_tokens"),
             "temperature": SETTINGS.get("router_decide_temperature"),
@@ -119,7 +87,6 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
         if isinstance(stop_list, list) and stop_list:
             params["stop"] = stop_list
         params = {k: v for k, v in params.items() if v is not None}
-
         raw_out_obj = llm.create_chat_completion(
             messages=[{"role": "user", "content": the_prompt}],
             **params,
@@ -127,13 +94,8 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
         text_out = (raw_out_obj.get("choices", [{}])[0]
                                   .get("message", {})
                                   .get("content") or "").strip()
-
-        # NEW: keep raw router output for debugging
-        telemetry["rawRouterOut"] = text_out[:2000]  # cap for safety
-
+        telemetry["rawRouterOut"] = text_out[:2000]
         data = _force_json(text_out) or {}
-
-        # Coerce 'need' with string tolerance
         need_val = data.get("need", None)
         if isinstance(need_val, str):
             nv = need_val.strip().lower()
@@ -141,30 +103,23 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
                 need_val = True
             elif nv in ("false", "no", "n", "0"):
                 need_val = False
-
         if isinstance(need_val, bool):
             need = need_val
             parsed_ok = True
         else:
             parsed_ok = False
             need_default = SETTINGS.get("router_default_need_when_invalid")
-            # If you want ingestion to proceed when parsing fails, set this to true in settings.
             need = bool(need_default) if isinstance(need_default, bool) else False
-
-        # Extract query (safe) and strip wrappers
         query_field = data.get("query", "")
         try:
             query = _strip_wrappers(str(query_field or "").strip())
         except Exception:
             query = ""
-
         if not need:
-            query = None  # ignore query when we decided 'no web'
-
+            query = None
         t_elapsed = time.perf_counter() - t_start
         in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": the_prompt}]) or 0
         out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": text_out}]) or 0
-
         telemetry.update({
             "needed": bool(need),
             "routerQuery": query if need else None,
@@ -173,12 +128,9 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
             "outputTokens": out_tokens,
             "parsedOk": parsed_ok,
         })
-
         return (need, query, telemetry)
-
     except Exception:
         return (False, None, telemetry)
-
 
 async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple[Optional[str], Dict[str, Any]]:
     telemetry: Dict[str, Any] = {}
@@ -186,10 +138,8 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple
     telemetry.update(tel_decide)
     if not need:
         return None, telemetry
-
     from .query_summarizer import summarize_query
     from .orchestrator import build_web_block
-
     base_query = _strip_wrappers((proposed_q or user_text).strip())
     try:
         q_summary, tel_sum = summarize_query(llm, base_query)
@@ -198,7 +148,6 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple
         telemetry["summarizedQuery"] = q_summary
     except Exception:
         q_summary = base_query
-
     t_start = time.perf_counter()
     try:
         block_res = await build_web_block(q_summary, k=k)
@@ -210,10 +159,15 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple
     except Exception:
         block = None
     t_elapsed = time.perf_counter() - t_start
-
     telemetry.update({
         "fetchElapsedSec": round(t_elapsed, 4),
         "blockChars": len(block) if block else 0,
     })
-
     return (block or None, telemetry)
+
+def _safe_prompt_format(tpl: str, **kwargs) -> str:
+    marker = "__ROUTER_TEXT_FIELD__"
+    tmp = tpl.replace("{text}", marker)
+    tmp = tmp.replace("{", "{{").replace("}", "}}")
+    tmp = tmp.replace(marker, "{text}")
+    return tmp.format(**kwargs)

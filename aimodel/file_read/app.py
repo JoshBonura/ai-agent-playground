@@ -13,7 +13,6 @@ from .api.rag import router as rag_router
 from .services.cancel import is_active
 from .api import settings as settings_router
 from .core.settings import SETTINGS
-from .services.warmup import start_warmup_runner, stop_warmup_runner, warmup_once
 
 bootstrap()
 app = FastAPI()
@@ -43,18 +42,5 @@ async def _startup():
     except Exception as e:
         print(f"❌ llama failed to load at startup: {e}")
 
-    if bool(SETTINGS.get("warmup_enabled", True)) and bool(SETTINGS.get("warmup_on_start", True)):
-        try:
-            await warmup_once()
-            print("✅ warmup_on_start complete")
-        except Exception as e:
-            print(f"⚠️ warmup_on_start failed: {e}")
-
-    global _warmup_stop_ev
-    _warmup_stop_ev = start_warmup_runner(asyncio.get_event_loop())
-
     asyncio.create_task(start_worker(), name="retitle_worker")
 
-@app.on_event("shutdown")
-async def _shutdown():
-    stop_warmup_runner(_warmup_stop_ev)

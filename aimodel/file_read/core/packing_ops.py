@@ -4,20 +4,19 @@ from typing import Dict, List
 
 from .packing_memory_core import (
     _SETTINGS,
-    _log,
     count_prompt_tokens,
     approx_tokens,
     summarize_chunks,
     _compress_summary_block,
     PACK_TELEMETRY,
 )
-from .style import STYLE_SYS
+from .style import get_style_sys
 
 def build_system(style: str, short: bool, bullets: bool) -> str:
     cfg = _SETTINGS.get()
-    _log(f"build_system flags short={short} bullets={bullets}")
-    parts = [STYLE_SYS]
-    if style and style != STYLE_SYS:
+    base = get_style_sys()
+    parts = [base]
+    if style and style != base:
         parts.append(style)
     if short:
         parts.append(cfg["system_brief_directive"])
@@ -45,8 +44,6 @@ def pack_messages(style: str, short: bool, bullets: bool, summary, recent, max_c
         PACK_TELEMETRY["packMsgs"] = int(len(packed))
     except Exception:
         pass
-    _log(f"pack_messages SETTINGS snapshot: {model_ctx=}, {gen_budget=}, {input_budget=}")
-    _log(f"pack_messages OUT msgs={len(packed)} tokens~{count_prompt_tokens(packed)} (model_ctx={model_ctx}, out_budget={gen_budget}, input_budget={input_budget})")
     PACK_TELEMETRY["packSec"] += float(time.time() - t0_pack)
     return packed, input_budget
 
@@ -64,7 +61,6 @@ def _final_safety_trim(packed: List[Dict[str,str]], input_budget: int) -> List[D
     PACK_TELEMETRY["finalTrimTokensBefore"] = int(t_before)
     dropped_msgs = 0
     dropped_tokens = 0
-    _log(f"final_trim START tokens={toks()} budget={input_budget}")
     keep_head = 2 if len(packed) >= 2 and isinstance(packed[1].get("content"), str) and packed[1]["content"].startswith(cfg["summary_header_prefix"]) else 1
     while toks() > input_budget and len(packed) > keep_head + 1:
         dropped = packed.pop(keep_head)
@@ -73,7 +69,6 @@ def _final_safety_trim(packed: List[Dict[str,str]], input_budget: int) -> List[D
             dropped_msgs += 1
         except Exception:
             pass
-        _log(f"final_trim DROP msg role={dropped['role']} size~{approx_tokens(dropped['content'])} toks={toks()}")
     if toks() > input_budget and keep_head == 2 and len(packed) >= 2:
         summary_msg = packed[1]
         txt = summary_msg["content"]
@@ -88,7 +83,6 @@ def _final_safety_trim(packed: List[Dict[str,str]], input_budget: int) -> List[D
             PACK_TELEMETRY["finalTrimSummaryDroppedChars"] = int(max(0, int(PACK_TELEMETRY["finalTrimSummaryShrunkFromChars"]) - int(PACK_TELEMETRY["finalTrimSummaryShrunkToChars"])))
         except Exception:
             pass
-        _log(f"final_trim SHRINK summary to {len(summary_msg['content'])} chars toks={toks()}")
     if toks() > input_budget and keep_head == 2 and len(packed) >= 2:
         removed = packed.pop(1)
         try:
@@ -96,7 +90,6 @@ def _final_safety_trim(packed: List[Dict[str,str]], input_budget: int) -> List[D
             dropped_msgs += 1
         except Exception:
             pass
-        _log(f"final_trim REMOVE summary len~{len(removed['content'])} toks={toks()}")
     while toks() > input_budget and len(packed) > 2:
         removed = packed.pop(2 if len(packed) > 3 else 1)
         try:
@@ -104,22 +97,15 @@ def _final_safety_trim(packed: List[Dict[str,str]], input_budget: int) -> List[D
             dropped_msgs += 1
         except Exception:
             pass
-        _log(f"final_trim LAST_RESORT drop size~{approx_tokens(removed['content'])} toks={toks()}")
     t_after = toks()
     PACK_TELEMETRY["finalTrimTokensAfter"] = int(t_after)
     PACK_TELEMETRY["finalTrimDroppedMsgs"] = int(dropped_msgs)
     PACK_TELEMETRY["finalTrimDroppedApproxTokens"] = int(max(0, dropped_tokens))
-    _log(f"final_trim END tokens={toks()} msgs={len(packed)}")
     PACK_TELEMETRY["finalTrimSec"] += float(time.time() - t0)
     return packed
 
 def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
     cfg = _SETTINGS.get()
-    _log("=== roll_summary_if_needed DEBUG START ===")
-    _log(f"skip_overage_lt={cfg['skip_overage_lt']}, max_peel_per_turn={cfg['max_peel_per_turn']}, peel_min={cfg['peel_min']}, peel_frac={cfg['peel_frac']}, peel_max={cfg['peel_max']}")
-    _log(f"len(recent)={len(recent)}, current_summary_len={len(summary) if summary else 0}")
-    _log(f"input_budget={input_budget}, reserved_system_tokens={cfg['reserved_system_tokens']}")
-    _log(f"model_ctx={cfg['model_ctx']}, out_budget={cfg['out_budget']}")
     def _tok():
         try:
             return count_prompt_tokens(packed)
@@ -129,13 +115,9 @@ def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
     overage = start_tokens - input_budget
     PACK_TELEMETRY["rollStartTokens"] = int(start_tokens)
     PACK_TELEMETRY["rollOverageTokens"] = int(overage)
-    _log(f"roll_summary_if_needed START tokens={start_tokens} input_budget={input_budget} overage={overage}")
     if overage <= int(cfg["skip_overage_lt"]):
-        _log(f"roll_summary_if_needed SKIP (overage {overage} <= {cfg['skip_overage_lt']})")
         packed = _final_safety_trim(packed, input_budget)
         PACK_TELEMETRY["rollEndTokens"] = int(count_prompt_tokens(packed))
-        _log(f"roll_summary_if_needed END tokens={count_prompt_tokens(packed)}")
-        _log("=== roll_summary_if_needed DEBUG END ===")
         return packed, summary
     peels_done = 0
     peeled_n = 0
@@ -148,7 +130,6 @@ def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
         for _ in range(min(target, len(recent))):
             peel.append(recent.popleft())
         peeled_n = len(peel)
-        _log(f"roll_summary peeled={len(peel)}")
         t0_sum = time.time()
         new_sum, _used_llm = summarize_chunks(peel)
         PACK_TELEMETRY["summarySec"] += float(time.time() - t0_sum)
@@ -170,12 +151,9 @@ def roll_summary_if_needed(packed, recent, summary, input_budget, system_text):
             {"role": "user", "content": cfg["summary_header_prefix"] + summary},
             *list(recent),
         ]
-        _log(f"roll_summary updated summary_len={len(summary)} tokens={_tok()}")
     t0_trim = time.time()
     packed = _final_safety_trim(packed, input_budget)
     PACK_TELEMETRY["finalTrimSec"] += float(time.time() - t0_trim)
     end_tokens = count_prompt_tokens(packed)
     PACK_TELEMETRY["rollEndTokens"] = int(end_tokens)
-    _log(f"roll_summary_if_needed END tokens={end_tokens}")
-    _log("=== roll_summary_if_needed DEBUG END ===")
     return packed, summary

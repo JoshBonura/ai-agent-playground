@@ -2,7 +2,6 @@
 from __future__ import annotations
 from typing import Any, Iterable, Dict, Tuple
 import re, time
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import safe_token_count_messages
 
