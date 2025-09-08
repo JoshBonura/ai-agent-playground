@@ -1,7 +1,217 @@
-gest] pdfminer ERROR {repr(e)}", flush=True)
+s:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.dumps(json.loads(ln), ensure_ascii=False, indent=2))
+            except Exception:
+                out.append(ln)
+        return "\n".join(out).strip(), "text/plain"
+
+    if name.endswith((".yaml", ".yml")):
+        _ing_dbg("-> yaml")
+        try:
+            import yaml
+            obj = yaml.safe_load(_utf8(data))
+            return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
+        except Exception as e:
+            _ing_dbg("yaml err:", repr(e))
+            return _utf8(data), "text/plain"
+
+    if name.endswith(".toml"):
+        _ing_dbg("-> toml")
+        try:
+            try:
+                import tomllib
+                obj = tomllib.loads(_utf8(data))
+            except Exception:
+                import toml
+                obj = toml.loads(_utf8(data))
+            return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
+        except Exception as e:
+            _ing_dbg("toml err:", repr(e))
+            return _utf8(data), "text/plain"
+
+    if name.endswith((".htm", ".html", ".xml")):
+        _ing_dbg("-> html/xml")
+        return _strip_html(_utf8(data)), "text/plain"
+
+    if name.endswith((
+        ".txt", ".log", ".md",
+        ".c", ".cpp", ".h", ".hpp",
+        ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".sh", ".ps1",
+        ".rs", ".java", ".go", ".rb", ".php",
+        ".swift", ".kt", ".scala", ".lua", ".perl",
+    )):
+        _ing_dbg("-> plaintext/code")
+        return _utf8(data), "text/plain"
+
+    _ing_dbg("-> default fallback")
+    return _utf8(data), "text/plain"
+
+# ===== aimodel/file_read/rag/ingest/ocr.py =====
+
+# aimodel/file_read/rag/ingest/ocr.py
+from __future__ import annotations
+from typing import List
+import io, re
+import pytesseract
+from PIL import Image
+import pypdfium2 as pdfium
+from ...core.settings import SETTINGS
+
+_cmd = str(SETTINGS.effective().get("tesseract_cmd", "")).strip()
+if _cmd:
+    pytesseract.pytesseract.tesseract_cmd = _cmd
+
+_ALNUM = re.compile(r"[A-Za-z0-9]")
+
+def _alnum_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    a = len(_ALNUM.findall(s))
+    return a / max(1, len(s))
+
+def is_bad_text(s: str) -> bool:
+    S = SETTINGS.effective
+    min_len = int(S().get("ocr_min_chars_for_ok", 32))
+    min_ratio = float(S().get("ocr_min_alnum_ratio_for_ok", 0.15))
+    s = (s or "").strip()
+    return (len(s) < min_len) or (_alnum_ratio(s) < min_ratio)
+
+def ocr_image_bytes(img_bytes: bytes) -> str:
+    S = SETTINGS.effective
+    lang = str(S().get("ocr_lang", "eng"))
+    psm = str(S().get("ocr_psm", "3"))
+    oem = str(S().get("ocr_oem", "3"))
+    cfg = f"--oem {oem} --psm {psm}"
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        im = im.convert("L")
+        return pytesseract.image_to_string(im, lang=lang, config=cfg) or ""
+
+def ocr_pdf(data: bytes) -> str:
+    S = SETTINGS.effective
+    dpi = int(S().get("pdf_ocr_dpi", 300))
+    max_pages = int(S().get("pdf_ocr_max_pages", 0))
+    lang = str(S().get("ocr_lang", "eng"))
+    oem = str(S().get("ocr_oem", "3"))
+    psm_default = str(S().get("ocr_psm", "6"))
+    try_psm = [psm_default, "4", "7", "3"]  
+    min_side = 1200  
+
+    def _dbg(*args):
+        try:
+            if bool(S().get("ingest_debug", False)):
+                print("[ocr_pdf]", *args, flush=True)
+        except Exception:
+            pass
+
+    try:
+        doc = pdfium.PdfDocument(io.BytesIO(data))
+    except Exception as e:
+        _dbg("PdfDocument ERROR:", repr(e))
+        return ""
+
+    n = len(doc)
+    limit = n if max_pages <= 0 else min(n, max_pages)
+    _dbg(f"pages={n}", f"limit={limit}", f"dpi={dpi}", f"lang={lang}", f"psm_default={psm_default}")
+
+    out: List[str] = []
+    for i in range(limit):
+        try:
+            page = doc[i]
+            pil = page.render(scale=dpi/72, rotation=0).to_pil().convert("L")
+            base_w, base_h = pil.width, pil.height
+
+            variants = []
+
+            img1 = pil
+            if min(base_w, base_h) < min_side:
+                f = max(1.0, min_side / float(min(base_w, base_h)))
+                img1 = pil.resize((int(base_w * f), int(base_h * f)))
+            variants.append(("gray", img1))
+
+            img2 = img1.point(lambda x: 255 if x > 180 else 0)
+            variants.append(("bin180", img2))
+
+            img3 = img1.point(lambda x: 255 - x)
+            variants.append(("inv", img3))
+
+            got = ""
+            for tag, imgv in variants:
+                for psm in try_psm:
+                    cfg = f"--oem {oem} --psm {psm}"   
+                    txt = pytesseract.image_to_string(imgv, lang=lang, config=cfg) or ""
+                    txt = txt.strip()
+                    _dbg(f"page={i+1}/{limit}", f"{tag} {imgv.width}x{imgv.height}", f"psm={psm}", f"len={len(txt)}", f"prev={repr(txt[:80])}")
+                    if txt:
+                        got = txt
+                        break
+                if got:
+                    break
+
+            if got:
+                out.append(got)
+        except Exception as e:
+            _dbg(f"page={i+1} ERROR:", repr(e))
+
+    final = "\n\n".join(out).strip()
+    _dbg("final_len=", len(final))
+    return final
+
+# ===== aimodel/file_read/rag/ingest/pdf_ingest.py =====
+
+# aimodel/file_read/rag/ingest/pdf_ingest.py
+from __future__ import annotations
+from typing import Tuple
+import io
+from ...core.settings import SETTINGS
+from .ocr import is_bad_text, ocr_pdf
+from .common import _utf8
+
+def _dbg(*args):
+    try:
+        if bool(SETTINGS.effective().get("ingest_debug", False)):
+            print("[pdf_ingest]", *args, flush=True)
+    except Exception:
+        pass
+
+def extract_pdf(data: bytes) -> Tuple[str, str]:
+    print("[pdf_ingest] ENTER extract_pdf", flush=True)
+
+    S = SETTINGS.effective
+    OCR_ENABLED = bool(S().get("pdf_ocr_enable", False))
+    OCR_MODE = str(S().get("pdf_ocr_mode", "auto")).lower()   
+    WHEN_BAD  = bool(S().get("pdf_ocr_when_bad", True))
+    DPI       = int(S().get("pdf_ocr_dpi", 300))
+    MAX_PAGES = int(S().get("pdf_ocr_max_pages", 0))
+
+    print(f"[pdf_ingest] cfg ocr_enabled={OCR_ENABLED} mode={OCR_MODE} when_bad={WHEN_BAD} dpi={DPI} max_pages={MAX_PAGES}", flush=True)
+
+    def _do_ocr() -> str:
+        print("[pdf_ingest] OCR_CALL begin", flush=True)  
+        txt = (ocr_pdf(data) or "").strip()
+        print(f"[pdf_ingest] OCR_CALL end text_len={len(txt)} preview={repr(txt[:120])}", flush=True)
+        return txt
+
+    if OCR_ENABLED and OCR_MODE == "force":
+        _dbg("mode=force -> OCR first")
+        ocr_txt = _do_ocr()
+        if ocr_txt:
+            print("[pdf_ingest] EXIT (force OCR success)", flush=True)
+            return ocr_txt, "text/plain"
+        _dbg("mode=force -> OCR empty, trying text extract")
+
+    txt = ""
+    try:
+        from pdfminer.high_level import extract_text
+        txt = (extract_text(io.BytesIO(data)) or "").strip()
+        print(f"[pdf_ingest] pdfminer text_len={len(txt)} preview={repr(txt[:120])}", flush=True)
+    except Exception as e:
+        print(f"[pdf_ingest] pdfminer ERROR {repr(e)}", flush=True)
         txt = ""
 
-    # AUTO: OCR if missing/weak text
     if OCR_ENABLED and OCR_MODE != "never":
         try_ocr = (not txt) or (WHEN_BAD and is_bad_text(txt))
         print(f"[pdf_ingest] auto-eval try_ocr={try_ocr} has_text={bool(txt)} is_bad={(is_bad_text(txt) if txt else 'n/a')}", flush=True)
@@ -11,7 +221,6 @@ gest] pdfminer ERROR {repr(e)}", flush=True)
                 print("[pdf_ingest] EXIT (auto OCR success)", flush=True)
                 return ocr_txt, "text/plain"
 
-    # Fallback: PyPDF2
     if not txt:
         try:
             from PyPDF2 import PdfReader
@@ -197,7 +406,6 @@ from __future__ import annotations
 from typing import Tuple, List
 from datetime import datetime, date, time
 from ...core.settings import SETTINGS
-
 import re
 
 _WS_RE = re.compile(r"[ \t]+")
@@ -205,19 +413,13 @@ def _squeeze_spaces_inline(s: str) -> str:
     return _WS_RE.sub(" ", (s or "")).strip()
 
 def extract_xls(data: bytes) -> Tuple[str, str]:
-    """
-    Extract text from legacy .xls using xlrd and emit a format compatible with
-    extract_excel() (headers/rows or key/values) so downstream RAG stays consistent.
-    """
     try:
-        import xlrd  # BSD-licensed
+        import xlrd  
     except Exception:
-        # If xlrd is not installed, return plaintext to avoid 500s.
         return (data.decode("utf-8", errors="replace"), "text/plain")
 
     S = SETTINGS.effective
 
-    # --- formatting/config (mirrors excel_ingest) ---
     sig = int(S().get("excel_number_sigfigs"))
     maxp = int(S().get("excel_decimal_max_places"))
     trim = bool(S().get("excel_trim_trailing_zeros"))
@@ -287,17 +489,14 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
         s = re.sub(r"_+", "_", s).strip("_")
         return s or h
 
-    # --- open workbook ---
     try:
         book = xlrd.open_workbook(file_contents=data)
     except Exception:
-        # Misnamed/garbled file: fail soft
         return (data.decode("utf-8", errors="replace"), "text/plain")
 
     datemode = book.datemode
 
     def xlrd_cell_to_py(cell):
-        # xlrd types: 0 empty, 1 text, 2 number, 3 date, 4 boolean, 5 error, 6 blank
         ctype, value = cell.ctype, cell.value
         if ctype == xlrd.XL_CELL_DATE:
             try:
@@ -318,7 +517,6 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
         if nrows == 0 or ncols == 0:
             continue
 
-        # header inference
         headers_raw = []
         header_fill = 0
         for c in range(ncols):
@@ -342,7 +540,6 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
 
         lines.append(f"# Sheet: {sheet.name}")
 
-        # key/value mode (two-column heuristic)
         if EMIT_KEYVALUES and ncols == 2:
             textish = valueish = rows = 0
             for r in range(start_row, nrows):
@@ -364,9 +561,8 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
                         continue
                     lines.append(f"- {k}: {v}" if k else f"- : {v}")
                 lines.append("")
-                continue  # done with this sheet
-
-        # table mode
+                continue 
+            
         lines.append("## Inferred Table")
         if any(h for h in norm_headers):
             lines.append("headers: " + ", ".join(h for h in norm_headers if h))
@@ -387,14 +583,13 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
 # ===== aimodel/file_read/rag/rerank.py =====
 
 from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Optional
 from ..core.settings import SETTINGS
 
 _RERANKER = None
 _RERANKER_NAME = None
 
 def _load_reranker():
-    """Lazy-load a sentence-transformers cross-encoder for reranking."""
     global _RERANKER, _RERANKER_NAME
     model_name = SETTINGS.get("rag_rerank_model")
     if not model_name:
@@ -413,10 +608,6 @@ def _load_reranker():
         return None
 
 def rerank_hits(query: str, hits: List[dict], *, top_m: Optional[int] = None) -> List[dict]:
-    """
-    Cross-encoder reranking (dense pair scoring: (query, hit_text)).
-    Keeps structure of each hit; adds 'rerankScore'.
-    """
     if not hits:
         return hits
     model = _load_reranker()
@@ -455,13 +646,8 @@ def cap_per_source(hits: List[dict], per_source_cap: int) -> List[dict]:
     return out
 
 def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
-    """
-    Keep hits whose score is within the top `frac` of the range, robust for negative logits.
-    If all scores equal or list empty, returns hits unchanged.
-    """
     if not hits:
         return hits
-    # collect numeric scores
     vals = []
     for h in hits:
         try:
@@ -473,28 +659,14 @@ def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
     s_min = min(vals)
     s_max = max(vals)
     if s_max == s_min:
-        # all same -> nothing to filter
         return hits
 
     kept = []
     for h, v in zip(hits, vals):
-        # min-max normalize to [0,1], then compare against frac
         norm = (v - s_min) / (s_max - s_min)
         if norm >= float(frac):
             kept.append(h)
     return kept
-
-# ===== aimodel/file_read/rag/retrieve.py =====
-
-# ===== aimodel/file_read/rag/retrieve.py =====
-from __future__ import annotations
-from typing import Tuple, Dict, Any, Optional
-from ..retrieve_core import (
-    build_rag_block,
-    build_rag_block_with_telemetry,
-    build_rag_block_session_only,
-    build_rag_block_session_only_with_telemetry,
-)
 
 # ===== aimodel/file_read/rag/retrieve_common.py =====
 
@@ -502,17 +674,12 @@ from ..retrieve_core import (
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
-import time
-
 from ..core.settings import SETTINGS
 from .retrieve_tabular import make_rag_block_tabular
 
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10  # cap how many hits we dump at each stage
-
-
-# ========= Embedding helpers =========
+PRINT_MAX = 10 
 
 def _get_embedder():
     global _EMBEDDER, _EMBEDDER_NAME
@@ -552,9 +719,6 @@ def _embed_query(q: str) -> List[float]:
         print(f"[RAG] embedding encode failed: {e}")
         return []
 
-
-# ========= Scoring / ordering =========
-
 def _primary_score(h: Dict[str, Any]) -> float:
     s = h.get("rerankScore")
     if s is not None:
@@ -566,7 +730,6 @@ def _primary_score(h: Dict[str, Any]) -> float:
         return float(h.get("score") or 0.0)
     except Exception:
         return 0.0
-
 
 def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
     hits_sorted = sorted(hits, key=_primary_score, reverse=True)
@@ -582,9 +745,6 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
         if len(out) >= k:
             break
     return out
-
-
-# ========= Block rendering =========
 
 def _default_header(h: Dict[str, Any]) -> str:
     src = str(h.get("source") or "")
@@ -639,9 +799,6 @@ def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[
         )
     return block or ""
 
-
-# ========= Preference boost / debug =========
-
 def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
     if not preferred_sources:
         return hits
@@ -683,9 +840,6 @@ def _nohit_block(q: str) -> str:
         return f"{preamble}\n- {msg}\n- query={q!r}"
     return f"{preamble}\n- {msg}"
 
-
-# ========= Telemetry =========
-
 @dataclass
 class RagTelemetry:
     embedSec: float = 0.0
@@ -714,7 +868,6 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
 import time
-
 from ..core.settings import SETTINGS
 from .store import search_vectors
 from .retrieve_tabular import make_rag_block_tabular
@@ -722,7 +875,7 @@ from .rerank import rerank_hits, cap_per_source, min_score_fraction
 
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10  # cap how many hits we dump at each stage
+PRINT_MAX = 10  
 
 
 def _get_embedder():
@@ -946,21 +1099,17 @@ def _build_rag_block_core(
         print("[RAG SEARCH] no hits")
         return None, tel
 
-    # Preference boost
     all_hits = _rescore_for_preferred_sources(all_hits, preferred_sources=preferred_sources)
     _print_hits("After preference boost", all_hits)
 
-    # Keep a safe copy BEFORE pruning
     pre_prune_hits = list(all_hits)
 
-    # --- Rerank (guarded) ---
     t_rr = time.perf_counter()
     top_m_cfg = SETTINGS.get("rag_rerank_top_m")
     try:
         top_m = int(top_m_cfg) if top_m_cfg not in (None, "", False) else None
     except Exception:
         top_m = None
-    # clamp to available hits if provided
     if isinstance(top_m, int):
         top_m = max(1, min(top_m, len(all_hits)))
 
@@ -968,7 +1117,6 @@ def _build_rag_block_core(
         all_hits = rerank_hits(q, all_hits, top_m=top_m)
     except Exception as e:
         print(f"[RAG] rerank error: {e}; skipping rerank")
-        # keep pre-prune ordering
         pass
 
     tel.rerankSec = round(time.perf_counter() - t_rr, 6)
@@ -976,7 +1124,6 @@ def _build_rag_block_core(
     tel.keptAfterRerank = len(all_hits)
     _print_hits(f"After rerank (top_m={top_m})", all_hits)
 
-    # --- Min-score fraction first (robust) ---
     frac_cfg = SETTINGS.get("rag_min_score_frac")
     try:
         frac = float(frac_cfg) if frac_cfg not in (None, "", False) else None
@@ -994,7 +1141,6 @@ def _build_rag_block_core(
             _print_hits("Dropped by minScoreFrac", dropped)
     tel.keptAfterMinFrac = len(all_hits)
 
-    # --- Per-source cap AFTER min-frac ---
     cap_cfg = SETTINGS.get("rag_per_source_cap")
     try:
         cap_val = int(cap_cfg) if cap_cfg not in (None, "", False) else 0
@@ -1010,7 +1156,6 @@ def _build_rag_block_core(
             _print_hits("Dropped by per-source cap", dropped)
     tel.keptAfterCap = len(all_hits)
 
-    # SAFETY NET
     if not all_hits:
         best = sorted(pre_prune_hits, key=_primary_score, reverse=True)[:1]
         all_hits = best
@@ -1018,13 +1163,11 @@ def _build_rag_block_core(
         print("[RAG] pruning yielded 0 hits; falling back to best pre-prune hit")
         _print_hits("Fallback best pre-prune", all_hits)
 
-    # Final selection
     t3 = time.perf_counter()
     hits_top = _dedupe_and_sort(all_hits, k=k)
     tel.dedupeSec = round(time.perf_counter() - t3, 6)
     _print_hits(f"Final top-k (k={k})", hits_top)
 
-    # Build block
     t4 = time.perf_counter()
     block = build_block_for_hits(hits_top, preferred_sources=preferred_sources)
     tel.blockBuildSec = round(time.perf_counter() - t4, 6)
@@ -1076,7 +1219,6 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import List, Tuple, Dict, Any, Optional
 import time
-
 from ..core.settings import SETTINGS
 from .store import search_vectors
 from .rerank import rerank_hits, cap_per_source, min_score_fraction
@@ -1271,7 +1413,6 @@ def build_rag_block_session_only_with_telemetry(query: str, session_id: Optional
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 import re, os
-
 from ..core.settings import SETTINGS
 
 _TABLE_RE = re.compile(r"^##\s*Table:\s*(?P<sheet>[^!]+)!\s*R(?P<r1>\d+)-(?P<r2>\d+),C(?P<c1>\d+)-(?P<c2>\d+)", re.MULTILINE)
@@ -1446,7 +1587,7 @@ def make_rag_block_tabular(hits: List[dict], preferred_sources: Optional[List[st
 # ===== aimodel/file_read/rag/router_ai.py =====
 from __future__ import annotations
 from typing import Tuple, Optional, Any
-import json, re, traceback, time
+import json, re, traceback
 from ..core.settings import SETTINGS
 
 def _dbg(msg: str):
@@ -1575,14 +1716,14 @@ def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
 # ===== aimodel/file_read/rag/schemas.py =====
 
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal, Dict
+from typing import Optional, Dict
 
 class SearchReq(BaseModel):
     query: str
     sessionId: Optional[str] = None
     kChat: int = 6
     kGlobal: int = 4
-    hybrid_alpha: float = 0.5  # 0..1, higher = semantic weight
+    hybrid_alpha: float = 0.5  
 
 class ItemRow(BaseModel):
     id: str
@@ -1598,7 +1739,7 @@ class SearchHit(BaseModel):
     id: str
     text: str
     score: float
-    source: Optional[str] = None   # <-- safer
+    source: Optional[str] = None   
     title: Optional[str] = None
     sessionId: Optional[str] = None
     url: Optional[str] = None
@@ -1606,12 +1747,9 @@ class SearchHit(BaseModel):
 # ===== aimodel/file_read/rag/search.py =====
 
 from __future__ import annotations
-from typing import List, Dict, Optional
-import numpy as np
-from .store import search_vectors
+from typing import List, Dict
 
 def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]:
-    # results = [list_from_chat, list_from_global]
     scores: Dict[str, float] = {}
     lookup: Dict[str, Dict] = {}
     for lst in results:
@@ -1623,17 +1761,12 @@ def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]
     fused.sort(key=lambda x: x["score"], reverse=True)
     return fused
 
-def merge_chat_first(chat_hits: List[Dict], global_hits: List[Dict], alpha: float = 0.5) -> List[Dict]:
-    # alpha weights semantic scores; RRF stabilizes positions
-    fused = reciprocal_rank_fusion([chat_hits, global_hits])
-    return fused
-
 # ===== aimodel/file_read/rag/store.py =====
 
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
-import faiss, json, os, time, hashlib
+import faiss, json
 import numpy as np
 from ..store.base import APP_DIR   
 import shutil
@@ -1667,14 +1800,11 @@ def add_vectors(session_id: Optional[str], embeds: np.ndarray, metas: List[Dict]
     idx_path, meta_path = _paths(session_id)
     idx = _load_index(dim, idx_path)
 
-    # ensure index type
     if not isinstance(idx, faiss.IndexFlatIP):
         idx = faiss.IndexFlatIP(dim) if idx.ntotal == 0 else idx
 
-    # normalize vectors
     embeds = _norm(embeds)
 
-    # ✅ read existing ids to avoid duplicates
     existing_ids = set()
     if meta_path.exists():
         with meta_path.open("r", encoding="utf-8") as f:
@@ -1710,7 +1840,6 @@ def search_vectors(session_id: Optional[str], query_vec: np.ndarray, topk: int, 
 
     idx = _load_index(dim, idx_path)
 
-    # ✅ ensure numpy array for reshape
     query_vec = np.asarray(query_vec, dtype="float32")
     q = _norm(query_vec.reshape(1, -1))
 
@@ -1749,11 +1878,11 @@ def add_texts(
     metas: List[Dict],
     *,
     session_id: Optional[str],
-    embed_fn,  # callable: List[str] -> np.ndarray[float32]
+    embed_fn,  
 ) -> int:
     if not texts:
         return 0
-    vecs = embed_fn(texts)  # should return (n, d) float32
+    vecs = embed_fn(texts) 
     if not isinstance(vecs, np.ndarray):
         vecs = np.asarray(vecs, dtype="float32")
     dim = int(vecs.shape[-1])
@@ -1761,10 +1890,6 @@ def add_texts(
     return len(texts)
 
 def delete_namespace(session_id: str) -> bool:
-    """
-    Hard-delete all RAG data for a given session: the by_session/<sessionId> folder.
-    Returns True if it existed and was removed.
-    """
     d = _ns_dir(session_id)
     try:
         if d.exists():
@@ -1774,13 +1899,7 @@ def delete_namespace(session_id: str) -> bool:
     except Exception:
         return False
 
-# --- add near the other helpers ---
 def session_has_any_vectors(session_id: Optional[str]) -> bool:
-    """
-    Return True if this session has any indexed vectors stored on disk.
-    We consider the namespace non-empty if the FAISS index exists and ntotal > 0,
-    and the meta.jsonl exists with at least one line.
-    """
     if not session_id:
         return False
 
@@ -1789,7 +1908,7 @@ def session_has_any_vectors(session_id: Optional[str]) -> bool:
         return False
 
     try:
-        idx = _load_index(dim=1, p=idx_path)  # dim not used by IndexFlatIP reader
+        idx = _load_index(dim=1, p=idx_path)  
         if getattr(idx, "ntotal", 0) <= 0:
             return False
     except Exception as e:
@@ -1797,7 +1916,6 @@ def session_has_any_vectors(session_id: Optional[str]) -> bool:
         return False
 
     try:
-        # quick check: meta file has at least one JSONL line
         with meta_path.open("r", encoding="utf-8") as f:
             for _ in f:
                 return True
@@ -1809,25 +1927,23 @@ def session_has_any_vectors(session_id: Optional[str]) -> bool:
 # ===== aimodel/file_read/rag/uploads.py =====
 
 from __future__ import annotations
-from typing import Dict, List, Optional, Iterable, Tuple
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-import json, os
+import json
 import numpy as np
 import faiss
 
-from .store import _ns_dir  # reuse your namespace layout
+from .store import _ns_dir  
 
 _META_FN = "meta.jsonl"
 _INDEX_FN = "index.faiss"
 
-# ---------- Read-only helpers (NO mkdir) ----------
 def _meta_path_ro(session_id: Optional[str]) -> Path:
     return _ns_dir(session_id) / _META_FN
 
 def _index_path_ro(session_id: Optional[str]) -> Path:
     return _ns_dir(session_id) / _INDEX_FN
 
-# ---------- Mutating helpers (mkdir when writing) ----------
 def _paths_mut(session_id: Optional[str]) -> Tuple[Path, Path]:
     d = _ns_dir(session_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -1864,7 +1980,7 @@ def _norm(x: np.ndarray) -> np.ndarray:
 
 def list_sources(session_id: Optional[str], include_global: bool = True) -> List[dict]:
     def _agg(ns: Optional[str]) -> Dict[str, int]:
-        mp = _meta_path_ro(ns)  # read-only, no mkdir
+        mp = _meta_path_ro(ns)  
         agg: Dict[str, int] = {}
         for j in _read_meta(mp):
             src = (j.get("source") or "").strip()
@@ -1884,11 +2000,7 @@ def list_sources(session_id: Optional[str], include_global: bool = True) -> List
     return rows
 
 def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> dict:
-    """
-    Remove all chunks for `source` in the given namespace and REBUILD the FAISS index.
-    `embedder`: callable(List[str]) -> np.ndarray[float32] (same one used on ingest).
-    """
-    idx_path, meta_path = _paths_mut(session_id)  # mutating path (mkdir allowed)
+    idx_path, meta_path = _paths_mut(session_id) 
     rows = _read_meta(meta_path)
     if not rows:
         return {"ok": True, "removed": 0, "remaining": 0}
@@ -1904,12 +2016,10 @@ def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> d
     if removed == 0:
         return {"ok": True, "removed": 0, "remaining": len(keep)}
 
-    # Reassign contiguous row ids for the kept entries
     for i, j in enumerate(keep):
         j["row"] = i
 
     if len(keep) == 0:
-        # No rows left: drop index; empty meta file
         if idx_path.exists():
             try:
                 idx_path.unlink()
@@ -1918,7 +2028,6 @@ def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> d
         _write_meta(meta_path, [])
         return {"ok": True, "removed": removed, "remaining": 0}
 
-    # Re-embed kept texts in batches
     texts = [str(j.get("text") or "") for j in keep]
     B = 128  # batch size
     parts: List[np.ndarray] = []
@@ -1934,15 +2043,10 @@ def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> d
     new_index = faiss.IndexFlatIP(dim)
     new_index.add(embeds)
 
-    # Save rebuilt index + meta
     faiss.write_index(new_index, str(idx_path))
     _write_meta(meta_path, keep)
 
     return {"ok": True, "removed": removed, "remaining": len(keep)}
-
-# ===== aimodel/file_read/rag/worker.py =====
-
-
 
 # ===== aimodel/file_read/requirements.txt =====
 
@@ -1981,9 +2085,14 @@ python-pptx==0.6.23
 
 pytesseract==0.3.13
 pypdfium2==4.30.0
-Pillow==10.4.0
+Pillow==10.4.
+
+pydantic[email]==2.11.7
+python-jose==3.3.0
+passlib[bcrypt]==1.7.4
 
 
+pynacl==1.5.0
 
 # ===== aimodel/file_read/runtime/__init__.py =====
 
@@ -1993,12 +2102,10 @@ Pillow==10.4.0
 
 # aimodel/file_read/model_runtime.py
 from __future__ import annotations
-import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Optional, List
-
 from ..adaptive.config.paths import read_settings, write_settings
 
 try:
@@ -2156,22 +2263,22 @@ def list_local_models() -> List[Dict[str, Any]]:
 
 # ===== aimodel/file_read/services/attachments.py =====
 
+# aimodel/file_read/services/attachments.py
 from __future__ import annotations
 from typing import Any, Iterable, Optional, List
 
 
 def att_get(att: Any, key: str, default=None):
-    """Safe accessor for dicts OR Pydantic models."""
     try:
-        return att.get(key, default)          # dict-like
+        return att.get(key, default)          
     except AttributeError:
-        return getattr(att, key, default)     # model-like
+        return getattr(att, key, default)    
 
 
 def join_attachment_names(attachments: Optional[Iterable[Any]]) -> str:
     if not attachments:
         return ""
-    names: List[str] = [att_get(a, "name") for a in attachments]  # type: ignore[list-item]
+    names: List[str] = [att_get(a, "name") for a in attachments]  
     names = [n for n in names if n]
     return ", ".join(names)
 
@@ -2363,7 +2470,6 @@ from typing import AsyncGenerator, AsyncIterator, Dict
 from dataclasses import asdict
 from fastapi.responses import StreamingResponse
 import time
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import RUNJSON_START, RUNJSON_END
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
@@ -2694,6 +2800,15 @@ async def _finish_prepare_generation_with_telemetry(
         has_atts and bool(eff["disable_global_rag_on_attachments"])
     )) or must_inject_session
 
+    # NEW: if web router said it's needed or we already injected web, skip RAG router
+    web_needed = bool((telemetry.get("web") or {}).get("needed"))
+    web_injected = bool((telemetry.get("web") or {}).get("injected"))
+    if web_needed or web_injected:
+        rag_router_allowed = False
+        telemetry.setdefault("rag", {})
+        telemetry["rag"]["routerSkipped"] = True
+        telemetry["rag"]["routerSkippedReason"] = "web_needed" if web_needed else "web_block_present"
+
     ephemeral_once: List[Dict[str, str]] = []
     if rag_router_allowed and bool(eff["rag_enabled"]) and not ephemeral_once:
         rag_need = False
@@ -2747,57 +2862,4 @@ async def _finish_prepare_generation_with_telemetry(
         if block_text:
             print(f"[PIPE][RAG] injected block preview: {block_text[:200]!r}")
             telemetry["rag"]["blockChars"] = len(block_text)
-            tok = _approx_block_tokens(llm, "user", block_text)
-            if tok is not None:
-                telemetry["rag"]["blockTokensApprox"] = tok
-            telemetry["rag"]["injected"] = True
-            telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
-        else:
-            inserted = _diff_find_inserted_block(packed, packed2)
-            if inserted and isinstance(inserted.get("content"), str):
-                print(f"[PIPE][RAG] diff-inserted block preview: {inserted['content'][:200]!r}")
-                text = inserted["content"]
-                telemetry["rag"]["blockChars"] = len(text)
-                tok = _approx_block_tokens(llm, "user", text)
-                if tok is not None:
-                    telemetry["rag"]["blockTokensApprox"] = tok
-                telemetry["rag"]["injected"] = True
-                telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
-
-        tokens_after = _tok_count(llm, packed2)
-        if tokens_before is not None:
-            telemetry["rag"]["packedTokensBefore"] = tokens_before
-        if tokens_after is not None:
-            telemetry["rag"]["packedTokensAfter"] = tokens_after
-        if tokens_before is not None and tokens_after is not None:
-            telemetry["rag"]["ragTokensAdded"] = max(0, tokens_after - tokens_before)
-        packed = packed2
-    else:
-        telemetry["rag"]["routerSkipped"] = True
-        if telemetry.get("web", {}).get("ephemeralBlocks"):
-            telemetry["rag"]["routerSkippedReason"] = "ephemeral_block_present"
-        elif not rag_router_allowed:
-            telemetry["rag"]["routerSkippedReason"] = "attachments_disable_global_or_rag_disabled"
-        elif not bool(eff["rag_enabled"]):
-            telemetry["rag"]["routerSkippedReason"] = "rag_disabled"
-        print(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
-
-    packed, out_budget_adj = _enforce_fit(llm, eff, packed, out_budget_req)
-    packed_chars = chars_len(packed)
-    telemetry["pack"]["packedChars"] = packed_chars
-    telemetry["pack"]["messages"] = len(packed)
-    telemetry["pack"]["summarySec"] = float(PACK_TELEMETRY.get("summarySec") or 0.0)
-    telemetry["pack"]["summaryTokensApprox"] = int(PACK_TELEMETRY.get("summaryTokensApprox") or 0)
-    telemetry["pack"]["summaryUsedLLM"] = bool(PACK_TELEMETRY.get("summaryUsedLLM") or False)
-    telemetry["pack"]["finalTrimSec"] = float(PACK_TELEMETRY.get("finalTrimSec") or 0.0)
-    telemetry["pack"]["compressSec"] = float(PACK_TELEMETRY.get("compressSec") or 0.0)
-    telemetry["pack"]["packInputTokensApprox"] = int(PACK_TELEMETRY.get("packInputTokensApprox") or 0)
-    telemetry["pack"]["packMsgs"] = int(PACK_TELEMETRY.get("packMsgs") or 0)
-    telemetry["pack"]["finalTrimTokensBefore"] = int(PACK_TELEMETRY.get("finalTrimTokensBefore") or 0)
-    telemetry["pack"]["finalTrimTokensAfter"] = int(PACK_TELEMETRY.get("finalTrimTokensAfter") or 0)
-    telemetry["pack"]["finalTrimDroppedMsgs"] = int(PACK_TELEMETRY.get("finalTrimDroppedMsgs") or 0)
-    telemetry["pack"]["finalTrimDroppedApproxTokens"] = int(PACK_TELEMETRY.get("finalTrimDroppedApproxTokens") or 0)
-    telemetry["pack"]["finalTrimSummaryShrunkFromChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkFromChars") or 0)
-    telemetry["pack"]["finalTrimSummaryShrunkToChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkToChars") or 0)
-    telemetry["pack"]["finalTrimSummaryDroppedChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryDroppedChars") or 0)
-    telemetry["pack"]["rollStartTokens"] = int(PACK_TELEMETRY.get("rollStartToken
+            tok = _approx_block_tokens(llm, "use

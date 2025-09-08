@@ -1,4 +1,57 @@
-s") or 0)
+r", block_text)
+            if tok is not None:
+                telemetry["rag"]["blockTokensApprox"] = tok
+            telemetry["rag"]["injected"] = True
+            telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
+        else:
+            inserted = _diff_find_inserted_block(packed, packed2)
+            if inserted and isinstance(inserted.get("content"), str):
+                print(f"[PIPE][RAG] diff-inserted block preview: {inserted['content'][:200]!r}")
+                text = inserted["content"]
+                telemetry["rag"]["blockChars"] = len(text)
+                tok = _approx_block_tokens(llm, "user", text)
+                if tok is not None:
+                    telemetry["rag"]["blockTokensApprox"] = tok
+                telemetry["rag"]["injected"] = True
+                telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
+
+        tokens_after = _tok_count(llm, packed2)
+        if tokens_before is not None:
+            telemetry["rag"]["packedTokensBefore"] = tokens_before
+        if tokens_after is not None:
+            telemetry["rag"]["packedTokensAfter"] = tokens_after
+        if tokens_before is not None and tokens_after is not None:
+            telemetry["rag"]["ragTokensAdded"] = max(0, tokens_after - tokens_before)
+        packed = packed2
+    else:
+        telemetry["rag"]["routerSkipped"] = True
+        if telemetry.get("web", {}).get("ephemeralBlocks"):
+            telemetry["rag"]["routerSkippedReason"] = "ephemeral_block_present"
+        elif not rag_router_allowed:
+            telemetry["rag"]["routerSkippedReason"] = "attachments_disable_global_or_rag_disabled"
+        elif not bool(eff["rag_enabled"]):
+            telemetry["rag"]["routerSkippedReason"] = "rag_disabled"
+        print(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
+
+    packed, out_budget_adj = _enforce_fit(llm, eff, packed, out_budget_req)
+    packed_chars = chars_len(packed)
+    telemetry["pack"]["packedChars"] = packed_chars
+    telemetry["pack"]["messages"] = len(packed)
+    telemetry["pack"]["summarySec"] = float(PACK_TELEMETRY.get("summarySec") or 0.0)
+    telemetry["pack"]["summaryTokensApprox"] = int(PACK_TELEMETRY.get("summaryTokensApprox") or 0)
+    telemetry["pack"]["summaryUsedLLM"] = bool(PACK_TELEMETRY.get("summaryUsedLLM") or False)
+    telemetry["pack"]["finalTrimSec"] = float(PACK_TELEMETRY.get("finalTrimSec") or 0.0)
+    telemetry["pack"]["compressSec"] = float(PACK_TELEMETRY.get("compressSec") or 0.0)
+    telemetry["pack"]["packInputTokensApprox"] = int(PACK_TELEMETRY.get("packInputTokensApprox") or 0)
+    telemetry["pack"]["packMsgs"] = int(PACK_TELEMETRY.get("packMsgs") or 0)
+    telemetry["pack"]["finalTrimTokensBefore"] = int(PACK_TELEMETRY.get("finalTrimTokensBefore") or 0)
+    telemetry["pack"]["finalTrimTokensAfter"] = int(PACK_TELEMETRY.get("finalTrimTokensAfter") or 0)
+    telemetry["pack"]["finalTrimDroppedMsgs"] = int(PACK_TELEMETRY.get("finalTrimDroppedMsgs") or 0)
+    telemetry["pack"]["finalTrimDroppedApproxTokens"] = int(PACK_TELEMETRY.get("finalTrimDroppedApproxTokens") or 0)
+    telemetry["pack"]["finalTrimSummaryShrunkFromChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkFromChars") or 0)
+    telemetry["pack"]["finalTrimSummaryShrunkToChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkToChars") or 0)
+    telemetry["pack"]["finalTrimSummaryDroppedChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryDroppedChars") or 0)
+    telemetry["pack"]["rollStartTokens"] = int(PACK_TELEMETRY.get("rollStartTokens") or 0)
     telemetry["pack"]["rollOverageTokens"] = int(PACK_TELEMETRY.get("rollOverageTokens") or 0)
 
     persist_summary(session_id, st["summary"])
@@ -44,7 +97,6 @@ s") or 0)
 # ===== aimodel/file_read/services/generate_pipeline_support.py =====
 
 # aimodel/file_read/services/generate_pipeline_support.py
-# utility helpers for generate pipeline; no inline comments per request
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -288,19 +340,6 @@ def chars_len(msgs: List[object]) -> int:
     return total
 
 
-def dump_full_prompt(
-    messages: List[Dict[str, object]],
-    *,
-    params: Dict[str, object],
-    session_id: str,
-) -> None:
-    try:
-        print(f"[{now_str()}] PROMPT DUMP BEGIN session={session_id} msgs={len(messages)}")
-        print(json.dumps({"messages": messages, "params": params}, ensure_ascii=False, indent=2))
-        print(f"[{now_str()}] PROMPT DUMP END   session={session_id}")
-    except Exception as e:
-        print(f"[{now_str()}] PROMPT DUMP ERROR session={session_id} err={type(e).__name__}: {e}")
-
 # ===== aimodel/file_read/services/router_text.py =====
 
 from __future__ import annotations
@@ -381,15 +420,13 @@ def persist_summary(session_id: str, summary: str):
 # ===== aimodel/file_read/services/streaming_worker.py =====
 
 # aimodel/file_read/services/streaming_worker.py
-# updated to account for retrieve timings in pre-ttft accounting (no "or 0.0" fallbacks)
 from __future__ import annotations
 import asyncio, json, time, logging
 from typing import AsyncGenerator, Optional, List
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import (
     RUNJSON_START, RUNJSON_END,
-    build_run_json, watch_disconnect,
+    build_run_json, watch_disconnect, collect_engine_timings,
 )
 
 log = logging.getLogger("aimodel.api.generate")
@@ -501,72 +538,13 @@ async def run_stream(
                 if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
                     stage["queueWaitSec"] = budget_view.get("queueWaitSec")
 
-                engine = None
-                method_used = None
                 try:
-                    td = None
-                    g_last = getattr(llm, "get_last_timings", None)
-                    if callable(g_last):
-                        method_used = "get_last_timings"
-                        td = g_last()
-                    if td is None:
-                        g = getattr(llm, "get_timings", None)
-                        if callable(g):
-                            method_used = "get_timings"
-                            td = g()
-                    if td is None:
-                        if isinstance(getattr(llm, "timings", None), dict):
-                            method_used = "timings_attr"
-                            td = getattr(llm, "timings")
-                        elif isinstance(getattr(llm, "perf", None), dict):
-                            method_used = "perf_attr"
-                            td = getattr(llm, "perf")
-
-                    if isinstance(td, dict):
-                        def fms(v):
-                            try:
-                                return float(v) / 1000.0
-                            except Exception:
-                                return None
-                        def to_i(v):
-                            try:
-                                return int(v)
-                            except Exception:
-                                return None
-                        load_ms = td.get("load_ms") or td.get("loadMs")
-                        prompt_ms = td.get("prompt_ms") or td.get("promptMs") or td.get("prefill_ms")
-                        eval_ms = td.get("eval_ms") or td.get("evalMs") or td.get("decode_ms")
-                        prompt_n = td.get("prompt_n") or td.get("promptN") or td.get("prompt_tokens")
-                        eval_n = td.get("eval_n") or td.get("evalN") or td.get("eval_tokens")
-                        engine = {}
-                        x = fms(load_ms)
-                        if x is not None:
-                            engine["loadSec"] = round(x, 3)
-                        x = fms(prompt_ms)
-                        if x is not None:
-                            engine["promptSec"] = round(x, 3)
-                        x = fms(eval_ms)
-                        if x is not None:
-                            engine["evalSec"] = round(x, 3)
-                        n = to_i(prompt_n)
-                        if n is not None:
-                            engine["promptN"] = n
-                        n = to_i(eval_n)
-                        if n is not None:
-                            engine["evalN"] = n
-                        try:
-                            log.debug("llm timings method=%s keys=%s", method_used, list(td.keys()))
-                        except Exception:
-                            pass
-                    else:
-                        log.debug("llm timings unavailable")
-                except Exception as e:
-                    log.debug("llm timings probe error: %s", e)
+                    engine = collect_engine_timings(llm)
+                except Exception:
                     engine = None
                 if engine:
                     stage["engine"] = engine
 
-                # ---------- Accurate pre-TTFT accounting (no "or 0.0" fallbacks) ----------
                 if isinstance(budget_view, dict):
                     def _fnum(x) -> float:
                         try:
@@ -581,15 +559,12 @@ async def run_stream(
                     rag    = budget_view.get("rag") or {}
                     web_bd = ((budget_view.get("web") or {}).get("breakdown")) or {}
 
-                    # packing / trimming
                     pack_sec = _fnum(pack.get("packSec"))
                     trim_sec = _fnum(pack.get("finalTrimSec"))
                     comp_sec = _fnum(pack.get("compressSec"))
 
-                    # rag router decision
                     rag_router = _fnum(rag.get("routerDecideSec"))
 
-                    # prefer aggregate build timing if present; otherwise sum component steps
                     build_candidates = (
                         rag.get("injectBuildSec"),
                         rag.get("sessionOnlyBuildSec"),
@@ -608,11 +583,9 @@ async def run_stream(
                     else:
                         rag_pipeline_sec = rag_embed + rag_s_chat + rag_s_glob + rag_dedupe
 
-                    # web and prep
                     prep_sec    = _fnum(web_bd.get("prepSec"))
                     web_pre     = _fnum(web_bd.get("totalWebPreTtftSec"))
 
-                    # queue time between model call and first token
                     model_queue = _fnum(stage.get("modelQueueSec"))
 
                     pre_accounted = (
@@ -631,7 +604,6 @@ async def run_stream(
                         "preTtftAccountedSec": round(pre_accounted, 6),
                         "unattributedTtftSec": round(unattr_ttft, 6),
                     })
-                # -------------------------------------------------------------------------
 
                 run_json = build_run_json(
                     request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
@@ -683,52 +655,53 @@ async def run_stream(
 
 from .chats import (
     ChatMessageRow,
-    upsert_on_first_message, update_last, append_message,
-    delete_message, delete_messages_batch, list_messages,
-    list_paged, delete_batch,
-    merge_chat, merge_chat_new, edit_message, set_summary, get_summary,  # ← add these
+    upsert_on_first_message,
+    update_last,
+    append_message,
+    delete_message,
+    delete_messages_batch,
+    list_messages,
+    list_paged,
+    delete_batch,
+    edit_message,
+    set_summary,
+    get_summary,
 )
 from .index import ChatMeta
 
 __all__ = [
-    # chats
     "ChatMessageRow",
-    "upsert_on_first_message", "update_last", "append_message",
-    "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch",
-    "merge_chat", "merge_chat_new", "edit_message",  # ← add these
-    # index
+    "upsert_on_first_message",
+    "update_last",
+    "append_message",
+    "delete_message",
+    "delete_messages_batch",
+    "list_messages",
+    "list_paged",
+    "delete_batch",
+    "edit_message",
+    "set_summary",
+    "get_summary",
     "ChatMeta",
-    # pending
-    "set_summary", "get_summary"
 ]
 
 # ===== aimodel/file_read/store/base.py =====
 
 from __future__ import annotations
-import json, os, shutil, tempfile, threading
+import json, os, shutil, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 from ..adaptive.config.paths import app_data_dir
 
-# -------- Directories & Paths --------
 APP_DIR = app_data_dir()
 CHATS_DIR = APP_DIR / "chats"
 INDEX_PATH = APP_DIR / "index.json"
-PENDING_PATH = APP_DIR / "pending.json"              # NEW
-OLD_PENDING_DELETES = APP_DIR / "pending_deletes.json"  # NEW
 
-# -------- Lock for safe writes --------
-_lock = threading.RLock()
-
-# -------- Helpers --------
 def now_iso() -> str:
-    """UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
 
 def atomic_write(path: Path, data: Dict[str, Any] | List[Any]):
-    """Safely write JSON to a temp file then move into place."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=path.name, dir=str(path.parent))
     try:
@@ -745,24 +718,18 @@ def atomic_write(path: Path, data: Dict[str, Any] | List[Any]):
             pass
 
 def ensure_dirs():
-    """Ensure app/chats directories exist and index.json is initialized."""
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     if not INDEX_PATH.exists():
         atomic_write(INDEX_PATH, [])
 
 def chat_path(session_id: str) -> Path:
-    """Return path to chat file for a session ID."""
     return CHATS_DIR / f"{session_id}.json"
 
-# -------- Exports --------
 __all__ = [
     "APP_DIR",
     "CHATS_DIR",
     "INDEX_PATH",
-    "PENDING_PATH",          # NEW
-    "OLD_PENDING_DELETES",   # NEW
-    "_lock",
     "now_iso",
     "atomic_write",
     "ensure_dirs",
@@ -776,7 +743,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import strip_runjson
 from .base import chat_path, atomic_write, now_iso
@@ -791,7 +757,7 @@ def _load_chat(session_id: str) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
         if "summary" not in data:
-            data["summary"] = ""  # backfill older files
+            data["summary"] = ""
         return data
 
 
@@ -802,14 +768,13 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
-    attachments: Optional[List[Dict]] = None   # ✅ added
+    attachments: Optional[List[Dict]] = None
 
 def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
     if not atts:
         return None
     out = []
     for a in atts:
-        # convert dataclass/typed object to dict
         if isinstance(a, dict):
             out.append({
                 "name": a.get("name"),
@@ -881,14 +846,11 @@ def append_message(session_id: str, role: str, content: str, attachments: Option
     }
     norm_atts = _normalize_attachments(attachments)
     if norm_atts:
-        msg["attachments"] = norm_atts   # ✅ now JSON-serializable
+        msg["attachments"] = norm_atts
 
     data["messages"].append(msg)
     data["seq"] = seq
     _save_chat(session_id, data)
-
-    # update index meta as before...
-    ...
     return ChatMessageRow(
         id=seq,
         sessionId=session_id,
@@ -897,7 +859,6 @@ def append_message(session_id: str, role: str, content: str, attachments: Option
         createdAt=msg["createdAt"],
         attachments=norm_atts,
     )
-
 
 
 def delete_message(session_id: str, message_id: int) -> int:
@@ -944,7 +905,7 @@ def list_messages(session_id: str) -> List[ChatMessageRow]:
             role=m["role"],
             content=m["content"],
             createdAt=m.get("createdAt"),
-            attachments=m.get("attachments", []),  # ✅ safe default
+            attachments=m.get("attachments", []),
         ))
     return rows
 
@@ -976,41 +937,22 @@ def list_paged(page: int, size: int, ceiling_iso: Optional[str]) -> Tuple[List[C
 
 
 def delete_batch(session_ids: List[str]) -> List[str]:
-    # delete chat jsons
     for sid in session_ids:
         try:
             chat_path(sid).unlink(missing_ok=True)
         except Exception:
             pass
 
-    # delete RAG namespaces for those sessions
     for sid in session_ids:
         try:
             rag_delete_namespace(sid)
         except Exception:
             pass
 
-    # prune index.json
     idx = load_index()
     keep = [r for r in idx if r["sessionId"] not in set(session_ids)]
     save_index(keep)
     return session_ids
-
-
-def merge_chat(source_id: str, target_id: str):
-    source_msgs = list_messages(source_id)
-    target_msgs = list_messages(target_id)
-
-    merged = []
-    for m in source_msgs:
-        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
-        merged.append(row)
-
-    for m in target_msgs:
-        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
-        merged.append(row)
-
-    return merged
 
 
 def _save_chat(session_id: str, data: Dict[str, Any]):
@@ -1028,24 +970,6 @@ def get_summary(session_id: str) -> str:
     return str(data.get("summary") or "")
 
 
-def merge_chat_new(source_id: str, target_id: Optional[str] = None):
-    from uuid import uuid4
-    new_id = str(uuid4())
-    upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
-
-    merged = []
-    for m in list_messages(source_id):
-        row = append_message(new_id, m.role, m.content, attachments=m.attachments)
-        merged.append(row)
-
-    if target_id:
-        for m in list_messages(target_id):
-            row = append_message(new_id, m.role, m.content, attachments=m.attachments)
-            merged.append(row)
-
-    return new_id, merged
-
-
 def edit_message(session_id: str, message_id: int, new_content: str) -> Optional[ChatMessageRow]:
     data = _load_chat(session_id)
     msgs = data.get("messages", [])
@@ -1055,17 +979,8 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
         if int(m.get("id", -1)) == int(message_id):
             m["content"] = new_content
             m["updatedAt"] = now_iso()
-            # normalize attachments
             if "attachments" in m and m["attachments"] is not None:
-                norm = []
-                for a in m["attachments"]:
-                    if hasattr(a, "dict"):
-                        norm.append(a.dict())
-                    elif isinstance(a, dict):
-                        norm.append(a)
-                    else:
-                        norm.append(dict(a))
-                m["attachments"] = norm
+                m["attachments"] = _normalize_attachments(m["attachments"])
             updated = m
             break
 
@@ -1085,12 +1000,11 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
     )
 
 
-
 __all__ = [
     "ChatMessageRow",
     "upsert_on_first_message", "update_last", "append_message",
     "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch", "merge_chat", "merge_chat_new",
+    "list_paged", "delete_batch",
     "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary",
 ]
 
@@ -1152,12 +1066,12 @@ __all__ = [
   "router_summary_label": "Summary:",
   "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
   "__comment_web_provider": "=== Web Search Provider Selection & Config ===",
-  "web_search_provider": "ddg",
+  "web_search_provider": "brave",
+  "brave_api_key": "",
+  "brave_worker_url": "https://brave-proxy.localmind.workers.dev/brave",
   "web_search_cache_ttl_sec": 900,
   "web_search_cache_superset_k": 12,
-  "web_search_region": "us-en",
-  "web_search_safesearch": "moderate",
-  "web_search_debug_logging": true,
+  "brave_api_base": "https://api.search.brave.com/res/v1/web/search",
   "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
   "pack_style": "",
   "pack_short": false,
@@ -1175,35 +1089,33 @@ __all__ = [
   "min_out_tokens": 16,
   "__comment_store": "=== Chat storage ===",
   "chat_default_title": "New Chat",
-  "chat_merged_title": "Merged Chat",
   "chat_page_min_size": 1,
   "chat_page_max_size": 100,
-  "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
-  "web_fetch_timeout_sec": 6,
-  "web_fetch_max_chars": 2000,
+  "web_fetch_timeout_sec": 4,
+  "web_fetch_max_chars": 2400,
   "web_fetch_max_bytes": 1048576,
   "web_fetch_max_parallel": 4,
   "web_fetch_user_agent": "LocalAI/0.1 (+clean-fetch)",
   "__comment_web_orchestrator": "=== Web Orchestrator & Block Assembly ===",
-  "web_orch_default_k": 3,
-  "web_orch_total_char_budget": 1200,
-  "web_orch_per_doc_char_budget": 700,
+  "web_orch_default_k": 4,
+  "web_orch_total_char_budget": 1800,
+  "web_orch_per_doc_char_budget": 600,
   "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 1.5,
-  "web_orch_overfetch_min_extra": 1,
-  "web_orch_enable_js_retry": false,
-  "web_orch_js_retry_avg_q": 0.55,
-  "web_orch_js_retry_low_q": 0.45,
-  "web_orch_js_retry_lowish_ratio": 0.5,
+  "web_orch_overfetch_factor": 2,
+  "web_orch_overfetch_min_extra": 4,
+  "web_orch_enable_js_retry": true,
+  "web_orch_js_retry_avg_q": 0.3,
+  "web_orch_js_retry_low_q": 0.18,
+  "web_orch_js_retry_lowish_ratio": 0.6,
   "web_orch_js_retry_timeout_add": 4,
   "web_orch_js_retry_timeout_cap": 12,
-  "web_orch_js_retry_parallel_delta": -1,
+  "web_orch_js_retry_parallel_delta": 1,
   "web_orch_js_retry_min_parallel": 2,
   "web_block_header": "Web findings for: {query}",
   "web_orch_block_separator": "\n\n",
   "web_orch_min_block_reserve": 200,
   "web_orch_min_chunk_after_shrink": 160,
-  "web_orch_head_fraction": 0.6,
+  "web_orch_head_fraction": 0.4,
   "web_orch_tail_min_chars": 200,
   "web_orch_ellipsis": " … ",
   "web_orch_bullet_prefix": "- ",
@@ -1242,6 +1154,9 @@ __all__ = [
       "cap": 0.2
     }
   ],
+  "__comment_web_orch_diversity": "=== Diversity & Adaptive Chunking ===",
+  "web_orch_min_hosts": 3,
+  "__comment_web_misc": "=== Misc flags ===",
   "web_ephemeral_only": true,
   "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
@@ -1310,6 +1225,7 @@ __all__ = [
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
+  "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
   "__comment_rag": "=== Local RAG ===",
   "default_auto_rag": true,
   "disable_web_on_attachments": true,
@@ -1425,7 +1341,16 @@ __all__ = [
   "ocr_min_image_bytes": 16384,
   "pptx_ocr_images": true,
   "docx_ocr_images": true,
-  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe"
+  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe",
+  "style_sys": "You are a helpful assistant. Always follow the user's explicit instructions carefully and exactly. Do not repeat yourself. Stay coherent and complete.",
+  "style_patterns": {
+    "talk_like": "\\btalk\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "respond_like": "\\brespond\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "be": "\\bbe\\s+(?P<style>[^.;\\n]+)",
+    "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
+  },
+  "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
+  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:"
 }
 
 # ===== aimodel/file_read/store/effective_settings.json =====
@@ -1486,12 +1411,12 @@ __all__ = [
   "router_summary_label": "Summary:",
   "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
   "__comment_web_provider": "=== Web Search Provider Selection & Config ===",
-  "web_search_provider": "ddg",
+  "web_search_provider": "brave",
+  "brave_api_key": "BSAJsnvyOOOULDffIM8myC1IUk34u-d",
+  "brave_worker_url": "",
   "web_search_cache_ttl_sec": 900,
   "web_search_cache_superset_k": 12,
-  "web_search_region": "us-en",
-  "web_search_safesearch": "moderate",
-  "web_search_debug_logging": true,
+  "brave_api_base": "https://api.search.brave.com/res/v1/web/search",
   "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
   "pack_style": "",
   "pack_short": false,
@@ -1509,35 +1434,33 @@ __all__ = [
   "min_out_tokens": 16,
   "__comment_store": "=== Chat storage ===",
   "chat_default_title": "New Chat",
-  "chat_merged_title": "Merged Chat",
   "chat_page_min_size": 1,
   "chat_page_max_size": 100,
-  "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
-  "web_fetch_timeout_sec": 6,
-  "web_fetch_max_chars": 2000,
+  "web_fetch_timeout_sec": 4,
+  "web_fetch_max_chars": 2400,
   "web_fetch_max_bytes": 1048576,
   "web_fetch_max_parallel": 4,
   "web_fetch_user_agent": "LocalAI/0.1 (+clean-fetch)",
   "__comment_web_orchestrator": "=== Web Orchestrator & Block Assembly ===",
-  "web_orch_default_k": 3,
-  "web_orch_total_char_budget": 1200,
-  "web_orch_per_doc_char_budget": 700,
+  "web_orch_default_k": 4,
+  "web_orch_total_char_budget": 1800,
+  "web_orch_per_doc_char_budget": 600,
   "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 1.5,
-  "web_orch_overfetch_min_extra": 1,
-  "web_orch_enable_js_retry": false,
-  "web_orch_js_retry_avg_q": 0.55,
-  "web_orch_js_retry_low_q": 0.45,
-  "web_orch_js_retry_lowish_ratio": 0.5,
+  "web_orch_overfetch_factor": 2,
+  "web_orch_overfetch_min_extra": 4,
+  "web_orch_enable_js_retry": true,
+  "web_orch_js_retry_avg_q": 0.3,
+  "web_orch_js_retry_low_q": 0.18,
+  "web_orch_js_retry_lowish_ratio": 0.6,
   "web_orch_js_retry_timeout_add": 4,
   "web_orch_js_retry_timeout_cap": 12,
-  "web_orch_js_retry_parallel_delta": -1,
+  "web_orch_js_retry_parallel_delta": 1,
   "web_orch_js_retry_min_parallel": 2,
   "web_block_header": "Web findings for: {query}",
   "web_orch_block_separator": "\n\n",
   "web_orch_min_block_reserve": 200,
   "web_orch_min_chunk_after_shrink": 160,
-  "web_orch_head_fraction": 0.6,
+  "web_orch_head_fraction": 0.4,
   "web_orch_tail_min_chars": 200,
   "web_orch_ellipsis": " … ",
   "web_orch_bullet_prefix": "- ",
@@ -1576,6 +1499,9 @@ __all__ = [
       "cap": 0.2
     }
   ],
+  "__comment_web_orch_diversity": "=== Diversity & Adaptive Chunking ===",
+  "web_orch_min_hosts": 3,
+  "__comment_web_misc": "=== Misc flags ===",
   "web_ephemeral_only": true,
   "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
@@ -1644,6 +1570,7 @@ __all__ = [
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
+  "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
   "__comment_rag": "=== Local RAG ===",
   "default_auto_rag": true,
   "disable_web_on_attachments": true,
@@ -1759,7 +1686,17 @@ __all__ = [
   "ocr_min_image_bytes": 16384,
   "pptx_ocr_images": true,
   "docx_ocr_images": true,
-  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe"
+  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe",
+  "style_sys": "You are a helpful assistant. Always follow the user's explicit instructions carefully and exactly. Do not repeat yourself. Stay coherent and complete.",
+  "style_patterns": {
+    "talk_like": "\\btalk\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "respond_like": "\\brespond\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "be": "\\bbe\\s+(?P<style>[^.;\\n]+)",
+    "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
+  },
+  "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
+  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:",
+  "brave_api_key_present": true
 }
 
 # ===== aimodel/file_read/store/index.py =====
@@ -1862,12 +1799,12 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "router_summary_label": "Summary:",
   "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
   "__comment_web_provider": "=== Web Search Provider Selection & Config ===",
-  "web_search_provider": "ddg",
+  "web_search_provider": "brave",
+  "brave_api_key": "BSAJsnvyOOOULDffIM8myC1IUk34u-d",
+  "brave_worker_url": "",
   "web_search_cache_ttl_sec": 900,
   "web_search_cache_superset_k": 12,
-  "web_search_region": "us-en",
-  "web_search_safesearch": "moderate",
-  "web_search_debug_logging": true,
+  "brave_api_base": "https://api.search.brave.com/res/v1/web/search",
   "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
   "pack_style": "",
   "pack_short": false,
@@ -1885,35 +1822,33 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "min_out_tokens": 16,
   "__comment_store": "=== Chat storage ===",
   "chat_default_title": "New Chat",
-  "chat_merged_title": "Merged Chat",
   "chat_page_min_size": 1,
   "chat_page_max_size": 100,
-  "__comment_web_fetch": "=== Web Fetch (HTML fetch & clean) ===",
-  "web_fetch_timeout_sec": 6,
-  "web_fetch_max_chars": 2000,
+  "web_fetch_timeout_sec": 4,
+  "web_fetch_max_chars": 2400,
   "web_fetch_max_bytes": 1048576,
   "web_fetch_max_parallel": 4,
   "web_fetch_user_agent": "LocalAI/0.1 (+clean-fetch)",
   "__comment_web_orchestrator": "=== Web Orchestrator & Block Assembly ===",
-  "web_orch_default_k": 3,
-  "web_orch_total_char_budget": 1200,
-  "web_orch_per_doc_char_budget": 700,
+  "web_orch_default_k": 4,
+  "web_orch_total_char_budget": 1800,
+  "web_orch_per_doc_char_budget": 600,
   "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 1.5,
-  "web_orch_overfetch_min_extra": 1,
-  "web_orch_enable_js_retry": false,
-  "web_orch_js_retry_avg_q": 0.55,
-  "web_orch_js_retry_low_q": 0.45,
-  "web_orch_js_retry_lowish_ratio": 0.5,
+  "web_orch_overfetch_factor": 2,
+  "web_orch_overfetch_min_extra": 4,
+  "web_orch_enable_js_retry": true,
+  "web_orch_js_retry_avg_q": 0.3,
+  "web_orch_js_retry_low_q": 0.18,
+  "web_orch_js_retry_lowish_ratio": 0.6,
   "web_orch_js_retry_timeout_add": 4,
   "web_orch_js_retry_timeout_cap": 12,
-  "web_orch_js_retry_parallel_delta": -1,
+  "web_orch_js_retry_parallel_delta": 1,
   "web_orch_js_retry_min_parallel": 2,
   "web_block_header": "Web findings for: {query}",
   "web_orch_block_separator": "\n\n",
   "web_orch_min_block_reserve": 200,
   "web_orch_min_chunk_after_shrink": 160,
-  "web_orch_head_fraction": 0.6,
+  "web_orch_head_fraction": 0.4,
   "web_orch_tail_min_chars": 200,
   "web_orch_ellipsis": " … ",
   "web_orch_bullet_prefix": "- ",
@@ -1952,6 +1887,9 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
       "cap": 0.2
     }
   ],
+  "__comment_web_orch_diversity": "=== Diversity & Adaptive Chunking ===",
+  "web_orch_min_hosts": 3,
+  "__comment_web_misc": "=== Misc flags ===",
   "web_ephemeral_only": true,
   "web_inject_max_chars": 0,
   "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
@@ -2020,6 +1958,7 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "retitle_sanitize_max_words": 5,
   "retitle_sanitize_max_chars": 40,
   "retitle_min_user_chars": 15,
+  "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
   "__comment_rag": "=== Local RAG ===",
   "default_auto_rag": true,
   "disable_web_on_attachments": true,
@@ -2135,7 +2074,17 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
   "ocr_min_image_bytes": 16384,
   "pptx_ocr_images": true,
   "docx_ocr_images": true,
-  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe"
+  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe",
+  "style_sys": "You are a helpful assistant. Always follow the user's explicit instructions carefully and exactly. Do not repeat yourself. Stay coherent and complete.",
+  "style_patterns": {
+    "talk_like": "\\btalk\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "respond_like": "\\brespond\\s+like\\s+(?P<style>[^.;\\n]+)",
+    "be": "\\bbe\\s+(?P<style>[^.;\\n]+)",
+    "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
+  },
+  "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
+  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:",
+  "brave_api_key_present": true
 }
 
 # ===== aimodel/file_read/utils/streaming.py =====
@@ -2145,7 +2094,6 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 from ..runtime.model_runtime import current_model_info, get_llm
 
 RUNJSON_START = "\n[[RUNJSON]]\n"
@@ -2418,45 +2366,70 @@ async def watch_disconnect(request, stop_ev):
             stop_ev.set()
             break
 
+# ===== aimodel/file_read/utils/text.py =====
+
+from __future__ import annotations
+import re
+from typing import Optional
+
+def clean_ws(s: Optional[str]) -> str:
+    return " ".join((s or "").split())
+
+def strip_wrappers(text: str, *, trim_whitespace: bool, split_on_blank: bool, header_regex: Optional[str]) -> str:
+    t = text or ""
+    if trim_whitespace:
+        t = t.strip()
+    if not header_regex and not split_on_blank:
+        return t
+    head = t
+    if split_on_blank:
+        head = t.split("\n\n", 1)[0]
+    if header_regex:
+        try:
+            rx = re.compile(header_regex)
+            out = []
+            for ln in head.splitlines():
+                if rx.match(ln):
+                    break
+                out.append(ln)
+            core = " ".join(" ".join(out).split())
+            return core if core else t
+        except Exception:
+            return head
+    return head
+
 # ===== aimodel/file_read/web/__init__.py =====
 
 
 
-# ===== aimodel/file_read/web/duckduckgo.py =====
+# ===== aimodel/file_read/web/brave.py =====
 
-# aimodel/file_read/web/duckduckgo.py
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict, Any
-import asyncio, time
-from urllib.parse import urlparse
+import time, urllib.parse, hashlib
 
 try:
-    from ddgs import DDGS  # type: ignore
+    import httpx
 except Exception:
-    try:
-        from duckduckgo_search import DDGS  # type: ignore
-    except Exception:
-        DDGS = None  # type: ignore
+    httpx = None
 
 from ..core.settings import SETTINGS
 from .provider import SearchHit
+from .orchestrator_common import _host
 
 _CACHE: dict[str, Tuple[float, List[SearchHit]]] = {}
 
-def _cache_key(query: str) -> str:
-    return (query or "").strip().lower()
 
-def _host(u: str) -> str:
-    try:
-        h = (urlparse(u).hostname or "").lower()
-        return h[4:] if h.startswith("www.") else h
-    except Exception:
-        return ""
+def _cache_key(query: str, base: str, key_marker: str) -> str:
+    q = (query or "").strip().lower()
+    b = (base or "").strip().lower()
+    m = (key_marker or "").strip().lower()
+    return f"{q}||{b}||{m}"
 
-def _cache_get(query: str) -> Optional[List[SearchHit]]:
+
+def _cache_get(key: str) -> Optional[List[SearchHit]]:
     eff = SETTINGS.effective()
     ttl = int(eff["web_search_cache_ttl_sec"])
-    key = _cache_key(query)
     v = _CACHE.get(key)
     if not v:
         return None
@@ -2466,263 +2439,137 @@ def _cache_get(query: str) -> Optional[List[SearchHit]]:
         return None
     return hits
 
-def _cache_set(query: str, hits: List[SearchHit]) -> None:
-    _CACHE[_cache_key(query)] = (time.time(), hits)
 
-def _ddg_sync_search(query: str, k: int, *, region: str, safesearch: str) -> List[SearchHit]:
-    results: List[SearchHit] = []
-    if DDGS is None:
-        return results
-    with DDGS() as ddg:
-        for i, r in enumerate(ddg.text(query, max_results=max(1, k), safesearch=safesearch, region=region)):
-            title = (r.get("title") or "").strip()
-            url = (r.get("href") or "").strip()
-            snippet: Optional[str] = (r.get("body") or "").strip() or None
-            if not url:
-                continue
-            results.append(SearchHit(title=title or url, url=url, snippet=snippet, rank=i))
-            if i + 1 >= k:
-                break
-    return results
+def _cache_set(key: str, hits: List[SearchHit]) -> None:
+    _CACHE[key] = (time.time(), hits)
 
-class DuckDuckGoProvider:
-    async def search(self, query: str, k: int = 3, telemetry: Optional[Dict[str, Any]] = None) -> List[SearchHit]:
+
+def _set_hits_telemetry(tel: Dict[str, Any], all_hits: List[SearchHit], out: List[SearchHit]) -> None:
+    tel["hits"] = {
+        "total": len(all_hits),
+        "returned": len(out),
+        "top": [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]],
+    }
+
+
+def _build_url(base: str, q: str, k: int) -> str:
+    params = {"q": q, "count": str(max(1, k))}
+    return f"{base}?{urllib.parse.urlencode(params)}"
+
+
+def _num(x: Any) -> Optional[int]:
+    try:
+        return int(str(x))
+    except Exception:
+        return None
+
+
+class BraveProvider:
+    async def search(
+        self,
+        query: str,
+        k: int = 3,
+        telemetry: Optional[Dict[str, Any]] = None,
+        xid: Optional[str] = None
+    ) -> List[SearchHit]:
         t_start = time.perf_counter()
         eff = SETTINGS.effective()
         q_norm = (query or "").strip()
         if not q_norm:
             if telemetry is not None:
-                telemetry.update({"query": q_norm, "k": int(k), "supersetK": int(k), "elapsedSec": round(time.perf_counter() - t_start, 6), "cache": {"hit": False}})
+                telemetry.update({
+                    "query": q_norm,
+                    "k": int(k),
+                    "supersetK": int(k),
+                    "elapsedSec": round(time.perf_counter() - t_start, 6),
+                    "cache": {"hit": False}
+                })
             return []
-        superset_k = max(int(k), int(eff["web_search_cache_superset_k"]))
-        region = str(eff["web_search_region"])
-        safesearch = str(eff["web_search_safesearch"])
 
-        tel: Dict[str, Any] = {"query": q_norm, "k": int(k), "supersetK": superset_k, "region": region, "safesearch": safesearch}
+        superset_k = max(int(k), int(eff["web_search_cache_superset_k"]))
+        tel: Dict[str, Any] = {"query": q_norm, "k": int(k), "supersetK": superset_k}
+
+        brave_base = (eff.get("brave_api_base") or "https://api.search.brave.com/res/v1/web/search").strip()
+        # Global key from SETTINGS (admin-configured)
+        key = (SETTINGS.get("brave_api_key", "") or "").strip()
+        key_hash = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8] if key else "nokey"
+        ckey = _cache_key(q_norm, brave_base, key_hash)
+
         t_cache = time.perf_counter()
-        cached = _cache_get(q_norm)
+        cached = _cache_get(ckey)
         tel["cache"] = {"hit": cached is not None, "elapsedSec": round(time.perf_counter() - t_cache, 6)}
         if cached is not None:
+            print("BRAVE cache hit", {"query": q_norm, "k": k, "base": brave_base, "keyHash": key_hash})
             out = cached[:k]
-            tel["hits"] = {
-                "total": len(cached),
-                "returned": len(out),
-                "top": [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]],
-            }
+            _set_hits_telemetry(tel, cached, out)
             tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
             if telemetry is not None:
                 telemetry.update(tel)
             return out
 
         hits: List[SearchHit] = []
-        prov_info: Dict[str, Any] = {"available": DDGS is not None}
+        prov_info: Dict[str, Any] = {"available": httpx is not None}
         t_fetch = time.perf_counter()
-        if DDGS is not None:
-            try:
-                hits = await asyncio.to_thread(_ddg_sync_search, q_norm, superset_k, region=region, safesearch=safesearch)
-                prov_info["errorType"] = None
-                prov_info["errorMsg"] = None
-            except Exception as e:
-                prov_info["errorType"] = type(e).__name__
-                prov_info["errorMsg"] = str(e)
-                hits = []
-        else:
+
+        if httpx is None:
             prov_info["errorType"] = "ProviderUnavailable"
-            prov_info["errorMsg"] = "DDGS is not installed or failed to import."
+            prov_info["errorMsg"] = "httpx not installed"
+        else:
+            print("BRAVE cfg", {"base": brave_base, "byok": False, "keyHash": key_hash})
+            url = _build_url(brave_base, q_norm, superset_k)
+            headers: Dict[str, str] = {}
+            if key:
+                headers["X-Subscription-Token"] = key
+            print("BRAVE headers", {"hasKey": bool(key)})
+
+            if not key:
+                prov_info["errorType"] = "Unauthorized"
+                prov_info["errorMsg"] = "No Brave API key configured in settings"
+            else:
+                try:
+                    timeout = float(eff.get("web_fetch_timeout_sec", 8))
+                    print("BRAVE call", {"url": url, "timeoutSec": timeout})
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        r = await client.get(url, headers=headers)
+                        print("BRAVE resp", {
+                            "status": r.status_code,
+                            "len": len(r.text or ""),
+                            "preview": (r.text[:200] if r.text else ""),
+                        })
+                        r.raise_for_status()
+                        data = r.json()
+                    rate = {
+                        "minute": {
+                            "limit": _num(r.headers.get("X-RateLimit-Limit-Minute")),
+                            "remaining": _num(r.headers.get("X-RateLimit-Remaining-Minute")),
+                            "resetMs": _num(r.headers.get("X-RateLimit-Reset-Minute")),
+                        },
+                        "day": {
+                            "limit": _num(r.headers.get("X-RateLimit-Limit-Day")),
+                            "remaining": _num(r.headers.get("X-RateLimit-Remaining-Day")),
+                            "resetMs": _num(r.headers.get("X-RateLimit-Reset-Day")),
+                        },
+                    }
+                    prov_info["rate"] = rate
+                    web = (data or {}).get("web") or {}
+                    results = web.get("results") or []
+                    for i, item in enumerate(results[:superset_k], start=1):
+                        title = (item.get("title") or "").strip()
+                        url_i = (item.get("url") or "").strip()
+                        snippet = (item.get("description") or "").strip() or None
+                        if not url_i:
+                            continue
+                        hits.append(SearchHit(title=title or url_i, url=url_i, snippet=snippet, rank=i))
+                    prov_info["errorType"] = None
+                    prov_info["errorMsg"] = None
+                except httpx.HTTPStatusError as e:
+                    print("BRAVE HTTP error", {"status": r.status_code, "body": (r.text or "")[:200]})
+                    prov_info["errorType"] = "HTTPStatusError"
+                    prov_info["errorMsg"] = f"{e.response.status_code} {e.response.text}"
+                except Exception as e:
+                    print("BRAVE exception", {"type": type(e).__name__, "msg": str(e)})
+                    prov_info["errorType"] = type(e).__name__
+                    prov_info["errorMsg"] = str(e)
+
         prov_info["elapsedSec"] = round(time.perf_counter() - t_fetch, 6)
-        tel["provider"] = prov_info
-
-        _cache_set(q_norm, hits)
-        out = hits[:k]
-        tel["hits"] = {
-            "total": len(hits),
-            "returned": len(out),
-            "top": [f"{h.rank}:{_host(h.url)}:{(h.title or '')[:60]}" for h in out[:5]],
-        }
-        tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
-        if telemetry is not None:
-            telemetry.update(tel)
-        return out
-
-# ===== aimodel/file_read/web/fetch.py =====
-
-# aimodel/file_read/web/fetch.py
-from __future__ import annotations
-import asyncio
-from typing import Tuple, List, Optional, Dict, Any
-import time
-import httpx
-
-try:
-    from readability import Document
-except Exception:
-    Document = None  # type: ignore
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None  # type: ignore
-
-try:
-    from selectolax.parser import HTMLParser
-except Exception:
-    HTMLParser = None  # type: ignore
-
-from ..core.settings import SETTINGS
-
-
-def _req(key: str):
-    return SETTINGS[key]
-
-def _ua() -> str:
-    return str(_req("web_fetch_user_agent"))
-
-def _timeout() -> float:
-    return float(_req("web_fetch_timeout_sec"))
-
-def _max_chars() -> int:
-    return int(_req("web_fetch_max_chars"))
-
-def _max_bytes() -> int:
-    return int(_req("web_fetch_max_bytes"))
-
-def _max_parallel() -> int:
-    return max(1, int(_req("web_fetch_max_parallel")))
-
-
-async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
-    out = bytearray()
-    async for chunk in resp.aiter_bytes():
-        if not chunk:
-            continue
-        remaining = cap_bytes - len(out)
-        if remaining <= 0:
-            break
-        out.extend(chunk[:remaining])
-        if len(out) >= cap_bytes:
-            break
-    return bytes(out)
-
-
-def _extract_text_from_html(raw_html: str, url: str) -> str:
-    html = raw_html or ""
-    if Document is not None:
-        try:
-            doc = Document(html)
-            summary_html = doc.summary(html_partial=True) or ""
-            if summary_html:
-                if BeautifulSoup is not None:
-                    soup = BeautifulSoup(summary_html, "lxml")
-                    txt = soup.get_text(" ", strip=True)
-                    if txt:
-                        return txt
-        except Exception:
-            pass
-    if HTMLParser is not None:
-        try:
-            tree = HTMLParser(html)
-            for bad in ("script", "style", "noscript"):
-                for n in tree.tags(bad):
-                    n.decompose()
-            txt = tree.body.text(separator=" ", strip=True) if tree.body else tree.text(separator=" ", strip=True)
-            if txt:
-                return txt
-        except Exception:
-            pass
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            for s in soup(["script", "style", "noscript"]):
-                s.extract()
-            txt = soup.get_text(" ", strip=True)
-            if txt:
-                return txt
-        except Exception:
-            pass
-    return html
-
-
-async def fetch_clean(
-    url: str,
-    timeout_s: Optional[float] = None,
-    max_chars: Optional[int] = None,
-    max_bytes: Optional[int] = None,
-    telemetry: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, int, str]:
-    t0 = time.perf_counter()
-    timeout = _timeout() if timeout_s is None else float(timeout_s)
-    cap_chars = _max_chars() if max_chars is None else int(max_chars)
-    cap_bytes = _max_bytes() if max_bytes is None else int(max_bytes)
-
-    headers = {"User-Agent": _ua()}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        raw_bytes = await _read_capped_bytes(r, cap_bytes)
-        enc = r.encoding or "utf-8"
-        raw_text = raw_bytes.decode(enc, errors="ignore")
-        txt = _extract_text_from_html(raw_text, str(r.url))
-        txt = (txt or "").strip().replace("\r", "")
-        if len(txt) > cap_chars:
-            txt = txt[:cap_chars]
-        if telemetry is not None:
-            telemetry.update({
-                "reqUrl": url,
-                "finalUrl": str(r.url),
-                "status": int(r.status_code),
-                "elapsedSec": round(time.perf_counter() - t0, 6),
-                "bytes": len(raw_bytes),
-                "chars": len(txt),
-                "timeoutSec": timeout,
-                "capBytes": cap_bytes,
-                "capChars": cap_chars,
-            })
-        return (str(r.url), r.status_code, txt)
-
-
-async def fetch_many(
-    urls: List[str],
-    per_timeout_s: Optional[float] = None,
-    cap_chars: Optional[int] = None,
-    cap_bytes: Optional[int] = None,
-    max_parallel: Optional[int] = None,
-    telemetry: Optional[Dict[str, Any]] = None,
-):
-    t_total0 = time.perf_counter()
-    sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
-    tel_items: List[Dict[str, Any]] = []
-
-    async def _one(u: str):
-        item_tel: Dict[str, Any] = {"reqUrl": u}
-        t0 = time.perf_counter()
-        async with sem:
-            try:
-                res = await fetch_clean(
-                    u,
-                    timeout_s=per_timeout_s,
-                    max_chars=cap_chars,
-                    max_bytes=cap_bytes,
-                    telemetry=item_tel,
-                )
-                item_tel.setdefault("elapsedSec", round(time.perf_counter() - t0, 6))
-                item_tel["ok"] = True
-                tel_items.append(item_tel)
-                return u, res
-            except Exception as e:
-                item_tel.update({
-                    "ok": False,
-                    "errorType": type(e).__name__,
-                    "errorMsg": str(e),
-                    "elapsedSec": round(time.perf_counter() - t0, 6),
-                    "timeoutSec": (float(per_timeout_s) if per_timeout_s is not None else _timeout()),
-                    "capBytes": (int(cap_bytes) if cap_bytes is not None else _max_bytes()),
-                    "capChars": (int(cap_chars) if cap_chars is not None else _max_chars()),
-                })
-                tel_items.append(item_tel)
-                return u, None
-
-    tasks = [_one(u) for u in urls]
-    results = await asyncio.gather(*tasks)
-
-    if telemetry is not None:
-        ok_cnt = sum(1 for it
+        tel["provider"] = p

@@ -1,4 +1,964 @@
-nter justify-center rounded border bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition ${compact ? "h-7 w-7" : "h-8 w-8"}`}
+n>
+          </div>
+        </div>
+      )}
+
+      {open && (
+        <div className="md:hidden">
+          <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setOpen(false)} />
+          <div className="fixed inset-x-0 bottom-0 z-50 rounded-t-2xl bg-white shadow-2xl">
+            <div className="px-4 pt-4 pb-2 text-sm text-gray-600 truncate border-b">{display}</div>
+
+            {/* License Key (mobile) */}
+            <div className="p-4 border-b bg-gray-50/60">
+              <div className="text-[11px] font-medium text-gray-600 mb-1">License key</div>
+              <div className="flex items-center gap-2">
+                <input
+                  value={license}
+                  onChange={(e) => setLicense(e.target.value)}
+                  placeholder="paste-your-key"
+                  className="flex-1 rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-black"
+                  spellCheck={false}
+                />
+                <button
+                  onClick={saveLicense}
+                  className="inline-flex items-center gap-1 rounded-lg border px-3 py-2 text-sm hover:bg-gray-50"
+                >
+                  <Save size={16} /> Save
+                </button>
+              </div>
+              {saved === "ok" && <div className="mt-1 text-[11px] text-green-600">Saved</div>}
+              {saved === "err" && <div className="mt-1 text-[11px] text-red-600">Couldn’t save</div>}
+            </div>
+
+            <div className="p-2">
+              <button className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50" onClick={() => { setOpen(false); }}>
+                <Stars className="w-4 h-4" /> Upgrade plan
+              </button>
+              <button className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50" onClick={openCustomize}>
+                <Wand2 className="w-4 h-4" /> Customize
+              </button>
+              <button className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50" onClick={openKnowledge}>
+                <BookOpen className="w-4 h-4" /> Knowledge
+              </button>
+              <button className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50" onClick={openSettings}>
+                <Settings className="w-4 h-4" /> Settings
+              </button>
+              <button className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50 text-red-600" onClick={logout}>
+                <LogOut className="w-4 h-4" /> Log out
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatSidebar/ChatSidebar.tsx =====
+
+import { useState } from "react";
+import { deleteChatsBatch } from "../../data/chatApi";
+import type { ChatRow } from "../../types/chat";
+import { useMultiSelect } from "../../hooks/useMultiSelect";
+import { useChatsPager } from "../../hooks/useChatsPager";
+import SidebarHeader from "./SidebarHeader";
+import SidebarListItem from "./SidebarListItem";
+import AccountPanel from "./AccountPanel";
+
+const PAGE_SIZE = 10;
+
+type Props = {
+  onOpen: (id: string) => Promise<void>;
+  onNew: () => Promise<void>;
+  refreshKey?: number;
+  activeId?: string;
+  onHideSidebar?: () => void;
+  onCancelSessions?: (ids: string[]) => Promise<void>;
+};
+
+export default function ChatSidebar({
+  onOpen, onNew, refreshKey, activeId, onHideSidebar, onCancelSessions,
+}: Props) {
+  const {
+    chats, page, hasMore, total, totalPages,
+    initialLoading, loadingMore,
+    scrollRef, sentinelRef, loadMore, setChats, decTotal,
+  } = useChatsPager(PAGE_SIZE, refreshKey);
+
+  const [isEditing, setIsEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [newPending, setNewPending] = useState(false);
+
+  const allIds = chats.map(c => c.sessionId);
+  const { selected, setSelected, allSelected, toggleOne, toggleAll } = useMultiSelect(allIds);
+
+  async function handleNew() {
+    if (newPending) return;
+    setNewPending(true);
+    try { await onNew(); } finally { setNewPending(false); }
+  }
+
+  async function onDeleteSelected(): Promise<void> {
+    const count = selected.size;
+    if (!count || deleting) return;
+
+    const isAll = count === chats.length;
+    const ok = window.confirm(
+      isAll
+        ? `Delete ALL ${count} chats? This cannot be undone.`
+        : `Delete ${count} selected chat${count > 1 ? "s" : ""}?`
+    );
+    if (!ok) return;
+
+    const ids = [...selected];
+    try { await onCancelSessions?.(ids); await Promise.resolve(); } catch {}
+
+    const deletingActive = activeId ? selected.has(activeId) : false;
+    const fallback = chats.find(c => !selected.has(c.sessionId))?.sessionId;
+
+    setDeleting(true);
+    try {
+      const deleted = await deleteChatsBatch(ids);
+      if (!deleted.length) return;
+      setChats(prev => prev.filter(c => !deleted.includes(c.sessionId)));
+      decTotal(deleted.length);
+      setSelected(new Set());
+      setIsEditing(false);
+
+      if (deletingActive && fallback) {
+        void onOpen(fallback);
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <aside className="w-full md:w-72 h-full border-r bg-white p-0 flex flex-col">
+      <SidebarHeader
+        isEditing={isEditing}
+        setIsEditing={(v) => { setIsEditing(v); setSelected(new Set()); }}
+        newPending={newPending}
+        onNew={handleNew}
+        onHideSidebar={onHideSidebar}
+        selectedCount={selected.size}
+        deleting={deleting}
+        onDelete={onDeleteSelected}
+      />
+
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto p-2 overscroll-contain"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
+        {initialLoading && (
+          <div className="px-2 py-1 text-xs text-gray-500">Loading…</div>
+        )}
+
+        <ul className="space-y-1">
+          {chats.map((c: ChatRow) => (
+            <SidebarListItem
+              key={c.sessionId}
+              c={c}
+              isActive={activeId === c.sessionId}
+              isEditing={isEditing}
+              isChecked={selected.has(c.sessionId)}
+              onToggle={() => toggleOne(c.sessionId)}
+              onOpen={() => void onOpen(c.sessionId)}
+            />
+          ))}
+        </ul>
+
+        <div className="h-6" ref={sentinelRef} />
+
+        {hasMore && (
+          <div className="px-2 pb-2">
+            <button
+              className={`w-full text-xs px-3 py-1 rounded border ${loadingMore ? "opacity-50 cursor-wait" : ""}`}
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              title="Load next page"
+            >
+              {loadingMore ? "Loading…" : `Load more (${chats.length}/${total || "?"})`}
+            </button>
+          </div>
+        )}
+
+        {!hasMore && chats.length > 0 && (
+          <div className="px-2 py-2 text-[11px] text-gray-400 text-center">
+            End of list • showing {chats.length} of {total || chats.length}
+          </div>
+        )}
+      </div>
+
+      <div className="border-t px-3 py-2 text-[11px] text-gray-500">
+        <span className="uppercase tracking-wide">Chats</span>{" "}
+        <span className="text-gray-400">
+          ({chats.length}{total ? `/${total}` : ""} • page {Math.max(page, 1)} of {Math.max(totalPages || 1, 1)})
+        </span>
+        {isEditing && (
+          <label className="ml-2 text-[11px]">
+            <input
+              type="checkbox"
+              className="mr-1 align-middle"
+              checked={allSelected}
+              onChange={toggleAll}
+            />
+            Select all
+          </label>
+        )}
+      </div>
+
+      <div className="border-t">
+        <AccountPanel />
+      </div>
+    </aside>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatSidebar/SidebarHeader.tsx =====
+
+import { PanelLeftClose, Plus, Pencil, Trash2 } from "lucide-react";
+
+export default function SidebarHeader({
+  isEditing, setIsEditing, newPending, onNew, onHideSidebar,
+  selectedCount, deleting, onDelete,
+}: {
+  isEditing: boolean;
+  setIsEditing: (v: boolean) => void;
+  newPending: boolean;
+  onNew: () => Promise<void>;
+  onHideSidebar?: () => void;
+  selectedCount: number;
+  deleting: boolean;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="sticky top-0 z-10 bg-white border-b">
+      <div className="flex items-center justify-between px-3 py-2">
+        <div className="text-[11px] md:text-xs uppercase text-gray-500">Chats</div>
+        <div className="flex items-center gap-2">
+          <button
+            className={`h-9 px-3 inline-flex items-center gap-2 justify-center rounded border ${
+              newPending ? "opacity-50 cursor-not-allowed" : ""
+            }`}
+            onClick={async () => { if (!newPending) await onNew(); }}
+            title="New chat"
+            disabled={newPending}
+          >
+            <Plus className="w-4 h-4" />
+            <span className="text-xs md:text-[11px] leading-none">New</span>
+          </button>
+
+          <button
+            className="h-9 px-3 inline-flex items-center gap-2 justify-center rounded border"
+            onClick={() => setIsEditing(!isEditing)}
+            aria-pressed={isEditing}
+            title={isEditing ? "Exit edit mode" : "Edit chats"}
+          >
+            <Pencil className="w-4 h-4" />
+            <span className="text-xs md:text-[11px] leading-none">
+              {isEditing ? "Done" : "Edit"}
+            </span>
+          </button>
+
+          {onHideSidebar && (
+            <button
+              className="hidden md:inline-flex h-9 w-9 items-center justify-center rounded border"
+              onClick={onHideSidebar}
+              title="Hide sidebar"
+              aria-label="Hide sidebar"
+            >
+              <PanelLeftClose className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {isEditing && (
+        <div className="px-3 py-2 border-t bg-white flex items-center gap-3">
+          <div className="text-sm text-gray-600">{selectedCount} selected</div>
+          <button
+            className={`ml-auto inline-flex items-center gap-2 text-sm px-3 py-1 rounded ${
+              selectedCount && !deleting
+                ? "bg-red-600 text-white"
+                : "bg-gray-200 text-gray-500 cursor-not-allowed"
+            }`}
+            disabled={!selectedCount || deleting}
+            onClick={onDelete}
+            title={selectedCount ? "Delete selected chats" : "Select chats to delete"}
+          >
+            <Trash2 className="w-4 h-4" />
+            {deleting ? "Deleting…" : `Delete (${selectedCount})`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatSidebar/SidebarListItem.tsx =====
+
+import { firstLineSmart } from "../../shared/lib/text";
+import type { ChatRow } from "../../types/chat";
+
+export default function SidebarListItem({
+  c, isActive, isEditing, isChecked, onToggle, onOpen,
+}: {
+  c: ChatRow;
+  isActive: boolean;
+  isEditing: boolean;
+  isChecked: boolean;
+  onToggle: () => void;
+  onOpen: () => void;
+}) {
+  const displayTitle =
+    (c.title && c.title.trim()) ||
+    firstLineSmart(c.lastMessage || "", 48) ||
+    "New Chat";
+  const preview = c.lastMessage ? firstLineSmart(c.lastMessage, 120) : "";
+
+  return (
+    <li>
+      <div
+        className={`w-full flex items-start gap-2 px-2 py-2 rounded ${
+          isActive ? "bg-black text-white" : "hover:bg-gray-50"
+        }`}
+      >
+        {isEditing && (
+          <input
+            type="checkbox"
+            checked={isChecked}
+            onChange={onToggle}
+            className="mt-1"
+            aria-label={`Select chat ${displayTitle}`}
+          />
+        )}
+        <button
+          className="text-left flex-1"
+          aria-current={isActive ? "true" : undefined}
+          onClick={() => { if (!isEditing) onOpen(); }}
+          title={displayTitle}
+        >
+          <div className="font-medium truncate">{displayTitle}</div>
+          {preview && (
+            <div className={`text-xs line-clamp-2 ${isActive ? "text-white/80" : "text-gray-500"}`}>
+              {preview}
+            </div>
+          )}
+          <div className="text-[10px] mt-1 opacity-60">
+            {new Date(c.updatedAt).toLocaleString()}
+          </div>
+        </button>
+      </div>
+    </li>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatView/ChatView.tsx =====
+
+// frontend/src/file_read/components/ChatView/ChatView.tsx
+import type { ChatMsg } from "../../types/chat";
+import type { GenMetrics, RunJson } from "../../hooks/useChatStream";
+import ChatItem from "../ChatItem";
+import TypingIndicator from "../../shared/ui/TypingIndicator";
+import { useChatAutofollow } from "../../hooks/useChatAutoFollow";
+
+export default function ChatView({
+  messages,
+  loading,
+  queued = false,
+  bottomPad,
+  runMetrics,
+  runJson,
+  onDeleteMessages,
+  autoFollow = true,
+}: {
+  messages: ChatMsg[];
+  loading: boolean;
+  queued?: boolean;
+  bottomPad: number;
+  runMetrics?: GenMetrics | null;
+  runJson?: RunJson | null;
+  onDeleteMessages?: (ids: string[]) => void;
+  autoFollow?: boolean;
+}) {
+  const { listRef, bottomRef, lastAssistantIndex } = useChatAutofollow({
+    messages,
+    loading,
+    autoFollow,
+    bottomPad,
+  });
+
+  const lastMsg = messages[messages.length - 1];
+
+  return (
+    <div
+      ref={listRef}
+      className="p-4 space-y-3 bg-gray-50 min-w-0"
+      style={{ paddingBottom: bottomPad }}
+    >
+      {messages.map((m, idx) => (
+        <ChatItem
+          key={m.id}
+          m={m}
+          idx={idx}
+          loading={loading}
+          lastAssistantIndex={lastAssistantIndex}
+          runJsonLive={runJson ?? null}
+          runMetricsLive={runMetrics ?? null}
+          onDelete={onDeleteMessages ? (id) => onDeleteMessages([id]) : undefined}
+        />
+      ))}
+
+      {(loading || queued) &&
+        !(lastMsg?.role === "assistant" && (lastMsg.text?.trim().length ?? 0) > 0) && (
+          <TypingIndicator />
+        )}
+
+      <div ref={bottomRef} className="h-0" />
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/ChatView/StatusLine.ts =====
+
+// frontend/src/file_read/components/chat/StatusLine.ts
+import type { RunJson, GenMetrics } from "../../shared/lib/runjson";
+
+const oneDec = (n?: number | null) =>
+  typeof n === "number" && Number.isFinite(n) ? n.toFixed(1) : undefined;
+
+export function buildStatus(json?: RunJson | null, flat?: GenMetrics | null) {
+  const st = json?.stats;
+  if (st) {
+    const parts: string[] = [];
+    if (st.predictedTokensCount != null) parts.push(`${st.predictedTokensCount} tok`);
+    if (st.tokensPerSecond != null) parts.push(`${oneDec(st.tokensPerSecond) ?? st.tokensPerSecond} tok/s`);
+    if (st.timeToFirstTokenSec != null) parts.push(`TTFT ${Math.round(st.timeToFirstTokenSec * 1000)} ms`);
+    if (st.stopReason) parts.push(`stop: ${st.stopReason}`);
+    return parts.join(" • ");
+  }
+  if (flat) {
+    const parts: string[] = [];
+    if (flat.output_tokens != null) parts.push(`${flat.output_tokens} tok`);
+    if (flat.tok_per_sec != null) parts.push(`${oneDec(flat.tok_per_sec) ?? flat.tok_per_sec} tok/s`);
+    if (flat.ttft_ms != null) parts.push(`TTFT ${Math.round(flat.ttft_ms)} ms`);
+    if (flat.stop_reason) parts.push(`stop: ${flat.stop_reason}`);
+    return parts.join(" • ");
+  }
+  return "";
+}
+
+# ===== frontend/src/file_read/components/Composer/AttachmentChip.tsx =====
+
+import { X, Check } from "lucide-react";
+import ProgressBar from "./ProgressBar";
+import type { Att } from "../../hooks/useAttachmentUploads";
+
+export default function AttachmentChip({
+  a,
+  onRemove,
+}: {
+  a: Att;
+  onRemove: (a: Att) => void;
+}) {
+  return (
+    <div className="min-w-[160px] max-w-[280px] border rounded-lg px-2 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="truncate text-sm" title={a.name}>
+          {a.name}
+        </div>
+        <button
+          className="p-1 rounded hover:bg-gray-100"
+          aria-label="Remove file"
+          onClick={() => onRemove(a)}
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <ProgressBar pct={a.pct} error={a.status === "error"} />
+      <div className="mt-1 text-xs text-gray-500 flex items-center gap-1">
+        {a.status === "uploading" && <span>Uploading… {a.pct}%</span>}
+        {a.status === "ready" && (
+          <>
+            <Check size={14} /> Ready
+          </>
+        )}
+        {a.status === "error" && <span>Error</span>}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Composer/ComposerActions.tsx =====
+
+import { Paperclip, Square, SendHorizonal } from "lucide-react";
+
+type Props = {
+  disabledUpload: boolean;
+  onPickFile: () => void;
+  showStop: boolean;
+  onStop: () => void;
+  showSend: boolean;
+  onSend: () => void;
+};
+
+export default function ComposerActions({
+  disabledUpload,
+  onPickFile,
+  showStop,
+  onStop,
+  showSend,
+  onSend,
+}: Props) {
+  return (
+    <div className="flex items-end gap-2">
+      <button
+        className={`p-2 rounded-lg border hover:bg-gray-50 ${disabledUpload ? "opacity-60 cursor-not-allowed" : ""}`}
+        onClick={onPickFile}
+        title="Upload to this chat"
+        aria-label="Upload to this chat"
+        disabled={disabledUpload}
+      >
+        <Paperclip size={18} />
+      </button>
+
+      {showStop ? (
+        <button
+          className="p-2 rounded-lg border hover:bg-gray-50"
+          onClick={onStop}
+          title="Stop generating"
+          aria-label="Stop generating"
+        >
+          <Square size={18} />
+        </button>
+      ) : showSend ? (
+        <button
+          className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
+          onClick={onSend}
+          title="Send"
+          aria-label="Send"
+        >
+          <SendHorizonal size={18} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Composer/ProgressBar.tsx =====
+
+export default function ProgressBar({ pct, error }: { pct: number; error?: boolean }) {
+  return (
+    <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
+      <div
+        className={`h-1.5 rounded ${error ? "bg-red-500" : "bg-black"}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/DesktopHeader.tsx =====
+
+import { PanelLeftOpen } from "lucide-react";
+
+export default function DesktopHeader({
+  sidebarOpen,
+  onShowSidebar,
+  title = "Local AI Model",
+}: {
+  sidebarOpen: boolean;
+  onShowSidebar: () => void;
+  title?: string;
+}) {
+  return (
+    <div className="hidden md:flex h-14 shrink-0 items-center justify-between px-4 border-b bg-white">
+      <div className="flex items-center gap-2">
+        {!sidebarOpen && (
+          <button
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
+            onClick={onShowSidebar}
+            aria-label="Show sidebar"
+            title="Show sidebar"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+          </button>
+        )}
+        <div className="font-semibold">{title}</div>
+      </div>
+      <div />
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/KnowledgePanel.tsx =====
+
+import { useState, useEffect } from "react";
+import {
+  uploadRag,
+  searchRag,
+  listUploads,
+  deleteUploadHard,
+  type UploadRow,
+} from "../data/ragApi";
+
+export default function KnowledgePanel({
+  sessionId,
+  onClose,
+  toast,
+}: {
+  sessionId?: string;
+  onClose?: () => void;
+  toast?: (msg: string) => void;
+}) {
+  const [files, setFiles] = useState<FileList | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<{ text: string; source?: string; score: number }[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  const [scope, setScope] = useState<"all" | "session">("all");
+  const [uploads, setUploads] = useState<UploadRow[]>([]);
+  const [loadingUploads, setLoadingUploads] = useState(false);
+
+  useEffect(() => {
+    void refreshUploads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, sessionId]);
+
+  async function refreshUploads() {
+    setLoadingUploads(true);
+    try {
+      const out = await listUploads(sessionId, scope);
+      setUploads(out.uploads || []);
+    } catch (e: any) {
+      toast?.(e?.message || "Failed to load uploads");
+    } finally {
+      setLoadingUploads(false);
+    }
+  }
+
+  async function handleDeleteHard(source: string, ns?: string | null) {
+    try {
+      const res = await deleteUploadHard(source, ns ?? undefined);
+      toast?.(`Removed ${res.removed} chunk${res.removed === 1 ? "" : "s"}. Remaining: ${res.remaining}`);
+      await refreshUploads();
+    } catch (e: any) {
+      toast?.(e?.message || "Delete failed");
+    }
+  }
+
+  async function doUpload() {
+    if (!files || !files.length) return;
+    setBusy(true);
+    try {
+      let total = 0;
+      for (const f of Array.from(files)) {
+        const out = await uploadRag(f, undefined);
+        total += (out as any)?.added || 0;
+      }
+      toast?.(`Added ${total} chunk${total === 1 ? "" : "s"}`);
+      setFiles(null);
+      await refreshUploads();
+    } catch (e: any) {
+      toast?.(e?.message || "Upload failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doSearch() {
+    const q = query.trim();
+    if (!q) return;
+    setSearching(true);
+    try {
+      const out = await searchRag(q, { sessionId, kChat: 6, kGlobal: 4, alpha: 0.5 });
+      setHits(out.hits || []);
+    } catch (e: any) {
+      toast?.(e?.message || "Search failed");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
+      <div className="w-full max-w-5xl rounded-2xl bg-white shadow-xl border overflow-hidden">
+        <div className="px-4 py-3 border-b flex items-center gap-2">
+          <div className="font-semibold">Knowledge</div>
+          <div className="ml-auto flex items-center gap-2">
+            <button className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50" onClick={onClose}>
+              Close
+            </button>
+          </div>
+        </div>
+
+        <div className="p-4 grid gap-6 md:grid-cols-2">
+          {/* Upload */}
+          <div>
+            <div className="font-medium mb-2">Upload documents</div>
+            <input type="file" multiple className="block w-full text-sm" onChange={(e) => setFiles(e.target.files)} />
+            <button
+              className={`mt-2 text-sm px-3 py-1.5 rounded ${busy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"}`}
+              disabled={busy || !files || files.length === 0}
+              onClick={doUpload}
+            >
+              {busy ? "Uploading…" : "Upload"}
+            </button>
+            <div className="text-[11px] text-gray-500 mt-2">
+              Tip: CSV, TXT, MD, PDF (text extracted). Uploads can be global or per chat.
+            </div>
+
+            <div className="mt-6">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="font-medium">Your uploads</div>
+                <select
+                  className="ml-auto border rounded px-2 py-1 text-xs"
+                  value={scope}
+                  onChange={(e) => setScope(e.target.value as "all" | "session")}
+                  title="Scope"
+                >
+                  <option value="all">All (global + this chat)</option>
+                  <option value="session">This chat only</option>
+                </select>
+                <button
+                  className="text-xs px-2 py-1 rounded border hover:bg-gray-50"
+                  onClick={refreshUploads}
+                  disabled={loadingUploads}
+                >
+                  {loadingUploads ? "Refreshing…" : "Refresh"}
+                </button>
+              </div>
+
+              <ul className="space-y-2 max-h-64 overflow-auto">
+                {uploads.length === 0 && (
+                  <li className="text-xs text-gray-500">No uploads yet.</li>
+                )}
+                {uploads.map((u, i) => (
+                  <li key={`${u.source}-${u.sessionId ?? "global"}-${i}`} className="p-2 border rounded bg-gray-50">
+                    <div className="flex items-center gap-2">
+                      <div className="font-mono text-xs break-all">{u.source}</div>
+                      <span className="text-[11px] text-gray-500">
+                        {u.sessionId ? "session" : "global"} • {u.chunks} chunk{u.chunks === 1 ? "" : "s"}
+                      </span>
+                      <button
+                        className="ml-auto text-xs px-2 py-1 rounded border hover:bg-gray-100"
+                        title="Delete (hard delete by Source)"
+                        onClick={() => handleDeleteHard(u.source, u.sessionId ?? undefined)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          {/* Search */}
+          <div>
+            <div className="font-medium mb-2">Quick search</div>
+            <div className="flex gap-2">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Find in your knowledge…"
+                className="flex-1 border rounded px-2 py-1.5 text-sm"
+              />
+              <button
+                className={`text-sm px-3 py-1.5 rounded ${searching ? "opacity-60 cursor-wait" : "border hover:bg-gray-50"}`}
+                onClick={doSearch}
+                disabled={searching}
+              >
+                {searching ? "Searching…" : "Search"}
+              </button>
+            </div>
+
+            <ul className="mt-3 space-y-2 max-h-64 overflow-auto">
+              {hits.map((h, i) => (
+                <li key={i} className="p-2 border rounded bg-gray-50">
+                  <div className="text-[11px] text-gray-500 mb-1">
+                    {h.source || "uploaded"} • score {Number.isFinite(h.score) ? h.score.toFixed(3) : "—"}
+                  </div>
+                  <div className="text-sm whitespace-pre-wrap">{h.text}</div>
+                </li>
+              ))}
+              {!hits.length && <li className="text-xs text-gray-500">No results yet.</li>}
+            </ul>
+          </div>
+        </div>
+
+        <div className="px-4 py-3 border-t text-[11px] text-gray-500">
+          “Delete” performs a hard delete: removes chunks for that Source and rebuilds the index.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Markdown/MarkdownMessage.tsx =====
+
+// frontend/src/file_read/components/MarkdownMessage.tsx
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github.css";
+import CodeCopyButton from "../../shared/ui/CodeCopyButton";
+
+type Props = { text: string };
+
+export default function MarkdownMessage({ text }: Props) {
+  return (
+    <>
+      {/* keep pre spacing at zero; don't overwrite token colors */}
+      <style>{`
+        pre { margin: 0 !important; padding: 0 !important; background: transparent !important; }
+        pre code { display: block; margin: 0 !important; padding: 0 !important; }
+        .hljs { background: transparent !important; }
+      `}</style>
+
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        components={{
+          code({
+            inline,
+            className,
+            children,
+            ...props
+          }: {
+            inline?: boolean;
+            className?: string;
+            children?: React.ReactNode;
+          }) {
+            const raw = String(children ?? "");
+            const lang = (className || "").replace("language-", "");
+
+            if (inline) {
+              return (
+                <code
+                  className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-900 font-mono text-[14px]"
+                  {...props}
+                >
+                  {children}
+                </code>
+              );
+            }
+
+            return (
+              <div className="relative w-full">
+                <pre className="m-0 p-0 w-full overflow-x-auto rounded-md border border-gray-300">
+                  {/* Let hljs theme color tokens; no text color override here */}
+                  <code className={`${className ?? ""} hljs font-mono text-sm`} {...props}>
+                    {children}
+                  </code>
+                </pre>
+
+                <div className="absolute top-2 right-2 flex items-center gap-1">
+                  {lang && (
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-200 text-gray-700">
+                      {lang}
+                    </span>
+                  )}
+                  <CodeCopyButton text={raw} />
+                </div>
+              </div>
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </>
+  );
+}
+
+# ===== frontend/src/file_read/components/MetricsHoverCard.tsx =====
+
+// frontend/src/file_read/components/MetricsHoverCard.tsx
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Info } from "lucide-react";
+import MetricsHoverCardPanel from "./MetricsHoverCardPanel";
+
+type Props = {
+  data: unknown;
+  title?: string;
+  align?: "left" | "right";
+  maxWidthPx?: number;
+  compact?: boolean;
+};
+
+export default function MetricsHoverCard({
+  data,
+  title = "Run details",
+  align = "right",
+  maxWidthPx = 460,
+  compact = true,
+}: Props) {
+  const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [panelStyle, setPanelStyle] = useState<{ top: number; left: number; width: number } | null>(null);
+
+  useLayoutEffect(() => {
+    function place() {
+      if (!open || !btnRef.current) return;
+      const margin = 8;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const width = Math.min(maxWidthPx, vw - margin * 2);
+      const btnBox = btnRef.current.getBoundingClientRect();
+      let left = align === "right" ? btnBox.right - width : btnBox.left;
+      left = Math.max(margin, Math.min(left, vw - margin - width));
+      let top = btnBox.bottom + margin;
+      let panelH = panelRef.current?.offsetHeight || 0;
+      if (!panelH) panelH = 360 + 44;
+      if (top + panelH > vh - margin) top = Math.max(margin, btnBox.top - margin - panelH);
+      setPanelStyle({ top, left, width });
+    }
+    place();
+    if (!open) return;
+    const onReflow = () => place();
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
+    return () => {
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open, align, maxWidthPx]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+        btnRef.current?.focus();
+      }
+    };
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (btnRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative inline-block">
+      <button
+        ref={btnRef}
+        type="button"
+        className={`inline-flex items-center justify-center rounded border bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition ${compact ? "h-7 w-7" : "h-8 w-8"}`}
         title="Show run JSON"
         aria-haspopup="dialog"
         aria-expanded={open ? "true" : "false"}
@@ -42,7 +1002,6 @@ type PanelProps = {
   title: string;
 };
 
-const asNum = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const num0 = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
 export default function MetricsHoverCardPanel({ data, title }: PanelProps) {
@@ -264,33 +1223,501 @@ export default function MobileDrawer({ ...props }) {
   );
 }
 
+# ===== frontend/src/file_read/components/SearchTester.tsx =====
+
+import { useState } from "react";
+import ChatContainer from "../components/ChatContainer";
+import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
+import { useChatStream } from "../hooks/useChatStream";
+import { useSidebar } from "../hooks/useSidebar";
+import { useToast } from "../hooks/useToast";
+import DesktopHeader from "../components/DesktopHeader";
+import MobileDrawer from "../components/MobileDrawer";
+import Toast from "../shared/ui/Toast";
+import { createChat, deleteMessagesBatch } from "../data/chatApi";
+
+// NEW: settings panel
+import SettingsPanel from "../components/SettingsPanel";
+import KnowledgePanel from "../components/KnowledgePanel";
+import SearchTester from "../components/SearchTester";
+
+const LS_KEY = "lastSessionId";
+
+export default function AgentRunner() {
+  const chat = useChatStream();
+  const [showKnowledge, setShowKnowledge] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [autoFollow, setAutoFollow] = useState(true);
+  const { toast, show } = useToast();
+  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
+
+  // NEW: settings modal
+  const [showSettings, setShowSettings] = useState(false);
+
+  // ⛔ Removed the mount-time bootstrap that fetched chats and loaded history.
+
+  async function newChat(): Promise<void> {
+    const id = crypto.randomUUID();
+    chat.setSessionId(id);
+    try { await createChat(id, "New Chat"); } catch {}
+    localStorage.setItem(LS_KEY, id);
+    setRefreshKey((k) => k + 1);
+    chat.setInput("");
+    chat.clearMetrics?.();
+    await refreshFollow();
+  }
+
+  async function openSession(id: string): Promise<void> {
+    if (!id) return;
+    await chat.loadHistory(id);
+    localStorage.setItem(LS_KEY, id);
+    chat.setInput("");
+    chat.clearMetrics?.();
+    await refreshFollow();
+  }
+
+  // --- TWO REFRESH HELPERS ---
+
+  // 1) Follow-to-bottom refresh (normal)
+  async function refreshFollow() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    setAutoFollow(true);
+    await chat.loadHistory(sid);
+    const el = document.getElementById("chat-scroll-container");
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+async function handleCancelSessions(ids: string[]) {
+  if (!ids?.length) return;
+
+  const currentId = chat.sessionIdRef.current || "";
+  const deletingActive = currentId && ids.includes(currentId);
+
+  if (deletingActive) {
+    // clear out current session instead of making a new one
+    chat.setSessionId("");
+    chat.setInput("");
+    chat.clearMetrics?.();
+    // optional: clear messages too
+    chat.reset();
+    localStorage.removeItem(LS_KEY);
+  }
+
+  setRefreshKey((k) => k + 1);
+  try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+}
+
+
+  // 2) Preserve-scroll refresh (use for deletions, etc.)
+  async function refreshPreserve() {
+    const sid = chat.sessionIdRef.current;
+    if (!sid) return;
+    const el = document.getElementById("chat-scroll-container");
+    const prevTop = el?.scrollTop ?? 0;
+    const prevHeight = el?.scrollHeight ?? 0;
+
+    setAutoFollow(false);
+    await chat.loadHistory(sid);
+
+    requestAnimationFrame(() => {
+      if (el) {
+        const newHeight = el.scrollHeight;
+        el.scrollTop = prevTop + (newHeight - prevHeight);
+      }
+      setAutoFollow(true);
+    });
+  }
+
+  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
+  async function handleDeleteMessages(clientIds: string[]) {
+    const sid = chat.sessionIdRef.current;
+    if (!sid || !clientIds?.length) return;
+
+    const current = chat.messages;
+    const toDelete = new Set(clientIds);
+
+    const serverIds = current
+      .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
+      .map((m: any) => m.serverId as number);
+
+    const remaining = current.filter((m) => !toDelete.has(m.id));
+
+    // Optimistic local state
+    if ((chat as any).setMessagesForSession) {
+      (chat as any).setMessagesForSession(sid, () => remaining);
+    }
+
+    try {
+      if (serverIds.length) {
+        await deleteMessagesBatch(sid, serverIds);
+      }
+
+      await refreshPreserve();
+
+      setRefreshKey((k) => k + 1);
+      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
+
+      show("Message deleted");
+    } catch {
+      show("Failed to delete message");
+      await chat.loadHistory(sid);
+      setRefreshKey((k) => k + 1);
+    }
+  }
+
+  return (
+    <div className="h-screen w-full flex bg-gray-50">
+      {sidebarOpen && (
+        <div className="hidden md:flex h-full">
+          <ChatSidebar
+            onOpen={openSession}
+            onNew={newChat}
+            refreshKey={refreshKey}
+            activeId={chat.sessionIdRef.current}
+            onHideSidebar={() => setSidebarOpen(false)}
+            onCancelSessions={handleCancelSessions}
+          />
+        </div>
+      )}
+
+      <MobileDrawer
+        onOpenSession={openSession}
+        onNewChat={newChat}
+        refreshKey={refreshKey}
+        activeId={chat.sessionIdRef.current}
+        openMobileDrawer={openMobileDrawer}
+        closeMobileDrawer={closeMobileDrawer}
+      />
+      <div className="md:hidden h-14 shrink-0" />
+
+      <div className="flex-1 min-w-0 flex flex-col">
+        <DesktopHeader
+          sidebarOpen={sidebarOpen}
+          onShowSidebar={() => setSidebarOpen(true)}
+        />
+
+        <div className="px-3 md:px-6 pt-2">
+          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
+            <button
+              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
+              onClick={() => setShowKnowledge(true)}
+              title="Open Knowledge"
+            >
+              Knowledge
+            </button>
+            <button
+              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
+              onClick={() => setShowSettings(true)}
+              title="Open Settings"
+            >
+              Settings
+            </button>
+          </div>
+          <div className="mx-auto max-w-3xl md:max-w-4xl mt-2">
+            <SearchTester />
+          </div>
+        </div>
+
+        <div className="flex-1 min-h-0">
+          <div className="h-full px-3 md:px-6">
+            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
+              {/* Note: add id on the scroll container wrapper for refresh helpers */}
+              <div id="chat-scroll-container" className="h-full">
+                <ChatContainer
+                  messages={chat.messages}
+                  input={chat.input}
+                  setInput={chat.setInput}
+                  loading={chat.loading}
+                  queued={chat.queued}
+                  send={chat.send}
+                  stop={chat.stop}
+                  runMetrics={chat.runMetrics}
+                  runJson={chat.runJson}
+                  onRefreshChats={() => {}}
+                  onDeleteMessages={handleDeleteMessages}
+                  autoFollow={autoFollow}
+                  sessionId={chat.sessionIdRef.current} // enables per-chat uploads
+                />
+              </div>
+              <Toast message={toast} />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* NEW: settings modal */}
+      {showSettings && (
+        <SettingsPanel
+          sessionId={chat.sessionIdRef.current}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+      {showKnowledge && (
+        <KnowledgePanel
+          sessionId={chat.sessionIdRef.current}
+          onClose={() => setShowKnowledge(false)}
+          toast={show}
+        />
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Settings/BraveSearchCard.tsx =====
+
+import { useEffect, useState } from "react";
+import { getEffective, patchOverrides } from "../../data/settingsApi";
+
+export default function BraveSearchCard() {
+  const [loading, setLoading] = useState(true);
+  const [, setProvider] = useState("brave");
+  const [useWorker, setUseWorker] = useState(false);
+  const [workerUrl, setWorkerUrl] = useState("");
+
+  // we don’t prefill the API key for security; we only show a “present” flag
+  const [hasKey, setHasKey] = useState<boolean>(false);
+  const [apiKey, setApiKey] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const eff = await getEffective();
+        setProvider(String(eff.web_search_provider ?? "brave"));
+        setWorkerUrl(String(eff.brave_worker_url ?? ""));
+        setUseWorker(Boolean(eff.brave_worker_url));
+        // backend will mask the key and expose only boolean presence
+        setHasKey(Boolean(eff.brave_api_key_present));
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  async function save() {
+    const patch: Record<string, any> = {
+      web_search_provider: "brave",
+      // if worker is used, clear server-side key (we’ll route via worker instead)
+      brave_api_key: useWorker ? "" : apiKey,
+      brave_worker_url: useWorker ? workerUrl : "",
+    };
+    await patchOverrides(patch);
+    // don’t keep key in memory after save
+    setApiKey("");
+    setHasKey(!useWorker && !!patch.brave_api_key);
+  }
+
+  if (loading) return null;
+
+  return (
+    <div className="rounded-2xl p-4 border">
+      <h3 className="font-semibold mb-2">Web Search (Brave)</h3>
+
+      <div className="mb-3">
+        <label className="block text-sm mb-1">Route via Cloudflare Worker</label>
+        <input
+          type="checkbox"
+          checked={useWorker}
+          onChange={(e) => setUseWorker(e.target.checked)}
+        />
+      </div>
+
+      {useWorker ? (
+        <div className="mb-3">
+          <label className="block text-sm mb-1">Worker URL</label>
+          <input
+            className="w-full border rounded p-2"
+            placeholder="https://your-worker.workers.dev/brave"
+            value={workerUrl}
+            onChange={(e) => setWorkerUrl(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            Your Worker holds the Brave API key. The app doesn’t store it.
+          </p>
+        </div>
+      ) : (
+        <div className="mb-3">
+          <label className="block text-sm mb-1">Brave API Key</label>
+          <input
+            className="w-full border rounded p-2"
+            placeholder="X-Subscription-Token"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            spellCheck={false}
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            {hasKey ? "Key is stored on the server." : "No key stored yet."}
+          </p>
+        </div>
+      )}
+
+      <button className="mt-2 px-3 py-2 rounded bg-black text-white" onClick={save}>
+        Save
+      </button>
+    </div>
+  );
+}
+
+# ===== frontend/src/file_read/components/Settings/WebSearchSection.tsx =====
+
+import { useEffect, useState } from "react";
+import { getEffective, patchOverrides } from "../../data/settingsApi";
+
+export default function WebSearchSection({ onSaved }: { onSaved?: () => void }) {
+  const [apiKey, setApiKey] = useState("");
+  const [masked, setMasked] = useState(true);
+  const [status, setStatus] = useState<null | { ok: boolean; msg: string }>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const eff = await getEffective();
+        setApiKey(eff.brave_api_key || "");
+      } catch {
+        // fallback if no settings
+      }
+    })();
+  }, []);
+
+  async function save() {
+    try {
+      await patchOverrides({ brave_api_key: apiKey.trim() });
+      setStatus({ ok: true, msg: "Saved" });
+      onSaved?.();
+    } catch (e: any) {
+      setStatus({ ok: false, msg: e?.message || "Failed to save" });
+    }
+  }
+
+  function clearKey() {
+    patchOverrides({ brave_api_key: "" });
+    setApiKey("");
+    setStatus({ ok: true, msg: "Key cleared" });
+    onSaved?.();
+  }
+
+  const displayVal = masked && apiKey ? "•".repeat(Math.min(apiKey.length, 24)) : apiKey;
+
+  return (
+    <div className="space-y-4">
+      <div className="text-sm text-gray-600">
+        Enable web search via your own <b>Brave Search API</b> key. Stored in settings, not in local storage.
+      </div>
+
+      <div className="space-y-2">
+        <label className="block text-sm">Brave API key</label>
+        <div className="flex items-stretch gap-2">
+          <input
+            className="flex-1 border rounded px-3 py-2 text-sm"
+            placeholder="X-Subscription-Token"
+            value={displayVal}
+            onChange={(e) => setApiKey(e.target.value)}
+            onFocus={() => setMasked(false)}
+            onBlur={() => setMasked(true)}
+          />
+          <button
+            className="px-3 py-2 rounded border text-sm hover:bg-gray-50"
+            onClick={() => setMasked((m) => !m)}
+            title={masked ? "Show" : "Hide"}
+          >
+            {masked ? "Show" : "Hide"}
+          </button>
+          <button
+            className="px-3 py-2 rounded border text-sm hover:bg-gray-50"
+            onClick={clearKey}
+            title="Clear key"
+          >
+            Clear
+          </button>
+          <button className="px-3 py-2 rounded bg-black text-white text-sm" onClick={save}>
+            Save
+          </button>
+        </div>
+        {status && (
+          <div className={`text-xs ${status.ok ? "text-green-600" : "text-red-600"}`}>{status.msg}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 # ===== frontend/src/file_read/components/SettingsPanel.tsx =====
 
 import { useEffect, useMemo, useState } from "react";
 import { useSettings } from "../hooks/useSettings";
+import WebSearchSection from "../components/Settings/WebSearchSection";
 
-export default function SettingsPanel({ sessionId, onClose }: { sessionId?: string; onClose?: () => void }) {
-  const { loading, error, effective, overrides, defaults, adaptive, saveOverrides, runAdaptive, reload } =
-    useSettings(sessionId);
+type Tab =
+  | "general"
+  | "notifications"
+  | "personalization"
+  | "connectors"
+  | "schedules"
+  | "datacontrols"
+  | "security"
+  | "account"
+  | "developer";
 
-  const [tab, setTab] = useState<"effective"|"overrides"|"adaptive"|"defaults">("effective");
+const NAV: { key: Tab; label: string }[] = [
+  { key: "general", label: "General" },
+  { key: "notifications", label: "Notifications" },
+  { key: "personalization", label: "Personalization" },
+  { key: "connectors", label: "Connectors" },
+  { key: "schedules", label: "Schedules" },
+  { key: "datacontrols", label: "Data controls" },
+  { key: "security", label: "Security" },
+  { key: "account", label: "Account" },
+  { key: "developer", label: "Developer" },
+];
+
+export default function SettingsPanel({
+  sessionId,
+  onClose,
+}: {
+  sessionId?: string;
+  onClose?: () => void;
+}) {
+  const {
+    loading,
+    error,
+    effective,
+    overrides,
+    defaults,
+    adaptive,
+    saveOverrides,
+    runAdaptive,
+    reload,
+  } = useSettings(sessionId);
+
+  const [tab, setTab] = useState<Tab>("general");
+
+  // Developer JSON views (kept from your original panel)
+  const [devSubtab, setDevSubtab] = useState<"effective" | "overrides" | "adaptive" | "defaults">("effective");
   const [draft, setDraft] = useState(() => JSON.stringify(overrides ?? {}, null, 2));
   const [saveBusy, setSaveBusy] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
-  useEffect(() => { setDraft(JSON.stringify(overrides ?? {}, null, 2)); }, [overrides]);
+  useEffect(() => {
+    setDraft(JSON.stringify(overrides ?? {}, null, 2));
+  }, [overrides]);
 
-  const view = useMemo(() => {
-    switch (tab) {
-      case "effective": return effective;
-      case "adaptive":  return adaptive;
-      case "defaults":  return defaults;
-      case "overrides": return null;
+  const devView = useMemo(() => {
+    switch (devSubtab) {
+      case "effective":
+        return effective;
+      case "adaptive":
+        return adaptive;
+      case "defaults":
+        return defaults;
+      case "overrides":
+        return null;
     }
-  }, [tab, effective, adaptive, defaults]);
+  }, [devSubtab, effective, adaptive, defaults]);
 
-  async function onSave(method: "patch" | "put") {
-    setSaveErr(null); setSaveBusy(true);
+  async function onSaveDev(method: "patch" | "put") {
+    setSaveErr(null);
+    setSaveBusy(true);
     try {
       const parsed = draft.trim() ? JSON.parse(draft) : {};
       await saveOverrides(parsed, method);
@@ -303,93 +1730,185 @@ export default function SettingsPanel({ sessionId, onClose }: { sessionId?: stri
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
-      <div className="w-full max-w-4xl rounded-2xl bg-white shadow-xl border">
-        {/* header */}
-        <div className="px-4 py-3 border-b flex items-center gap-2">
-          <div className="font-semibold">Settings</div>
-          <div className="ml-auto flex items-center gap-2">
+      <div className="w-full max-w-5xl h-[90vh] rounded-2xl bg-white shadow-xl border overflow-hidden flex">
+        {/* Sidebar */}
+        <aside className="w-60 border-r bg-gray-50/60">
+          <div className="px-4 py-3 text-sm font-semibold">Settings</div>
+          <nav className="px-2 pb-3 space-y-1">
+            {NAV.map((item) => (
+              <button
+                key={item.key}
+                onClick={() => setTab(item.key)}
+                className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
+                  tab === item.key
+                    ? "bg-black text-white"
+                    : "hover:bg-gray-100"
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </nav>
+          <div className="px-3 pt-2 mt-auto hidden md:block">
             <button
-              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
-              onClick={() => runAdaptive()}
-              title="Recompute adaptive with current context"
-            >
-              Recompute Adaptive
-            </button>
-            <button
-              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
+              className="w-full text-xs px-3 py-2 rounded border hover:bg-gray-100"
               onClick={() => reload()}
-              title="Reload"
+              title="Reload settings"
             >
               Reload
             </button>
             <button
-              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
+              className="w-full mt-2 text-xs px-3 py-2 rounded border hover:bg-gray-100"
+              onClick={() => runAdaptive()}
+              title="Recompute adaptive"
+            >
+              Recompute Adaptive
+            </button>
+            <button
+              className="w-full mt-2 text-xs px-3 py-2 rounded border hover:bg-gray-100"
               onClick={onClose}
               title="Close"
             >
               Close
             </button>
           </div>
-        </div>
+        </aside>
 
-        {/* tabs */}
-        <div className="px-4 py-2 border-b">
-          {(["effective","overrides","adaptive","defaults"] as const).map(key => (
-            <button
-              key={key}
-              onClick={() => setTab(key)}
-              className={`text-xs mr-2 px-3 py-1.5 rounded ${tab===key ? "bg-black text-white" : "border hover:bg-gray-50"}`}
-            >
-              {key}
-            </button>
-          ))}
-        </div>
+        {/* Main */}
+        <section className="flex-1 min-w-0 flex flex-col">
+          <header className="px-5 py-4 border-b">
+            <div className="text-base font-semibold capitalize">{tab.replace(/([a-z])([A-Z])/g, "$1 $2")}</div>
+            {loading && <div className="text-xs text-gray-500 mt-1">Loading…</div>}
+            {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+          </header>
 
-        {/* body */}
-        <div className="p-4">
-          {loading && <div className="text-sm text-gray-500">Loading…</div>}
-          {error && <div className="text-sm text-red-600">{error}</div>}
+          <div className="flex-1 overflow-auto p-5">
+            {tab === "general" && (
+              <div className="space-y-6">
+                <Section title="Appearance">
+                  <Row label="Theme">
+                    <select className="border rounded px-2 py-1 text-sm">
+                      <option>System</option>
+                      <option>Light</option>
+                      <option>Dark</option>
+                    </select>
+                  </Row>
+                  <Row label="Accent color">
+                    <select className="border rounded px-2 py-1 text-sm">
+                      <option>Default</option>
+                      <option>Blue</option>
+                      <option>Green</option>
+                      <option>Purple</option>
+                    </select>
+                  </Row>
+                  <Row label="Language">
+                    <select className="border rounded px-2 py-1 text-sm">
+                      <option>Auto-detect</option>
+                      <option>English</option>
+                      <option>Spanish</option>
+                      <option>French</option>
+                    </select>
+                  </Row>
+                </Section>
 
-          {tab !== "overrides" && (
-            <pre className="text-xs bg-gray-50 border rounded p-3 overflow-auto max-h-[60vh]">
-              {JSON.stringify(view ?? {}, null, 2)}
-            </pre>
-          )}
-
-          {tab === "overrides" && (
-            <div className="space-y-2">
-              <div className="text-xs text-gray-600">
-                Edit <code>user_overrides</code> JSON. Use <b>Patch</b> to merge or <b>Replace</b> to overwrite.
+                <Section title="Web & Integrations">
+                  {/* BYOK Brave search controls */}
+                  <WebSearchSection
+                    onSaved={() => {
+                      // reflect to backend that web search is enabled (no key transmitted)
+                      saveOverrides({ web_search_provider: "brave", brave_worker_url: "", brave_api_key_present: true });
+                    }}
+                  />
+                </Section>
               </div>
-              <textarea
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                className="w-full h-[50vh] border rounded p-2 font-mono text-xs"
-                spellCheck={false}
-              />
-              <div className="flex items-center gap-2">
-                <button
-                  className={`text-xs px-3 py-1.5 rounded ${saveBusy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"}`}
-                  disabled={saveBusy}
-                  onClick={() => onSave("patch")}
-                  title="Deep-merge with existing overrides"
-                >
-                  Save (Patch)
-                </button>
-                <button
-                  className={`text-xs px-3 py-1.5 rounded border ${saveBusy ? "opacity-60 cursor-not-allowed" : "hover:bg-gray-50"}`}
-                  disabled={saveBusy}
-                  onClick={() => onSave("put")}
-                  title="Replace overrides entirely"
-                >
-                  Save (Replace)
-                </button>
-                {saveErr && <div className="text-xs text-red-600 ml-2">{saveErr}</div>}
+            )}
+
+            {tab === "developer" && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  {(["effective", "overrides", "adaptive", "defaults"] as const).map((k) => (
+                    <button
+                      key={k}
+                      onClick={() => setDevSubtab(k)}
+                      className={`text-xs mr-2 px-3 py-1.5 rounded ${
+                        devSubtab === k ? "bg-black text-white" : "border hover:bg-gray-50"
+                      }`}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+
+                {devSubtab !== "overrides" && (
+                  <pre className="text-xs bg-gray-50 border rounded p-3 overflow-auto max-h-[60vh]">
+                    {JSON.stringify(devView ?? {}, null, 2)}
+                  </pre>
+                )}
+
+                {devSubtab === "overrides" && (
+                  <div className="space-y-2">
+                    <div className="text-xs text-gray-600">
+                      Edit <code>user_overrides</code> JSON. Use <b>Patch</b> to merge or <b>Replace</b> to overwrite.
+                    </div>
+                    <textarea
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      className="w-full h-[50vh] border rounded p-2 font-mono text-xs"
+                      spellCheck={false}
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        className={`text-xs px-3 py-1.5 rounded ${
+                          saveBusy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"
+                        }`}
+                        disabled={saveBusy}
+                        onClick={() => onSaveDev("patch")}
+                        title="Deep-merge with existing overrides"
+                      >
+                        Save (Patch)
+                      </button>
+                      <button
+                        className={`text-xs px-3 py-1.5 rounded border ${
+                          saveBusy ? "opacity-60 cursor-not-allowed" : "hover:bg-gray-50"
+                        }`}
+                        disabled={saveBusy}
+                        onClick={() => onSaveDev("put")}
+                        title="Replace overrides entirely"
+                      >
+                        Save (Replace)
+                      </button>
+                      {saveErr && <div className="text-xs text-red-600 ml-2">{saveErr}</div>}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
-        </div>
+            )}
+
+            {/* Stubs for other tabs (expand later) */}
+            {tab !== "general" && tab !== "developer" && (
+              <div className="text-sm text-gray-500">This section is coming soon.</div>
+            )}
+          </div>
+        </section>
       </div>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl border p-4">
+      <div className="font-semibold mb-3">{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <div className="w-44 text-sm text-gray-600">{label}</div>
+      <div className="flex-1">{children}</div>
     </div>
   );
 }
@@ -833,26 +2352,49 @@ export function createStreamController(opts: StreamCoreOpts): StreamController {
 # ===== frontend/src/file_read/hooks/stream/core/network.ts =====
 
 // frontend/src/file_read/hooks/stream/core/network.ts
-import { API_BASE } from "../../../services/http";
+// (replace the existing file contents with this version)
+
+import { buildUrl, requestRaw } from "../../../services/http";
+
+function bearerHeaderFromLocal() {
+  const h: Record<string, string> = {};
+  const jwt = localStorage.getItem("local_jwt");
+  if (jwt) h["Authorization"] = `Bearer ${jwt}`;
+  const lic = localStorage.getItem("license_key");
+  if (lic) h["x-license"] = lic;
+  return h;
+}
 
 export async function postStream(body: unknown, signal: AbortSignal) {
-  const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+  const url = buildUrl("/ai/generate/stream");
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+    ...bearerHeaderFromLocal(),
+  };
+
+  console.debug("[SSE fetch]", { url, hasAuth: !!headers.Authorization }); 
+
+  const res = await requestRaw(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
     signal,
   });
-  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+  if (!res.ok || !res.body) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${res.statusText} ${t}`);
+  }
   return res.body.getReader();
 }
 
 export async function postCancel(sessionId: string) {
   try {
-    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, {
-      method: "POST",
-    });
+    const url = buildUrl(`/ai/cancel/${encodeURIComponent(sessionId)}`);
+    await requestRaw(url, { method: "POST", headers: bearerHeaderFromLocal() });
   } catch {
-    /* best-effort */
   }
 }
 
@@ -1325,1806 +2867,156 @@ export function snapshotPendingAssistant(msgs: ChatMsg[]): string {
 
 # ===== frontend/src/file_read/hooks/useAttachmentUploads.ts =====
 
-import { useState } from "react";
-import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
-
-export type Att = {
-  id: string;
-  name: string;
-  pct: number;
-  status: "uploading" | "ready" | "error";
-  abort?: AbortController;
-};
-
-export function useAttachmentUploads(sessionId?: string, onRefreshChats?: () => void) {
-  const [atts, setAtts] = useState<Att[]>([]);
-
-  const anyUploading = atts.some(a => a.status === "uploading");
-  const anyReady = atts.some(a => a.status === "ready");
-
-  async function addFiles(files: FileList | File[]) {
-    if (!files || !sessionId) return;
-    const picked = Array.from(files);
-    const news: Att[] = picked.map((f, i) => ({
-      id: `${Date.now()}-${i}-${f.name}`,
-      name: f.name,
-      pct: 0,
-      status: "uploading",
-      abort: new AbortController(),
-    }));
-    setAtts(prev => [...prev, ...news]);
-
-    news.forEach((att, idx) => {
-      const f = picked[idx];
-      uploadRagWithProgress(
-        f,
-        sessionId,
-        (pct) => setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct } : a)),
-        att.abort?.signal
-      )
-        .then(() => {
-          setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct: 100, status: "ready", abort: undefined } : a));
-          onRefreshChats?.();
-        })
-        .catch(() => {
-          setAtts(prev => prev.map(a => a.id === att.id ? { ...a, status: "error", abort: undefined } : a));
-        });
-    });
-  }
-
-  async function removeAtt(att: Att) {
-    if (att.status === "uploading" && att.abort) {
-      try { att.abort.abort(); } catch {}
-    }
-    if (sessionId) {
-      try { await deleteUploadHard(att.name, sessionId); } catch {}
-    }
-    setAtts(prev => prev.filter(a => a.id !== att.id));
-    onRefreshChats?.();
-  }
-
-  function attachmentsForPost(): Array<{ name: string; source: string; sessionId: string }> {
-    if (!sessionId) return [];
-    return atts
-      .filter(a => a.status === "ready")
-      .map(a => ({ name: a.name, source: a.name, sessionId }));
-  }
-
-  function reset() {
-    setAtts([]);
-  }
-
-  return { atts, addFiles, removeAtt, anyUploading, anyReady, attachmentsForPost, reset };
-}
-
-# ===== frontend/src/file_read/hooks/useChatAutoFollow.ts =====
-
-import { useEffect, useMemo, useRef } from "react";
-import type { ChatMsg } from "../types/chat";
-
-const SCROLL_THRESHOLD_VH = 0.75;
-const MIN_THRESHOLD_PX = 24;
-const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
-
-export function useChatAutofollow({
-  messages,
-  loading,
-  autoFollow = true,
-  bottomPad = 0,
-}: {
-  messages: ChatMsg[];
-  loading: boolean;
-  autoFollow?: boolean;
-  bottomPad?: number;
-}) {
-  const listRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
-
-  const prevLoadingRef = useRef<boolean>(loading);
-  const prevAsstLenRef = useRef<number>(0);
-  const didInitialAutoscrollRef = useRef(false);
-
-  function getScrollEl(): HTMLElement | null {
-    const el = listRef.current;
-    if (!el) return null;
-    return el.closest<HTMLElement>("[data-chat-scroll]") ?? el;
-  }
-
-  function isNearBottom(ratio = SCROLL_THRESHOLD_VH): boolean {
-    const el = getScrollEl();
-    if (!el) return true;
-    const threshold = Math.max(MIN_THRESHOLD_PX, el.clientHeight * ratio);
-    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
-    return dist <= threshold;
-  }
-
-  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
-    bottomRef.current?.scrollIntoView({ behavior, block: "end" });
-  };
-
-  useEffect(() => {
-    if (didInitialAutoscrollRef.current) return;
-    if (messages.length === 0) return;
-    didInitialAutoscrollRef.current = true;
-    scrollToBottom("auto");
-    requestAnimationFrame(() => scrollToBottom("auto"));
-  }, [messages.length]);
-
-  useEffect(() => {
-    const handler = (evt: Event) => {
-      const behavior =
-        (evt as CustomEvent<{ behavior?: ScrollBehavior }>).detail?.behavior ?? "smooth";
-      bottomRef.current?.scrollIntoView({ behavior, block: "end" });
-    };
-    window.addEventListener(FORCE_SCROLL_EVT, handler as EventListener);
-    return () => window.removeEventListener(FORCE_SCROLL_EVT, handler as EventListener);
-  }, []);
-
-  const lastAssistantIndex = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "assistant") return i;
-    }
-    return -1;
-  }, [messages]);
-
-  const asstText = lastAssistantIndex >= 0 ? (messages[lastAssistantIndex]?.text ?? "") : "";
-
-  useEffect(() => {
-    if (lastAssistantIndex < 0) return;
-    const len = asstText.length;
-    const prev = prevAsstLenRef.current || 0;
-    prevAsstLenRef.current = len;
-    if (!autoFollow) return;
-    if (len > prev && isNearBottom()) scrollToBottom("auto");
-  }, [lastAssistantIndex, asstText, autoFollow]);
-
-  useEffect(() => {
-    const prev = prevLoadingRef.current;
-    const cur = loading;
-    prevLoadingRef.current = cur;
-    if (prev && !cur && autoFollow && isNearBottom()) scrollToBottom("smooth");
-  }, [loading, autoFollow]);
-
-  useEffect(() => {
-    if (autoFollow && isNearBottom()) {
-      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-    }
-  }, [bottomPad, autoFollow]);
-
-  return { listRef, bottomRef, lastAssistantIndex };
-}
-
-# ===== frontend/src/file_read/hooks/useChatsPager.ts =====
-
-import { useEffect, useMemo, useRef, useState } from "react";
-import { listChatsPage } from "../data/chatApi";
-import type { ChatRow } from "../types/chat";
-
-export function useChatsPager(pageSize = 10, refreshKey?: number) {
-  const [chats, setChats] = useState<ChatRow[]>([]);
-  const [page, setPage] = useState(0);
-  const [hasMore, setHasMore] = useState(true);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
-  const [ceiling, setCeiling] = useState<string | null>(null);
-  const [initialLoading, setInitialLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const loadingMoreRef = useRef(false);
-
-  const seenIds = useMemo(() => new Set(chats.map(c => c.sessionId)), [chats]);
-
-  async function loadFirst() {
-    setInitialLoading(true);
-    try {
-      const ceil = new Date().toISOString();
-      setCeiling(ceil);
-      const res = await listChatsPage(0, pageSize, ceil);
-      setChats(res.content);
-      setPage(1);
-      setHasMore(!res.last);
-      setTotal(res.totalElements ?? 0);
-      setTotalPages(res.totalPages ?? 0);
-    } catch {
-      setChats([]); setPage(0); setHasMore(false); setTotal(0); setTotalPages(0);
-    } finally {
-      setInitialLoading(false);
-    }
-  }
-
-  async function loadMore() {
-    if (loadingMoreRef.current || loadingMore || !hasMore || !ceiling) return;
-    loadingMoreRef.current = true;
-    setLoadingMore(true);
-    try {
-      const res = await listChatsPage(page, pageSize, ceiling);
-      const next = res.content.filter(c => !seenIds.has(c.sessionId));
-      setChats(prev => [...prev, ...next]);
-      setPage(p => p + 1);
-      setHasMore(!res.last);
-      setTotal(res.totalElements ?? total);
-      setTotalPages(res.totalPages ?? totalPages);
-    } catch {
-      setHasMore(false);
-    } finally {
-      loadingMoreRef.current = false;
-      setLoadingMore(false);
-    }
-  }
-
-  async function refreshFirst() {
-    setChats([]); setPage(0); setHasMore(true);
-    setTotal(0); setTotalPages(0); setCeiling(null);
-    await loadFirst();
-  }
-
-  const didMountRef = useRef(false);
-  useEffect(() => {
-    if (!didMountRef.current) { didMountRef.current = true; return; }
-    if (typeof refreshKey !== "undefined") void refreshFirst();
-  }, [refreshKey]);
-
-  useEffect(() => {
-    const handler = (evt: Event) => {
-      const detail = (evt as CustomEvent<any>).detail;
-      if (!detail?.sessionId) return;
-      const sid = String(detail.sessionId);
-      setChats(prev => {
-        const ix = prev.findIndex(c => c.sessionId === sid);
-        const shouldMoveToTop = typeof detail.lastMessage === "string";
-        if (ix === -1) {
-          if (!shouldMoveToTop) return prev;
-          const injected: ChatRow = {
-            sessionId: sid,
-            id: -1,
-            title: detail.title ?? "New Chat",
-            lastMessage: detail.lastMessage ?? "",
-            createdAt: new Date().toISOString(),
-            updatedAt: detail.updatedAt ?? new Date().toISOString(),
-          };
-          return [injected, ...prev];
-        }
-        const cur = prev[ix];
-        const patched: ChatRow = {
-          ...cur,
-          lastMessage: detail.lastMessage ?? cur.lastMessage,
-          title: detail.title ?? cur.title,
-          updatedAt: detail.updatedAt ?? cur.updatedAt,
-        };
-        const rest = prev.filter((_, i) => i !== ix);
-        return shouldMoveToTop ? [patched, ...rest] : [...prev.slice(0, ix), patched, ...prev.slice(ix + 1)];
-      });
-    };
-    window.addEventListener("chats:refresh", handler as EventListener);
-    return () => window.removeEventListener("chats:refresh", handler as EventListener);
-  }, []);
-
-  useEffect(() => {
-    const rootEl = scrollRef.current, sentinel = sentinelRef.current;
-    if (!rootEl || !sentinel) return;
-    const hasOverflow = rootEl.scrollHeight - rootEl.clientHeight > 8;
-    if (!hasOverflow) return;
-    const io = new IntersectionObserver((entries) => {
-      const entry = entries[0];
-      if (entry?.isIntersecting) void loadMore();
-    }, { root: rootEl, rootMargin: "96px 0px", threshold: 0.01 });
-    io.observe(sentinel);
-    return () => io.disconnect();
-  }, [chats.length, page, hasMore, ceiling]);
-
-  function decTotal(count: number) {
-    setTotal(prev => {
-      const next = Math.max(0, prev - count);
-      setTotalPages(Math.max(1, Math.ceil(next / pageSize)));
-      return next;
-    });
-  }
-
-  return {
-    chats, page, hasMore, total, totalPages,
-    initialLoading, loadingMore,
-    scrollRef, sentinelRef,
-    loadMore, refreshFirst, setChats,
-    decTotal,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useChatState.ts =====
-
-import { useState } from "react";
-import type { ChatMsg } from "../types/chat";
-
-type BySession<T> = Record<string, T>;
-
-export function useChatState() {
-  const [bySession, setBySession] = useState<BySession<ChatMsg[]>>({});
-  const [input, setInput] = useState("");
-
-  const getMsgs = (sid: string) => bySession[sid] ?? [];
-  const setMsgs = (
-    sid: string,
-    upd: ((prev: ChatMsg[]) => ChatMsg[]) | ChatMsg[]
-  ) => {
-    setBySession((prev) => {
-      const cur = prev[sid] ?? [];
-      const next = Array.isArray(upd) ? upd : upd(cur);
-      return next === cur ? prev : { ...prev, [sid]: next };
-    });
-  };
-
-  const resetMsgs = (sid: string) =>
-    setBySession((prev) => (prev[sid] ? { ...prev, [sid]: [] } : prev));
-
-  return { bySession, input, setInput, getMsgs, setMsgs, resetMsgs };
-}
-
-# ===== frontend/src/file_read/hooks/useChatStream.ts =====
-
-import { useMemo } from "react";
-import type { ChatMsg } from "../types/chat";
-import { useSession } from "./useSession";
-import { useStream } from "./useStream";
-import { useChatState } from "./useChatState";
-import { useRunState } from "./useRunState";
-import { useMetrics } from "./useMetrics";
-// Retitle disabled for now
-// import { useRetitle } from "./useRetitle";
-
-export type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-export function useChatStream() {
-  // state slices
-  const chat = useChatState();
-  const run = useRunState();
-  const met = useMetrics();
-  // Retitle disabled
-  // const { retitleNow } = useRetitle(true);
-
-  // session plumbing
-  const { sessionIdRef, ensureChatCreated, loadHistory, setSessionId, resetSession } = useSession({
-    setMessagesForSession: (sid: string, msgs: ChatMsg[]) => chat.setMsgs(sid, msgs),
-    getMessagesForSession: (sid: string) => chat.getMsgs(sid),
-    isStreaming: (sid: string) => !!run.loadingBy[sid],
-  });
-
-  // stream controller
-  const { send, stop, cancelBySessionId } = useStream({
-    messages: chat.getMsgs(sessionIdRef.current), // keeps deps stable
-    setMessagesForSession: (sid, updater) => chat.setMsgs(sid, updater),
-    getMessagesForSession: chat.getMsgs,
-    setInput: chat.setInput,
-    sessionId: () => sessionIdRef.current,
-    ensureChatCreated,
-
-    // 🔕 Retitle disabled: provide a no-op with the expected signature
-    onRetitle: async (_sessionId: string, _latestAssistant: string) => { /* no-op */ },
-
-    setLoadingForSession: run.setLoadingFor,
-    setQueuedForSession: run.setQueuedFor,
-    setMetricsForSession: met.setMetricsFor,
-    setMetricsFallbackForSession: met.setMetricsFallbackFor,
-    resetMetricsForSession: met.resetMetricsFor,
-  });
-
-  async function cancelSessions(ids: string[]) {
-    await Promise.all(ids.map(cancelBySessionId));
-  }
-
-  // derived (active session)
-  const activeId = sessionIdRef.current;
-  const messages = useMemo(() => chat.getMsgs(activeId), [chat.bySession, activeId]);
-  const loading = !!run.loadingBy[activeId];
-  const queued = !!run.queuedBy[activeId];
-  const runJson = met.metricsBy[activeId]?.runJson ?? null;
-  const runMetrics = met.metricsBy[activeId]?.flat ?? null;
-
-  function reset() {
-    chat.setInput("");
-    met.resetMetricsFor(activeId);
-    resetSession();
-  }
-
-  function snapshotPendingAssistant(): string {
-    const msgs = chat.getMsgs(activeId);
-    const last = msgs[msgs.length - 1];
-    return last?.role === "assistant" ? (last.text ?? "") : "";
-  }
-
-  return {
-    // chat state
-    messages,
-    input: chat.input,
-    setInput: chat.setInput,
-    loading,
-    queued,
-
-    // actions
-    send,
-    stop,
-    cancelSessions,
-
-    // session ctl
-    setSessionId,
-    sessionIdRef,
-    loadHistory,
-    reset,
-    snapshotPendingAssistant,
-
-    // metrics (active only)
-    runMetrics,
-    runJson,
-    clearMetrics: () => met.resetMetricsFor(activeId),
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useMetrics.ts =====
-
-import { useState } from "react";
-import type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-type BySession<T> = Record<string, T>;
-type Pair = { runJson: RunJson | null; flat: GenMetrics | null };
-
-export function useMetrics() {
-  const [metricsBy, setMetricsBy] = useState<BySession<Pair>>({});
-
-  function resetMetricsFor(sid: string) {
-    setMetricsBy((prev) => ({ ...prev, [sid]: { runJson: null, flat: null } }));
-  }
-
-  function setMetricsFor(sid: string, json?: RunJson, flat?: GenMetrics) {
-    setMetricsBy((prev) => {
-      const cur = prev[sid] ?? { runJson: null, flat: null };
-      return { ...prev, [sid]: { runJson: json ?? cur.runJson, flat: flat ?? cur.flat } };
-    });
-  }
-
-  function setMetricsFallbackFor(sid: string, reason: string, partialOut: string) {
-    const json: RunJson = {
-      stats: {
-        stopReason: reason,
-        tokensPerSecond: null,
-        timeToFirstTokenSec: null,
-        totalTimeSec: null,
-        promptTokensCount: null,
-        predictedTokensCount: partialOut ? partialOut.length : 0,
-        totalTokensCount: null,
-      },
-    };
-    const flat: GenMetrics = {
-      stop_reason: reason,
-      tok_per_sec: null,
-      ttft_ms: null,
-      output_tokens: null,
-      input_tokens_est: null,
-      total_tokens_est: null,
-    };
-    setMetricsFor(sid, json, flat);
-  }
-
-  return { metricsBy, resetMetricsFor, setMetricsFor, setMetricsFallbackFor };
-}
-
-# ===== frontend/src/file_read/hooks/useMultiSelect.ts =====
-
-// frontend/src/file_read/hooks/useMultiSelect.ts
-import { useEffect, useMemo, useState } from "react";
-
-export function useMultiSelect(allIds: string[]) {
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-
-  // keep selection pruned when the list of ids changes
-  useEffect(() => {
-    setSelected(prev => {
-      const next = new Set([...prev].filter(id => allIds.includes(id)));
-      // only update if it actually changed
-      return next.size === prev.size ? prev : next;
-    });
-  }, [allIds]);
-
-  const allSelected = useMemo(
-    () => selected.size > 0 && selected.size === allIds.length,
-    [selected, allIds.length]
-  );
-
-  const toggleOne = (id: string) => {
-    setSelected(prev => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-  };
-
-  const toggleAll = () => {
-    setSelected(prev =>
-      prev.size === allIds.length ? new Set() : new Set(allIds)
-    );
-  };
-
-  return { selected, setSelected, allSelected, toggleOne, toggleAll };
-}
-
-# ===== frontend/src/file_read/hooks/useRetitle.ts =====
-
-// frontend/src/file_read/hooks/useRetitle.ts
-import { API_BASE } from "../services/http";
-import { listMessages, updateChatLast } from "../data/chatApi";
-import { stripRunJson } from "../shared/lib/runjson";
-
-const TITLE_MAX_WORDS = 6;
-
-function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
-  let t = (raw.split(/\r?\n/)[0] ?? "");
-  t = t.replace(/[^\p{L}\p{N} ]+/gu, " ");
-  t = t.replace(/\s+/g, " ").trim();
-  t = t.split(" ").slice(0, maxWords).join(" ").trim();
-  return t;
-}
-
-export function useRetitle(enabled = true) {
-  async function retitleNow(sessionId: string, latestAssistant: string) {
-    console.log("1")
-    if (!enabled) return;
-
-    try {
-      // Build a minimal transcript to title on
-      const rows = await listMessages(sessionId);
-      const textDump = rows
-        .map((r) => `${r.role === "user" ? "User" : "Assistant"}: ${r.content}`)
-        .join("\n");
-
-      // Ask the local model for a very short title
-      const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: `${sessionId}::titlebot`,
-          messages: [
-            {
-              role: "system",
-              content: "You output ultra-concise, neutral chat titles and nothing else.",
-            },
-            {
-              role: "user",
-              content:
-                "Write ONE short title summarizing the conversation below.\n" +
-                "Rules: at most 6 words — sentence or title case — no punctuation — no emojis — no quotes — return ONLY the title\n\n" +
-                textDump +
-                "\n\nTitle:",
-            },
-          ],
-          max_tokens: 24,
-          temperature: 0.2,
-          top_p: 0.9,
-        }),
-      });
-
-      if (!res.ok || !res.body) return;
-
-      // Gather the streamed text + strip runjson
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let raw = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value) raw += decoder.decode(value, { stream: true });
-      }
-
-      const { text } = stripRunJson(raw);
-      const title = sanitizeTitle(text);
-      if (!title) return;
-
-      // Save title + lastMessage (lastMessage stays the full assistant text)
-      await updateChatLast(sessionId, latestAssistant, title).catch(() => {});
-      // Nudge sidebar so it shows new title immediately
-      try {
-        window.dispatchEvent(new CustomEvent("chats:refresh"));
-      } catch {}
-    } catch (e) {
-      console.warn("retitleNow failed:", e);
-    }
-  }
-
-  return { retitleNow };
-}
-
-# ===== frontend/src/file_read/hooks/useRunState.ts =====
-
-import { useState } from "react";
-
-type BySession<T> = Record<string, T>;
-
-export function useRunState() {
-  const [loadingBy, setLoadingBy] = useState<BySession<boolean>>({});
-  const [queuedBy, setQueuedBy] = useState<BySession<boolean>>({});
-
-  const setBool =
-    (setter: React.Dispatch<React.SetStateAction<BySession<boolean>>>) =>
-    (sid: string, v: boolean) =>
-      setter((prev) => (prev[sid] === v ? prev : { ...prev, [sid]: v }));
-
-  return {
-    loadingBy,
-    queuedBy,
-    setLoadingFor: setBool(setLoadingBy),
-    setQueuedFor: setBool(setQueuedBy),
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useSession.ts =====
-
-// frontend/src/file_read/hooks/useSession.ts
-import { useRef } from "react";
-import type { ChatMsg, ChatMessageRow } from "../types/chat";
-import { createChat, listMessages } from "../data/chatApi";
-import { extractRunJsonFromBuffer } from "../shared/lib/runjson";
-
-function rowToMsg(r: ChatMessageRow): ChatMsg {
-  if (r.role === "assistant") {
-    const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
-    const base: ChatMsg = {
-      id: `cid-${r.id}`,        // stable UI id derived from server id
-      serverId: r.id,
-      role: r.role,
-      text: clean,
-      // ✅ KEEP attachments from server
-      attachments: r.attachments ?? [],
-    };
-    if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
-    return base;
-  }
-
-  // user
-  return {
-    id: `cid-${r.id}`,
-    serverId: r.id,
-    role: r.role,
-    text: r.content,
-    // ✅ KEEP attachments from server
-    attachments: r.attachments ?? [],
-  };
-}
-
-export function useSession(opts: {
-  setMessagesForSession: (sid: string, msgs: ChatMsg[]) => void;
-  getMessagesForSession: (sid: string) => ChatMsg[];
-  isStreaming: (sid: string) => boolean;
-}) {
-  const { setMessagesForSession, getMessagesForSession, isStreaming } = opts;
-  const sessionIdRef = useRef<string>(crypto.randomUUID());
-  const hasCreatedRef = useRef(false);
-
-  async function ensureChatCreated() {
-    if (!sessionIdRef.current) {
-      sessionIdRef.current = crypto.randomUUID();
-      hasCreatedRef.current = false;
-    }
-    if (hasCreatedRef.current) return;
-    try {
-      await createChat(sessionIdRef.current, "New Chat");
-      hasCreatedRef.current = true;
-    } catch (e) {
-      console.warn("createChat failed:", e);
-    }
-  }
-
-  async function loadHistory(sessionId: string): Promise<void> {
-    sessionIdRef.current = sessionId;
-    hasCreatedRef.current = true;
-
-    try {
-      const rows = await listMessages(sessionId);
-      const serverMsgs = rows.map(rowToMsg);
-
-      const prevClient = getMessagesForSession(sessionId) ?? [];
-
-      if (isStreaming(sessionId)) {
-        // Merge by serverId; preserve any in-flight tail
-        const byServer = new Map<number, ChatMsg>(
-          prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
-        );
-        const merged = serverMsgs.map(s => {
-          const prev = byServer.get(s.serverId!);
-          if (!prev) return s;
-          const meta = s.meta ?? prev.meta ?? undefined;
-          return { ...prev, ...s, meta };
-        });
-
-        const tail: ChatMsg[] = [];
-        const last = prevClient[prevClient.length - 1];
-        if (last?.role === "assistant" && (last.text?.length ?? 0) > 0 && last.serverId == null) {
-          tail.push(last);
-        }
-
-        setMessagesForSession(sessionId, [...merged, ...tail]);
-      } else {
-        setMessagesForSession(sessionId, serverMsgs);
-      }
-    } catch (e) {
-      console.warn("listMessages failed:", e);
-      if (!isStreaming(sessionId)) setMessagesForSession(sessionId, []);
-    }
-  }
-
-  function setSessionId(newId: string) {
-    sessionIdRef.current = newId;
-    hasCreatedRef.current = false;
-    setMessagesForSession(newId, []);
-  }
-
-  function resetSession() {
-    const id = sessionIdRef.current;
-    if (id) setMessagesForSession(id, []);
-  }
-
-  return {
-    sessionIdRef,
-    ensureChatCreated,
-    loadHistory,
-    setSessionId,
-    resetSession,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useSettings.ts =====
-
-import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  getEffective, getOverrides, getDefaults, getAdaptive,
-  patchOverrides, putOverrides, recomputeAdaptive,
-} from "../data/settingsApi";
-
-type State = {
-  loading: boolean;
-  error: string | null;
-  effective: any | null;
-  overrides: any | null;
-  defaults: any | null;
-  adaptive: any | null;
-};
-
-export function useSettings(sessionId?: string) {
-  const [state, setState] = useState<State>({
-    loading: false,
-    error: null,
-    effective: null,
-    overrides: null,
-    defaults: null,
-    adaptive: null,
-  });
-
-  const load = useCallback(async () => {
-    setState(s => ({ ...s, loading: true, error: null }));
-    try {
-      const [effective, overrides, defaults, adaptive] = await Promise.all([
-        getEffective(sessionId),
-        getOverrides(),
-        getDefaults(),
-        getAdaptive(),
-      ]);
-      setState({
-        loading: false,
-        error: null,
-        effective,
-        overrides,
-        defaults,
-        adaptive,
-      });
-    } catch (e: any) {
-      setState(s => ({
-        ...s,
-        loading: false,
-        error: e?.message || "Failed to load settings",
-      }));
-    }
-  }, [sessionId]);
-
-  useEffect(() => { void load(); }, [load]);
-
-  const saveOverrides = useCallback(
-    async (data: Record<string, any>, method: "patch" | "put" = "patch") => {
-      if (method === "put") await putOverrides(data);
-      else await patchOverrides(data);
-      await load();
-    },
-    [load]
-  );
-
-  const runAdaptive = useCallback(async () => {
-    await recomputeAdaptive(sessionId);
-    await load();
-  }, [load, sessionId]);
-
-  return useMemo(
-    () => ({
-      ...state,
-      reload: load,
-      saveOverrides,
-      runAdaptive,
-    }),
-    [state, load, saveOverrides, runAdaptive]
-  );
-}
-
-# ===== frontend/src/file_read/hooks/useSidebar.ts =====
-
-// frontend/src/file_read/hooks/useSidebar.ts
-import { useEffect, useState } from "react";
-
-export function useSidebar() {
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
-
-  // pin on desktop
-  useEffect(() => {
-    const onResize = () => {
-      if (window.innerWidth >= 768) setSidebarOpen(true);
-    };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-
-  // Ctrl+B toggle
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
-        e.preventDefault();
-        setSidebarOpen((v) => !v);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // mobile drawer helpers (DOM-level; safe here)
-  const openMobileDrawer = () => {
-    document.getElementById("mobile-drawer")?.classList.remove("hidden");
-    document.getElementById("mobile-backdrop")?.classList.remove("hidden");
-    document.body.style.overflow = "hidden";
-  };
-  const closeMobileDrawer = () => {
-    document.getElementById("mobile-drawer")?.classList.add("hidden");
-    document.getElementById("mobile-backdrop")?.classList.add("hidden");
-    document.body.style.overflow = "";
-  };
-
-  return {
-    sidebarOpen,
-    setSidebarOpen,
-    openMobileDrawer,
-    closeMobileDrawer,
-  };
-}
-
-# ===== frontend/src/file_read/hooks/useStream.ts =====
-
-// frontend/src/file_read/hooks/useStream.ts
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMsg } from "../types/chat";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-import { createStreamController } from "./stream/core/controller";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { Attachment } from "../types/chat";
+import { requestRaw } from "../services/http";
 
-type UseStreamDeps = {
-  // not read directly; keeps memo deps stable
-  messages: ChatMsg[];
+// Local UI id for keys & removal
+const makeUiId = () =>
+  Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
 
-  // message state per session
-  setMessagesForSession: (
-    sid: string,
-    updater: (prev: ChatMsg[]) => ChatMsg[]
-  ) => void;
-  getMessagesForSession: (sid: string) => ChatMsg[];
+export type UIAttachment = {
+  uiId: string;
+  name: string;
 
-  // ui
-  setInput: (v: string) => void;
+  // UI state
+  status: "uploading" | "ready" | "error";
+  pct: number;           // 0..100
+  error?: string;
 
-  // session plumbing
-  sessionId: () => string;
-  ensureChatCreated: () => Promise<void>;
-  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
-
-  // per-session flags/metrics
-  setLoadingForSession: (sid: string, v: boolean) => void;
-  setQueuedForSession?: (sid: string, v: boolean) => void;
-  setMetricsForSession: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
-  setMetricsFallbackForSession: (
-    sid: string,
-    reason: string,
-    partialOut: string
-  ) => void;
-  resetMetricsForSession: (sid: string) => void;
+  // Optional extras
+  size?: number;
+  mime?: string;
+  url?: string;
+  serverId?: string;     // if backend returns an id
 };
 
-export function useStream({
-  setMessagesForSession,
-  getMessagesForSession,
-  setInput,
-  sessionId,
-  ensureChatCreated,
-  onRetitle,
-  setLoadingForSession,
-  setQueuedForSession,
-  setMetricsForSession,
-  setMetricsFallbackForSession,
-  resetMetricsForSession,
-}: UseStreamDeps) {
-  const [loading, setLoading] = useState(false);
-  const controllerRef = useRef<ReturnType<typeof createStreamController> | null>(null);
+type ReturnShape = {
+  atts: UIAttachment[];
+  addFiles: (files: FileList | File[]) => Promise<void>;
+  removeAtt: (arg: string | UIAttachment) => void; // accepts uiId or whole object
+  anyUploading: boolean;
+  anyReady: boolean;
+  attachmentsForPost: () => Attachment[];          // what your API expects
+  reset: () => void;
+};
 
-  const controller = useMemo(() => {
-    return createStreamController({
-      // message access
-      getMessagesFor: (sid) => getMessagesForSession(sid),
-      setMessagesFor: (sid, updater) => setMessagesForSession(sid, updater),
+export function useAttachmentUploads(
+  sessionId?: string,
+  onRefreshChats?: () => void
+): ReturnShape {
+  const [atts, setAtts] = useState<UIAttachment[]>([]);
+  const triedEndpoints = useRef<string[] | null>(null);
 
-      // ui hooks
-      setInput: () => setInput(""),
-      setLoadingFor: (sid, v) => {
-        if (sid === sessionId()) setLoading(v);
-        setLoadingForSession(sid, v);
-      },
-      setQueuedFor: setQueuedForSession ?? (() => {}),
+  const detectAndUpload = useCallback(
+    async (file: File): Promise<UIAttachment> => {
+      const endpoints =
+        triedEndpoints.current ??
+        ["/api/rag/upload", "/api/rag/uploads", "/api/uploads"];
 
-      // metrics
-      setMetricsFor: (sid, json, flat) => setMetricsForSession(sid, json, flat),
-      setMetricsFallbackFor: (sid, reason, out) =>
-        setMetricsFallbackForSession(sid, reason, out),
+      let lastErr: unknown = null;
 
-      // patch server id onto a bubble identified by clientId
-      setServerIdFor: (sid, clientId, serverId) => {
-        setMessagesForSession(sid, (prev) =>
-          prev.map((m) => (m.id === clientId ? { ...m, serverId } : m))
-        );
-      },
+      for (const ep of endpoints) {
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          if (sessionId) fd.append("sessionId", sessionId);
 
-      // session plumbing
-      getSessionId: sessionId,
-      ensureChatCreated,
-      onRetitle,
-      resetMetricsFor: (sid) => resetMetricsForSession(sid),
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+          const res = await requestRaw(ep, { method: "POST", body: fd });
+          const text = await res.text();
+          if (!res.ok) throw new Error(`Upload failed (${res.status}) ${res.statusText} ${text || ""}`.trim());
+
+          let data: any = {};
+          try { data = text ? JSON.parse(text) : {}; } catch {}
+
+          const ui: UIAttachment = {
+            uiId: makeUiId(),
+            name: (data.name ?? file.name) as string,
+            status: "ready",
+            pct: 100,
+            size: Number(data.size ?? file.size) || file.size,
+            mime: (data.contentType ?? data.mime ?? file.type) as string,
+            url: (data.url ?? data.location ?? undefined) as string | undefined,
+            serverId: (data.id ?? data.fileId ?? data.uploadId)?.toString(),
+          };
+
+          if (!triedEndpoints.current) {
+            triedEndpoints.current = [ep, ...endpoints.filter((e) => e !== ep)];
+          }
+          return ui;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr ?? new Error("No working upload endpoint found");
+    },
+    [sessionId]
+  );
+
+  const addFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const arr = Array.from(files);
+      if (arr.length === 0) return;
+
+      // optimistic rows
+      const optimistic: UIAttachment[] = arr.map((f) => ({
+        uiId: makeUiId(),
+        name: f.name,
+        status: "uploading",
+        pct: 0,
+        size: f.size,
+        mime: f.type,
+      }));
+      setAtts((cur) => [...cur, ...optimistic]);
+
+      await Promise.all(
+        arr.map(async (file, i) => {
+          const tempUiId = optimistic[i].uiId;
+          try {
+            const finalUi: UIAttachment = sessionId
+              ? await detectAndUpload(file)
+              : {
+                  uiId: makeUiId(),
+                  name: file.name,
+                  status: "ready",
+                  pct: 100,
+                  size: file.size,
+                  mime: file.type,
+                };
+
+            setAtts((cur) => cur.map((a) => (a.uiId === tempUiId ? finalUi : a)));
+          } catch (e: any) {
+            setAtts((cur) =>
+              cur.map((a) =>
+                a.uiId === tempUiId
+                  ? { ...a, status: "error", pct: 0, error: e?.message ?? "Upload failed." }
+                  : a
+              )
+            );
+          }
+        })
+      );
+
+      onRefreshChats?.();
+    },
+    [detectAndUpload, onRefreshChats, sessionId]
+  );
+
+  const removeAtt = useCallback((arg: string | UIAttachment) => {
+    const uiId = typeof arg === "string" ? arg : arg.uiId;
+    setAtts((cur) => cur.filter((a) => a.uiId !== uiId));
   }, []);
 
-  useEffect(() => {
-    controllerRef.current = controller;
-    return () => controllerRef.current?.dispose();
-  }, [controller]);
-
-  async function send(override?: string, attachments: Attachment[] = []) {
-    const text = (override ?? "").trim();
-    if (!text && attachments.length === 0) return;
-    await controller.send(text, attachments);
-  }
-
-  async function stop() {
-    await controller.stop();
-  }
-
-  async function cancelBySessionId(sid: string) {
-    await controller.cancelBySessionId(sid);
-  }
-
-  return { loading, send, stop, cancelBySessionId };
-}
-
-# ===== frontend/src/file_read/hooks/useToast.ts =====
-
-import { useState } from "react";
-
-export function useToast() {
-  const [toast, setToast] = useState<string | null>(null);
-  function show(msg: string, ms = 1800) {
-    setToast(msg);
-    window.clearTimeout((show as any)._t);
-    (show as any)._t = window.setTimeout(() => setToast(null), ms);
-  }
-  return { toast, show };
-}
-
-# ===== frontend/src/file_read/index.css =====
-
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-# ===== frontend/src/file_read/main.tsx =====
-
-import { StrictMode } from 'react'
-import './index.css';
-import { createRoot } from 'react-dom/client'
-import App from './App.tsx'
-
-
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-
-# ===== frontend/src/file_read/pages/AgentRunner.tsx =====
-
-import { useState } from "react";
-import ChatContainer from "../components/ChatContainer";
-import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
-import { useChatStream } from "../hooks/useChatStream";
-import { useSidebar } from "../hooks/useSidebar";
-import { useToast } from "../hooks/useToast";
-import DesktopHeader from "../components/DesktopHeader";
-import MobileDrawer from "../components/MobileDrawer";
-import Toast from "../shared/ui/Toast";
-import { createChat, deleteMessagesBatch } from "../data/chatApi";
-
-// NEW: settings panel
-import SettingsPanel from "../components/SettingsPanel";
-import KnowledgePanel from "../components/KnowledgePanel";
-
-const LS_KEY = "lastSessionId";
-
-export default function AgentRunner() {
-  const chat = useChatStream();
-  const [showKnowledge, setShowKnowledge] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
-  const [autoFollow, setAutoFollow] = useState(true);
-  const { toast, show } = useToast();
-  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
-
-  // NEW: settings modal
-  const [showSettings, setShowSettings] = useState(false);
-
-  // ⛔ Removed the mount-time bootstrap that fetched chats and loaded history.
-
-  async function newChat(): Promise<void> {
-    const id = crypto.randomUUID();
-    chat.setSessionId(id);
-    try { await createChat(id, "New Chat"); } catch {}
-    localStorage.setItem(LS_KEY, id);
-    setRefreshKey((k) => k + 1);
-    chat.setInput("");
-    chat.clearMetrics?.();
-    await refreshFollow();
-  }
-
-  async function openSession(id: string): Promise<void> {
-    if (!id) return;
-    await chat.loadHistory(id);
-    localStorage.setItem(LS_KEY, id);
-    chat.setInput("");
-    chat.clearMetrics?.();
-    await refreshFollow();
-  }
-
-  // --- TWO REFRESH HELPERS ---
-
-  // 1) Follow-to-bottom refresh (normal)
-  async function refreshFollow() {
-    const sid = chat.sessionIdRef.current;
-    if (!sid) return;
-    setAutoFollow(true);
-    await chat.loadHistory(sid);
-    const el = document.getElementById("chat-scroll-container");
-    if (el) el.scrollTop = el.scrollHeight;
-  }
-
-async function handleCancelSessions(ids: string[]) {
-  if (!ids?.length) return;
-
-  const currentId = chat.sessionIdRef.current || "";
-  const deletingActive = currentId && ids.includes(currentId);
-
-  if (deletingActive) {
-    // clear out current session instead of making a new one
-    chat.setSessionId("");
-    chat.setInput("");
-    chat.clearMetrics?.();
-    // optional: clear messages too
-    chat.reset();
-    localStorage.removeItem(LS_KEY);
-  }
-
-  setRefreshKey((k) => k + 1);
-  try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
-}
-
-
-  // 2) Preserve-scroll refresh (use for deletions, etc.)
-  async function refreshPreserve() {
-    const sid = chat.sessionIdRef.current;
-    if (!sid) return;
-    const el = document.getElementById("chat-scroll-container");
-    const prevTop = el?.scrollTop ?? 0;
-    const prevHeight = el?.scrollHeight ?? 0;
-
-    setAutoFollow(false);
-    await chat.loadHistory(sid);
-
-    requestAnimationFrame(() => {
-      if (el) {
-        const newHeight = el.scrollHeight;
-        el.scrollTop = prevTop + (newHeight - prevHeight);
-      }
-      setAutoFollow(true);
-    });
-  }
-
-  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
-  async function handleDeleteMessages(clientIds: string[]) {
-    const sid = chat.sessionIdRef.current;
-    if (!sid || !clientIds?.length) return;
-
-    const current = chat.messages;
-    const toDelete = new Set(clientIds);
-
-    const serverIds = current
-      .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
-      .map((m: any) => m.serverId as number);
-
-    const remaining = current.filter((m) => !toDelete.has(m.id));
-
-    // Optimistic local state
-    if ((chat as any).setMessagesForSession) {
-      (chat as any).setMessagesForSession(sid, () => remaining);
-    }
-
-    try {
-      if (serverIds.length) {
-        await deleteMessagesBatch(sid, serverIds);
-      }
-
-      await refreshPreserve();
-
-      setRefreshKey((k) => k + 1);
-      try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
-
-      show("Message deleted");
-    } catch {
-      show("Failed to delete message");
-      await chat.loadHistory(sid);
-      setRefreshKey((k) => k + 1);
-    }
-  }
-
-  return (
-    <div className="h-screen w-full flex bg-gray-50">
-      {sidebarOpen && (
-        <div className="hidden md:flex h-full">
-          <ChatSidebar
-            onOpen={openSession}
-            onNew={newChat}
-            refreshKey={refreshKey}
-            activeId={chat.sessionIdRef.current}
-            onHideSidebar={() => setSidebarOpen(false)}
-            onCancelSessions={handleCancelSessions}
-          />
-        </div>
-      )}
-
-      <MobileDrawer
-        onOpenSession={openSession}
-        onNewChat={newChat}
-        refreshKey={refreshKey}
-        activeId={chat.sessionIdRef.current}
-        openMobileDrawer={openMobileDrawer}
-        closeMobileDrawer={closeMobileDrawer}
-      />
-      <div className="md:hidden h-14 shrink-0" />
-
-      <div className="flex-1 min-w-0 flex flex-col">
-        <DesktopHeader
-          sidebarOpen={sidebarOpen}
-          onShowSidebar={() => setSidebarOpen(true)}
-        />
-
-        <div className="px-3 md:px-6 pt-2">
-          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowKnowledge(true)}
-              title="Open Knowledge"
-            >
-              Knowledge
-            </button>
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowSettings(true)}
-              title="Open Settings"
-            >
-              Settings
-            </button>
-          </div>
-        </div>
-
-        <div className="flex-1 min-h-0">
-          <div className="h-full px-3 md:px-6">
-            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              {/* Note: add id on the scroll container wrapper for refresh helpers */}
-              <div id="chat-scroll-container" className="h-full">
-                <ChatContainer
-                  messages={chat.messages}
-                  input={chat.input}
-                  setInput={chat.setInput}
-                  loading={chat.loading}
-                  queued={chat.queued}
-                  send={chat.send}
-                  stop={chat.stop}
-                  runMetrics={chat.runMetrics}
-                  runJson={chat.runJson}
-                  onRefreshChats={() => {}}
-                  onDeleteMessages={handleDeleteMessages}
-                  autoFollow={autoFollow}
-                  sessionId={chat.sessionIdRef.current} // enables per-chat uploads
-                />
-              </div>
-              <Toast message={toast} />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* NEW: settings modal */}
-      {showSettings && (
-        <SettingsPanel
-          sessionId={chat.sessionIdRef.current}
-          onClose={() => setShowSettings(false)}
-        />
-      )}
-      {showKnowledge && (
-        <KnowledgePanel
-          sessionId={chat.sessionIdRef.current}
-          onClose={() => setShowKnowledge(false)}
-          toast={show}
-        />
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/services/http.ts =====
-
-export const API_BASE = import.meta.env.VITE_API_URL || "";
-
-function buildUrl(path: string) {
-  const base = API_BASE.replace(/\/$/, "");
-  return `${base}${path.startsWith("/") ? path : `/${path}`}`;
-}
-
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(buildUrl(path), init);
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    let msg = text || res.statusText;
-    try { msg = JSON.parse(text)?.detail || msg; } catch {}
-    throw new Error(`HTTP ${res.status} – ${msg}`);
-  }
-  return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
-}
-
-# ===== frontend/src/file_read/shared/lib/runjson.helpers.ts =====
-
-// frontend/src/file_read/components/shared/lib/runjson.helpers.ts
-import {
-  MET_START,
-  MET_END,
-  type RunJson,
-  type GenMetrics,
-  type BudgetViewJson,
-  type TurnBudgetJson,
-  type NormalizedBudget,
-  type RagTelemetry,
-  type WebTelemetry,
-  type PackTelemetry,
-  type BudgetBreakdown,
-} from "./runjson.types";
-
-export function extractRunJsonFromBuffer(
-  buf: string
-): { clean: string; json?: RunJson; flat?: GenMetrics } {
-  const re = /(?:\s*)\[\[RUNJSON\]\]\s*([\s\S]*?)\s*\[\[\/RUNJSON\]\](?:\s*)/g;
-  let match: RegExpExecArray | null = null;
-  let last: RegExpExecArray | null = null;
-  while ((match = re.exec(buf)) !== null) last = match;
-  if (!last) return { clean: buf };
-  const payload = last[1] ?? "";
-  let parsed: RunJson | undefined;
-  try {
-    parsed = JSON.parse(payload) as RunJson;
-  } catch {}
-  const start = last.index as number;
-  const end = start + last[0].length;
-  const clean = buf.slice(0, start) + buf.slice(end);
-  let flat: GenMetrics | undefined;
-  const s = parsed?.stats;
-  if (s) {
-    flat = {
-      ttft_ms: s.timeToFirstTokenSec != null ? Math.max(0, s.timeToFirstTokenSec) * 1000 : null,
-      tok_per_sec: s.tokensPerSecond ?? null,
-      output_tokens: s.predictedTokensCount ?? null,
-      input_tokens_est: s.promptTokensCount ?? null,
-      total_tokens_est: s.totalTokensCount ?? null,
-      stop_reason: s.stopReason ?? null,
-    };
-  }
-  return { clean, json: parsed, flat };
-}
-
-export function stripRunJson(raw: string): {
-  text: string;
-  json?: RunJson;
-  flat?: GenMetrics;
-} {
-  const { clean, json, flat } = extractRunJsonFromBuffer(raw);
-  return { text: clean, json, flat };
-}
-
-export { MET_START as MET_START_TAG, MET_END as MET_END_TAG };
-
-export function getNormalizedBudget(r?: RunJson | null): NormalizedBudget | null {
-  if (!r) return null;
-  const bv = r.budget_view as BudgetViewJson | null | undefined;
-  if (bv && bv.modelCtx != null) {
-    return {
-      modelCtx: bv.modelCtx as number,
-      clampMargin: (bv.clampMargin as number) ?? 0,
-      inputTokensEst: (bv.inputTokensEst as number) ?? 0,
-      outBudgetChosen: (bv.outBudgetChosen as number) ?? 0,
-      outBudgetMaxAllowed: (bv.outBudgetMaxAllowed as number) ?? 0,
-      overByTokens: (bv.overByTokens as number) ?? 0,
-    };
-  }
-  const tb = r.stats?.budget as TurnBudgetJson | null | undefined;
-  if (tb && tb.n_ctx != null) {
-    const nctx = tb.n_ctx ?? 0;
-    const margin = tb.clamp_margin ?? 0;
-    const inp = tb.input_tokens_est ?? 0;
-    const chosen = tb.clamped_out_tokens ?? 0;
-    const avail = Math.max(0, nctx - inp - margin);
-    return {
-      modelCtx: nctx,
-      clampMargin: margin,
-      inputTokensEst: inp,
-      outBudgetChosen: chosen,
-      outBudgetMaxAllowed: Math.max(0, avail),
-      overByTokens: Math.max(0, (tb.requested_out_tokens ?? chosen) - avail),
-    };
-  }
-  return null;
-}
-
-export function getRagTelemetry(r?: RunJson | null): RagTelemetry | null {
-  if (!r) return null;
-  const bv = r.budget_view as BudgetViewJson | null | undefined;
-  if (bv?.rag) return bv.rag || null;
-  const tb = r.stats?.budget as TurnBudgetJson | null | undefined;
-  if (tb?.rag) return tb.rag || null;
-  return null;
-}
-
-export function getWebTelemetry(r?: RunJson | null): WebTelemetry | null {
-  if (!r) return null;
-  const bv = r.budget_view as BudgetViewJson | null | undefined;
-  if (bv?.web) return bv.web || null;
-  const tb = r.stats?.budget as TurnBudgetJson | null | undefined;
-  if (tb?.web) return tb.web || null;
-  return null;
-}
-
-export function getPackTelemetry(r?: RunJson | null): PackTelemetry | null {
-  if (!r) return null;
-  const bv = r.budget_view as BudgetViewJson | null | undefined;
-  if (bv?.pack) return bv.pack || null;
-  const tb = r.stats?.budget as TurnBudgetJson | null | undefined;
-  if (tb?.pack) return tb.pack || null;
-  return null;
-}
-
-export function getBudgetBreakdown(r?: RunJson | null): BudgetBreakdown | null {
-  if (!r) return null;
-  const bv = r.budget_view as BudgetViewJson | null | undefined;
-  if (bv?.breakdown) return bv.breakdown || null;
-  const tb = (r.stats?.budget as any) || null;
-  if (tb?.breakdown) return (tb.breakdown as BudgetBreakdown) || null;
-  return null;
-}
-
-export function getTimingMetrics(
-  r?: RunJson | null
-): {
-  ttftSec: number | null;
-  totalSec: number | null;
-  genSec: number | null;
-  queueWaitSec: number | null;
-  preModelSec: number | null;
-  modelQueueSec: number | null;
-  engine?: {
-    loadSec?: number | null;
-    promptSec?: number | null;
-    evalSec?: number | null;
-    promptN?: number | null;
-    evalN?: number | null;
-  } | null;
-} | null {
-  if (!r?.stats) return null;
-  const timings: any = (r.stats as any).timings || null;
-  const ttftSec =
-    typeof timings?.ttftSec === "number"
-      ? timings.ttftSec
-      : typeof r.stats.timeToFirstTokenSec === "number"
-      ? r.stats.timeToFirstTokenSec
-      : null;
-  const totalSec =
-    typeof timings?.totalSec === "number"
-      ? timings.totalSec
-      : typeof r.stats.totalTimeSec === "number"
-      ? r.stats.totalTimeSec
-      : null;
-  const genSec = typeof timings?.genSec === "number" ? timings.genSec : null;
-
-  const qvFromBV = (r.budget_view as any)?.queueWaitSec;
-  const qvFromStats = (r.stats as any)?.budget?.queueWaitSec;
-  const queueWaitSec =
-    typeof qvFromBV === "number"
-      ? qvFromBV
-      : typeof qvFromStats === "number"
-      ? qvFromStats
-      : typeof timings?.queueWaitSec === "number"
-      ? timings.queueWaitSec
-      : null;
-
-  const preModelSec =
-    typeof timings?.preModelSec === "number" ? timings.preModelSec : null;
-  const modelQueueSec =
-    typeof timings?.modelQueueSec === "number" ? timings.modelQueueSec : null;
-  const engine = timings?.engine ?? null;
-  return { ttftSec, totalSec, genSec, queueWaitSec, preModelSec, modelQueueSec, engine };
-}
-
-export function getThroughput(r?: RunJson | null): {
-  encodeTps: number | null;
-  decodeTps: number | null;
-  overallTps: number | null;
-  promptN: number | null;
-  evalN: number | null;
-} | null {
-  if (!r?.stats) return null;
-  const promptN =
-    typeof r.stats.promptTokensCount === "number"
-      ? r.stats.promptTokensCount
-      : typeof r.stats.timings?.engine?.promptN === "number"
-      ? r.stats.timings!.engine!.promptN!
-      : null;
-  const evalN =
-    typeof r.stats.predictedTokensCount === "number"
-      ? r.stats.predictedTokensCount
-      : typeof r.stats.timings?.engine?.evalN === "number"
-      ? r.stats.timings!.engine!.evalN!
-      : null;
-  const modelQueueSec =
-    typeof r.stats.timings?.modelQueueSec === "number"
-      ? r.stats.timings!.modelQueueSec!
-      : null;
-  const genSec =
-    typeof r.stats.timings?.genSec === "number"
-      ? r.stats.timings!.genSec!
-      : null;
-  const totalTokens =
-    typeof r.stats.totalTokensCount === "number"
-      ? r.stats.totalTokensCount
-      : null;
-  const totalSec =
-    typeof r.stats.totalTimeSec === "number"
-      ? r.stats.totalTimeSec
-      : typeof r.stats.timings?.totalSec === "number"
-      ? r.stats.timings!.totalSec!
-      : null;
-  const safeDiv = (n: number | null, d: number | null) =>
-    n != null && d != null && d > 0 ? n / d : null;
-  const encodeTps = safeDiv(promptN, modelQueueSec);
-  const decodeTps = safeDiv(evalN, genSec);
-  const overallTps = safeDiv(totalTokens, totalSec);
-  return { encodeTps, decodeTps, overallTps, promptN, evalN };
-}
-
-# ===== frontend/src/file_read/shared/lib/runjson.ts =====
-
-// frontend/src/file_read/components/shared/lib/runjson.ts
-export * from "./runjson.types";
-export * from "./runjson.helpers";
-
-# ===== frontend/src/file_read/shared/lib/runjson.types.ts =====
-
-// frontend/src/file_read/components/shared/lib/runjson.types.ts
-export const MET_START = "[[RUNJSON]]";
-export const MET_END = "[[/RUNJSON]]";
-
-export type GenMetrics = {
-  ttft_ms?: number | null;
-  tok_per_sec?: number | null;
-  output_tokens?: number | null;
-  input_tokens_est?: number | null;
-  total_tokens_est?: number | null;
-  stop_reason?: string | null;
-};
-
-export type RagTelemetry = {
-  routerDecideSec?: number;
-  routerNeeded?: boolean;
-  routerQuery?: string;
-  embedSec?: number;
-  searchChatSec?: number;
-  searchGlobalSec?: number;
-  hitsChat?: number;
-  hitsGlobal?: number;
-  dedupeSec?: number;
-  blockBuildSec?: number;
-  injectBuildSec?: number;
-  sessionOnlyBuildSec?: number;
-  topKRequested?: number;
-  blockChars?: number;
-  injected?: boolean;
-  mode?: string;
-  blockTokens?: number;
-  blockTokensApprox?: number;
-  packedTokensBefore?: number;
-  packedTokensAfter?: number;
-  ragTokensAdded?: number;
-  sessionOnlyTokensApprox?: number;
-  sessionOnly?: boolean;
-  routerSkipped?: boolean;
-  routerSkippedReason?: string;
-};
-
-
-export type WebBreakdown = {
-  routerSec?: number;
-  summarizeSec?: number;
-  searchSec?: number;
-  fetchSec?: number;
-  jsFetchSec?: number;
-  assembleSec?: number;
-  orchestratorSec?: number;
-  injectSec?: number;
-  totalWebPreTtftSec?: number;
-  unattributedWebSec?: number;
-  prepSec?: number;
-};
-
-export type WebTelemetry = {
-  needed?: boolean;
-  summarizedQuery?: string;
-  fetchElapsedSec?: number;
-  blockChars?: number;
-  injectElapsedSec?: number;
-  ephemeralBlocks?: number;
-  summarizer?: Record<string, unknown> | null;
-  orchestrator?: Record<string, unknown> | null;
-  elapsedSec?: number;
-  breakdown?: WebBreakdown | null;
-};
-
-
-export type PackTelemetry = {
-  packSec?: number;
-  summarySec?: number;
-  finalTrimSec?: number;
-  compressSec?: number;
-  summaryTokensApprox?: number;
-  summaryUsedLLM?: boolean;
-  packedChars?: number;
-  messages?: number;
-
-
-  packInputTokensApprox?: number;
-  packMsgs?: number;
-
-  finalTrimTokensBefore?: number;
-  finalTrimTokensAfter?: number;
-  finalTrimDroppedMsgs?: number;
-  finalTrimDroppedApproxTokens?: number;
-  finalTrimSummaryShrunkFromChars?: number;
-  finalTrimSummaryShrunkToChars?: number;
-  finalTrimSummaryDroppedChars?: number;
-
-  rollStartTokens?: number;
-  rollOverageTokens?: number;
-  rollPeeledMsgs?: number;
-  rollNewSummaryChars?: number;
-  rollNewSummaryTokensApprox?: number;
-};
-
-export type TurnBudgetJson = {
-  n_ctx?: number;
-  input_tokens_est?: number | null;
-  requested_out_tokens?: number;
-  clamped_out_tokens?: number;
-  clamp_margin?: number;
-  reserved_system_tokens?: number | null;
-  available_for_out_tokens?: number | null;
-  headroom_tokens?: number | null;
-  overage_tokens?: number | null;
-  reason?: string;
-  rag?: RagTelemetry | null;
-  web?: WebTelemetry | null;
-  pack?: PackTelemetry | null;
-  ephemeral?: boolean;
-  droppedFromSummary?: boolean;
-};
-
-export type BudgetView = {
-  modelCtx: number;
-  clampMargin: number;
-  usableCtx: number;
-  inputTokensEst: number;
-  outBudgetChosen: number;
-  outBudgetDefault: number;
-  outBudgetRequested: number;
-  outBudgetMaxAllowed: number;
-  overByTokens: number;
-  minOutTokens: number;
-  queueWaitSec: number | null;
-};
-
-export type BudgetBreakdown = {
-  ttftSec?: number;
-  preTtftAccountedSec?: number;
-  unattributedTtftSec?: number;
-};
-
-export type BudgetViewJson = Partial<BudgetView> & {
-  rag?: RagTelemetry | null;
-  web?: WebTelemetry | null;
-  pack?: PackTelemetry | null;
-  breakdown?: BudgetBreakdown | null;
-};
-
-export type RunJson = {
-  stats?: {
-    stopReason?: string | null;
-    tokensPerSecond?: number | null;
-    timeToFirstTokenSec?: number | null;
-    totalTimeSec?: number | null;
-    promptTokensCount?: number | null;
-    predictedTokensCount?: number | null;
-    totalTokensCount?: number | null;
-    budget?: TurnBudgetJson | null;
-    timings?: {
-      queueWaitSec?: number | null;
-      genSec?: number | null;
-      ttftSec?: number | null;
-      totalSec?: number | null;
-      preModelSec?: number | null;
-      modelQueueSec?: number | null;
-      engine?: {
-        loadSec?: number | null;
-        promptSec?: number | null;
-        evalSec?: number | null;
-        promptN?: number | null;
-        evalN?: number | null;
-      } | null;
-    } | null;
-  };
-  budget_view?: BudgetViewJson | null;
-  [k: string]: unknown;
-};
-
-export type NormalizedBudget = {
-  modelCtx: number;
-  clampMargin: number;
-  inputTokensEst: number;
-  outBudgetChosen: number;
-  outBudgetMaxAllowed: number;
-  overByTokens: number;
-};
-
-# ===== frontend/src/file_read/shared/lib/text.ts =====
-
-export function firstLineSmart(s: string, max = 48): string {
-  const one = s.replace(/\s+/g, " ").trim();
-  return one.length <= max ? one : one.slice(0, max - 1).trimEnd() + "…";
-}
-
-# ===== frontend/src/file_read/shared/ui/CodeCopyButton.tsx =====
-
-// frontend/src/file_read/components/CodeCopyButton.tsx
-import { Copy, Check } from "lucide-react";
-import { useState } from "react";
-
-export default function CodeCopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  async function onCopy() {
-    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
-  }
-  return (
-    <button
-      type="button"
-      onClick={onCopy}
-      title={copied ? "Copied!" : "Copy"}
-      className="inline-flex items-center justify-center w-7 h-7 rounded bg-gray-200 text-gray-600 hover:bg-gray-300 transition"
-    >
-      {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-    </button>
-  );
-}
-
-# ===== frontend/src/file_read/shared/ui/Toast.tsx =====
-
-export default function Toast({ message }: { message: string | null }) {
-  if (!message) return null;
-  return (
-    <div className="pointer-events-none fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
-      <div className="px-3 py-2 rounded-lg bg-black text-white text-xs shadow-lg">
-        {message}
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/shared/ui/TypingIndicator.tsx =====
-
-// components/TypingIndicator.tsx
-export default function TypingIndicator() {
-  return (
-    <div className="flex items-start gap-2">
-      {/* Optional avatar spot */}
-      <div className="h-8 w-8 rounded-full bg-gray-200 shrink-0" />
-      <div className="px-3 py-2 rounded-lg bg-gray-100 text-gray-600">
-        <span className="inline-flex gap-1">
-          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.2s]" />
-          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.1s]" />
-          <span className="h-2 w-2 rounded-full bg-gray-400 animate-bounce" />
-        </span>
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/types/chat.ts =====
-
-export type Role = "user" | "assistant";
-
-import type { GenMetrics, RunJson } from "../shared/lib/runjson";
-
-export type Attachment = {
-  name: string;
-  source?: string;
-  sessionId?: string | null;
-};
-
-export type ChatMsg = {
-  id: string;                // clientId
-  serverId: number | null;
-  role: Role;
-  text: string;
-
-  // NEW
-  attachments?: Attachment[];
-
-  meta?: {
-    runJson?: RunJson | null;
-    flat?: GenMetrics | null;
-  };
-};
-
-export type ChatRow = {
-  id: number;
-  sessionId: string;
-  title: string;
-  lastMessage: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type ChatMessageRow = {
-  id: number;
-  sessionId: string;
-  role: Role;
-  content: string;
-  createdAt: string;
-  attachments?: Attachment[]; // ✅ this must exist
-};
-
-# ===== frontend/src/file_read/vite-env.d.ts =====
-
-/// <reference types="vite/client" />
+  const anyUploading = useMemo(() => atts.some((a) => a.status === "uploading"), [atts]);
+  const anyReady = useMemo(() => atts.some((a) => a.status === "ready"), [atts]);
+
+  const attachmentsForPost = useCallback((): Attachment[] => {
+    return atts
+      .filter((a) => a.status === "ready")
+      .map<Attachment>((a) => {
+        const out = { name: a.name } as Attachment;
+        // If your Attachment type supports these, you can add them:
+        // (out as any).url = a.url;
+        // (out as any).contentType = a.mime;
+        // (out as any).bytes = a.size;
+        // (out as a

@@ -1,23 +1,27 @@
-// frontend/src/file_read/hooks/stream/core/network.ts
-import { API_BASE } from "../../../services/http";
+import { buildUrl, requestRaw } from "../../../services/http";
 
 export async function postStream(body: unknown, signal: AbortSignal) {
-  const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+  const url = buildUrl("/ai/generate/stream");
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  const res = await requestRaw(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
     signal,
   });
-  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok || !res.body) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${res.statusText} ${t}`);
+  }
   return res.body.getReader();
 }
 
 export async function postCancel(sessionId: string) {
   try {
-    await fetch(`${API_BASE}/api/ai/cancel/${encodeURIComponent(sessionId)}`, {
-      method: "POST",
-    });
-  } catch {
-    /* best-effort */
-  }
+    const url = buildUrl(`/ai/cancel/${encodeURIComponent(sessionId)}`);
+    await requestRaw(url, { method: "POST" });
+  } catch {}
 }

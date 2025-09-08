@@ -7,16 +7,23 @@ ai-agent-playground/
   clean-structure-3.txt
   clean-structure-4.txt
   clean-structure-5.txt
+  clean-structure-6.txt
   fs.py
   my-structure.txt
   pc.py
+  run_backend.py
   .git/
+  .runtime/
+    auth.sqlite
+    ports.json
   .venv/
     Include/
     Lib/
       site-packages/
         MarkupSafe-3.0.2.dist-info/
         PIL/
+        PyJWT-2.10.1.dist-info/
+        PyNaCl-1.5.0.dist-info/
         PyPDF2/
         PyYAML-6.0.2.dist-info/
         _cffi_backend.cp311-win_amd64.pyd
@@ -28,6 +35,8 @@ ai-agent-playground/
         anyio-4.10.0.dist-info/
         babel/
         babel-2.17.0.dist-info/
+        bcrypt/
+        bcrypt-4.3.0.dist-info/
         beautifulsoup4-4.12.3.dist-info/
         bin/
         bs4/
@@ -60,8 +69,12 @@ ai-agent-playground/
         diskcache/
         diskcache-5.6.3.dist-info/
         distutils-precedence.pth
+        dns/
+        dnspython-2.7.0.dist-info/
         docx/
         dotenv/
+        email_validator/
+        email_validator-2.3.0.dist-info/
         et_xmlfile/
         et_xmlfile-2.0.0.dist-info/
         faiss/
@@ -94,6 +107,7 @@ ai-agent-playground/
         joblib-1.5.1.dist-info/
         justext/
         justext-3.0.2.dist-info/
+        jwt/
         lib/
         llama_cpp/
         llama_cpp_python-0.3.4.dist-info/
@@ -105,6 +119,7 @@ ai-agent-playground/
         mpmath/
         mpmath-1.3.0.dist-info/
         multipart/
+        nacl/
         networkx/
         networkx-3.5.dist-info/
         numpy/
@@ -118,12 +133,16 @@ ai-agent-playground/
         pandas/
         pandas-2.2.2.dist-info/
         pandas.libs/
+        passlib/
+        passlib-1.7.4.dist-info/
         pdfminer/
         pdfminer.six-20240706.dist-info/
         pillow-10.4.0.dist-info/
         pip/
         pip-25.2.dist-info/
         pkg_resources/
+        platformdirs/
+        platformdirs-4.4.0.dist-info/
         pptx/
         primp/
         primp-0.15.0.dist-info/
@@ -175,6 +194,8 @@ ai-agent-playground/
         soupsieve-2.7.dist-info/
         starlette/
         starlette-0.47.2.dist-info/
+        stripe/
+        stripe-12.5.1.dist-info/
         striprtf/
         striprtf-0.0.26.dist-info/
         sympy/
@@ -229,6 +250,7 @@ ai-agent-playground/
       deactivate.bat
       dotenv.exe
       dumppdf.py
+      email_validator.exe
       f2py.exe
       fastapi.exe
       hf.exe
@@ -265,7 +287,10 @@ ai-agent-playground/
   .vscode/
     settings.json
   aimodel/
+    .runtime/
+      ports.json
     file_read/
+      .env
       __init__.py
       app.py
       requirements.txt
@@ -277,31 +302,39 @@ ai-agent-playground/
           settings.json
       api/
         __init__.py
+        billing.py
         chats.py
         generate_router.py
+        licensing.py
+        local_auth.py
         metrics.py
         models.py
         rag.py
         settings.py
       backend/
-        .env
+        .runtime/
+          ports.json
       core/
         __init__.py
         files.py
-        logging_init.py
         packing_memory_core.py
         packing_ops.py
+        request_ctx.py
         schemas.py
         settings.py
         style.py
       rag/
-        retrieve.py
+        __init__.py
+        rerank.py
+        retrieve_common.py
+        retrieve_core.py
+        retrieve_pipeline.py
+        retrieve_tabular.py
         router_ai.py
         schemas.py
         search.py
         store.py
         uploads.py
-        worker.py
         ingest/
           __init__.py
           common.py
@@ -310,6 +343,7 @@ ai-agent-playground/
           docx_ingest.py
           excel_ingest.py
           excel_ingest_core.py
+          main.py
           ocr.py
           pdf_ingest.py
           ppt_ingest.py
@@ -318,19 +352,20 @@ ai-agent-playground/
         __init__.py
         model_runtime.py
       services/
+        __init__.py
         attachments.py
         budget.py
         cancel.py
         context_window.py
         generate_flow.py
         generate_pipeline.py
+        generate_pipeline_part2.py
         generate_pipeline_support.py
         packing.py
         prompt_utils.py
         router_text.py
         session_io.py
         streaming_worker.py
-        warmup.py
       store/
         __init__.py
         base.py
@@ -355,9 +390,10 @@ ai-agent-playground/
             meta.jsonl
       utils/
         streaming.py
+        text.py
       web/
         __init__.py
-        duckduckgo.py
+        brave.py
         fetch.py
         orchestrator.py
         orchestrator_common.py
@@ -366,6 +402,317 @@ ai-agent-playground/
         router_ai.py
       workers/
         retitle_worker.py
+  cloudflare/
+    .gitignore
+    gen-keys.js
+    package-lock.json
+    package.json
+    tsconfig.json
+    worker-licensing.ts
+    wrangler.toml
+    .wrangler/
+      tmp/
+    node_modules/
+      .bin/
+      .cache/
+      .package-lock.json
+      @cloudflare/
+      @cspotcode/
+      @emnapi/
+      @esbuild/
+      @esbuild-plugins/
+      @fastify/
+      @img/
+      @jridgewell/
+      acorn/
+      acorn-walk/
+      as-table/
+      blake3-wasm/
+      color/
+      color-convert/
+      color-name/
+      color-string/
+      cookie/
+      data-uri-to-buffer/
+      defu/
+      detect-libc/
+      esbuild/
+      escape-string-regexp/
+      estree-walker/
+      exit-hook/
+      exsolve/
+      get-source/
+      glob-to-regexp/
+      is-arrayish/
+      magic-string/
+      mime/
+      miniflare/
+      mustache/
+      ohash/
+      path-to-regexp/
+      pathe/
+      printable-characters/
+      rollup-plugin-inject/
+      rollup-plugin-node-polyfills/
+      rollup-pluginutils/
+      semver/
+      sharp/
+      simple-swizzle/
+      source-map/
+      sourcemap-codec/
+      stacktracey/
+      stoppable/
+      tweetnacl/
+      ufo/
+      undici/
+      unenv/
+      workerd/
+      wrangler/
+      ws/
+      youch/
+      zod/
+  desktop/
+    main.ts
+    package-lock.json
+    package.json
+    tsconfig.json
+    node_modules/
+      .bin/
+      .package-lock.json
+      7zip-bin/
+      @develar/
+      @electron/
+      @gar/
+      @isaacs/
+      @malept/
+      @npmcli/
+      @pkgjs/
+      @sindresorhus/
+      @szmarczak/
+      @tootallnate/
+      @types/
+      @xmldom/
+      agent-base/
+      ajv/
+      ajv-keywords/
+      ansi-regex/
+      ansi-styles/
+      app-builder-bin/
+      app-builder-lib/
+      archiver/
+      archiver-utils/
+      argparse/
+      async/
+      async-exit-hook/
+      asynckit/
+      at-least-node/
+      balanced-match/
+      base64-js/
+      bl/
+      bluebird/
+      bluebird-lst/
+      boolean/
+      brace-expansion/
+      buffer/
+      buffer-crc32/
+      buffer-equal/
+      buffer-from/
+      builder-util/
+      builder-util-runtime/
+      cacheable-lookup/
+      cacheable-request/
+      call-bind-apply-helpers/
+      chalk/
+      chownr/
+      chromium-pickle-js/
+      ci-info/
+      cliui/
+      clone-response/
+      color-convert/
+      color-name/
+      combined-stream/
+      commander/
+      compare-version/
+      compress-commons/
+      concat-map/
+      config-file-ts/
+      core-util-is/
+      crc-32/
+      crc32-stream/
+      cross-spawn/
+      debug/
+      decompress-response/
+      defer-to-connect/
+      define-data-property/
+      define-properties/
+      delayed-stream/
+      detect-node/
+      dir-compare/
+      dmg-builder/
+      dotenv/
+      dotenv-expand/
+      dunder-proto/
+      eastasianwidth/
+      ejs/
+      electron/
+      electron-builder/
+      electron-builder-squirrel-windows/
+      electron-publish/
+      emoji-regex/
+      end-of-stream/
+      env-paths/
+      err-code/
+      es-define-property/
+      es-errors/
+      es-object-atoms/
+      es-set-tostringtag/
+      es6-error/
+      escalade/
+      escape-string-regexp/
+      extract-zip/
+      fast-deep-equal/
+      fast-json-stable-stringify/
+      fd-slicer/
+      filelist/
+      foreground-child/
+      form-data/
+      fs-constants/
+      fs-extra/
+      fs-minipass/
+      fs.realpath/
+      function-bind/
+      get-caller-file/
+      get-intrinsic/
+      get-proto/
+      get-stream/
+      glob/
+      global-agent/
+      globalthis/
+      gopd/
+      got/
+      graceful-fs/
+      has-flag/
+      has-property-descriptors/
+      has-symbols/
+      has-tostringtag/
+      hasown/
+      hosted-git-info/
+      http-cache-semantics/
+      http-proxy-agent/
+      http2-wrapper/
+      https-proxy-agent/
+      iconv-lite/
+      ieee754/
+      inflight/
+      inherits/
+      is-ci/
+      is-fullwidth-code-point/
+      isarray/
+      isbinaryfile/
+      isexe/
+      jackspeak/
+      jake/
+      js-yaml/
+      json-buffer/
+      json-schema-traverse/
+      json-stringify-safe/
+      json5/
+      jsonfile/
+      keyv/
+      lazy-val/
+      lazystream/
+      lodash/
+      lodash.defaults/
+      lodash.difference/
+      lodash.flatten/
+      lodash.isplainobject/
+      lodash.union/
+      lowercase-keys/
+      lru-cache/
+      matcher/
+      math-intrinsics/
+      mime/
+      mime-db/
+      mime-types/
+      mimic-response/
+      minimatch/
+      minimist/
+      minipass/
+      minizlib/
+      mkdirp/
+      ms/
+      normalize-path/
+      normalize-url/
+      object-keys/
+      once/
+      p-cancelable/
+      package-json-from-dist/
+      path-is-absolute/
+      path-key/
+      path-scurry/
+      pend/
+      picocolors/
+      plist/
+      process-nextick-args/
+      progress/
+      promise-retry/
+      pump/
+      punycode/
+      quick-lru/
+      read-config-file/
+      readable-stream/
+      readdir-glob/
+      require-directory/
+      resolve-alpn/
+      responselike/
+      retry/
+      roarr/
+      safe-buffer/
+      safer-buffer/
+      sanitize-filename/
+      sax/
+      semver/
+      semver-compare/
+      serialize-error/
+      shebang-command/
+      shebang-regex/
+      signal-exit/
+      simple-update-notifier/
+      source-map/
+      source-map-support/
+      sprintf-js/
+      stat-mode/
+      string-width/
+      string-width-cjs/
+      string_decoder/
+      strip-ansi/
+      strip-ansi-cjs/
+      sumchecker/
+      supports-color/
+      tar/
+      tar-stream/
+      temp-file/
+      tmp/
+      tmp-promise/
+      truncate-utf8-bytes/
+      type-fest/
+      typescript/
+      undici-types/
+      universalify/
+      uri-js/
+      utf8-byte-length/
+      util-deprecate/
+      which/
+      wrap-ansi/
+      wrap-ansi-cjs/
+      wrappy/
+      xmlbuilder/
+      y18n/
+      yallist/
+      yargs/
+      yargs-parser/
+      yauzl/
+      zip-stream/
   frontend/
     .env.development
     .gitignore
@@ -383,8 +730,8 @@ ai-agent-playground/
     vite.config.ts
     node_modules/
       .bin/
-      .lightningcss-win32-x64-msvc-VUcSpYcj/
       .package-lock.json
+      .tmp/
       .vite/
       .vite-temp/
       @alloc/
@@ -392,12 +739,15 @@ ai-agent-playground/
       @esbuild/
       @eslint/
       @eslint-community/
+      @firebase/
+      @grpc/
       @humanfs/
       @humanwhocodes/
       @isaacs/
       @jridgewell/
       @nodelib/
       @pkgjs/
+      @protobufjs/
       @rolldown/
       @rollup/
       @swc/
@@ -433,6 +783,7 @@ ai-agent-playground/
       character-reference-invalid/
       chokidar/
       chownr/
+      cliui/
       color-convert/
       color-name/
       comma-separated-tokens/
@@ -474,14 +825,17 @@ ai-agent-playground/
       fast-json-stable-stringify/
       fast-levenshtein/
       fastq/
+      faye-websocket/
       file-entry-cache/
       fill-range/
       find-up/
+      firebase/
       flat-cache/
       flatted/
       foreground-child/
       fraction.js/
       function-bind/
+      get-caller-file/
       glob/
       glob-parent/
       globals/
@@ -495,6 +849,8 @@ ai-agent-playground/
       hast-util-whitespace/
       highlight.js/
       html-url-attributes/
+      http-parser-js/
+      idb/
       ignore/
       import-fresh/
       imurmurhash/
@@ -524,9 +880,11 @@ ai-agent-playground/
       lilconfig/
       lines-and-columns/
       locate-path/
+      lodash.camelcase/
       lodash.castarray/
       lodash.isplainobject/
       lodash.merge/
+      long/
       longest-streak/
       lowlight/
       lru-cache/
@@ -614,6 +972,7 @@ ai-agent-playground/
       postcss-value-parser/
       prelude-ls/
       property-information/
+      protobufjs/
       punycode/
       queue-microtask/
       react/
@@ -628,11 +987,13 @@ ai-agent-playground/
       remark-parse/
       remark-rehype/
       remark-stringify/
+      require-directory/
       resolve/
       resolve-from/
       reusify/
       rollup/
       run-parallel/
+      safe-buffer/
       scheduler/
       semver/
       set-cookie-parser/
@@ -663,6 +1024,7 @@ ai-agent-playground/
       trough/
       ts-api-utils/
       ts-interface-checker/
+      tslib/
       type-check/
       typescript/
       typescript-eslint/
@@ -680,12 +1042,18 @@ ai-agent-playground/
       vfile/
       vfile-message/
       vite/
+      web-vitals/
+      websocket-driver/
+      websocket-extensions/
       which/
       word-wrap/
       wrap-ansi/
       wrap-ansi-cjs/
+      y18n/
       yallist/
       yaml/
+      yargs/
+      yargs-parser/
       yocto-queue/
       zwitch/
     public/
@@ -696,6 +1064,15 @@ ai-agent-playground/
         index.css
         main.tsx
         vite-env.d.ts
+        api/
+          billing.ts
+          licensingWorker.ts
+        auth/
+          AuthContext.tsx
+          ForgotPassword.tsx
+          SignIn.tsx
+          SignUp.tsx
+          localAuth.ts
         components/
           AssistantMetrics.tsx
           ChatBubble.tsx
@@ -705,13 +1082,16 @@ ai-agent-playground/
           DesktopHeader.tsx
           KnowledgePanel.tsx
           MetricsHoverCard.tsx
+          MetricsHoverCardPanel.tsx
           MobileDrawer.tsx
+          SearchTester.tsx
           SettingsPanel.tsx
           Budget/
             BudgetBar.tsx
             BudgetBarPanelsCore.tsx
             BudgetBarPanelsExtras.tsx
           ChatSidebar/
+            AccountPanel.tsx
             ChatSidebar.tsx
             SidebarHeader.tsx
             SidebarListItem.tsx
@@ -724,6 +1104,10 @@ ai-agent-playground/
             ProgressBar.tsx
           Markdown/
             MarkdownMessage.tsx
+          Settings/
+            BraveSearchCard.tsx
+            UpgradeSection.tsx
+            WebSearchSection.tsx
         data/
           chatApi.ts
           ragApi.ts
@@ -745,7 +1129,6 @@ ai-agent-playground/
           useSidebar.ts
           useStream.ts
           useToast.ts
-          data/
           stream/
             core/
               buffer.ts

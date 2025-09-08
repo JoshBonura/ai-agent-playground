@@ -15,7 +15,6 @@ type PanelProps = {
   title: string;
 };
 
-const asNum = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const num0 = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
 export default function MetricsHoverCardPanel({ data, title }: PanelProps) {

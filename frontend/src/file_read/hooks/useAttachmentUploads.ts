@@ -1,71 +1,164 @@
-import { useState } from "react";
-import { uploadRagWithProgress, deleteUploadHard } from "../data/ragApi";
+import { useCallback, useMemo, useRef, useState } from "react";
+import type { Attachment } from "../types/chat";
+import { requestRaw } from "../services/http";
 
-export type Att = {
-  id: string;
+// Local UI id for keys & removal
+const makeUiId = () =>
+  Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+
+export type UIAttachment = {
+  uiId: string;
   name: string;
-  pct: number;
+
+  // UI state
   status: "uploading" | "ready" | "error";
-  abort?: AbortController;
+  pct: number;           // 0..100
+  error?: string;
+
+  // Optional extras
+  size?: number;
+  mime?: string;
+  url?: string;
+  serverId?: string;     // if backend returns an id
 };
 
-export function useAttachmentUploads(sessionId?: string, onRefreshChats?: () => void) {
-  const [atts, setAtts] = useState<Att[]>([]);
+type ReturnShape = {
+  atts: UIAttachment[];
+  addFiles: (files: FileList | File[]) => Promise<void>;
+  removeAtt: (arg: string | UIAttachment) => void; // accepts uiId or whole object
+  anyUploading: boolean;
+  anyReady: boolean;
+  attachmentsForPost: () => Attachment[];          // what your API expects
+  reset: () => void;
+};
 
-  const anyUploading = atts.some(a => a.status === "uploading");
-  const anyReady = atts.some(a => a.status === "ready");
+export function useAttachmentUploads(
+  sessionId?: string,
+  onRefreshChats?: () => void
+): ReturnShape {
+  const [atts, setAtts] = useState<UIAttachment[]>([]);
+  const triedEndpoints = useRef<string[] | null>(null);
 
-  async function addFiles(files: FileList | File[]) {
-    if (!files || !sessionId) return;
-    const picked = Array.from(files);
-    const news: Att[] = picked.map((f, i) => ({
-      id: `${Date.now()}-${i}-${f.name}`,
-      name: f.name,
-      pct: 0,
-      status: "uploading",
-      abort: new AbortController(),
-    }));
-    setAtts(prev => [...prev, ...news]);
+  const detectAndUpload = useCallback(
+    async (file: File): Promise<UIAttachment> => {
+      const endpoints =
+        triedEndpoints.current ??
+        ["/api/rag/upload", "/api/rag/uploads", "/api/uploads"];
 
-    news.forEach((att, idx) => {
-      const f = picked[idx];
-      uploadRagWithProgress(
-        f,
-        sessionId,
-        (pct) => setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct } : a)),
-        att.abort?.signal
-      )
-        .then(() => {
-          setAtts(prev => prev.map(a => a.id === att.id ? { ...a, pct: 100, status: "ready", abort: undefined } : a));
-          onRefreshChats?.();
+      let lastErr: unknown = null;
+
+      for (const ep of endpoints) {
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          if (sessionId) fd.append("sessionId", sessionId);
+
+          const res = await requestRaw(ep, { method: "POST", body: fd });
+          const text = await res.text();
+          if (!res.ok) throw new Error(`Upload failed (${res.status}) ${res.statusText} ${text || ""}`.trim());
+
+          let data: any = {};
+          try { data = text ? JSON.parse(text) : {}; } catch {}
+
+          const ui: UIAttachment = {
+            uiId: makeUiId(),
+            name: (data.name ?? file.name) as string,
+            status: "ready",
+            pct: 100,
+            size: Number(data.size ?? file.size) || file.size,
+            mime: (data.contentType ?? data.mime ?? file.type) as string,
+            url: (data.url ?? data.location ?? undefined) as string | undefined,
+            serverId: (data.id ?? data.fileId ?? data.uploadId)?.toString(),
+          };
+
+          if (!triedEndpoints.current) {
+            triedEndpoints.current = [ep, ...endpoints.filter((e) => e !== ep)];
+          }
+          return ui;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr ?? new Error("No working upload endpoint found");
+    },
+    [sessionId]
+  );
+
+  const addFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const arr = Array.from(files);
+      if (arr.length === 0) return;
+
+      // optimistic rows
+      const optimistic: UIAttachment[] = arr.map((f) => ({
+        uiId: makeUiId(),
+        name: f.name,
+        status: "uploading",
+        pct: 0,
+        size: f.size,
+        mime: f.type,
+      }));
+      setAtts((cur) => [...cur, ...optimistic]);
+
+      await Promise.all(
+        arr.map(async (file, i) => {
+          const tempUiId = optimistic[i].uiId;
+          try {
+            const finalUi: UIAttachment = sessionId
+              ? await detectAndUpload(file)
+              : {
+                  uiId: makeUiId(),
+                  name: file.name,
+                  status: "ready",
+                  pct: 100,
+                  size: file.size,
+                  mime: file.type,
+                };
+
+            setAtts((cur) => cur.map((a) => (a.uiId === tempUiId ? finalUi : a)));
+          } catch (e: any) {
+            setAtts((cur) =>
+              cur.map((a) =>
+                a.uiId === tempUiId
+                  ? { ...a, status: "error", pct: 0, error: e?.message ?? "Upload failed." }
+                  : a
+              )
+            );
+          }
         })
-        .catch(() => {
-          setAtts(prev => prev.map(a => a.id === att.id ? { ...a, status: "error", abort: undefined } : a));
-        });
-    });
-  }
+      );
 
-  async function removeAtt(att: Att) {
-    if (att.status === "uploading" && att.abort) {
-      try { att.abort.abort(); } catch {}
-    }
-    if (sessionId) {
-      try { await deleteUploadHard(att.name, sessionId); } catch {}
-    }
-    setAtts(prev => prev.filter(a => a.id !== att.id));
-    onRefreshChats?.();
-  }
+      onRefreshChats?.();
+    },
+    [detectAndUpload, onRefreshChats, sessionId]
+  );
 
-  function attachmentsForPost(): Array<{ name: string; source: string; sessionId: string }> {
-    if (!sessionId) return [];
+  const removeAtt = useCallback((arg: string | UIAttachment) => {
+    const uiId = typeof arg === "string" ? arg : arg.uiId;
+    setAtts((cur) => cur.filter((a) => a.uiId !== uiId));
+  }, []);
+
+  const anyUploading = useMemo(() => atts.some((a) => a.status === "uploading"), [atts]);
+  const anyReady = useMemo(() => atts.some((a) => a.status === "ready"), [atts]);
+
+  const attachmentsForPost = useCallback((): Attachment[] => {
     return atts
-      .filter(a => a.status === "ready")
-      .map(a => ({ name: a.name, source: a.name, sessionId }));
-  }
+      .filter((a) => a.status === "ready")
+      .map<Attachment>((a) => {
+        const out = { name: a.name } as Attachment;
+        // If your Attachment type supports these, you can add them:
+        // (out as any).url = a.url;
+        // (out as any).contentType = a.mime;
+        // (out as any).bytes = a.size;
+        // (out as any).id = a.serverId;
+        return out;
+      });
+  }, [atts]);
 
-  function reset() {
-    setAtts([]);
-  }
+  const reset = useCallback(() => setAtts([]), []);
 
   return { atts, addFiles, removeAtt, anyUploading, anyReady, attachmentsForPost, reset };
 }
+
+// Back-compat alias if you want to import as Att
+export type Att = UIAttachment;

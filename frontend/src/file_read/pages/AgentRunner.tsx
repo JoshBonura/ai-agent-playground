@@ -1,4 +1,5 @@
-import { useState } from "react";
+//frontend/src/file_read/pages/AgentRunner.tsx
+import { useEffect, useState } from "react";
 import ChatContainer from "../components/ChatContainer";
 import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
 import { useChatStream } from "../hooks/useChatStream";
@@ -8,8 +9,6 @@ import DesktopHeader from "../components/DesktopHeader";
 import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
 import { createChat, deleteMessagesBatch } from "../data/chatApi";
-
-// NEW: settings panel
 import SettingsPanel from "../components/SettingsPanel";
 import KnowledgePanel from "../components/KnowledgePanel";
 
@@ -22,11 +21,21 @@ export default function AgentRunner() {
   const [autoFollow, setAutoFollow] = useState(true);
   const { toast, show } = useToast();
   const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
-
-  // NEW: settings modal
   const [showSettings, setShowSettings] = useState(false);
 
-  // ⛔ Removed the mount-time bootstrap that fetched chats and loaded history.
+useEffect(() => {
+  const openSettings = () => setShowSettings(true);
+  const openKnowledge = () => setShowKnowledge(true);
+  const openCustomize = () => setShowKnowledge(true);
+  window.addEventListener("open:settings", openSettings);
+  window.addEventListener("open:knowledge", openKnowledge);
+  window.addEventListener("open:customize", openCustomize);
+  return () => {
+    window.removeEventListener("open:settings", openSettings);
+    window.removeEventListener("open:knowledge", openKnowledge);
+    window.removeEventListener("open:customize", openCustomize);
+  };
+}, []);
 
   async function newChat(): Promise<void> {
     const id = crypto.randomUUID();
@@ -48,9 +57,6 @@ export default function AgentRunner() {
     await refreshFollow();
   }
 
-  // --- TWO REFRESH HELPERS ---
-
-  // 1) Follow-to-bottom refresh (normal)
   async function refreshFollow() {
     const sid = chat.sessionIdRef.current;
     if (!sid) return;
@@ -60,38 +66,29 @@ export default function AgentRunner() {
     if (el) el.scrollTop = el.scrollHeight;
   }
 
-async function handleCancelSessions(ids: string[]) {
-  if (!ids?.length) return;
-
-  const currentId = chat.sessionIdRef.current || "";
-  const deletingActive = currentId && ids.includes(currentId);
-
-  if (deletingActive) {
-    // clear out current session instead of making a new one
-    chat.setSessionId("");
-    chat.setInput("");
-    chat.clearMetrics?.();
-    // optional: clear messages too
-    chat.reset();
-    localStorage.removeItem(LS_KEY);
+  async function handleCancelSessions(ids: string[]) {
+    if (!ids?.length) return;
+    const currentId = chat.sessionIdRef.current || "";
+    const deletingActive = currentId && ids.includes(currentId);
+    if (deletingActive) {
+      chat.setSessionId("");
+      chat.setInput("");
+      chat.clearMetrics?.();
+      chat.reset();
+      localStorage.removeItem(LS_KEY);
+    }
+    setRefreshKey((k) => k + 1);
+    try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
   }
 
-  setRefreshKey((k) => k + 1);
-  try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
-}
-
-
-  // 2) Preserve-scroll refresh (use for deletions, etc.)
   async function refreshPreserve() {
     const sid = chat.sessionIdRef.current;
     if (!sid) return;
     const el = document.getElementById("chat-scroll-container");
     const prevTop = el?.scrollTop ?? 0;
     const prevHeight = el?.scrollHeight ?? 0;
-
     setAutoFollow(false);
     await chat.loadHistory(sid);
-
     requestAnimationFrame(() => {
       if (el) {
         const newHeight = el.scrollHeight;
@@ -101,35 +98,25 @@ async function handleCancelSessions(ids: string[]) {
     });
   }
 
-  // Delete by clientId(s). Immediate UI remove; API delete only for server-backed msgs.
   async function handleDeleteMessages(clientIds: string[]) {
     const sid = chat.sessionIdRef.current;
     if (!sid || !clientIds?.length) return;
-
     const current = chat.messages;
     const toDelete = new Set(clientIds);
-
     const serverIds = current
       .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
       .map((m: any) => m.serverId as number);
-
     const remaining = current.filter((m) => !toDelete.has(m.id));
-
-    // Optimistic local state
     if ((chat as any).setMessagesForSession) {
       (chat as any).setMessagesForSession(sid, () => remaining);
     }
-
     try {
       if (serverIds.length) {
         await deleteMessagesBatch(sid, serverIds);
       }
-
       await refreshPreserve();
-
       setRefreshKey((k) => k + 1);
       try { window.dispatchEvent(new CustomEvent("chats:refresh")); } catch {}
-
       show("Message deleted");
     } catch {
       show("Failed to delete message");
@@ -169,29 +156,9 @@ async function handleCancelSessions(ids: string[]) {
           onShowSidebar={() => setSidebarOpen(true)}
         />
 
-        <div className="px-3 md:px-6 pt-2">
-          <div className="mx-auto max-w-3xl md:max-w-4xl flex justify-end gap-2">
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowKnowledge(true)}
-              title="Open Knowledge"
-            >
-              Knowledge
-            </button>
-            <button
-              className="text-xs px-3 py-1.5 rounded border bg-white hover:bg-gray-50"
-              onClick={() => setShowSettings(true)}
-              title="Open Settings"
-            >
-              Settings
-            </button>
-          </div>
-        </div>
-
         <div className="flex-1 min-h-0">
           <div className="h-full px-3 md:px-6">
             <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              {/* Note: add id on the scroll container wrapper for refresh helpers */}
               <div id="chat-scroll-container" className="h-full">
                 <ChatContainer
                   messages={chat.messages}
@@ -206,7 +173,7 @@ async function handleCancelSessions(ids: string[]) {
                   onRefreshChats={() => {}}
                   onDeleteMessages={handleDeleteMessages}
                   autoFollow={autoFollow}
-                  sessionId={chat.sessionIdRef.current} // enables per-chat uploads
+                  sessionId={chat.sessionIdRef.current}
                 />
               </div>
               <Toast message={toast} />
@@ -215,7 +182,6 @@ async function handleCancelSessions(ids: string[]) {
         </div>
       </div>
 
-      {/* NEW: settings modal */}
       {showSettings && (
         <SettingsPanel
           sessionId={chat.sessionIdRef.current}

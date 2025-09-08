@@ -1,0 +1,37 @@
+{
+  "name": "localmind-desktop",
+  "version": "0.1.0",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "tsc && electron .",
+    "build:frontend": "cd ../frontend && npm ci && npm run build",
+    "build:backend": "pyinstaller --onefile --name localmind-backend ../run_backend.py",
+    "prepack": "npm run build:frontend && npm run build:backend && tsc",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.localmind.app",
+    "files": [
+      "dist/**/*",
+      "../.runtime/**",
+      "../frontend/dist/**",
+      "../dist/localmind-backend*", 
+      "../run_backend.py",
+      "../aimodel/**"               
+    ],
+    "extraResources": [
+      { "from": "../dist", "to": "dist" }
+    ],
+    "win": { "target": "nsis" },
+    "mac": { "target": "dmg" },
+    "linux": { "target": "AppImage" }
+  },
+  "dependencies": {
+    "electron": "^31.0.0"
+  },
+  "devDependencies": {
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.4.0"
+  }
+}

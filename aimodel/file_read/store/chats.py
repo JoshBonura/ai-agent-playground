@@ -17,7 +17,7 @@ def _load_chat(session_id: str) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
         if "summary" not in data:
-            data["summary"] = "" 
+            data["summary"] = ""
         return data
 
 
@@ -28,7 +28,7 @@ class ChatMessageRow:
     role: str
     content: str
     createdAt: str
-    attachments: Optional[List[Dict]] = None   
+    attachments: Optional[List[Dict]] = None
 
 def _normalize_attachments(atts: Optional[list[Any]]) -> Optional[list[dict]]:
     if not atts:
@@ -106,12 +106,11 @@ def append_message(session_id: str, role: str, content: str, attachments: Option
     }
     norm_atts = _normalize_attachments(attachments)
     if norm_atts:
-        msg["attachments"] = norm_atts   
+        msg["attachments"] = norm_atts
 
     data["messages"].append(msg)
     data["seq"] = seq
     _save_chat(session_id, data)
-    ...
     return ChatMessageRow(
         id=seq,
         sessionId=session_id,
@@ -120,7 +119,6 @@ def append_message(session_id: str, role: str, content: str, attachments: Option
         createdAt=msg["createdAt"],
         attachments=norm_atts,
     )
-
 
 
 def delete_message(session_id: str, message_id: int) -> int:
@@ -167,7 +165,7 @@ def list_messages(session_id: str) -> List[ChatMessageRow]:
             role=m["role"],
             content=m["content"],
             createdAt=m.get("createdAt"),
-            attachments=m.get("attachments", []),  
+            attachments=m.get("attachments", []),
         ))
     return rows
 
@@ -217,22 +215,6 @@ def delete_batch(session_ids: List[str]) -> List[str]:
     return session_ids
 
 
-def merge_chat(source_id: str, target_id: str):
-    source_msgs = list_messages(source_id)
-    target_msgs = list_messages(target_id)
-
-    merged = []
-    for m in source_msgs:
-        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
-        merged.append(row)
-
-    for m in target_msgs:
-        row = append_message(target_id, m.role, m.content, attachments=m.attachments)
-        merged.append(row)
-
-    return merged
-
-
 def _save_chat(session_id: str, data: Dict[str, Any]):
     atomic_write(chat_path(session_id), data)
 
@@ -248,24 +230,6 @@ def get_summary(session_id: str) -> str:
     return str(data.get("summary") or "")
 
 
-def merge_chat_new(source_id: str, target_id: Optional[str] = None):
-    from uuid import uuid4
-    new_id = str(uuid4())
-    upsert_on_first_message(new_id, SETTINGS["chat_merged_title"])
-
-    merged = []
-    for m in list_messages(source_id):
-        row = append_message(new_id, m.role, m.content, attachments=m.attachments)
-        merged.append(row)
-
-    if target_id:
-        for m in list_messages(target_id):
-            row = append_message(new_id, m.role, m.content, attachments=m.attachments)
-            merged.append(row)
-
-    return new_id, merged
-
-
 def edit_message(session_id: str, message_id: int, new_content: str) -> Optional[ChatMessageRow]:
     data = _load_chat(session_id)
     msgs = data.get("messages", [])
@@ -276,15 +240,7 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
             m["content"] = new_content
             m["updatedAt"] = now_iso()
             if "attachments" in m and m["attachments"] is not None:
-                norm = []
-                for a in m["attachments"]:
-                    if hasattr(a, "dict"):
-                        norm.append(a.dict())
-                    elif isinstance(a, dict):
-                        norm.append(a)
-                    else:
-                        norm.append(dict(a))
-                m["attachments"] = norm
+                m["attachments"] = _normalize_attachments(m["attachments"])
             updated = m
             break
 
@@ -304,11 +260,10 @@ def edit_message(session_id: str, message_id: int, new_content: str) -> Optional
     )
 
 
-
 __all__ = [
     "ChatMessageRow",
     "upsert_on_first_message", "update_last", "append_message",
     "delete_message", "delete_messages_batch", "list_messages",
-    "list_paged", "delete_batch", "merge_chat", "merge_chat_new",
+    "list_paged", "delete_batch",
     "_load_chat", "_save_chat", "edit_message", "set_summary", "get_summary",
 ]

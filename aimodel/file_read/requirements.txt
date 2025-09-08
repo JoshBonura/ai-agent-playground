@@ -33,6 +33,15 @@ python-pptx==0.6.23
 
 pytesseract==0.3.13
 pypdfium2==4.30.0
-Pillow==10.4.0
+Pillow==10.4.
+
+pydantic[email]==2.11.7
+python-jose==3.3.0
+passlib[bcrypt]==1.7.4
 
 
+pynacl==1.5.0
+
+PyJWT>=2.8.0
+cryptography>=41.0.0
+python-jose[cryptography]

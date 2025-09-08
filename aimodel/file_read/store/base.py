@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, shutil, tempfile, threading
+import json, os, shutil, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -8,9 +8,6 @@ from ..adaptive.config.paths import app_data_dir
 APP_DIR = app_data_dir()
 CHATS_DIR = APP_DIR / "chats"
 INDEX_PATH = APP_DIR / "index.json"
-PENDING_PATH = APP_DIR / "pending.json"              
-OLD_PENDING_DELETES = APP_DIR / "pending_deletes.json" 
-_lock = threading.RLock()
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -40,14 +37,10 @@ def ensure_dirs():
 def chat_path(session_id: str) -> Path:
     return CHATS_DIR / f"{session_id}.json"
 
-# -------- Exports --------
 __all__ = [
     "APP_DIR",
     "CHATS_DIR",
     "INDEX_PATH",
-    "PENDING_PATH",          
-    "OLD_PENDING_DELETES",   
-    "_lock",
     "now_iso",
     "atomic_write",
     "ensure_dirs",

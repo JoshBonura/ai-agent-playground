@@ -3,6 +3,7 @@ from typing import Tuple, Optional, Any, Dict
 import json, re, time
 from ..core.settings import SETTINGS
 from ..utils.streaming import safe_token_count_messages
+from ..utils.text import strip_wrappers as _strip_wrappers
 
 def _force_json(s: str) -> dict:
     if not s:
@@ -41,30 +42,6 @@ def _force_json(s: str) -> dict:
         pass
     return {}
 
-def _strip_wrappers(text: str) -> str:
-    t = (text or "")
-    if SETTINGS.get("router_trim_whitespace") is True:
-        t = t.strip()
-    if SETTINGS.get("router_strip_wrappers_enabled") is not True:
-        return t
-    head = t
-    if SETTINGS.get("router_strip_split_on_blank") is True:
-        head = t.split("\n\n", 1)[0]
-    pat = SETTINGS.get("router_strip_header_regex")
-    if isinstance(pat, str) and pat:
-        try:
-            rx = re.compile(pat)
-            out = []
-            for ln in head.splitlines():
-                if rx.match(ln):
-                    break
-                out.append(ln)
-            core = " ".join(" ".join(out).split())
-            return core if core else t
-        except Exception:
-            return head
-    return head
-
 def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     telemetry: Dict[str, Any] = {}
     try:
@@ -72,7 +49,15 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
             return (False, None, telemetry)
         t_start = time.perf_counter()
         t_raw = user_text.strip()
-        core_text = _strip_wrappers(t_raw)
+        if SETTINGS.get("router_strip_wrappers_enabled") is True:
+            core_text = _strip_wrappers(
+                t_raw,
+                trim_whitespace=SETTINGS.get("router_trim_whitespace") is True,
+                split_on_blank=SETTINGS.get("router_strip_split_on_blank") is True,
+                header_regex=SETTINGS.get("router_strip_header_regex"),
+            )
+        else:
+            core_text = t_raw.strip() if SETTINGS.get("router_trim_whitespace") is True else t_raw
         prompt_tpl = SETTINGS.get("router_decide_prompt")
         if not isinstance(prompt_tpl, str) or not prompt_tpl.strip():
             return (False, None, telemetry)
@@ -112,7 +97,15 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
             need = bool(need_default) if isinstance(need_default, bool) else False
         query_field = data.get("query", "")
         try:
-            query = _strip_wrappers(str(query_field or "").strip())
+            if SETTINGS.get("router_strip_wrappers_enabled") is True:
+                query = _strip_wrappers(
+                    str(query_field or "").strip(),
+                    trim_whitespace=SETTINGS.get("router_trim_whitespace") is True,
+                    split_on_blank=SETTINGS.get("router_strip_split_on_blank") is True,
+                    header_regex=SETTINGS.get("router_strip_header_regex"),
+                )
+            else:
+                query = str(query_field or "").strip()
         except Exception:
             query = ""
         if not need:
@@ -140,10 +133,26 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple
         return None, telemetry
     from .query_summarizer import summarize_query
     from .orchestrator import build_web_block
-    base_query = _strip_wrappers((proposed_q or user_text).strip())
+    if SETTINGS.get("router_strip_wrappers_enabled") is True:
+        base_query = _strip_wrappers(
+            (proposed_q or user_text).strip(),
+            trim_whitespace=SETTINGS.get("router_trim_whitespace") is True,
+            split_on_blank=SETTINGS.get("router_strip_split_on_blank") is True,
+            header_regex=SETTINGS.get("router_strip_header_regex"),
+        )
+    else:
+        base_query = (proposed_q or user_text).strip()
     try:
         q_summary, tel_sum = summarize_query(llm, base_query)
-        q_summary = _strip_wrappers((q_summary or "").strip()) or base_query
+        if SETTINGS.get("router_strip_wrappers_enabled") is True:
+            q_summary = _strip_wrappers(
+                (q_summary or "").strip(),
+                trim_whitespace=SETTINGS.get("router_trim_whitespace") is True,
+                split_on_blank=SETTINGS.get("router_strip_split_on_blank") is True,
+                header_regex=SETTINGS.get("router_strip_header_regex"),
+            ) or base_query
+        else:
+            q_summary = (q_summary or "").strip() or base_query
         telemetry["summarizer"] = tel_sum
         telemetry["summarizedQuery"] = q_summary
     except Exception:

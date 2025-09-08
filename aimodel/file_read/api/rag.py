@@ -55,26 +55,31 @@ async def upload_doc(sessionId: Optional[str] = Form(default=None), file: Upload
 
 @router.post("/search")
 async def search(req: SearchReq):
-    q = req.query.strip()
+    q = (req.query or "").strip()
     if not q:
         return {"hits": []}
-    qv = np.array(_embed([q])[0], dtype="float32")
-    chat_hits = search_vectors(req.sessionId, qv, req.kChat, dim=qv.shape[0])
-    global_hits = search_vectors(None, qv, req.kGlobal, dim=qv.shape[0])
-    from ..rag.search import merge_chat_first
-    fused = merge_chat_first(chat_hits, global_hits, alpha=req.hybrid_alpha)
+
+    qv = _embed([q])[0]
+    chat_hits = search_vectors(req.sessionId, qv, req.kChat, dim=qv.shape[0]) if req.kChat else []
+    global_hits = search_vectors(None, qv, req.kGlobal, dim=qv.shape[0]) if req.kGlobal else []
+
+    fused = sorted(chat_hits + global_hits, key=lambda r: r["score"], reverse=True)
+
     out: List[SearchHit] = []
     for r in fused:
         out.append(SearchHit(
-            id=r["id"], text=r["text"], score=float(r["score"]),
-            source=r.get("source"), title=r.get("title"), sessionId=r.get("sessionId")
+            id=r["id"],
+            text=r["text"],
+            score=float(r["score"]),
+            source=r.get("source"),
+            title=r.get("title"),
+            sessionId=r.get("sessionId"),
         ))
     return {"hits": [h.model_dump() for h in out]}
 
 @router.get("/list")
 async def list_items(sessionId: Optional[str] = None, k: int = 20):
-
-    qv = np.array(_embed(["list"])[0], dtype="float32")
+    qv = _embed(["list"])[0]
     hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
 
     items = []
@@ -93,12 +98,8 @@ async def list_items(sessionId: Optional[str] = None, k: int = 20):
 
 @router.get("/dump")
 async def dump_items(sessionId: Optional[str] = None, k: int = 50):
-    """
-    Debug: return full texts of top-k chunks (be careful: can be large).
-    Useful to confirm exact strings that were indexed.
-    """
-    qv = np.array(_embed(["dump"])[0], dtype="float32")
-    hits = search_vectors(sessionId, qv, k=k, dim=qv.shape[0])
+    qv = _embed(["dump"])[0]
+    hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
 
     chunks = []
     for h in hits:
@@ -124,11 +125,6 @@ async def api_delete_upload_hard(body: dict[str, str]):
     session_id = (body.get("sessionId") or None)
     if not source:
         return {"error": "source required"}
-
-    model = _get_st_model() 
-    def _embed(texts: List[str]):
-        arr = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-        return arr.astype("float32")
 
     out = hard_delete_source(source, session_id=session_id, embedder=_embed)
     return out

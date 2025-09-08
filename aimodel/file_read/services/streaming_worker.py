@@ -1,13 +1,11 @@
 # aimodel/file_read/services/streaming_worker.py
-
 from __future__ import annotations
 import asyncio, json, time, logging
 from typing import AsyncGenerator, Optional, List
-
 from ..core.settings import SETTINGS
 from ..utils.streaming import (
     RUNJSON_START, RUNJSON_END,
-    build_run_json, watch_disconnect,
+    build_run_json, watch_disconnect, collect_engine_timings,
 )
 
 log = logging.getLogger("aimodel.api.generate")
@@ -119,67 +117,9 @@ async def run_stream(
                 if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
                     stage["queueWaitSec"] = budget_view.get("queueWaitSec")
 
-                engine = None
-                method_used = None
                 try:
-                    td = None
-                    g_last = getattr(llm, "get_last_timings", None)
-                    if callable(g_last):
-                        method_used = "get_last_timings"
-                        td = g_last()
-                    if td is None:
-                        g = getattr(llm, "get_timings", None)
-                        if callable(g):
-                            method_used = "get_timings"
-                            td = g()
-                    if td is None:
-                        if isinstance(getattr(llm, "timings", None), dict):
-                            method_used = "timings_attr"
-                            td = getattr(llm, "timings")
-                        elif isinstance(getattr(llm, "perf", None), dict):
-                            method_used = "perf_attr"
-                            td = getattr(llm, "perf")
-
-                    if isinstance(td, dict):
-                        def fms(v):
-                            try:
-                                return float(v) / 1000.0
-                            except Exception:
-                                return None
-                        def to_i(v):
-                            try:
-                                return int(v)
-                            except Exception:
-                                return None
-                        load_ms = td.get("load_ms") or td.get("loadMs")
-                        prompt_ms = td.get("prompt_ms") or td.get("promptMs") or td.get("prefill_ms")
-                        eval_ms = td.get("eval_ms") or td.get("evalMs") or td.get("decode_ms")
-                        prompt_n = td.get("prompt_n") or td.get("promptN") or td.get("prompt_tokens")
-                        eval_n = td.get("eval_n") or td.get("evalN") or td.get("eval_tokens")
-                        engine = {}
-                        x = fms(load_ms)
-                        if x is not None:
-                            engine["loadSec"] = round(x, 3)
-                        x = fms(prompt_ms)
-                        if x is not None:
-                            engine["promptSec"] = round(x, 3)
-                        x = fms(eval_ms)
-                        if x is not None:
-                            engine["evalSec"] = round(x, 3)
-                        n = to_i(prompt_n)
-                        if n is not None:
-                            engine["promptN"] = n
-                        n = to_i(eval_n)
-                        if n is not None:
-                            engine["evalN"] = n
-                        try:
-                            log.debug("llm timings method=%s keys=%s", method_used, list(td.keys()))
-                        except Exception:
-                            pass
-                    else:
-                        log.debug("llm timings unavailable")
-                except Exception as e:
-                    log.debug("llm timings probe error: %s", e)
+                    engine = collect_engine_timings(llm)
+                except Exception:
                     engine = None
                 if engine:
                     stage["engine"] = engine
@@ -203,7 +143,6 @@ async def run_stream(
                     comp_sec = _fnum(pack.get("compressSec"))
 
                     rag_router = _fnum(rag.get("routerDecideSec"))
-
 
                     build_candidates = (
                         rag.get("injectBuildSec"),

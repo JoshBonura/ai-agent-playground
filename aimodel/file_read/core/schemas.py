@@ -14,11 +14,6 @@ class ChatMessage(BaseModel):
     content: str
     attachments: Optional[List[Attachment]] = None  
 
-class MergeChatReq(BaseModel):
-    sourceId: str
-    targetId: Optional[str] = None
-    newChat: bool = False
-
 class ChatMetaModel(BaseModel):
     id: int
     sessionId: str

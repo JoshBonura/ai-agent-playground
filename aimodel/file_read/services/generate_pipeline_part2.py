@@ -27,6 +27,15 @@ async def _finish_prepare_generation_with_telemetry(
         has_atts and bool(eff["disable_global_rag_on_attachments"])
     )) or must_inject_session
 
+    # NEW: if web router said it's needed or we already injected web, skip RAG router
+    web_needed = bool((telemetry.get("web") or {}).get("needed"))
+    web_injected = bool((telemetry.get("web") or {}).get("injected"))
+    if web_needed or web_injected:
+        rag_router_allowed = False
+        telemetry.setdefault("rag", {})
+        telemetry["rag"]["routerSkipped"] = True
+        telemetry["rag"]["routerSkippedReason"] = "web_needed" if web_needed else "web_block_present"
+
     ephemeral_once: List[Dict[str, str]] = []
     if rag_router_allowed and bool(eff["rag_enabled"]) and not ephemeral_once:
         rag_need = False

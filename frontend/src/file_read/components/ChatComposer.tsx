@@ -4,6 +4,7 @@ import ComposerActions from "./Composer/ComposerActions";
 import AttachmentChip from "./Composer/AttachmentChip";
 import { useAttachmentUploads } from "../hooks/useAttachmentUploads";
 import type { Attachment } from "../types/chat";
+import type { UIAttachment } from "../hooks/useAttachmentUploads";
 
 const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
 
@@ -62,7 +63,9 @@ export default function ChatComposer({
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  useEffect(() => { autogrow(); }, [draft, atts.length]);
+  useEffect(() => {
+    autogrow();
+  }, [draft, atts.length]);
 
   const hasText = draft.trim().length > 0;
 
@@ -95,7 +98,10 @@ export default function ChatComposer({
   const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-    if (!sessionId) { e.target.value = ""; return; }
+    if (!sessionId) {
+      e.target.value = "";
+      return;
+    }
     await addFiles(files);
     e.target.value = "";
   };
@@ -114,8 +120,8 @@ export default function ChatComposer({
     <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
       {atts.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-2">
-          {atts.map((a) => (
-            <AttachmentChip key={a.id} a={a} onRemove={removeAtt} />
+          {atts.map((a: UIAttachment) => (
+            <AttachmentChip key={a.uiId} a={a} onRemove={removeAtt} />
           ))}
         </div>
       )}
@@ -126,7 +132,11 @@ export default function ChatComposer({
         <textarea
           ref={taRef}
           value={draft}
-          onChange={(e) => { setDraft(e.target.value); setInput(e.target.value); autogrow(); }}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setInput(e.target.value);
+            autogrow();
+          }}
           onInput={autogrow}
           onKeyDown={onKeyDown}
           placeholder="Ask anything…"

@@ -8,11 +8,10 @@ function rowToMsg(r: ChatMessageRow): ChatMsg {
   if (r.role === "assistant") {
     const { clean, json, flat } = extractRunJsonFromBuffer(r.content);
     const base: ChatMsg = {
-      id: `cid-${r.id}`,        // stable UI id derived from server id
+      id: `cid-${r.id}`,        
       serverId: r.id,
       role: r.role,
       text: clean,
-      // ✅ KEEP attachments from server
       attachments: r.attachments ?? [],
     };
     if (json || flat) base.meta = { runJson: json ?? null, flat: flat ?? null };
@@ -25,7 +24,6 @@ function rowToMsg(r: ChatMessageRow): ChatMsg {
     serverId: r.id,
     role: r.role,
     text: r.content,
-    // ✅ KEEP attachments from server
     attachments: r.attachments ?? [],
   };
 }
@@ -64,7 +62,6 @@ export function useSession(opts: {
       const prevClient = getMessagesForSession(sessionId) ?? [];
 
       if (isStreaming(sessionId)) {
-        // Merge by serverId; preserve any in-flight tail
         const byServer = new Map<number, ChatMsg>(
           prevClient.filter(m => m.serverId != null).map(m => [m.serverId as number, m])
         );

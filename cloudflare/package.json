@@ -1,0 +1,16 @@
+{
+  "name": "lic-server",
+  "private": true,
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250906.0",
+    "wrangler": "^3.114.14"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}

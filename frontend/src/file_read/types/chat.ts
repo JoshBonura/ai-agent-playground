@@ -1,3 +1,4 @@
+//aimodel/file_read/types/chat.ts
 export type Role = "user" | "assistant";
 
 import type { GenMetrics, RunJson } from "../shared/lib/runjson";

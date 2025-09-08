@@ -5,6 +5,7 @@ import { useMultiSelect } from "../../hooks/useMultiSelect";
 import { useChatsPager } from "../../hooks/useChatsPager";
 import SidebarHeader from "./SidebarHeader";
 import SidebarListItem from "./SidebarListItem";
+import AccountPanel from "./AccountPanel";
 
 const PAGE_SIZE = 10;
 
@@ -148,6 +149,10 @@ export default function ChatSidebar({
             Select all
           </label>
         )}
+      </div>
+
+      <div className="border-t">
+        <AccountPanel />
       </div>
     </aside>
   );

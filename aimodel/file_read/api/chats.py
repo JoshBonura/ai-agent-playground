@@ -15,7 +15,6 @@ from ..core.schemas import (
     PageResp,
     BatchMsgDeleteReq,
     BatchDeleteReq,
-    MergeChatReq,
     EditMessageReq,
 )
 
@@ -28,8 +27,6 @@ from ..store import (
     delete_batch as store_delete_batch,
     delete_message as store_delete_message,
     delete_messages_batch as store_delete_messages_batch,
-    merge_chat as store_merge_chat,
-    merge_chat_new as store_merge_chat_new,
     edit_message as edit_message,
 )
 
@@ -110,14 +107,6 @@ async def api_delete_batch(req: BatchDeleteReq):
     deleted = store_delete_batch(req.sessionIds or [])
     return {"deleted": deleted}
 
-@router.post("/api/chats/merge")
-async def api_merge_chat(req: MergeChatReq):
-    if req.newChat:
-        new_id, merged = store_merge_chat_new(req.sourceId, req.targetId)
-        return {"newChatId": new_id, "mergedCount": len(merged)}
-    else:
-        merged = store_merge_chat(req.sourceId, req.targetId)
-        return {"mergedCount": len(merged)}
 
 @router.put("/api/chats/{session_id}/messages/{message_id}")
 async def api_edit_message(session_id: str, message_id: int, req: EditMessageReq):

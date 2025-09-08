@@ -6,7 +6,7 @@ import sys, os, argparse
 # ──────────────────────────────────────────────────────────────────────────────
 # Chunked output config
 # ──────────────────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 100000
+CHUNK_SIZE = 10000000
 OUTPUT_PREFIX = "clean-structure"   # clean-structure-1.txt, clean-structure-2.txt, ...
 OUTPUT_DIR = "."                    # write files here
 
@@ -24,6 +24,8 @@ if os.name == "nt":
 SEARCH_FOLDERS = [
     "aimodel/file_read",
     "frontend/src/file_read",
+    "cloudflare"
+    "desktop"
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,7 +49,6 @@ IGNORE_DIRS = {
 
 IGNORE_BASENAMES = {
     "package-lock.json",
-    "package.json",
     "postcss.config.js"   # skip npm lockfile
     # add more if you want:
     # "yarn.lock", "pnpm-lock.yaml", "bun.lockb"
