@@ -1,16 +1,23 @@
 # aimodel/file_read/services/generate_flow.py
 from __future__ import annotations
-from typing import AsyncGenerator, AsyncIterator, Dict
-from dataclasses import asdict
-from fastapi.responses import StreamingResponse
+
 import time
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import asdict
+
+from fastapi.responses import StreamingResponse
+
 from ..core.settings import SETTINGS
-from ..utils.streaming import RUNJSON_START, RUNJSON_END
+from ..utils.streaming import RUNJSON_END, RUNJSON_START
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
 from .streaming_worker import run_stream as _run_stream
-run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream
 
+run_stream: callable[..., AsyncIterator[bytes]] = _run_stream
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
 from .generate_pipeline import prepare_generation_with_telemetry
+
 
 async def generate_stream_flow(data, request) -> StreamingResponse:
     prep = await prepare_generation_with_telemetry(data)
@@ -66,7 +73,9 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
                     if start != -1:
                         end = full_text.find(RUNJSON_END, start)
                         if end != -1:
-                            full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
+                            full_text = (
+                                full_text[:start] + full_text[end + len(RUNJSON_END) :]
+                            ).strip()
                     if full_text:
                         prep.st["recent"].append({"role": "assistant", "content": full_text})
                 except Exception:
@@ -74,13 +83,16 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
 
                 try:
                     from ..store import apply_pending_for
+
                     apply_pending_for(prep.session_id)
                 except Exception:
                     pass
 
                 try:
                     from ..store import list_messages as store_list_messages
-                    from ..workers.retitle_worker import enqueue as enqueue_retitle
+                    from ..workers.retitle_worker import \
+                        enqueue as enqueue_retitle
+
                     msgs = store_list_messages(prep.session_id)
                     last_seq = max((int(m.id) for m in msgs), default=0)
                     enqueue_retitle(prep.session_id, [asdict(m) for m in msgs], job_seq=last_seq)
@@ -92,13 +104,20 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
     return StreamingResponse(
         streamer(),
         media_type="text/plain",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
-async def cancel_session(session_id: str) -> Dict[str, bool]:
+
+async def cancel_session(session_id: str) -> dict[str, bool]:
     from .cancel import cancel_event
+
     cancel_event(session_id).set()
     return {"ok": True}
 
-async def cancel_session_alias(session_id: str) -> Dict[str, bool]:
+
+async def cancel_session_alias(session_id: str) -> dict[str, bool]:
     return await cancel_session(session_id)

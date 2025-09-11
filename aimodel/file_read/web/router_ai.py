@@ -1,9 +1,17 @@
 from __future__ import annotations
-from typing import Tuple, Optional, Any, Dict
-import json, re, time
+
+import json
+import re
+import time
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
 from ..utils.streaming import safe_token_count_messages
 from ..utils.text import strip_wrappers as _strip_wrappers
+
+log = get_logger(__name__)
+
 
 def _force_json(s: str) -> dict:
     if not s:
@@ -22,7 +30,9 @@ def _force_json(s: str) -> dict:
         pass
     try:
         m = None
-        for m in re.finditer(r"\{[^{}]*\"need\"\s*:\s*(?:true|false|\"true\"|\"false\")[^{}]*\}", raw, re.IGNORECASE):
+        for m in re.finditer(
+            r"\{[^{}]*\"need\"\s*:\s*(?:true|false|\"true\"|\"false\")[^{}]*\}", raw, re.IGNORECASE
+        ):
             pass
         if m:
             frag = m.group(0)
@@ -42,8 +52,9 @@ def _force_json(s: str) -> dict:
         pass
     return {}
 
-def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    telemetry: Dict[str, Any] = {}
+
+def decide_web(llm: Any, user_text: str) -> tuple[bool, str | None, dict[str, Any]]:
+    telemetry: dict[str, Any] = {}
     try:
         if not user_text or not user_text.strip():
             return (False, None, telemetry)
@@ -76,9 +87,9 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
             messages=[{"role": "user", "content": the_prompt}],
             **params,
         )
-        text_out = (raw_out_obj.get("choices", [{}])[0]
-                                  .get("message", {})
-                                  .get("content") or "").strip()
+        text_out = (
+            raw_out_obj.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        ).strip()
         telemetry["rawRouterOut"] = text_out[:2000]
         data = _force_json(text_out) or {}
         need_val = data.get("need", None)
@@ -112,27 +123,35 @@ def decide_web(llm: Any, user_text: str) -> Tuple[bool, Optional[str], Dict[str,
             query = None
         t_elapsed = time.perf_counter() - t_start
         in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": the_prompt}]) or 0
-        out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": text_out}]) or 0
-        telemetry.update({
-            "needed": bool(need),
-            "routerQuery": query if need else None,
-            "elapsedSec": round(t_elapsed, 4),
-            "inputTokens": in_tokens,
-            "outputTokens": out_tokens,
-            "parsedOk": parsed_ok,
-        })
+        out_tokens = (
+            safe_token_count_messages(llm, [{"role": "assistant", "content": text_out}]) or 0
+        )
+        telemetry.update(
+            {
+                "needed": bool(need),
+                "routerQuery": query if need else None,
+                "elapsedSec": round(t_elapsed, 4),
+                "inputTokens": in_tokens,
+                "outputTokens": out_tokens,
+                "parsedOk": parsed_ok,
+            }
+        )
         return (need, query, telemetry)
     except Exception:
         return (False, None, telemetry)
 
-async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple[Optional[str], Dict[str, Any]]:
-    telemetry: Dict[str, Any] = {}
+
+async def decide_web_and_fetch(
+    llm: Any, user_text: str, *, k: int = 3
+) -> tuple[str | None, dict[str, Any]]:
+    telemetry: dict[str, Any] = {}
     need, proposed_q, tel_decide = decide_web(llm, (user_text or "").strip())
     telemetry.update(tel_decide)
     if not need:
         return None, telemetry
-    from .query_summarizer import summarize_query
     from .orchestrator import build_web_block
+    from .query_summarizer import summarize_query
+
     if SETTINGS.get("router_strip_wrappers_enabled") is True:
         base_query = _strip_wrappers(
             (proposed_q or user_text).strip(),
@@ -145,12 +164,15 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple
     try:
         q_summary, tel_sum = summarize_query(llm, base_query)
         if SETTINGS.get("router_strip_wrappers_enabled") is True:
-            q_summary = _strip_wrappers(
-                (q_summary or "").strip(),
-                trim_whitespace=SETTINGS.get("router_trim_whitespace") is True,
-                split_on_blank=SETTINGS.get("router_strip_split_on_blank") is True,
-                header_regex=SETTINGS.get("router_strip_header_regex"),
-            ) or base_query
+            q_summary = (
+                _strip_wrappers(
+                    (q_summary or "").strip(),
+                    trim_whitespace=SETTINGS.get("router_trim_whitespace") is True,
+                    split_on_blank=SETTINGS.get("router_strip_split_on_blank") is True,
+                    header_regex=SETTINGS.get("router_strip_header_regex"),
+                )
+                or base_query
+            )
         else:
             q_summary = (q_summary or "").strip() or base_query
         telemetry["summarizer"] = tel_sum
@@ -168,11 +190,14 @@ async def decide_web_and_fetch(llm: Any, user_text: str, *, k: int = 3) -> Tuple
     except Exception:
         block = None
     t_elapsed = time.perf_counter() - t_start
-    telemetry.update({
-        "fetchElapsedSec": round(t_elapsed, 4),
-        "blockChars": len(block) if block else 0,
-    })
+    telemetry.update(
+        {
+            "fetchElapsedSec": round(t_elapsed, 4),
+            "blockChars": len(block) if block else 0,
+        }
+    )
     return (block or None, telemetry)
+
 
 def _safe_prompt_format(tpl: str, **kwargs) -> str:
     marker = "__ROUTER_TEXT_FIELD__"

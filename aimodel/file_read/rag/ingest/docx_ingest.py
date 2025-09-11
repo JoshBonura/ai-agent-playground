@@ -1,17 +1,25 @@
 # DOCX-only extraction (no .doc/RTF here)
 from __future__ import annotations
-from typing import Tuple, List, Optional
-import io, re
+
+import io
+import re
+
+from ...core.logging import get_logger
 from ...core.settings import SETTINGS
 from .ocr import ocr_image_bytes
 
+log = get_logger(__name__)
+
 _WS_RE = re.compile(r"[ \t]+")
+
+
 def _squeeze_spaces(s: str) -> str:
     s = (s or "").replace("\xa0", " ")
     s = _WS_RE.sub(" ", s)
     return s.strip()
 
-def _is_heading(style_name: str) -> Optional[int]:
+
+def _is_heading(style_name: str) -> int | None:
     if not style_name:
         return None
     m = re.match(r"Heading\s+(\d+)", style_name, flags=re.IGNORECASE)
@@ -22,14 +30,17 @@ def _is_heading(style_name: str) -> Optional[int]:
     except Exception:
         return None
 
+
 def _is_list_style(style_name: str) -> bool:
     return bool(style_name) and any(k in style_name.lower() for k in ("list", "bullet", "number"))
+
 
 def _extract_paragraph_text(p) -> str:
     return _squeeze_spaces(p.text)
 
-def _docx_image_blobs(doc) -> List[bytes]:
-    blobs: List[bytes] = []
+
+def _docx_image_blobs(doc) -> list[bytes]:
+    blobs: list[bytes] = []
     seen_rids = set()
     try:
         part = doc.part
@@ -50,7 +61,9 @@ def _docx_image_blobs(doc) -> List[bytes]:
             for r in p.runs:
                 for d in getattr(r._element, "xpath", lambda *_: [])(".//a:blip"):
                     try:
-                        rId = d.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+                        rId = d.get(
+                            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+                        )
                         if rId and rId not in seen_rids:
                             blob = part.related_parts[rId].blob
                             if blob:
@@ -63,8 +76,10 @@ def _docx_image_blobs(doc) -> List[bytes]:
         pass
     return blobs
 
-def extract_docx(data: bytes) -> Tuple[str, str]:
+
+def extract_docx(data: bytes) -> tuple[str, str]:
     from docx import Document
+
     S = SETTINGS.effective
     HEADING_MAX_LEVEL = int(S().get("docx_heading_max_level", 3))
     USE_MARKDOWN_HEADINGS = bool(S().get("docx_use_markdown_headings", True))
@@ -75,7 +90,7 @@ def extract_docx(data: bytes) -> Tuple[str, str]:
     DROP_EMPTY_LINES = bool(S().get("docx_drop_empty_lines", True))
 
     doc = Document(io.BytesIO(data))
-    lines: List[str] = []
+    lines: list[str] = []
 
     try:
         title = (getattr(doc, "core_properties", None) or {}).title
@@ -97,7 +112,9 @@ def extract_docx(data: bytes) -> Tuple[str, str]:
                     break
                 try:
                     hdr_ps = getattr(sec.header, "paragraphs", []) or []
-                    hdr_text = "\n".join(_squeeze_spaces(p.text) for p in hdr_ps if _squeeze_spaces(p.text))
+                    hdr_text = "\n".join(
+                        _squeeze_spaces(p.text) for p in hdr_ps if _squeeze_spaces(p.text)
+                    )
                     if hdr_text:
                         lines.append("## Header")
                         lines.append(_clip(hdr_text))
@@ -106,7 +123,9 @@ def extract_docx(data: bytes) -> Tuple[str, str]:
                     pass
                 try:
                     ftr_ps = getattr(sec.footer, "paragraphs", []) or []
-                    ftr_text = "\n".join(_squeeze_spaces(p.text) for p in ftr_ps if _squeeze_spaces(p.text))
+                    ftr_text = "\n".join(
+                        _squeeze_spaces(p.text) for p in ftr_ps if _squeeze_spaces(p.text)
+                    )
                     if ftr_text:
                         lines.append("## Footer")
                         lines.append(_clip(ftr_text))
@@ -138,7 +157,9 @@ def extract_docx(data: bytes) -> Tuple[str, str]:
     if INCLUDE_TABLES and getattr(doc, "tables", None):
         for t_idx, tbl in enumerate(doc.tables):
             try:
-                non_empty = any(_squeeze_spaces(cell.text) for row in tbl.rows for cell in row.cells)
+                non_empty = any(
+                    _squeeze_spaces(cell.text) for row in tbl.rows for cell in row.cells
+                )
             except Exception:
                 non_empty = True
             if not non_empty:

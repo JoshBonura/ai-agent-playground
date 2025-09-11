@@ -1,78 +1,90 @@
 from __future__ import annotations
-from fastapi import APIRouter, Depends, HTTPException, Query
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+
+from fastapi import APIRouter, Depends, Header, Query
 from pydantic import BaseModel
+
 from ..deps.auth_deps import require_auth
-from ..services.licensing_service import (
-    apply_license_string,
-    license_status_local,
-    recover_by_email,
-    refresh_license,
-    fetch_license_by_session,
-    install_from_session as svc_install_from_session,
-    remove_license_file,
-    email_from_auth,
-    read_license_claims
-)
+# NEW: device activation helpers
+from ..services.licensing_service import \
+    get_activation_status  # <- tiny helper to read local activation.json
+from ..services.licensing_service import \
+    redeem_activation  # <- we'll add in service file below
+from ..services.licensing_service import \
+    refresh_activation  # <- we'll add in service file below
+from ..services.licensing_service import (apply_license_string,
+                                          email_from_auth,
+                                          license_status_local,
+                                          refresh_license)
 
 router = APIRouter(prefix="/api/license", tags=["license"])
+
 
 class ApplyReq(BaseModel):
     license: str
 
+
 @router.post("/apply")
-def apply_license(body: ApplyReq):
-    print("[license] POST /apply")
-    return apply_license_string(body.license)
+async def apply_license(body: ApplyReq, user_agent: str | None = Header(default=None)):
+    """
+    1) Verify and persist the LM1 license locally.
+    2) Redeem a device-scoped activation token (best-effort: do not fail apply if server unreachable).
+    """
+    log.info("[license] POST /apply")
+    res = apply_license_string(body.license)
+
+    # Best-effort device activation
+    try:
+        device_name = (user_agent or "device").split("(")[0].strip()[:64]
+        act = await redeem_activation(body.license, device_name=device_name)
+        res.update({"activation": {"ok": True, "exp": act.get("exp")}})
+    except Exception as e:
+        # Do not block license apply on activation network issues
+        log.warning(f"[license] activation redeem failed: {e!r}")
+        res.update({"activation": {"ok": False}})
+
+    return res
+
 
 @router.get("/apply")
-def apply_license_get(license: str = Query(..., min_length=10)):
-    print("[license] GET /apply")
-    return apply_license_string(license)
+async def apply_license_get(
+    license: str = Query(..., min_length=10), user_agent: str | None = Header(default=None)
+):
+    log.info("[license] GET /apply (discouraged; use POST)")
+    return await apply_license(ApplyReq(license=license), user_agent=user_agent)
 
-@router.get("/status")
-def status(user=Depends(require_auth)):  # <-- remove decorator dependencies=[]
-    email = (user.get("email") or "").strip().lower()
-    st = license_status_local(expected_email=email)   # <-- pass expected_email
-    return st if st else {"plan": "free", "valid": False}
-
-@router.get("/claims", dependencies=[Depends(require_auth)])
-def claims():
-    print("[license] GET /claims")
-    st = license_status_local()
-    if not st.get("valid"):
-        raise HTTPException(404, "No license installed")
-    return st
-
-@router.delete("/", dependencies=[Depends(require_auth)])
-def remove_license():
-    print("[license] DELETE /api/license")
-    return remove_license_file()
-
-@router.get("/by-session", dependencies=[Depends(require_auth)])
-async def license_by_session(session_id: str = Query(..., min_length=6)):
-    print(f"[license] GET /by-session session_id={session_id}")
-    return await fetch_license_by_session(session_id)
-
-@router.post("/install-from-session", dependencies=[Depends(require_auth)])
-async def install_from_session(session_id: str = Query(..., min_length=6)):
-    print(f"[license] POST /install-from-session session_id={session_id}")
-    return await svc_install_from_session(session_id)
-
-@router.post("/recover")
-async def recover(auth=Depends(require_auth)):
-    email = email_from_auth(auth)
-    print(f"[license] POST /recover email={email or 'MISSING'}")
-    if not email:
-        raise HTTPException(400, "Email required")
-    return await recover_by_email(email)
 
 @router.post("/refresh")
 async def refresh(auth=Depends(require_auth), force: bool = Query(False)):
-    print(f"[license] POST /refresh force={force}")
+    """
+    Refresh:
+    - License (if expiring soon or forced)
+    - Device activation token (rolling 30d window), best-effort
+    """
+    log.info(f"[license] POST /refresh force={force}")
     email = email_from_auth(auth)
-    return await refresh_license(email, force)
+    lr = await refresh_license(email, force)
 
-@router.get("/claims", dependencies=[Depends(require_auth)])
-def claims():
-    # Now returns the raw license claims (license_id, sub, entitlements, issued_at, exp, plan, etc.)
-    return read_license_claims()
+    # Best-effort activation refresh
+    try:
+        ar = await refresh_activation()
+        lr.update({"activation": {"ok": True, "exp": ar.get("exp")}})
+    except Exception as e:
+        log.warning(f"[license] activation refresh failed: {e!r}")
+        # Keep license refresh result even if activation refresh fails
+        if "activation" not in lr:
+            lr["activation"] = {"ok": False}
+
+    return lr
+
+
+@router.get("/status")
+def status(user=Depends(require_auth)):
+    email = (user.get("email") or "").strip().lower()
+    st = license_status_local(expected_email=email) or {"plan": "free", "valid": False}
+    # add activation local view (no network)
+    st["activation"] = get_activation_status()
+    return st

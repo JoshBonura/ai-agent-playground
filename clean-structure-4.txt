@@ -1,378 +1,4 @@
-rov_info
-
-        _cache_set(ckey, hits)
-        out = hits[:k]
-        _set_hits_telemetry(tel, hits, out)
-        tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
-        if telemetry is not None:
-            telemetry.update(tel)
-        return out
-
-# ===== aimodel/file_read/web/fetch.py =====
-
-# aimodel/file_read/web/fetch.py
-from __future__ import annotations
-import asyncio
-from typing import Tuple, List, Optional, Dict, Any
-import time
-import httpx
-from urllib.parse import urlparse
-
-try:
-    from readability import Document
-except Exception:
-    Document = None  # optional
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None  # optional
-
-try:
-    from selectolax.parser import HTMLParser
-except Exception:
-    HTMLParser = None  # optional
-
-from ..core.settings import SETTINGS
-
-
-def _req(key: str):
-    return SETTINGS[key]
-
-def _ua() -> str:
-    return str(_req("web_fetch_user_agent"))
-
-def _timeout() -> float:
-    return float(_req("web_fetch_timeout_sec"))
-
-def _max_chars() -> int:
-    return int(_req("web_fetch_max_chars"))
-
-def _max_bytes() -> int:
-    return int(_req("web_fetch_max_bytes"))
-
-def _max_parallel() -> int:
-    return max(1, int(_req("web_fetch_max_parallel")))
-
-
-# -------------------- Adaptive cooldown (generic, no host hardcoding) --------------------
-# host -> (fail_count, cooldown_until_ts)
-_BAD_HOSTS: Dict[str, Tuple[int, float]] = {}
-
-def _now() -> float:
-    return time.time()
-
-def _host_of(u: str) -> str:
-    try:
-        return (urlparse(u).hostname or "").lower()
-    except Exception:
-        return ""
-
-def _cooldown_secs(fails: int) -> float:
-    # 15m, 30m, 60m, ... capped at 24h
-    base = 15 * 60.0
-    cap = 24 * 60 * 60.0
-    return min(cap, base * (2 ** max(0, fails - 1)))
-
-def _mark_bad(host: str) -> None:
-    if not host:
-        return
-    fails, until = _BAD_HOSTS.get(host, (0, 0.0))
-    fails += 1
-    _BAD_HOSTS[host] = (fails, _now() + _cooldown_secs(fails))
-
-def _mark_good(host: str) -> None:
-    if not host:
-        return
-    if host in _BAD_HOSTS:
-        fails, until = _BAD_HOSTS[host]
-        fails = max(0, fails - 1)
-        if fails == 0:
-            _BAD_HOSTS.pop(host, None)
-        else:
-            _BAD_HOSTS[host] = (fails, _now() + _cooldown_secs(fails))
-
-def _is_on_cooldown(host: str) -> bool:
-    ent = _BAD_HOSTS.get(host)
-    return bool(ent and ent[1] > _now())
-# ----------------------------------------------------------------------------------------
-
-
-async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
-    out = bytearray()
-    async for chunk in resp.aiter_bytes():
-        if not chunk:
-            continue
-        remaining = cap_bytes - len(out)
-        if remaining <= 0:
-            break
-        out.extend(chunk[:remaining])
-        if len(out) >= cap_bytes:
-            break
-    return bytes(out)
-
-
-def _extract_text_from_html(raw_html: str, url: str) -> str:
-    html = raw_html or ""
-    # Try readability first (often best for article-like pages)
-    if Document is not None:
-        try:
-            doc = Document(html)
-            summary_html = doc.summary(html_partial=True) or ""
-            if summary_html:
-                if BeautifulSoup is not None:
-                    soup = BeautifulSoup(summary_html, "lxml")
-                    txt = soup.get_text(" ", strip=True)
-                    if txt:
-                        return txt
-        except Exception:
-            pass
-    # Try selectolax (fast, robust)
-    if HTMLParser is not None:
-        try:
-            tree = HTMLParser(html)
-            for bad in ("script", "style", "noscript"):
-                for n in tree.tags(bad):
-                    n.decompose()
-            txt = tree.body.text(separator=" ", strip=True) if tree.body else tree.text(separator=" ", strip=True)
-            if txt:
-                return txt
-        except Exception:
-            pass
-    # Fallback to BeautifulSoup full parse
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            for s in soup(["script", "style", "noscript"]):
-                s.extract()
-            txt = soup.get_text(" ", strip=True)
-            if txt:
-                return txt
-        except Exception:
-            pass
-    # Last resort: return raw html (will be trimmed by char cap)
-    return html
-
-
-async def fetch_clean(
-    url: str,
-    timeout_s: Optional[float] = None,
-    max_chars: Optional[int] = None,
-    max_bytes: Optional[int] = None,
-    telemetry: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, int, str]:
-    t0 = time.perf_counter()
-    timeout = _timeout() if timeout_s is None else float(timeout_s)
-    cap_chars = _max_chars() if max_chars is None else int(max_chars)
-    cap_bytes = _max_bytes() if max_bytes is None else int(max_bytes)
-
-    headers = {"User-Agent": _ua()}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        ctype = (r.headers.get("content-type") or "").lower()
-
-        raw_bytes = await _read_capped_bytes(r, cap_bytes)
-        enc = r.encoding or "utf-8"
-        raw_text = raw_bytes.decode(enc, errors="ignore")
-        txt = _extract_text_from_html(raw_text, str(r.url))
-        txt = (txt or "").strip().replace("\r", "")
-        if len(txt) > cap_chars:
-            txt = txt[:cap_chars]
-
-        # Generic usefulness test: skip non-HTML or extremely short bodies
-        MIN_USEFUL_CHARS = 80
-        host_final = _host_of(str(r.url))
-        if ("text/html" not in ctype) or (len(txt) < MIN_USEFUL_CHARS):
-            _mark_bad(host_final)
-        else:
-            _mark_good(host_final)
-
-        if telemetry is not None:
-            telemetry.update({
-                "reqUrl": url,
-                "finalUrl": str(r.url),
-                "status": int(r.status_code),
-                "elapsedSec": round(time.perf_counter() - t0, 6),
-                "bytes": len(raw_bytes),
-                "chars": len(txt),
-                "timeoutSec": timeout,
-                "capBytes": cap_bytes,
-                "capChars": cap_chars,
-                "contentType": ctype,
-                "cooldownFails": _BAD_HOSTS.get(host_final, (0, 0.0))[0] if host_final in _BAD_HOSTS else 0,
-            })
-        return (str(r.url), r.status_code, txt)
-
-
-async def fetch_many(
-    urls: List[str],
-    per_timeout_s: Optional[float] = None,
-    cap_chars: Optional[int] = None,
-    cap_bytes: Optional[int] = None,
-    max_parallel: Optional[int] = None,
-    telemetry: Optional[Dict[str, Any]] = None,
-):
-    t_total0 = time.perf_counter()
-    sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
-    tel_items: List[Dict[str, Any]] = []
-
-    async def _one(u: str):
-        item_tel: Dict[str, Any] = {"reqUrl": u}
-        host = _host_of(u)
-
-        # Skip hosts currently on adaptive cooldown (generic, no lists)
-        if _is_on_cooldown(host):
-            item_tel.update({
-                "ok": False,
-                "skipped": True,
-                "skipReason": "cooldown",
-                "host": host,
-            })
-            tel_items.append(item_tel)
-            return u, None
-
-        t0 = time.perf_counter()
-        async with sem:
-            try:
-                res = await fetch_clean(
-                    u,
-                    timeout_s=per_timeout_s,
-                    max_chars=cap_chars,
-                    max_bytes=cap_bytes,
-                    telemetry=item_tel,
-                )
-                item_tel.setdefault("elapsedSec", round(time.perf_counter() - t0, 6))
-                item_tel["ok"] = True
-                item_tel["host"] = host
-                tel_items.append(item_tel)
-                return u, res
-            except Exception as e:
-                _mark_bad(host)  # network/HTTP error counts as a fail
-                item_tel.update({
-                    "ok": False,
-                    "errorType": type(e).__name__,
-                    "errorMsg": str(e),
-                    "elapsedSec": round(time.perf_counter() - t0, 6),
-                    "timeoutSec": (float(per_timeout_s) if per_timeout_s is not None else _timeout()),
-                    "capBytes": (int(cap_bytes) if cap_bytes is not None else _max_bytes()),
-                    "capChars": (int(cap_chars) if cap_chars is not None else _max_chars()),
-                    "host": host,
-                })
-                tel_items.append(item_tel)
-                return u, None
-
-    tasks = [_one(u) for u in urls]
-    results = await asyncio.gather(*tasks)
-
-    if telemetry is not None:
-        ok_cnt = sum(1 for it in tel_items if it.get("ok"))
-        telemetry.update({
-            "totalSec": round(time.perf_counter() - t_total0, 6),
-            "requested": len(urls),
-            "ok": ok_cnt,
-            "miss": len(urls) - ok_cnt,
-            "items": tel_items,
-            "settings": {
-                "userAgent": _ua(),
-                "defaultTimeoutSec": _timeout(),
-                "defaultCapChars": _max_chars(),
-                "defaultCapBytes": _max_bytes(),
-                "maxParallel": _max_parallel() if max_parallel is None else int(max_parallel),
-            },
-        })
-
-    return results
-
-# ===== aimodel/file_read/web/orchestrator.py =====
-
-from __future__ import annotations
-from typing import List, Tuple, Optional, Dict, Any
-import time
-from collections import defaultdict
-
-from .brave import BraveProvider
-from .provider import SearchHit
-from .orchestrator_common import (
-    _as_int, _as_float, _as_bool, _as_str,
-    condense_doc, content_quality_score,
-    _dedupe_by_host, score_hit, _head_tail,
-    _fetch_round, _host,   # NOTE: make sure _host is imported
-)
-from ..core.request_ctx import get_x_id
-
-
-async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
-    tel: Dict[str, Any] = {"query": (query or "").strip()}
-    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
-    total_char_budget   = _as_int("web_orch_total_char_budget")
-    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
-    max_parallel        = _as_int("web_orch_max_parallel_fetch")
-    overfetch_factor    = _as_float("web_orch_overfetch_factor")
-    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
-    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
-    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
-    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
-    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
-    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
-    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
-    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
-    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
-    header_tpl          = _as_str("web_block_header")
-    sep_str             = _as_str("web_orch_block_separator")
-    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
-    min_block_reserve   = _as_int("web_orch_min_block_reserve")
-    per_timeout = (float(per_url_timeout_s) if per_url_timeout_s is not None else _as_float("web_fetch_timeout_sec"))
-    start_time = time.perf_counter()
-
-    provider = BraveProvider()
-    # widen search result pool a bit for better host variety
-    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
-    tel["search"] = {"requestedK": cfg_k, "overfetch": overfetch}
-    t0 = time.perf_counter()
-    try:
-        hits: List[SearchHit] = await provider.search(query, k=overfetch, telemetry=tel["search"], xid=get_x_id())
-    except Exception as e:
-        tel["error"] = {"stage": "search", "type": type(e).__name__, "msg": str(e)}
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        print("[web-block] (empty) due to search error:", tel["error"])
-        return None, tel
-    tel["search"]["elapsedSecTotal"] = round(time.perf_counter() - t0, 6)
-
-    if not hits:
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        print("[web-block] (empty) — no hits")
-        return None, tel
-
-    # score & keep uniques by URL
-    seen_urls = set()
-    scored: List[Tuple[int, SearchHit]] = []
-    for h in hits:
-        u = (h.url or "").strip()
-        if not u or u in seen_urls:
-            continue
-        seen_urls.add(u)
-        s = score_hit(h, query)
-        scored.append((s, h))
-    tel["scoring"] = {"inputHits": len(hits), "scored": len(scored)}
-
-    if not scored:
-        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
-        print("[web-block] (empty) — no scored hits")
-        return None, tel
-
-    # IMPORTANT: dedupe by host to a PREFETCH set (larger than k) to increase variety
-    prefetch = max(cfg_k * 2, cfg_k + 6)
-    top_hits = _dedupe_by_host(scored, prefetch)
-    tel["scoring"]["picked"] = len(top_hits)
-    urls = [h.url for h in top_hits]
-    meta = [(h.title or h.url, h.url) for h in top_hits]
-
-    # fetch round 1
-    t_f = time.perf_counter()
-    tel["fetch1"] = {}
-    results = await _fetch_round(
-        urls, meta, per_url_timeout_s=per_timeout, max_parallel=max_parallel, use_js=False, telemetry=tel["fetch1"]
+allel=max_parallel, use_js=False, telemetry=tel["fetch1"]
     )
     tel["fetch1"]["roundSec"] = round(time.perf_counter() - t_f, 6)
 
@@ -1181,1614 +807,305 @@ def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = N
     except RuntimeError:
         asyncio.run(_put())
 
-# ===== frontend/src/file_read/App.tsx =====
+# ===== cloudflare/license-do.ts =====
 
-import AgentRunner from "./pages/AgentRunner";
-import { useAuth } from "./auth/AuthContext";
-import SignIn from "./auth/SignIn";
-import SignUp from "./auth/SignUp";
-import ForgotPassword from "./auth/ForgotPassword";
-import { useState } from "react";
+// aimodel/file_read/cloudflare/license-do.ts
+import type { DurableObjectState, DurableObjectStorage } from "@cloudflare/workers-types";
 
-export default function App() {
-  const { user, loading } = useAuth();
-  const [mode, setMode] = useState<"signin" | "signup" | "forgot">("signin");
-
-  // BYPASS: render app even if not signed in
-  if (import.meta.env.VITE_BYPASS_AUTH === "true") {
-    return (
-      <main className="bg-gray-50 h-screen overflow-hidden">
-        <AgentRunner />
-      </main>
-    );
+export class LicenseStore {
+  state: DurableObjectState;
+  storage: DurableObjectStorage;
+  constructor(state: DurableObjectState) {
+    this.state = state;
+    this.storage = state.storage;
   }
-
-  if (loading) {
-    return <main className="min-h-screen grid place-items-center">Loading…</main>;
+  async fetch(req: Request) {
+    const url = new URL(req.url);
+    if (req.method === "POST" && url.pathname === "/put") {
+      const { key, value } = await req.json<any>();
+      if (!key || !value) return new Response(JSON.stringify({ error: "bad_request" }), { status: 400, headers: { "content-type": "application/json" } });
+      await this.storage.put(key, value);
+      return new Response(null, { status: 204 });
+    }
+    if (req.method === "GET" && url.pathname === "/get") {
+      const key = url.searchParams.get("key") || "";
+      const value = await this.storage.get<any>(key);
+      return new Response(JSON.stringify(value ?? null), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("not found", { status: 404 });
   }
-
-  if (!user) {
-    return (
-      <main className="min-h-screen grid place-items-center bg-gray-50 px-4">
-        <div className="w-full max-w-sm bg-white p-6 rounded-2xl shadow">
-          {mode === "signin" && <SignIn />}
-          {mode === "signup" && <SignUp />}
-          {mode === "forgot" && <ForgotPassword />}
-
-          <div className="mt-4 text-sm text-center text-gray-700">
-            {mode !== "signin" && (
-              <button onClick={() => setMode("signin")} className="underline mx-2">Sign in</button>
-            )}
-            {mode !== "signup" && (
-              <button onClick={() => setMode("signup")} className="underline mx-2">Create account</button>
-            )}
-            {mode !== "forgot" && (
-              <button onClick={() => setMode("forgot")} className="underline mx-2">Forgot password</button>
-            )}
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  return (
-    <main className="bg-gray-50 h-screen overflow-hidden">
-      <AgentRunner />
-    </main>
-  );
 }
 
-# ===== frontend/src/file_read/auth/AuthContext.tsx =====
+# ===== cloudflare/package.json =====
 
-// frontend/src/file_read/auth/AuthContext.tsx
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { getJSON } from "../services/http";
+{
+  "name": "lic-server",
+  "private": true,
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250906.0",
+    "wrangler": "^3.114.14"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}
 
-type LocalUser = {
-  email?: string;
-  name?: string;
-  // add more fields if your /auth/me returns them
-};
+# ===== cloudflare/tsconfig.json =====
 
-type Ctx = {
-  user: LocalUser | null;
-  loading: boolean;
-  setToken: (t: string | null) => void;
-  logout: () => void;
-};
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "WebWorker", "DOM", "DOM.Iterable"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true
+  },
+  "include": ["**/*.ts"]
+}
 
-const AuthContext = createContext<Ctx>({
-  user: null,
-  loading: true,
-  setToken: () => {},
-  logout: () => {},
-});
+# ===== cloudflare/worker-licensing.ts =====
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, _setToken] = useState<string | null>(null);
-  const [user, setUser] = useState<LocalUser | null>(null);
-  const [loading, setLoading] = useState(true);
+// aimodel/file_read/cloudflare/worker-licensing.ts
+import type { ExecutionContext, DurableObjectNamespace } from "@cloudflare/workers-types";
+import nacl from "tweetnacl";
+export { LicenseStore } from "./license-do";
 
-  // Single writer for token + localStorage
-  const setToken = (t: string | null) => {
-    _setToken(t);
-    try {
-      if (t) localStorage.setItem("local_jwt", t);
-      else localStorage.removeItem("local_jwt");
-    } catch {}
-  };
+export interface Env {
+  APP_BASE_URL: string;
+  PORTAL_RETURN_URL?: string;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_WEBHOOK_SECRET: string;
+  PRICE_MONTHLY_ID: string;
+  LIC_ED25519_PRIV_HEX: string;
+  LIC_ED25519_PUB_HEX: string;
+  LICENSES: DurableObjectNamespace;
+  ADMIN_KEY?: string;
+}
 
-  const logout = () => {
-    setToken(null);
-    setUser(null);
-  };
+function withCORS(res: Response, origin = "*") {
+  const h = new Headers(res.headers);
+  h.set("Access-Control-Allow-Origin", origin);
+  h.set("Vary", "Origin");
+  return new Response(res.body, { status: res.status, headers: h });
+}
+const allowOrigin = (req: Request) => req.headers.get("Origin") || "*";
 
-  // On mount: read token and load profile (if any)
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
+function html(body: string, status = 200, headers: Record<string, string> = {}) {
+  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", ...headers } });
+}
+function json(obj: unknown, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+}
+async function hmac256Hex(secret: string, payload: string) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function b64u(data: Uint8Array): string {
+  let s = btoa(String.fromCharCode(...data));
+  return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function strToB64u(s: string) { return b64u(new TextEncoder().encode(s)); }
+const nowSec = () => Math.floor(Date.now() / 1000);
+
+type StoredLic = { license: string; email?: string; exp?: number };
+async function readFromDO(env: Env, key: string) {
+  const stub = env.LICENSES.get(env.LICENSES.idFromName("store"));
+  const r = await stub.fetch("https://store/get?key=" + encodeURIComponent(key));
+  if (!r.ok) return null;
+  return (await r.json<any>()) as StoredLic | null;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type,Stripe-Signature,Authorization"
+        }
+      });
+    }
+    if (url.pathname === "/health") return json({ ok: true });
+    if (url.pathname === "/pricing") {
+      return html(`<!doctype html>
+<title>LocalMind Pro</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 16px} .card{border:1px solid #ddd;border-radius:12px;padding:20px;margin:12px 0} button{border:1px solid #000;border-radius:10px;padding:10px 16px;background:#000;color:#fff;cursor:pointer} .muted{color:#555}</style>
+<h1>Choose your plan</h1>
+<div class="card">
+  <h2>Free</h2>
+  <ul class="muted"><li>Local only</li><li>Basic features</li></ul>
+</div>
+<div class="card">
+  <h2>Pro — $9.99 / month</h2>
+  <ul><li>All features unlocked</li><li>License works offline after activation</li></ul>
+  <form method="POST" action="/api/checkout/session">
+    <button type="submit">Go Pro</button>
+  </form>
+</div>`);
+    }
+    if (url.pathname === "/success") {
+      const sid = url.searchParams.get("session_id") || "";
+      if (!sid) return html("<p>Missing session_id.</p>", 400);
+      const stub = env.LICENSES.get(env.LICENSES.idFromName("store"));
+      const r = await stub.fetch("https://store/get?key=" + encodeURIComponent("sid:" + sid));
+      const data = await r.json<any>();
+      const lic = data?.license || "";
+      const masked = lic ? lic.slice(0, 16) + "… (copy below)" : "(not ready yet — webhook may still be processing; refresh in a few seconds)";
+      const deep = lic ? `localmind://activate?license=${encodeURIComponent(lic)}` : "#";
+      return html(`<!doctype html>
+<title>Activation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 16px} input{width:100%;padding:10px;border:1px solid #ccc;border-radius:8px;font-family:monospace} a.btn,button{display:inline-block;margin-top:10px;border:1px solid #000;border-radius:10px;padding:10px 16px;background:#000;color:#fff;text-decoration:none}</style>
+<h1>You're Pro 🎉</h1>
+<p>Session: <code>${sid}</code></p>
+<p><b>License:</b> ${masked}</p>
+${lic ? `
+<input id="lic" readonly value="${lic}"/>
+<button onclick="navigator.clipboard.writeText(document.getElementById('lic').value)">Copy License</button>
+<a class="btn" href="${deep}">Activate in app</a>
+` : `<p>Please wait a moment then <a href="/success?session_id=${encodeURIComponent(sid)}">refresh</a>.</p>`}
+`);
+    }
+    if (url.pathname === "/.well-known/licensing-public-key") {
+      return json({ alg: "Ed25519", public_key_hex: env.LIC_ED25519_PUB_HEX });
+    }
+    if (request.method === "POST" && url.pathname === "/api/checkout/session") {
+      type CheckoutBody = { email?: string };
+      let email = "";
       try {
-        const t = localStorage.getItem("local_jwt");
-        if (t) {
-          _setToken(t);
-          // Optional profile fetch; your backend should accept Authorization: Bearer <jwt>
-          try {
-            const me = await getJSON<LocalUser>("/auth/me");
-            if (!cancelled) setUser(me || null);
-            // store for UI label fallback (avatar initials)
-            if (me?.email) localStorage.setItem("profile_email", me.email);
-          } catch {
-            // if /auth/me not implemented, fall back to localStorage email
-            const stored = localStorage.getItem("profile_email") || "";
-            if (!cancelled) setUser(stored ? { email: stored } : { email: undefined });
-          }
-        } else {
-          // no token: not logged in
-          if (!cancelled) {
-            setUser(null);
+        const body = (await request.json()) as Partial<CheckoutBody>;
+        email = typeof body.email === "string" ? body.email : "";
+      } catch { email = ""; }
+      const price = env.PRICE_MONTHLY_ID;
+      const res = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          mode: "subscription",
+          "line_items[0][price]": price,
+          "line_items[0][quantity]": "1",
+          success_url: `${env.APP_BASE_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${env.APP_BASE_URL}/pricing`,
+          "automatic_tax[enabled]": "true",
+          customer_email: email || "",
+          client_reference_id: email || "anonymous",
+          allow_promotion_codes: "true"
+        })
+      });
+      const body = await res.json<any>();
+      if (!res.ok) return withCORS(json(body, 400), allowOrigin(request));
+      const wantsJSON = (request.headers.get("accept") || "").includes("application/json");
+      if (wantsJSON) return withCORS(json({ url: body.url }), allowOrigin(request));
+      return withCORS(html(`<!doctype html><meta http-equiv="refresh" content="0;url=${body.url}">Redirecting…`), allowOrigin(request));
+    }
+    if (request.method === "POST" && url.pathname === "/api/stripe/webhook") {
+      const sig = request.headers.get("stripe-signature") || "";
+      const raw = await request.text();
+      const parts = sig.split(",").reduce((acc, kv) => { const [k, v] = kv.split("="); acc[k] = v; return acc; }, {} as Record<string, string>);
+      const signedPayload = `${parts["t"]}.${raw}`;
+      const expected = await hmac256Hex(env.STRIPE_WEBHOOK_SECRET, signedPayload);
+      const provided = parts["v1"];
+      if (!provided || provided.toLowerCase() !== expected.toLowerCase()) return json({ error: "signature_verify_failed" }, 400);
+      const event = JSON.parse(raw);
+      const type = event.type as string;
+      const obj = event.data.object as any;
+      if (type === "checkout.session.completed" || type === "invoice.paid") {
+        const sessionId = obj.id || obj.checkout_session || "";
+        const customerId = obj.customer || "";
+        let email = "";
+        if (customerId) {
+          const c = await fetch(`https://api.stripe.com/v1/customers/${encodeURIComponent(customerId)}`, { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } }).then(r => r.json<any>());
+          email = c?.email || "";
+        }
+        const issued_at = nowSec();
+        const exp = issued_at + 365 * 24 * 3600;
+        const licenseClaims = { ver: 1, license_id: `lic_${sessionId || customerId || issued_at}`, sub: email || customerId || "unknown", plan: "pro", entitlements: ["all"], issued_at, exp };
+        const privHex = env.LIC_ED25519_PRIV_HEX.trim();
+        const priv = new Uint8Array(privHex.match(/.{1,2}/g)!.map(h => parseInt(h, 16)));
+        let keypair: { secretKey: Uint8Array; publicKey: Uint8Array };
+        if (priv.length === 32) keypair = nacl.sign.keyPair.fromSeed(priv);
+        else if (priv.length === 64) keypair = { secretKey: priv, publicKey: priv.slice(32) };
+        else return json({ error: "bad_private_key_length" }, 500);
+        const payloadStr = JSON.stringify(licenseClaims);
+        const payloadB64 = strToB64u(payloadStr);
+        const sigBytes = nacl.sign.detached(new TextEncoder().encode(payloadStr), keypair.secretKey);
+        const sigB64 = b64u(sigBytes);
+        const license = `LM1.${payloadB64}.${sigB64}`;
+        const stub = env.LICENSES.get(env.LICENSES.idFromName("store"));
+        await stub.fetch("https://store/put", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: "sid:" + (sessionId || customerId), value: { license, email, exp } }) });
+        if (customerId) {
+          await stub.fetch("https://store/put", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: "cust:" + customerId, value: { license, email, exp } }) });
+        }
+        if (email) {
+          await stub.fetch("https://store/put", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: "email:" + email.toLowerCase(), value: { license, email, exp } }) });
+        }
+      }
+      return json({ received: true }, 200);
+    }
+    if (request.method === "GET" && url.pathname === "/api/license/by-session") {
+      const sid = url.searchParams.get("session_id") || "";
+      if (!sid) return withCORS(json({ error: "missing_session_id" }, 400), allowOrigin(request));
+      const rec = await readFromDO(env, "sid:" + sid);
+      if (!rec?.license) return withCORS(json({ license: null }, 404), allowOrigin(request));
+      return withCORS(json(rec), allowOrigin(request));
+    }
+    if (request.method === "GET" && url.pathname === "/api/license/by-customer") {
+      const email = (url.searchParams.get("email") || "").toLowerCase().trim();
+      if (!email) return withCORS(json({ error: "missing_email" }, 400), allowOrigin(request));
+      let rec = await readFromDO(env, "email:" + email);
+      if (!rec?.license) {
+        const sr = await fetch("https://api.stripe.com/v1/customers?limit=1&email=" + encodeURIComponent(email), { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } });
+        const list = await sr.json<any>();
+        const cust = list?.data?.[0];
+        if (cust?.id) {
+          rec = await readFromDO(env, "cust:" + cust.id);
+          if (rec?.license) {
+            const stub = env.LICENSES.get(env.LICENSES.idFromName("store"));
+            await stub.fetch("https://store/put", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: "email:" + email, value: rec }) });
           }
         }
-      } finally {
-        if (!cancelled) setLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // If token changes later (SignIn/SignUp), refresh /auth/me
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (!token) return;
+      if (!rec?.license) return withCORS(json({ license: null }, 404), allowOrigin(request));
+      return withCORS(json(rec), allowOrigin(request));
+    }
+    if (request.method === "POST" && url.pathname === "/api/portal/session") {
+      let email = "";
       try {
-        const me = await getJSON<LocalUser>("/auth/me");
-        if (!cancelled) setUser(me || null);
-        if (me?.email) localStorage.setItem("profile_email", me.email);
-      } catch {
-        // okay to ignore if not implemented
-        const stored = localStorage.getItem("profile_email") || "";
-        if (!cancelled) setUser(stored ? { email: stored } : { email: undefined });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [token]);
-
-  const ctx = useMemo<Ctx>(() => ({ user, loading, setToken, logout }), [user, loading]);
-
-  return <AuthContext.Provider value={ctx}>{children}</AuthContext.Provider>;
+        const body = await request.json<any>();
+        email = (body?.email || "").toLowerCase().trim();
+      } catch {}
+      if (!email) return withCORS(json({ error: "missing_email" }, 400), allowOrigin(request));
+      const listRes = await fetch("https://api.stripe.com/v1/customers?limit=1&email=" + encodeURIComponent(email), { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } });
+      const list = await listRes.json<any>();
+      const customer = list?.data?.[0];
+      if (!customer?.id) return withCORS(json({ error: "customer_not_found" }, 404), allowOrigin(request));
+      const pr = await fetch("https://api.stripe.com/v1/billing_portal/sessions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ customer: customer.id, return_url: env.PORTAL_RETURN_URL || env.APP_BASE_URL })
+      });
+      const portal = await pr.json<any>();
+      if (!pr.ok) return withCORS(json(portal, 400), allowOrigin(request));
+      return withCORS(json({ url: portal.url }), allowOrigin(request));
+    }
+    if (request.method === "GET" && url.pathname === "/__admin/by-email") {
+      const k = url.searchParams.get("k") || "";
+      if (!env.ADMIN_KEY || k !== env.ADMIN_KEY) return withCORS(json({ error: "forbidden" }, 403), allowOrigin(request));
+      const email = (url.searchParams.get("email") || "").toLowerCase().trim();
+      if (!email) return withCORS(json({ error: "missing_email" }, 400), allowOrigin(request));
+      const rec = await readFromDO(env, "email:" + email);
+      return withCORS(json(rec || { license: null }), allowOrigin(request));
+    }
+    return json({ error: "not_found" }, 404);
+  }
 };
-
-export const useAuth = () => useContext(AuthContext);
-
-# ===== frontend/src/file_read/auth/ForgotPassword.tsx =====
-
-// frontend/src/file_read/auth/ForgotPassword.tsx
-import { useState } from "react";
-import { postJSON } from "../services/http";
-
-export default function ForgotPassword() {
-  const [email, setEmail] = useState("");
-  const [sent, setSent] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-    setSent(false);
-    setSubmitting(true);
-    try {
-      // Backend should implement: POST /auth/forgot  { email }
-      // Behavior suggestion:
-      //  - If SMTP configured: send email with reset link/token
-      //  - If offline: generate token and print reset URL to server logs (admin shares it)
-      await postJSON("/auth/forgot", { email: email.trim().toLowerCase() });
-      setSent(true);
-    } catch (e: any) {
-      // Common cases: 404 if endpoint not implemented, or 400/422 for bad email
-      const msg = (e?.message as string) || "";
-      if (/HTTP 404/i.test(msg)) {
-        setErr("Password reset isn’t enabled on this box. Ask the admin to reset your password.");
-      } else {
-        setErr(msg.replace(/^HTTP \d+\s*–\s*/, "") || "Could not send reset request");
-      }
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <form onSubmit={onSubmit} className="space-y-4">
-      <h1 className="text-xl font-semibold text-center">Reset password</h1>
-
-      <div className="space-y-1">
-        <label className="block text-sm text-gray-700">Email</label>
-        <input
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          type="email"
-          inputMode="email"
-          autoComplete="email"
-          required
-          className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-black"
-          placeholder="you@example.com"
-        />
-      </div>
-
-      {sent && (
-        <div className="text-sm text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">
-          If password reset is enabled, a link has been sent (or printed in the server logs if email isn’t configured).
-          Contact your admin if you don’t receive it.
-        </div>
-      )}
-
-      {err && (
-        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-          {err}
-        </div>
-      )}
-
-      <button
-        type="submit"
-        disabled={submitting}
-        className="w-full rounded-lg bg-black text-white py-2.5 font-medium disabled:opacity-60"
-      >
-        {submitting ? "Sending…" : "Send reset request"}
-      </button>
-    </form>
-  );
-}
-
-# ===== frontend/src/file_read/auth/localAuth.ts =====
-
-import { buildUrl } from "../services/http";
-
-const KEY = "local_jwt";
-export function getLocalToken(): string | null { return localStorage.getItem(KEY); }
-export function setLocalToken(tok: string | null) { tok ? localStorage.setItem(KEY, tok) : localStorage.removeItem(KEY); }
-
-export async function localRegister(email: string, password: string) {
-  const r = await fetch(buildUrl("/auth/register"), {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!r.ok) throw new Error(await r.text());
-}
-
-export async function localLogin(email: string, password: string) {
-  const r = await fetch(buildUrl("/auth/login"), {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  const data = await r.json();
-  setLocalToken(data.access_token);
-}
-
-export function localLogout() { setLocalToken(null); }
-
-# ===== frontend/src/file_read/auth/SignIn.tsx =====
-
-import { useState } from "react";
-import { localLogin, localRegister } from "./localAuth";
-import { useAuth } from "./AuthContext";
-
-export default function SignIn() {
-  const { setToken } = useAuth();
-  const [email, setEmail] = useState("");
-  const [pw, setPw] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-  const [mode, setMode] = useState<"signin" | "signup">("signin");
-  const [busy, setBusy] = useState(false);
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null); setBusy(true);
-    try {
-      if (mode === "signup") {
-        await localRegister(email, pw);
-      }
-      await localLogin(email, pw);
-      // token is stored by localLogin; poke context to re-evaluate
-      setToken(localStorage.getItem("local_jwt"));
-    } catch (e: any) {
-      setErr(e?.message || "Auth failed");
-    } finally { setBusy(false); }
-  }
-
-  return (
-    <form onSubmit={submit} className="space-y-3">
-      <h1 className="text-lg font-semibold">{mode === "signin" ? "Sign in" : "Create account"}</h1>
-      <input className="w-full border rounded px-3 py-2" placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} />
-      <input className="w-full border rounded px-3 py-2" placeholder="Password" type="password" value={pw} onChange={e=>setPw(e.target.value)} />
-      {err && <div className="text-sm text-red-600">{err}</div>}
-      <button disabled={busy} className="w-full rounded bg-black text-white py-2">{busy ? "Please wait…" : (mode === "signin" ? "Sign in" : "Sign up")}</button>
-      <div className="text-sm text-center">
-        {mode === "signin" ? (
-          <button type="button" className="underline" onClick={()=>setMode("signup")}>Create account</button>
-        ) : (
-          <button type="button" className="underline" onClick={()=>setMode("signin")}>Have an account? Sign in</button>
-        )}
-      </div>
-    </form>
-  );
-}
-
-# ===== frontend/src/file_read/auth/SignUp.tsx =====
-
-// frontend/src/file_read/auth/SignUp.tsx
-import { useState } from "react";
-import { Eye, EyeOff } from "lucide-react";
-import { localRegister, localLogin } from "./localAuth";
-import { useAuth } from "./AuthContext";
-
-export default function SignUp() {
-  const { setToken } = useAuth();
-  const [email, setEmail] = useState("");
-  const [pw, setPw] = useState("");
-  const [confirmPw, setConfirmPw] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [showPw, setShowPw] = useState(false);
-  const [showConfirm, setShowConfirm] = useState(false);
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-
-    const em = email.trim().toLowerCase();
-    if (!em) return setErr("Email is required");
-    if (pw.length < 6) return setErr("Password must be at least 6 characters");
-    if (pw !== confirmPw) return setErr("Passwords do not match");
-
-    setSubmitting(true);
-    try {
-      await localRegister(em, pw);     // create user locally
-      await localLogin(em, pw);        // get JWT + store in localStorage
-      setToken(localStorage.getItem("local_jwt")); // notify context (logged in)
-    } catch (e: any) {
-      setErr(e?.message || "Sign up failed");
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <form onSubmit={onSubmit} className="space-y-4">
-      <h1 className="text-xl font-semibold text-center">Create account</h1>
-
-      <div className="space-y-1">
-        <label className="block text-sm text-gray-700">Email</label>
-        <input
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          type="email"
-          inputMode="email"
-          autoComplete="email"
-          required
-          className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-black"
-          placeholder="you@example.com"
-        />
-      </div>
-
-      <div className="space-y-1">
-        <label className="block text-sm text-gray-700">Password</label>
-        <div className="relative">
-          <input
-            value={pw}
-            onChange={(e) => setPw(e.target.value)}
-            type={showPw ? "text" : "password"}
-            autoComplete="new-password"
-            minLength={6}
-            required
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 pr-10 outline-none focus:ring-2 focus:ring-black"
-            placeholder="At least 6 characters"
-          />
-          <button
-            type="button"
-            onClick={() => setShowPw((s) => !s)}
-            className="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-500"
-            aria-label={showPw ? "Hide password" : "Show password"}
-          >
-            {showPw ? <EyeOff size={18} /> : <Eye size={18} />}
-          </button>
-        </div>
-      </div>
-
-      <div className="space-y-1">
-        <label className="block text-sm text-gray-700">Confirm Password</label>
-        <div className="relative">
-          <input
-            value={confirmPw}
-            onChange={(e) => setConfirmPw(e.target.value)}
-            type={showConfirm ? "text" : "password"}
-            autoComplete="new-password"
-            minLength={6}
-            required
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 pr-10 outline-none focus:ring-2 focus:ring-black"
-            placeholder="Re-enter password"
-          />
-          <button
-            type="button"
-            onClick={() => setShowConfirm((s) => !s)}
-            className="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-500"
-            aria-label={showConfirm ? "Hide confirm password" : "Show confirm password"}
-          >
-            {showConfirm ? <EyeOff size={18} /> : <Eye size={18} />}
-          </button>
-        </div>
-      </div>
-
-      {err && (
-        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-          {err}
-        </div>
-      )}
-
-      <button
-        type="submit"
-        disabled={submitting}
-        className="w-full rounded-lg bg-black text-white py-2.5 font-medium disabled:opacity-60"
-      >
-        {submitting ? "Creating…" : "Create account"}
-      </button>
-    </form>
-  );
-}
-
-# ===== frontend/src/file_read/components/AssistantMetrics.tsx =====
-
-// frontend/src/file_read/components/chat/AssistantMetrics.tsx
-import { Info } from "lucide-react";
-import MetricsHoverCard from "./MetricsHoverCard";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-
-export default function AssistantMetrics({
-  status,
-  runJson,
-  flat,
-  align = "right",
-}: { status: string; runJson?: RunJson | null; flat?: GenMetrics | null; align?: "left" | "right" }) {
-  return (
-    <div className="mt-2 flex justify-start">
-      <div className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-white border shadow-sm text-[11px] text-gray-600">
-        <Info className="w-3.5 h-3.5 opacity-70" />
-        <span className="truncate max-w-[70vw] sm:max-w-none">{status || "Run details"}</span>
-        <MetricsHoverCard
-          data={
-            runJson ??
-            (flat
-              ? {
-                  stats: {
-                    stopReason: flat.stop_reason ?? null,
-                    tokensPerSecond: flat.tok_per_sec ?? null,
-                    timeToFirstTokenSec: flat.ttft_ms != null ? Math.max(0, flat.ttft_ms) / 1000 : null,
-                    totalTimeSec: null,
-                    promptTokensCount: flat.input_tokens_est ?? null,
-                    predictedTokensCount: flat.output_tokens ?? null,
-                    totalTokensCount: flat.total_tokens_est ?? null,
-                  },
-                }
-              : null)
-          }
-          title="Run JSON"
-          align={align}
-          compact
-        />
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/Budget/BudgetBar.tsx =====
-
-// frontend/src/file_read/components/Budget/BudgetBar.tsx
-
-import { useState } from "react";
-import {
-  type RunJson,
-  getNormalizedBudget,
-  getRagTelemetry,
-  getWebTelemetry,
-  getTimingMetrics,
-  getPackTelemetry,
-  getThroughput,
-} from "../../shared/lib/runjson";
-import {
-  RagPanel,
-  WebPanel,
-  TimingPanel,
-} from "./BudgetBarPanelsExtras";
-import {
-  num,
-  PackPanel,
-} from "./BudgetBarPanelsCore";
-
-import { ChevronDown, ChevronUp } from "lucide-react";
-
-function pct(n: number, d: number) {
-  if (!Number.isFinite(n) || !Number.isFinite(d) || d <= 0) return 0;
-  return Math.max(0, Math.min(100, (n / d) * 100));
-}
-
-export default function BudgetBar({ runJson }: { runJson?: RunJson | null }) {
-  const nb = getNormalizedBudget(runJson ?? undefined);
-  if (!nb) return null;
-
-  const [open, setOpen] = useState(false);
-
-  const rag = getRagTelemetry(runJson ?? undefined) as any | null;
-  const web = getWebTelemetry(runJson ?? undefined) as any | null;
-  const pack = getPackTelemetry(runJson ?? undefined) as any | null;
-  const timing = getTimingMetrics(runJson ?? undefined) as any | null;
-  const tps = getThroughput(runJson ?? undefined);
-
-  const breakdown =
-    (runJson as any)?.budget_view?.breakdown ??
-    (runJson as any)?.stats?.budget?.breakdown ??
-    null;
-
-  const modelCtx = num(nb.modelCtx);
-  const clampMargin = num(nb.clampMargin);
-  const inputTokensEst = num(nb.inputTokensEst);
-  const outBudgetChosen = num(nb.outBudgetChosen);
-  const outActual = num(runJson?.stats?.predictedTokensCount);
-  const outShown = outActual || outBudgetChosen;
-
-  const used = inputTokensEst + outShown + clampMargin;
-  const fullPct = pct(used, modelCtx);
-
-  const ragDelta = Math.max(
-    0,
-    num(rag?.ragTokensAdded) ||
-      num(rag?.blockTokens) ||
-      num(rag?.blockTokensApprox) ||
-      num(rag?.sessionOnlyTokensApprox)
-  );
-  const ragWasInjected = !!(rag?.injected || rag?.sessionOnly || ragDelta > 0);
-  const ragPctOfInput = inputTokensEst > 0 ? Math.round((ragDelta / inputTokensEst) * 100) : 0;
-  const ragBlockBuildTime =
-    rag?.injectBuildSec ?? rag?.blockBuildSec ?? rag?.sessionOnlyBuildSec;
-
-  const webRouteSec = web?.elapsedSec;
-  const webFetchSec = web?.fetchElapsedSec;
-  const webInjectSec = web?.injectElapsedSec;
-  const webPre =
-    num((web as any)?.breakdown?.totalWebPreTtftSec) ||
-    (num(webRouteSec) + num(webFetchSec) + num(webInjectSec));
-
-  const packPackSec = num(pack?.packSec);
-  const packSummarySec = num(pack?.summarySec);
-  const packFinalTrimSec = num(pack?.finalTrimSec);
-  const packCompressSec = num(pack?.compressSec);
-  const packSummaryTokens = num(pack?.summaryTokensApprox);
-  const packSummaryUsedLLM = !!pack?.summaryUsedLLM;
-
-  const droppedMsgs = num((pack as any)?.finalTrimDroppedMsgs);
-  const droppedApproxTok = num((pack as any)?.finalTrimDroppedApproxTokens);
-  const sumShrinkFrom = num((pack as any)?.finalTrimSummaryShrunkFromChars);
-  const sumShrinkTo = num((pack as any)?.finalTrimSummaryShrunkToChars);
-  const sumShrinkDropped = num((pack as any)?.finalTrimSummaryDroppedChars);
-  const rolledPeeledMsgs = num((pack as any)?.rollPeeledMsgs);
-  const rollNewSummaryTokens = num((pack as any)?.rollNewSummaryTokensApprox);
-
-  const engine = timing?.engine || null;
-  const engineLoadSec = num(engine?.loadSec);
-  const enginePromptSec = num(engine?.promptSec);
-  const engineEvalSec = num(engine?.evalSec);
-  const enginePromptN = engine?.promptN;
-  const engineEvalN = engine?.evalN;
-
-  const preModelSec = num(timing?.preModelSec);
-  const modelQueueSec = num(timing?.modelQueueSec);
-
-  const preAccountedFromBackend = num(breakdown?.preTtftAccountedSec);
-  const accountedFallback =
-    webPre +
-    num(rag?.routerDecideSec) +
-    num(ragBlockBuildTime) +
-    packPackSec +
-    packSummarySec +
-    packFinalTrimSec +
-    packCompressSec +
-    preModelSec +
-    modelQueueSec;
-  const accounted = preAccountedFromBackend || accountedFallback;
-
-  const unattributed =
-    (breakdown && Number.isFinite(breakdown.unattributedTtftSec))
-      ? num(breakdown.unattributedTtftSec)
-      : Math.max(0, num(timing?.ttftSec) - accounted);
-
-  return (
-    <div className="px-3 py-2 border-t bg-white/90 backdrop-blur sticky bottom-0 z-40">
-      <div className="flex items-center gap-2 text-[11px] text-gray-700">
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          aria-expanded={open ? "true" : "false"}
-          className="shrink-0 inline-flex items-center gap-1 px-2 h-6 rounded border bg-white hover:bg-gray-50"
-          title={open ? "Hide details" : "Show details"}
-        >
-          {open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
-          <span className="hidden sm:inline">Details</span>
-        </button>
-
-        <div
-          className="flex-1 h-1.5 rounded bg-gray-200 overflow-hidden"
-          title={`Context ${fullPct.toFixed(1)}%`}
-        >
-          <div className="h-1.5 bg-black" style={{ width: `${fullPct}%` }} />
-        </div>
-
-        <div className="whitespace-nowrap hidden xs:block">
-          In: <span className="font-medium">{inputTokensEst}</span>
-        </div>
-        <div className="whitespace-nowrap hidden xs:block">
-          Out: <span className="font-medium">{outShown}</span>
-        </div>
-        <div className="whitespace-nowrap hidden sm:block">
-          Ctx: <span className="font-medium">{modelCtx}</span>
-        </div>
-        <div className="whitespace-nowrap text-gray-500 hidden md:block">
-          {`Context is ${fullPct.toFixed(1)}% full`}
-        </div>
-      </div>
-
-      {open && (
-        <div className="mt-2 max-h-40 sm:max-h-48 md:max-h-56 overflow-y-auto pr-1 pb-1 -mr-1">
-          {pack && (
-            <PackPanel
-              pack={pack}
-              packPackSec={packPackSec}
-              packSummarySec={packSummarySec}
-              packFinalTrimSec={packFinalTrimSec}
-              packCompressSec={packCompressSec}
-              packSummaryTokens={packSummaryTokens}
-              packSummaryUsedLLM={packSummaryUsedLLM}
-              droppedMsgs={droppedMsgs}
-              droppedApproxTok={droppedApproxTok}
-              sumShrinkFrom={sumShrinkFrom}
-              sumShrinkTo={sumShrinkTo}
-              sumShrinkDropped={sumShrinkDropped}
-              rolledPeeledMsgs={rolledPeeledMsgs}
-              rollNewSummaryTokens={rollNewSummaryTokens}
-            />
-          )}
-
-          {rag && (
-            <RagPanel
-              rag={rag}
-              ragWasInjected={ragWasInjected}
-              ragBlockBuildTime={ragBlockBuildTime}
-              ragDelta={ragDelta}
-              ragPctOfInput={ragPctOfInput}
-              inputTokensEst={inputTokensEst}
-            />
-          )}
-
-          {web && <WebPanel web={web} />}
-
-          {timing && (
-            <TimingPanel
-              timing={timing}
-              enginePromptSec={enginePromptSec}
-              engineEvalSec={engineEvalSec}
-              engineLoadSec={engineLoadSec}
-              enginePromptN={enginePromptN}
-              engineEvalN={engineEvalN}
-              preModelSec={preModelSec}
-              modelQueueSec={modelQueueSec}
-              unattributed={unattributed}
-              encodeTps={tps?.encodeTps ?? null}
-              decodeTps={tps?.decodeTps ?? null}
-              overallTps={tps?.overallTps ?? null}
-            />
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/Budget/BudgetBarPanelsCore.tsx =====
-
-// frontend/src/file_read/components/Budget/BudgetBarPanelsCore.tsx
-export const num = (v: unknown) =>
-  typeof v === "number" && Number.isFinite(v) ? v : 0;
-
-export function fmtSec(v?: number) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  if (v < 0.01) return "<0.01s";
-  return `${v.toFixed(2)}s`;
-}
-
-export function fmtTps(v?: number | null) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  if (v < 1) return v.toFixed(2);
-  if (v < 10) return v.toFixed(1);
-  return Math.round(v).toString();
-}
-
-type PackPanelProps = {
-  pack: any;
-  packPackSec: number;
-  packSummarySec: number;
-  packFinalTrimSec: number;
-  packCompressSec: number;
-  packSummaryTokens: number;
-  packSummaryUsedLLM: boolean;
-  droppedMsgs: number;
-  droppedApproxTok: number;
-  sumShrinkFrom: number;
-  sumShrinkTo: number;
-  sumShrinkDropped: number;
-  rolledPeeledMsgs: number;
-  rollNewSummaryTokens: number;
-};
-
-export function PackPanel({
-  pack,
-  packPackSec,
-  packSummarySec,
-  packFinalTrimSec,
-  packCompressSec,
-  packSummaryTokens,
-  packSummaryUsedLLM,
-  droppedMsgs,
-  droppedApproxTok,
-  sumShrinkFrom,
-  sumShrinkTo,
-  sumShrinkDropped,
-  rolledPeeledMsgs,
-  rollNewSummaryTokens,
-}: PackPanelProps) {
-  return (
-    <div className="mt-2 text-[11px] text-gray-700">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        {"packSec" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            pack {fmtSec(packPackSec)}
-          </span>
-        )}
-        {"summarySec" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            summary {fmtSec(packSummarySec)} {packSummaryUsedLLM ? "(llm)" : "(fast)"}
-          </span>
-        )}
-        {"finalTrimSec" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            trim {fmtSec(packFinalTrimSec)}
-          </span>
-        )}
-        {"compressSec" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            compress {fmtSec(packCompressSec)}
-          </span>
-        )}
-        {"summaryTokensApprox" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            sumTokens≈<b>{packSummaryTokens}</b>
-          </span>
-        )}
-        {"packedChars" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            packed chars=<b>{(pack as any).packedChars}</b>
-          </span>
-        )}
-        {"messages" in pack && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            msgs=<b>{(pack as any).messages}</b>
-          </span>
-        )}
-
-        {(droppedMsgs > 0 || droppedApproxTok > 0) && (
-          <span className="px-1.5 py-0.5 rounded bg-red-50 border border-red-200 text-red-700">
-            dropped msgs=<b>{droppedMsgs}</b>
-            {droppedApproxTok ? (
-              <>
-                {" "}
-                / ≈<b>{droppedApproxTok}</b> tok
-              </>
-            ) : null}
-          </span>
-        )}
-
-        {sumShrinkDropped > 0 && (
-          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
-            summary shrink {sumShrinkFrom}→{sumShrinkTo} chars (−<b>{sumShrinkDropped}</b>)
-          </span>
-        )}
-
-        {rolledPeeledMsgs > 0 && (
-          <span className="px-1.5 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-800">
-            rolled: <b>{rolledPeeledMsgs}</b> msgs → +sum≈<b>{rollNewSummaryTokens}</b> tok
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/Budget/BudgetBarPanelsExtras.tsx =====
-
-// frontend/src/file_read/components/Budget/BudgetBarPanelsExtras.tsx
-import { fmtSec, fmtTps } from "./BudgetBarPanelsCore";
-
-type RagPanelProps = {
-  rag: any;
-  ragWasInjected: boolean;
-  ragBlockBuildTime?: number;
-  ragDelta: number;
-  ragPctOfInput: number;
-  inputTokensEst: number;
-};
-
-export function RagPanel({
-  rag,
-  ragWasInjected,
-  ragBlockBuildTime,
-  ragDelta,
-  ragPctOfInput,
-  inputTokensEst,
-}: RagPanelProps) {
-  const routerNeeded = rag?.routerNeeded;
-  const routerSkipped = rag?.routerSkipped;
-  const routerSkippedReason = rag?.routerSkippedReason;
-  const routerDecideSec = rag?.routerDecideSec;
-  const embedSec = rag?.embedSec;
-  const searchChatSec = rag?.searchChatSec;
-  const searchGlobalSec = rag?.searchGlobalSec;
-  const dedupeSec = rag?.dedupeSec;
-  const topKRequested = rag?.topKRequested;
-  const hitsChat = rag?.hitsChat;
-  const hitsGlobal = rag?.hitsGlobal;
-  const blockChars = rag?.blockChars ?? rag?.sessionOnlyChars;
-  const routerQuery = rag?.routerQuery;
-
-  return (
-    <div className="mt-2 text-[11px] text-gray-700">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-          RAG: <b>{ragWasInjected ? "injected" : "skipped"}</b> {rag?.mode ? `(${rag.mode})` : rag?.sessionOnly ? "(session-only)" : ""}
-        </span>
-        {"routerNeeded" in rag && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            router: <b>{routerNeeded ? "yes" : "no"}</b>
-          </span>
-        )}
-        {routerSkipped && (
-          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
-            skipped {routerSkippedReason ? `(${routerSkippedReason})` : ""}
-          </span>
-        )}
-        {"routerDecideSec" in rag && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            route {fmtSec(routerDecideSec)}
-          </span>
-        )}
-        {"embedSec" in rag && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            embed {fmtSec(embedSec)}
-          </span>
-        )}
-        {("searchChatSec" in rag || "searchGlobalSec" in rag) && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            search {fmtSec(searchChatSec)} / {fmtSec(searchGlobalSec)}
-          </span>
-        )}
-        {"dedupeSec" in rag && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            dedupe {fmtSec(dedupeSec)}
-          </span>
-        )}
-        {ragBlockBuildTime !== undefined && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            block {fmtSec(ragBlockBuildTime)}
-          </span>
-        )}
-        {topKRequested != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">k=<b>{topKRequested}</b></span>
-        )}
-        {hitsChat != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">hits chat=<b>{hitsChat}</b></span>
-        )}
-        {hitsGlobal != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">global=<b>{hitsGlobal}</b></span>
-        )}
-        {(rag.ragTokensAdded != null || rag.blockTokens != null || rag.blockTokensApprox != null || rag.sessionOnlyTokensApprox != null) && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            +RAG tokens=<b>{ragDelta}</b>
-            {inputTokensEst ? ` (${ragPctOfInput}% of input)` : ""}
-          </span>
-        )}
-        {blockChars != null && (
-          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-            block chars=<b>{blockChars}</b>
-          </span>
-        )}
-      </div>
-      {routerQuery && (
-        <div className="mt-1 text-[10px] text-gray-500 truncate" title={routerQuery}>
-          query: {routerQuery}
-        </div>
-      )}
-    </div>
-  );
-}
-
-type WebPanelProps = {
-  web: any;
-};
-
-export function WebPanel({ web }: WebPanelProps) {
-  const webWasInjected = !!web?.injected;
-  const webNeeded = web?.needed;
-  const webRouteSec = web?.elapsedSec;
-  const webFetchSec = web?.fetchElapsedSec;
-  const webInjectSec = web?.injectElapsedSec;
-  const webBlockChars = web?.blockChars;
-  const webEphemeralBlocks = web?.ephemeralBlocks;
-  const summarizedQuery = web?.summarizedQuery;
-
-  return (
-    <div className="mt-2 text-[11px] text-gray-700">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
-          WEB: <b>{webWasInjected ? "injected" : "skipped"}</b>
-          {webNeeded !== undefined ? <> (router: <b>{webNeeded ? "need" : "no"}</b>)</> : null}
-        </span>
-        {"elapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">route {fmtSec(webRouteSec)}</span>}
-        {"fetchElapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">fetch {fmtSec(webFetchSec)}</span>}
-        {"injectElapsedSec" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">inject {fmtSec(webInjectSec)}</span>}
-        {"blockChars" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">block chars=<b>{webBlockChars}</b></span>}
-        {"ephemeralBlocks" in web && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">eph blocks=<b>{webEphemeralBlocks}</b></span>}
-        {web.droppedFromSummary && (
-  <span className="px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800">
-    dropped after turn
-  </span>
-)}
-      </div>
-      {summarizedQuery && (
-        <div className="mt-1 text-[10px] text-gray-500 truncate" title={summarizedQuery}>
-          query: {summarizedQuery}
-        </div>
-      )}
-    </div>
-  );
-}
-
-type TimingPanelProps = {
-  timing: any;
-  enginePromptSec?: number;
-  engineEvalSec?: number;
-  engineLoadSec?: number;
-  enginePromptN?: number | null;
-  engineEvalN?: number | null;
-  preModelSec?: number;
-  modelQueueSec?: number;
-  unattributed?: number;
-  encodeTps?: number | null;
-  decodeTps?: number | null;
-  overallTps?: number | null;
-};
-
-export function TimingPanel({
-  timing,
-  enginePromptSec,
-  engineEvalSec,
-  engineLoadSec,
-  enginePromptN,
-  engineEvalN,
-  preModelSec,
-  modelQueueSec,
-  unattributed,
-  encodeTps,
-  decodeTps,
-  overallTps,
-}: TimingPanelProps) {
-  return (
-    <div className="mt-2 text-[11px] text-gray-700">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">ttft {fmtSec(timing.ttftSec ?? undefined)}</span>
-        {"queueWaitSec" in timing && timing.queueWaitSec != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">queue {fmtSec(timing.queueWaitSec)}</span>}
-        {"genSec" in timing && timing.genSec != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">gen {fmtSec(timing.genSec)}</span>}
-        {"totalSec" in timing && timing.totalSec != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">total {fmtSec(timing.totalSec)}</span>}
-        {!!enginePromptSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">prefill {fmtSec(enginePromptSec)}</span>}
-        {!!engineEvalSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">eval {fmtSec(engineEvalSec)}</span>}
-        {!!engineLoadSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">load {fmtSec(engineLoadSec)}</span>}
-        {enginePromptN != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">promptN={enginePromptN}</span>}
-        {engineEvalN != null && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">evalN={engineEvalN}</span>}
-        {!!preModelSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">pre-model {fmtSec(preModelSec)}</span>}
-        {!!modelQueueSec && <span className="px-1.5 py-0.5 rounded bg-gray-100 border">model-queue {fmtSec(modelQueueSec)}</span>}
-        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">unattributed {fmtSec(unattributed)}</span>
-        {encodeTps != null && <span className="px-1.5 py-0.5 rounded bg-green-50 border border-green-200 text-green-800">encode <b>{fmtTps(encodeTps)}</b> tok/s</span>}
-        {decodeTps != null && <span className="px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-800">decode <b>{fmtTps(decodeTps)}</b> tok/s</span>}
-        {overallTps != null && <span className="px-1.5 py-0.5 rounded bg-gray-50 border">overall <b>{fmtTps(overallTps)}</b> tok/s</span>}
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatBubble.tsx =====
-
-import { useState } from "react";
-import { Copy, Check, Trash2 } from "lucide-react";
-import MarkdownMessage from "./Markdown/MarkdownMessage";
-import { stripRunJson } from "../shared/lib/runjson";
-import type { Attachment } from "../types/chat";   // ✅ import Attachment type
-
-const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
-
-export default function ChatBubble({
-  role,
-  text,
-  attachments = [],   // ✅ new prop
-  showActions = true,
-  onDelete,
-}: {
-  role: "user" | "assistant";
-  text: string;
-  attachments?: Attachment[];   // ✅ allow attachments
-  showActions?: boolean;
-  onDelete?: () => void;
-}) {
-  const isUser = role === "user";
-  const raw = text ?? "";
-  const { text: stripped } = stripRunJson(raw);
-  let content = stripped.trim();
-
-  if (!isUser) content = content.replace(STOP_SENTINEL_RE, "");
-
-  const hasOnlyAttachments =
-    isUser && (!content || content.length === 0) && attachments.length > 0;
-
-  if (role === "assistant" && !content && attachments.length === 0) return null;
-
-  const [copiedMsg, setCopiedMsg] = useState(false);
-  const copyWholeMessage = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopiedMsg(true);
-      setTimeout(() => setCopiedMsg(false), 2000);
-    } catch {}
-  };
-
-  return (
-    <div className="mb-2">
-      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-        <div
-          className={`max-w-[80%] w-fit break-words rounded-2xl px-4 py-2 shadow-sm
-                      prose prose-base max-w-none
-            ${isUser ? "bg-black text-white prose-invert" : "bg-white border text-gray-900"}`}
-        >
-          {/* ✅ Render attachments */}
-          {attachments.length > 0 && (
-            <div className="mb-2 flex flex-wrap gap-2">
-              {attachments.map((att) => (
-                <div
-                  key={`${att.sessionId || "global"}:${att.source || att.name}`}
-                  className={`border rounded px-2 py-1 text-sm flex items-center gap-2 ${
-                    isUser
-                      ? "bg-white/10 border-white/30"
-                      : "bg-white"
-                  }`}
-                  title={att.name || att.source}
-                >
-                  📎 <span className="truncate max-w-[220px]">{att.name}</span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {content ? (
-            <div className="max-w-full">
-              <MarkdownMessage text={content} />
-            </div>
-          ) : hasOnlyAttachments ? null : isUser ? null : (
-            <span className="opacity-60">…</span>
-          )}
-        </div>
-      </div>
-
-      {showActions && (
-        <div className={`mt-1 flex ${isUser ? "justify-end" : "justify-start"}`}>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={copyWholeMessage}
-              title={copiedMsg ? "Copied" : "Copy"}
-              aria-label={copiedMsg ? "Copied" : "Copy message"}
-              className="inline-flex items-center justify-center w-7 h-7 rounded border
-                         bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
-            >
-              {copiedMsg ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-            </button>
-            {onDelete && (
-              <button
-                type="button"
-                onClick={onDelete}
-                title="Delete message"
-                aria-label="Delete message"
-                className="inline-flex items-center justify-center w-7 h-7 rounded border
-                           bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatComposer.tsx =====
-
-// frontend/src/file_read/components/ChatComposer.tsx
-import { useEffect, useRef, useState } from "react";
-import ComposerActions from "./Composer/ComposerActions";
-import AttachmentChip from "./Composer/AttachmentChip";
-import { useAttachmentUploads } from "../hooks/useAttachmentUploads";
-import type { Attachment } from "../types/chat";
-import type { UIAttachment } from "../hooks/useAttachmentUploads";
-
-const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
-
-type Props = {
-  input: string;
-  setInput: (v: string) => void;
-  loading: boolean;
-  queued?: boolean;
-  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
-  onStop: () => void | Promise<void>;
-  onHeightChange?: (h: number) => void;
-  onRefreshChats?: () => void;
-  sessionId?: string;
-};
-
-export default function ChatComposer({
-  input,
-  setInput,
-  loading,
-  queued = false,
-  onSend,
-  onStop,
-  onHeightChange,
-  onRefreshChats,
-  sessionId,
-}: Props) {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const taRef = useRef<HTMLTextAreaElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
-  const MAX_HEIGHT_PX = 192;
-
-  const [isClamped, setIsClamped] = useState(false);
-  const [draft, setDraft] = useState(input);
-
-  const { atts, addFiles, removeAtt, anyUploading, anyReady, attachmentsForPost, reset } =
-    useAttachmentUploads(sessionId, onRefreshChats);
-
-  useEffect(() => setDraft(input), [input]);
-
-  const autogrow = () => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    const next = Math.min(ta.scrollHeight, MAX_HEIGHT_PX);
-    ta.style.height = `${next}px`;
-    setIsClamped(ta.scrollHeight > MAX_HEIGHT_PX);
-    if (wrapRef.current && onHeightChange) {
-      onHeightChange(wrapRef.current.getBoundingClientRect().height);
-    }
-  };
-
-  useEffect(() => {
-    autogrow();
-    const onResize = () => autogrow();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-
-  useEffect(() => {
-    autogrow();
-  }, [draft, atts.length]);
-
-  const hasText = draft.trim().length > 0;
-
-  const forceScroll = (behavior: ScrollBehavior = "auto") => {
-    window.dispatchEvent(new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } }));
-  };
-
-  const handleSendClick = async () => {
-    const v = draft.trim();
-    if ((loading || queued) || (!v && !anyReady) || anyUploading) return;
-    forceScroll("auto");
-    setDraft("");
-    setInput("");
-    reset();
-    try {
-      await onSend(v, attachmentsForPost());
-    } finally {
-      onRefreshChats?.();
-      requestAnimationFrame(() => forceScroll("smooth"));
-    }
-  };
-
-  const handleStopClick = () => {
-    if (!loading && !queued) return;
-    void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
-  };
-
-  const pickFile = () => fileRef.current?.click();
-
-  const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    if (!sessionId) {
-      e.target.value = "";
-      return;
-    }
-    await addFiles(files);
-    e.target.value = "";
-  };
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void handleSendClick();
-    }
-  }
-
-  const disableActions = loading || queued || anyUploading;
-  const showSend = hasText || anyReady;
-
-  return (
-    <div ref={wrapRef} className="relative z-50 bg-white/95 backdrop-blur border-t p-3">
-      {atts.length > 0 && (
-        <div className="mb-2 flex flex-wrap gap-2">
-          {atts.map((a: UIAttachment) => (
-            <AttachmentChip key={a.uiId} a={a} onRemove={removeAtt} />
-          ))}
-        </div>
-      )}
-
-      <div className="flex gap-2">
-        <input ref={fileRef} type="file" multiple className="hidden" onChange={onFilePicked} />
-
-        <textarea
-          ref={taRef}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            setInput(e.target.value);
-            autogrow();
-          }}
-          onInput={autogrow}
-          onKeyDown={onKeyDown}
-          placeholder="Ask anything…"
-          className={`flex-1 border rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring ${
-            isClamped ? "overflow-y-auto" : "overflow-hidden"
-          }`}
-          rows={1}
-          style={{ maxHeight: MAX_HEIGHT_PX }}
-          disabled={queued}
-        />
-
-        <ComposerActions
-          disabledUpload={disableActions || !sessionId}
-          onPickFile={pickFile}
-          showStop={loading || queued}
-          onStop={handleStopClick}
-          showSend={showSend}
-          onSend={handleSendClick}
-        />
-      </div>
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatContainer.tsx =====
-
-// frontend/src/file_read/components/ChatContainer.tsx
-import { useState, useRef, useEffect, useMemo } from "react";
-import ChatView from "./ChatView/ChatView";
-import ChatComposer from "./ChatComposer";
-import BudgetBar from "./Budget/BudgetBar";
-import type { ChatMsg } from "../types/chat";
-import type { GenMetrics, RunJson } from "../shared/lib/runjson";
-import type { Attachment } from "../types/chat";
-
-interface Props {
-  messages: ChatMsg[];
-  input: string;
-  setInput: (s: string) => void;
-  loading: boolean;
-  queued?: boolean;
-  send: (text?: string, attachments?: Attachment[]) => Promise<void>;
-  stop: () => Promise<void> | void;
-  runMetrics?: GenMetrics | null;
-  runJson?: RunJson | null;
-  onRefreshChats?: () => void;
-  onDeleteMessages?: (ids: string[]) => void;
-  autoFollow?: boolean;
-  sessionId?: string;
-}
-
-export default function ChatContainer({
-  messages,
-  input,
-  setInput,
-  loading,
-  queued = false,
-  send,
-  stop,
-  runMetrics,
-  runJson,
-  onRefreshChats,
-  onDeleteMessages,
-  autoFollow = true,
-  sessionId,
-}: Props) {
-  const [composerH, setComposerH] = useState(0);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [pinned, setPinned] = useState(false);
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const threshold = 120;
-    const isNearBottom = () => el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
-    const onScroll = () => setPinned(!isNearBottom());
-    el.addEventListener("scroll", onScroll, { passive: true });
-    setPinned(!isNearBottom());
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
-
-  const forceScrollToBottom = (behavior: ScrollBehavior = "smooth") => {
-    const el = containerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior });
-  };
-
-  const handleSend = async (text?: string, attachments?: Attachment[]) => {
-    if (!pinned) forceScrollToBottom("auto");
-    await send(text, attachments);
-    onRefreshChats?.();
-    if (!pinned) requestAnimationFrame(() => forceScrollToBottom("smooth"));
-  };
-
-  const runJsonForBar = useMemo<RunJson | null>(() => {
-    if (runJson) return runJson;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m: any = messages[i];
-      if (m?.role === "assistant" && m?.meta?.runJson) return m.meta.runJson as RunJson;
-    }
-    return null;
-  }, [runJson, messages]);
-
-  return (
-    <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
-      <div ref={containerRef} data-chat-scroll className="flex-1 overflow-y-auto min-w-0">
-        <ChatView
-          messages={messages}
-          loading={loading}
-          queued={queued}
-          bottomPad={composerH}
-          runMetrics={runMetrics}
-          runJson={runJson}
-          onDeleteMessages={onDeleteMessages}
-          autoFollow={autoFollow}
-        />
-      </div>
-
-      <BudgetBar runJson={runJsonForBar ?? null} />
-
-      <ChatComposer
-        input={input}
-        setInput={setInput}
-        loading={loading}
-        queued={queued}
-        onSend={handleSend}
-        onStop={stop}
-        onHeightChange={setComposerH}
-        onRefreshChats={onRefreshChats}
-        sessionId={sessionId}
-      />
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatItem.tsx =====
-
-// frontend/src/file_read/components/chat/ChatItem.tsx
-import ChatBubble from "./ChatBubble";
-import AssistantMetrics from "./AssistantMetrics";
-import { buildStatus } from "./ChatView/StatusLine";
-import type { ChatMsg } from "../types/chat";
-import type { RunJson, GenMetrics } from "../shared/lib/runjson";
-
-export default function ChatItem({
-  m,
-  idx,
-  loading,
-  lastAssistantIndex,
-  runJsonLive,
-  runMetricsLive,
-  onDelete,
-}: {
-  m: ChatMsg;
-  idx: number;
-  loading: boolean;
-  lastAssistantIndex: number;
-  runJsonLive?: RunJson | null;
-  runMetricsLive?: GenMetrics | null;
-  onDelete?: (id: string) => void;
-}) {
-  const isAssistant = m.role === "assistant";
-  const isCurrentStreamingAssistant = isAssistant && loading && idx === lastAssistantIndex;
-
-  let jsonForThis: RunJson | null = null;
-  let flatForThis: GenMetrics | null = null;
-
-  if (isAssistant) {
-    // @ts-ignore meta bag
-    const meta = m.meta as { runJson?: RunJson | null; flat?: GenMetrics | null } | undefined;
-    jsonForThis = meta?.runJson ?? null;
-    flatForThis = meta?.flat ?? null;
-
-    if (isCurrentStreamingAssistant) {
-      if (runJsonLive) jsonForThis = runJsonLive;
-      if (runMetricsLive) flatForThis = runMetricsLive;
-    }
-  }
-
-  const status = isAssistant ? buildStatus(jsonForThis, flatForThis) : "";
-  const showMetrics = isAssistant && (jsonForThis || flatForThis);
-
-  return (
-    <div>
-      <ChatBubble
-        role={m.role}
-        text={m.text}
-        attachments={m.attachments} 
-        showActions={m.role === "user" || (m.role === "assistant" && !isCurrentStreamingAssistant)}
-        onDelete={onDelete ? () => onDelete(m.id) : undefined}
-      />
-      {showMetrics && <AssistantMetrics status={status} runJson={jsonForThis} flat={flatForThis} />}
-    </div>
-  );
-}
-
-# ===== frontend/src/file_read/components/ChatSidebar/AccountPanel.tsx =====
-
-// frontend/src/file_read/components/ChatSidebar/AccountPanel.tsx
-import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, LogOut, Settings, HelpCircle, Stars, BookOpen, Wand2, Save } from "lucide-react";
-import { useAuth } from "../../auth/AuthContext";
-
-function initials(s: string) {
-  const parts = (s || "").trim().split(/\s+/);
-  if (!parts[0]) return "AC";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[1][0]).toUpperCase();
-}
-
-export default function AccountPanel() {
-  const { user, setToken } = useAuth(); // local auth context
-  const [open, setOpen] = useState(false);
-
-  // --- identity display (prefer context; fallback to localStorage) ---
-  const storedEmail = typeof localStorage !== "undefined" ? localStorage.getItem("profile_email") || "" : "";
-  const display = user?.email || storedEmail || "Account";
-  const tier = "Pro";
-  const avatarText = useMemo(() => initials(display), [display]);
-
-  // --- license key management (used by proxy / app limits) ---
-  const [license, setLicense] = useState<string>("");
-  const [saved, setSaved] = useState<null | "ok" | "err">(null);
-
-  useEffect(() => {
-    try {
-      setLicense(localStorage.getItem("license_key") || "");
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  function saveLicense() {
-    try {
-      if (license.trim()) {
-        localStorage.setItem("license_key", license.trim());
-      } else {
-        localStorage.removeItem("license_key");
-      }
-      setSaved("ok");
-      setTimeout(() => setSaved(null), 1500);
-    } catch {
-      setSaved("err");
-      setTimeout(() => setSaved(null), 2000);
-    }
-  }
-
-  // --- actions ---
-  function openSettings() {
-    try { window.dispatchEvent(new CustomEvent("open:settings")); } catch {}
-    setOpen(false);
-  }
-  function openKnowledge() {
-    try { window.dispatchEvent(new CustomEvent("open:knowledge")); } catch {}
-    setOpen(false);
-  }
-  function openCustomize() {
-    try { window.dispatchEvent(new CustomEvent("open:customize")); } catch {}
-    setOpen(false);
-  }
-  function openHelp() {
-    // Swap with your docs/help URL
-    window.open("https://yourdocs.example.com", "_blank", "noopener,noreferrer");
-    setOpen(false);
-  }
-  function logout() {
-    try {
-      localStorage.removeItem("local_jwt");
-      // keep profile_email / license_key unless you want to clear them too
-      setToken?.(null);
-    } finally {
-      setOpen(false);
-      // Simple UX: reload to reset state everywhere
-      location.reload();
-    }
-  }
-
-  return (
-    <div className="p-2">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-3 bg-gray-100 hover:bg-gray-200 active:bg-gray-300 transition rounded-xl px-3 py-2 text-left"
-        aria-haspopup="menu"
-        aria-expanded={open}
-      >
-        <div className="w-8 h-8 rounded-lg bg-slate-800 text-white grid place-items-center text-xs font-semibold">
-          {avatarText}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium truncate">{display}</div>
-          <div className="text-[11px] text-gray-600">
-            <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px]">
-              {tier}
-            </span>
-          </div>
-        </div>
-        <ChevronDown className={`w-4 h-4 transition ${open ? "rotate-180" : ""}`} />
-      </button>
-
-      {open && (
-        <div className="hidden md:block relative">
-          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} aria-hidden />
-          <div role="menu" className="absolute z-40 bottom-14 left-2 right-2 rounded-xl border bg-white shadow-xl overflow-hidden">
-            <div className="px-3 py-2 text-xs text-gray-600 border-b truncate">{display}</div>
-
-            {/* License Key (for proxy/app rate-limits) */}
-            <div className="px-3 py-3 border-b bg-gray-50/60">
-              <div className="text-[11px] font-medium text-gray-600 mb-1">License key</div>
-              <div className="flex items-center gap-2">
-                <input
-                  value={license}
-                  onChange={(e) => setLicense(e.target.value)}
-                  placeholder="paste-your-key"
-                  className="flex-1 rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-black"
-                  spellCheck={false}
-                />
-                <button
-                  onClick={saveLicense}
-                  className="inline-flex items-center gap-1 rounded-lg border px-3 py-2 text-sm hover:bg-gray-50"
-                >
-                  <Save size={16} /> Save
-                </button>
-              </div>
-              {saved === "ok" && <div className="mt-1 text-[11px] text-green-600">Saved</div>}
-              {saved === "err" && <div className="mt-1 text-[11px] text-red-600">Couldn’t save</div>}
-            </div>
-
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50" onClick={() => { setOpen(false); }}>
-              <Stars className="w-4 h-4" /> Upgrade plan
-            </button>
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50" onClick={openCustomize}>
-              <Wand2 className="w-4 h-4" /> Customize
-            </button>
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50" onClick={openKnowledge}>
-              <BookOpen className="w-4 h-4" /> Knowledge
-            </button>
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50" onClick={openSettings}>
-              <Settings className="w-4 h-4" /> Settings
-            </button>
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50" onClick={openHelp}>
-              <HelpCircle className="w-4 h-4" /> Help
-            </button>
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50 text-red-600" onClick={logout}>
-              <LogOut className="w-4 h-4" /> Log out
-            </butto

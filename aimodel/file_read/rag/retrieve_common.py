@@ -1,39 +1,45 @@
-# aimodel/file_read/rag/retrieve_common.py
 from __future__ import annotations
+
+import logging
+
+log = logging.getLogger(__name__)
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
 from .retrieve_tabular import make_rag_block_tabular
 
+log = get_logger(__name__)
+
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10 
+PRINT_MAX = 10
+
 
 def _get_embedder():
     global _EMBEDDER, _EMBEDDER_NAME
     try:
         from sentence_transformers import SentenceTransformer
     except Exception as e:
-        print(f"[RAG] sentence_transformers unavailable: {e}")
-        return None, None
-
+        log.info(f"[RAG] sentence_transformers unavailable: {e}")
+        return (None, None)
     model_name = SETTINGS.get("rag_embedding_model")
     if not model_name:
-        print("[RAG] no rag_embedding_model configured")
-        return None, None
-
+        log.info("[RAG] no rag_embedding_model configured")
+        return (None, None)
     if _EMBEDDER is None or _EMBEDDER_NAME != model_name:
         try:
             _EMBEDDER = SentenceTransformer(model_name)
             _EMBEDDER_NAME = model_name
         except Exception as e:
-            print(f"[RAG] failed to load embedding model {model_name}: {e}")
+            log.error(f"[RAG] failed to load embedding model {model_name}: {e}")
             _EMBEDDER = None
             _EMBEDDER_NAME = None
-    return _EMBEDDER, _EMBEDDER_NAME
+    return (_EMBEDDER, _EMBEDDER_NAME)
 
 
-def _embed_query(q: str) -> List[float]:
+def _embed_query(q: str) -> list[float]:
     q = (q or "").strip()
     if not q:
         return []
@@ -44,10 +50,11 @@ def _embed_query(q: str) -> List[float]:
         arr = model.encode([q], normalize_embeddings=True, convert_to_numpy=True)
         return arr[0].tolist()
     except Exception as e:
-        print(f"[RAG] embedding encode failed: {e}")
+        log.error(f"[RAG] embedding encode failed: {e}")
         return []
 
-def _primary_score(h: Dict[str, Any]) -> float:
+
+def _primary_score(h: dict[str, Any]) -> float:
     s = h.get("rerankScore")
     if s is not None:
         try:
@@ -59,10 +66,11 @@ def _primary_score(h: Dict[str, Any]) -> float:
     except Exception:
         return 0.0
 
-def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
+
+def _dedupe_and_sort(hits: list[dict], *, k: int) -> list[dict]:
     hits_sorted = sorted(hits, key=_primary_score, reverse=True)
-    seen: set[Tuple[str, str]] = set()
-    out: List[dict] = []
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
     for h in hits_sorted:
         kid = str(h.get("id") or "")
         key = (kid, "") if kid else (str(h.get("source") or ""), str(h.get("chunkIndex") or ""))
@@ -74,34 +82,31 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
             break
     return out
 
-def _default_header(h: Dict[str, Any]) -> str:
+
+def _default_header(h: dict[str, Any]) -> str:
     src = str(h.get("source") or "")
     idx = h.get("chunkIndex")
     return f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
 
 
-def _render_header(h: Dict[str, Any]) -> str:
+def _render_header(h: dict[str, Any]) -> str:
     return _default_header(h)
 
 
-def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
+def make_rag_block_generic(hits: list[dict], *, max_chars: int) -> str:
     preamble = str(SETTINGS.get("rag_block_preamble") or "")
     preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
     total_budget = int(SETTINGS.get("rag_total_char_budget"))
-
     lines = [preamble]
     used = len(lines[0]) + 1
-
     for h in hits:
         head = _render_header(h)
         body = (h.get("text") or "").strip()
-
         head_cost = len(head) + 1
         if used + head_cost >= total_budget:
             break
         lines.append(head)
         used += head_cost
-
         if body:
             snippet = body[:max_chars]
             snippet_line = "  " + snippet
@@ -114,20 +119,21 @@ def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
                 break
             lines.append(snippet_line)
             used += snippet_cost
-
     return "\n".join(lines)
 
 
-def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[str]] = None) -> str:
+def build_block_for_hits(hits_top: list[dict], preferred_sources: list[str] | None = None) -> str:
     block = make_rag_block_tabular(hits_top, preferred_sources=preferred_sources)
     if block is None:
         block = make_rag_block_generic(
-            hits_top,
-            max_chars=int(SETTINGS.get("rag_max_chars_per_chunk")),
+            hits_top, max_chars=int(SETTINGS.get("rag_max_chars_per_chunk"))
         )
     return block or ""
 
-def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
+
+def _rescore_for_preferred_sources(
+    hits: list[dict], preferred_sources: list[str] | None = None
+) -> list[dict]:
     if not preferred_sources:
         return hits
     boost = float(SETTINGS.get("rag_new_upload_score_boost"))
@@ -137,36 +143,36 @@ def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional
         sc = float(h.get("score") or 0.0)
         src = str(h.get("source") or "").strip().lower()
         if src in pref:
-            sc *= (1.0 + boost)
+            sc *= 1.0 + boost
         hh = dict(h)
         hh["score"] = sc
         out.append(hh)
     return out
 
 
-def _fmt_hit(h: Dict[str, Any]) -> str:
-    return (
-        f"id={h.get('id')!s} src={h.get('source')!s} "
-        f"chunk={h.get('chunkIndex')!s} row={h.get('row')!s} "
-        f"score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
-    )
+def _fmt_hit(h: dict[str, Any]) -> str:
+    return f"id={h.get('id')!s} src={h.get('source')!s} chunk={h.get('chunkIndex')!s} row={h.get('row')!s} score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
 
 
-def _print_hits(label: str, hits: List[Dict[str, Any]], limit: int = PRINT_MAX) -> None:
-    print(f"[RAG DEBUG] {label}: count={len(hits)}")
+def _print_hits(label: str, hits: list[dict[str, Any]], limit: int = PRINT_MAX) -> None:
+    log.debug(f"[RAG DEBUG] {label}: count={len(hits)}")
     for i, h in enumerate(hits[:limit]):
-        print(f"[RAG DEBUG]   {i+1:02d}: {_fmt_hit(h)}")
+        log.debug(f"[RAG DEBUG]   {i + 1:02d}: {_fmt_hit(h)}")
     if len(hits) > limit:
-        print(f"[RAG DEBUG]   … (+{len(hits)-limit} more)")
+        log.debug(f"[RAG DEBUG]   … (+{len(hits) - limit} more)")
 
 
 def _nohit_block(q: str) -> str:
     preamble = str(SETTINGS.get("rag_block_preamble") or "Local knowledge")
     preamble = preamble if preamble.endswith(":") else preamble + ":"
-    msg = str(SETTINGS.get("rag_nohit_message") or "⛔ No relevant local entries found for this query. Do not guess.")
+    msg = str(
+        SETTINGS.get("rag_nohit_message")
+        or "⛔ No relevant local entries found for this query. Do not guess."
+    )
     if q:
         return f"{preamble}\n- {msg}\n- query={q!r}"
     return f"{preamble}\n- {msg}"
+
 
 @dataclass
 class RagTelemetry:

@@ -1,7 +1,4 @@
-s:
-            ln = ln.strip()
-            if not ln:
-                continue
+ntinue
             try:
                 out.append(json.dumps(json.loads(ln), ensure_ascii=False, indent=2))
             except Exception:
@@ -2094,6 +2091,10 @@ passlib[bcrypt]==1.7.4
 
 pynacl==1.5.0
 
+PyJWT>=2.8.0
+cryptography>=41.0.0
+python-jose[cryptography]
+
 # ===== aimodel/file_read/runtime/__init__.py =====
 
 
@@ -2281,6 +2282,135 @@ def join_attachment_names(attachments: Optional[Iterable[Any]]) -> str:
     names: List[str] = [att_get(a, "name") for a in attachments]  
     names = [n for n in names if n]
     return ", ".join(names)
+
+# ===== aimodel/file_read/services/auth_service.py =====
+
+from __future__ import annotations
+import os, time
+from typing import Dict, Any
+import httpx
+from jose import jwt as jose_jwt
+from jose.exceptions import ExpiredSignatureError, JWTError
+from fastapi import HTTPException
+
+FIREBASE_API_KEY = (os.getenv("FIREBASE_WEB_API_KEY") or "").strip()
+FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "").strip()
+
+_CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+_CERTS_TTL = 60 * 60  # 1 hour
+_CERTS_CACHE: Dict[str, Any] = {"k2pem": {}, "fetched_at": 0}
+
+def need_project_check() -> bool:
+    if not FIREBASE_PROJECT_ID:
+        print("[auth] ERROR: FIREBASE_PROJECT_ID is not set")
+        return True
+    return False
+
+def fetch_google_certs_sync() -> Dict[str, str]:
+    now = int(time.time())
+    if now - int(_CERTS_CACHE.get("fetched_at") or 0) < _CERTS_TTL:
+        return _CERTS_CACHE["k2pem"]  # type: ignore[return-value]
+    try:
+        r = httpx.get(_CERTS_URL, timeout=10.0)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            _CERTS_CACHE["k2pem"] = data
+            _CERTS_CACHE["fetched_at"] = now
+            print(f"[auth] fetched Google certs; kids={list(data.keys())[:3]}...")
+            return data
+    except Exception as e:
+        print(f"[auth] ERROR fetching Google certs: {e!r}")
+    return _CERTS_CACHE.get("k2pem", {})  # type: ignore[return-value]
+
+def verify_jwt_with_google(token: str) -> Dict[str, Any]:
+    if need_project_check():
+        raise HTTPException(500, "Auth not configured")
+    try:
+        header = jose_jwt.get_unverified_header(token)
+        kid = header.get("kid")
+        if not kid:
+            print("[auth] token header missing 'kid'")
+            raise HTTPException(401, "Invalid token header")
+
+        payload_preview = jose_jwt.get_unverified_claims(token)
+        print("[auth] id_token preview:", {
+            "header": {"alg": header.get("alg"), "kid": kid, "typ": header.get("typ")},
+            "payload": {
+                "iss": payload_preview.get("iss"),
+                "aud": payload_preview.get("aud"),
+                "email": payload_preview.get("email"),
+                "email_verified": payload_preview.get("email_verified"),
+                "uid": payload_preview.get("uid"),
+                "iat": payload_preview.get("iat"),
+                "exp": payload_preview.get("exp"),
+            }
+        })
+
+        certs = fetch_google_certs_sync()
+        pem = certs.get(kid)
+        if not pem:
+            print(f"[auth] kid {kid} not found in certs; refreshing once")
+            _CERTS_CACHE["fetched_at"] = 0
+            certs = fetch_google_certs_sync()
+            pem = certs.get(kid)
+            if not pem:
+                raise HTTPException(401, "Key not found for token")
+
+        issuer = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
+        claims = jose_jwt.decode(
+            token,
+            pem,
+            algorithms=["RS256"],
+            audience=FIREBASE_PROJECT_ID,
+            issuer=issuer,
+            options={"verify_signature": True, "verify_aud": True, "verify_iat": True, "verify_exp": True},
+        )
+        return claims
+    except ExpiredSignatureError:
+        print("[auth] token expired")
+        raise HTTPException(401, "Token expired")
+    except JWTError as e:
+        print(f"[auth] JWTError while verifying: {e}")
+        raise HTTPException(401, "Invalid token")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[auth] unexpected verify error: {e!r}")
+        raise HTTPException(401, "Invalid token")
+
+async def firebase_sign_in_with_password(email: str, password: str) -> Dict[str, Any]:
+    if not FIREBASE_API_KEY:
+        print("[auth] ERROR: FIREBASE_WEB_API_KEY not set")
+        raise HTTPException(500, "Server auth not configured")
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    if r.status_code >= 400:
+        print(f"[auth] REST login failed status={r.status_code} body={r.text[:200]!r}")
+        raise HTTPException(401, "Invalid credentials")
+    data = r.json()
+    print(f"[auth] REST login ok email={email}")
+    return data
+
+async def firebase_sign_up_with_password(email: str, password: str) -> Dict[str, Any]:
+    if not FIREBASE_API_KEY:
+        print("[auth] ERROR: FIREBASE_WEB_API_KEY not set")
+        raise HTTPException(500, "Server auth not configured")
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    if r.status_code >= 400:
+        # Typical errors: EMAIL_EXISTS, OPERATION_NOT_ALLOWED, WEAK_PASSWORD
+        try:
+            j = r.json()
+            msg = (j.get("error", {}).get("message") or "").replace("_", " ").title()
+        except Exception:
+            msg = r.text[:200]
+        raise HTTPException(400, msg or "Could not register")
+    data = r.json()
+    print(f"[auth] REST register ok email={email}")
+    return data
 
 # ===== aimodel/file_read/services/budget.py =====
 
@@ -2738,128 +2868,4 @@ async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
         print(f"[PIPE] session-only RAG built={bool(att_block)} block_chars={len(att_block or '')}")
         if att_block:
             rag_text = str(eff["rag_block_preamble"]) + "\n\n" + att_block
-            telemetry["rag"]["sessionOnly"] = True
-            telemetry["rag"]["mode"] = "session-only"
-            telemetry["rag"]["blockChars"] = len(rag_text)
-            tok = _approx_block_tokens(llm, "assistant", rag_text)
-            if tok is not None:
-                telemetry["rag"]["sessionOnlyTokensApprox"] = tok
-            telemetry["rag"]["injected"] = True
-            ephemeral_once.append({"role": "assistant", "content": rag_text, "_ephemeral": True})
-        else:
-            telemetry["rag"]["sessionOnly"] = False
-            telemetry["rag"].setdefault("injected", False)
-        telemetry["rag"]["sessionOnlyBuildSec"] = round(time.perf_counter() - t0_att, 6)
-
-    system_text = build_system_text()
-    t_pack0 = time.perf_counter()
-    packed, st["summary"], _ = pack_with_rollup(
-        system_text=system_text,
-        summary=st["summary"],
-        recent=st["recent"],
-        max_ctx=model_ctx,
-        out_budget=out_budget_req,
-        ephemeral=ephemeral_once,
-    )
-    telemetry["pack"]["packSec"] = round(time.perf_counter() - t_pack0, 6)
-
-    return await _finish_prepare_generation_with_telemetry(
-        llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
-        force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
-        telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
-    )
-
-# ===== aimodel/file_read/services/generate_pipeline_part2.py =====
-
-# aimodel/file_read/services/generate_pipeline_part2.py
-from __future__ import annotations
-import time
-from typing import Any, Dict, Optional, List
-from .prompt_utils import chars_len
-from .generate_pipeline_support import (
-    Prep, _tok_count, _approx_block_tokens, _diff_find_inserted_block,
-    _web_breakdown, _web_unattributed, _enforce_fit
-)
-from ..rag.router_ai import decide_rag
-from .packing import maybe_inject_rag_block
-from .session_io import persist_summary
-from .budget import analyze_budget
-from ..core.packing_memory_core import PACK_TELEMETRY
-from .context_window import clamp_out_budget
-
-async def _finish_prepare_generation_with_telemetry(
-    llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
-    force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
-    telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
-) -> Prep:
-    must_inject_session = bool(
-        force_session_only and rag_session_enabled and not has_atts and not telemetry.get("web", {}).get("ephemeralBlocks")
-    )
-
-    rag_router_allowed = ((rag_session_enabled or rag_global_enabled) and not (
-        has_atts and bool(eff["disable_global_rag_on_attachments"])
-    )) or must_inject_session
-
-    # NEW: if web router said it's needed or we already injected web, skip RAG router
-    web_needed = bool((telemetry.get("web") or {}).get("needed"))
-    web_injected = bool((telemetry.get("web") or {}).get("injected"))
-    if web_needed or web_injected:
-        rag_router_allowed = False
-        telemetry.setdefault("rag", {})
-        telemetry["rag"]["routerSkipped"] = True
-        telemetry["rag"]["routerSkippedReason"] = "web_needed" if web_needed else "web_block_present"
-
-    ephemeral_once: List[Dict[str, str]] = []
-    if rag_router_allowed and bool(eff["rag_enabled"]) and not ephemeral_once:
-        rag_need = False
-        rag_query: Optional[str] = None
-
-        if must_inject_session:
-            rag_need = True
-            rag_query = (latest_user_text or base_user_text or "").strip()
-            telemetry["rag"]["routerDecideSec"] = 0.0
-            telemetry["rag"]["routerNeeded"] = True
-            telemetry["rag"]["routerForcedSession"] = True
-            telemetry["rag"]["routerQuery"] = rag_query
-        else:
-            t_router0 = time.perf_counter()
-            if auto_rag:
-                try:
-                    rag_need, rag_query = decide_rag(llm, router_text)
-                except Exception:
-                    rag_need, rag_query = (False, None)
-            telemetry["rag"]["routerDecideSec"] = round(time.perf_counter() - t_router0, 6)
-            telemetry["rag"]["routerNeeded"] = bool(rag_need)
-            if rag_query is not None:
-                telemetry["rag"]["routerQuery"] = rag_query
-
-        skip_rag = bool(ephemeral_once) or (not rag_need)
-        tokens_before = _tok_count(llm, packed)
-        t_inject0 = time.perf_counter()
-
-        print(f"[PIPE][RAG] router query: {rag_query!r} skip_rag={skip_rag}")
-        res = maybe_inject_rag_block(
-            packed,
-            session_id=session_id,
-            skip_rag=skip_rag,
-            rag_query=rag_query,
-            force_session_only=force_session_only,
-        )
-
-        telemetry["rag"]["injectBuildSec"] = round(time.perf_counter() - t_inject0, 6)
-
-        if isinstance(res, tuple):
-            packed2 = res[0]
-            tel = res[1] if len(res) > 1 and isinstance(res[1], dict) else {}
-            block_text = res[2] if len(res) > 2 and isinstance(res[2], str) else None
-        else:
-            packed2 = res
-            tel = {}
-            block_text = None
-
-        if tel:
-            telemetry["rag"].update(tel)
-        if block_text:
-            print(f"[PIPE][RAG] injected block preview: {block_text[:200]!r}")
-            telemetry["rag"]["blockChars"] = len(block_text)
-            tok = _approx_block_tokens(llm, "use
+            t

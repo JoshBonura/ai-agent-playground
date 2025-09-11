@@ -1,12 +1,20 @@
 # aimodel/file_read/web/query_summarizer.py
 from __future__ import annotations
-from typing import Any, Iterable, Dict, Tuple
-import re, time
+
+import re
+import time
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
 from ..utils.streaming import safe_token_count_messages
 
+log = get_logger(__name__)
+
+
 def _tokens(s: str) -> set[str]:
     return set(re.findall(r"\w+", (s or "").lower()))
+
 
 def _as_list(v) -> list:
     if v is None:
@@ -15,8 +23,9 @@ def _as_list(v) -> list:
         return list(v)
     return [v]
 
-def summarize_query(llm: Any, user_text: str) -> Tuple[str, Dict[str, Any]]:
-    telemetry: Dict[str, Any] = {}
+
+def summarize_query(llm: Any, user_text: str) -> tuple[str, dict[str, Any]]:
+    telemetry: dict[str, Any] = {}
     txt = (user_text or "").strip()
 
     bypass_enabled = SETTINGS.get("query_sum_bypass_short_enabled")
@@ -52,13 +61,18 @@ def summarize_query(llm: Any, user_text: str) -> Tuple[str, Dict[str, Any]]:
         )
         elapsed = time.perf_counter() - t_start
         result = (out["choices"][0]["message"]["content"] or "").strip()
-        in_tokens = safe_token_count_messages(llm, [{"role": "user", "content": prompt.format(text=txt)}]) or 0
+        in_tokens = (
+            safe_token_count_messages(llm, [{"role": "user", "content": prompt.format(text=txt)}])
+            or 0
+        )
         out_tokens = safe_token_count_messages(llm, [{"role": "assistant", "content": result}]) or 0
-        telemetry.update({
-            "elapsedSec": round(elapsed, 4),
-            "inputTokens": in_tokens,
-            "outputTokens": out_tokens,
-        })
+        telemetry.update(
+            {
+                "elapsedSec": round(elapsed, 4),
+                "inputTokens": in_tokens,
+                "outputTokens": out_tokens,
+            }
+        )
     else:
         return txt, telemetry
 
@@ -70,7 +84,9 @@ def summarize_query(llm: Any, user_text: str) -> Tuple[str, Dict[str, Any]]:
         if not result or not out_toks:
             telemetry.update({"overlapRetained": True, "overlapScore": 0.0})
             return txt, telemetry
-        jaccard = (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
+        jaccard = (
+            (len(src_toks & out_toks) / len(src_toks | out_toks)) if (src_toks or out_toks) else 1.0
+        )
         telemetry.update({"overlapScore": round(jaccard, 4)})
         if jaccard < float(j_min):
             telemetry.update({"overlapRetained": True})

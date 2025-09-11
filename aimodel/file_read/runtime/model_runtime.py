@@ -1,15 +1,21 @@
 # aimodel/file_read/model_runtime.py
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, Optional, List
+from typing import Any
+
 from ..adaptive.config.paths import read_settings, write_settings
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
 
 try:
     from llama_cpp import Llama
 except Exception as e:
     raise RuntimeError("llama-cpp-python not installed or GPU libs missing") from e
+
 
 @dataclass
 class ModelConfig:
@@ -18,26 +24,32 @@ class ModelConfig:
     nThreads: int = 8
     nGpuLayers: int = 40
     nBatch: int = 256
-    ropeFreqBase: Optional[float] = None
-    ropeFreqScale: Optional[float] = None
+    ropeFreqBase: float | None = None
+    ropeFreqScale: float | None = None
 
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "ModelConfig":
+    def from_dict(d: dict[str, Any]) -> ModelConfig:
         return ModelConfig(
-            modelPath=str(d.get("modelPath","")).strip(),
+            modelPath=str(d.get("modelPath", "")).strip(),
             nCtx=int(d.get("nCtx", 4096)),
             nThreads=int(d.get("nThreads", 8)),
             nGpuLayers=int(d.get("nGpuLayers", 40)),
             nBatch=int(d.get("nBatch", 256)),
-            ropeFreqBase=(float(d["ropeFreqBase"]) if d.get("ropeFreqBase") not in (None,"") else None),
-            ropeFreqScale=(float(d["ropeFreqScale"]) if d.get("ropeFreqScale") not in (None,"") else None),
+            ropeFreqBase=(
+                float(d["ropeFreqBase"]) if d.get("ropeFreqBase") not in (None, "") else None
+            ),
+            ropeFreqScale=(
+                float(d["ropeFreqScale"]) if d.get("ropeFreqScale") not in (None, "") else None
+            ),
         )
 
-_runtime_lock = RLock()
-_llm: Optional[Llama] = None
-_cfg: Optional[ModelConfig] = None
 
-def _build_kwargs(cfg: ModelConfig) -> Dict[str, Any]:
+_runtime_lock = RLock()
+_llm: Llama | None = None
+_cfg: ModelConfig | None = None
+
+
+def _build_kwargs(cfg: ModelConfig) -> dict[str, Any]:
     kw = dict(
         model_path=cfg.modelPath,
         n_ctx=cfg.nCtx,
@@ -50,6 +62,7 @@ def _build_kwargs(cfg: ModelConfig) -> Dict[str, Any]:
     if cfg.ropeFreqScale is not None:
         kw["rope_freq_scale"] = cfg.ropeFreqScale
     return kw
+
 
 def _attach_introspection(llm: Llama) -> None:
     def get_last_timings():
@@ -74,10 +87,12 @@ def _attach_introspection(llm: Llama) -> None:
         except Exception:
             pass
         return None
+
     try:
-        setattr(llm, "get_last_timings", get_last_timings)
+        llm.get_last_timings = get_last_timings
     except Exception:
         pass
+
 
 def _close_llm():
     global _llm
@@ -87,12 +102,14 @@ def _close_llm():
     except Exception:
         _llm = None
 
-def current_model_info() -> Dict[str, Any]:
+
+def current_model_info() -> dict[str, Any]:
     with _runtime_lock:
         return {
             "loaded": _llm is not None,
             "config": asdict(_cfg) if _cfg else None,
         }
+
 
 def ensure_ready() -> None:
     global _llm, _cfg
@@ -102,7 +119,9 @@ def ensure_ready() -> None:
         s = read_settings()
         cfg = ModelConfig.from_dict(s)
         if not cfg.modelPath:
-            raise RuntimeError("No model selected. Load one via /models/load or set LOCALAI_MODEL_PATH.")
+            raise RuntimeError(
+                "No model selected. Load one via /models/load or set LOCALAI_MODEL_PATH."
+            )
         p = Path(cfg.modelPath)
         if not p.exists():
             raise FileNotFoundError(f"Model path not found: {p}")
@@ -110,16 +129,18 @@ def ensure_ready() -> None:
         _attach_introspection(_llm)
         _cfg = cfg
 
+
 def get_llm() -> Llama:
     ensure_ready()
     assert _llm is not None
     return _llm
 
-def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
+
+def load_model(config_patch: dict[str, Any]) -> dict[str, Any]:
     global _llm, _cfg
     with _runtime_lock:
         s = read_settings()
-        s.update({k:v for k,v in config_patch.items() if v is not None})
+        s.update({k: v for k, v in config_patch.items() if v is not None})
         cfg = ModelConfig.from_dict(s)
         if not cfg.modelPath:
             raise ValueError("modelPath is required")
@@ -132,24 +153,28 @@ def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
         write_settings(asdict(cfg))
         return current_model_info()
 
+
 def unload_model() -> None:
     global _llm
     with _runtime_lock:
         _close_llm()
 
-def list_local_models() -> List[Dict[str, Any]]:
+
+def list_local_models() -> list[dict[str, Any]]:
     s = read_settings()
     root = Path(s.get("modelsDir") or "")
     root.mkdir(parents=True, exist_ok=True)
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for p in root.rglob("*.gguf"):
         try:
-            out.append({
-                "path": str(p.resolve()),
-                "sizeBytes": p.stat().st_size,
-                "name": p.name,
-                "rel": str(p.relative_to(root)),
-            })
+            out.append(
+                {
+                    "path": str(p.resolve()),
+                    "sizeBytes": p.stat().st_size,
+                    "name": p.name,
+                    "rel": str(p.relative_to(root)),
+                }
+            )
         except Exception:
             pass
     out.sort(key=lambda x: x["sizeBytes"], reverse=True)

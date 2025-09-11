@@ -1,9 +1,13 @@
 from __future__ import annotations
-from typing import List, Dict
 
-def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]:
-    scores: Dict[str, float] = {}
-    lookup: Dict[str, Dict] = {}
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+def reciprocal_rank_fusion(results: list[list[dict]], k: int = 60) -> list[dict]:
+    scores: dict[str, float] = {}
+    lookup: dict[str, dict] = {}
     for lst in results:
         for rank, r in enumerate(lst, start=1):
             rid = r["id"]

@@ -13,6 +13,23 @@ function repoRoot() {
   return path.resolve(app.getAppPath(), "..");
 }
 
+function backendCommand(): { cmd: string; args: string[] } {
+  const root = repoRoot();
+  if (app.isPackaged) {
+    // use the PyInstaller binary
+    const exe = path.join(
+      process.resourcesPath,
+      "dist",
+      "localmind-backend" + (process.platform === "win32" ? ".exe" : ""),
+    );
+    return { cmd: exe, args: [] };
+  } else {
+    // dev mode: run Python script
+    const script = path.join(root, "run_backend.py");
+    return { cmd: pickPython()[0], args: [script] };
+  }
+}
+
 function readPortsJson(): number | null {
   const roots = [
     repoRoot(),
@@ -40,7 +57,10 @@ async function probePort(p: number, ms = 400): Promise<boolean> {
       res.resume();
       resolve(res.statusCode === 200);
     });
-    req.setTimeout(ms, () => { req.destroy(); resolve(false); });
+    req.setTimeout(ms, () => {
+      req.destroy();
+      resolve(false);
+    });
     req.on("error", () => resolve(false));
   });
 }
@@ -59,29 +79,24 @@ function pickPython(): string[] {
 
 async function startBackend(): Promise<void> {
   if (backendProc) return;
+  const { cmd, args } = backendCommand();
   const root = repoRoot();
-  const script = path.join(root, "run_backend.py");
-  for (const cmd of pickPython()) {
-    try {
-      const proc = spawn(cmd, [script], {
-        cwd: root,
-        env: {
-          ...process.env,
-          PYTHONUNBUFFERED: "1",
-          PYTHONIOENCODING: "utf-8",
-          PYTHONUTF8: "1",
-          LOCALMIND_DATA_DIR: app.getPath("userData"),
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      backendProc = proc;
-      proc.stdout?.on("data", (b) => console.log("[py]", String(b).trim()));
-      proc.stderr?.on("data", (b) => console.warn("[py err]", String(b).trim()));
-      proc.on("exit", (code, sig) => console.warn("[py exit]", code, sig));
-      return;
-    } catch {}
-  }
-  throw new Error("Could not start Python. Set LOCALMIND_PYTHON or create .venv.");
+
+  const proc = spawn(cmd, args, {
+    cwd: root,
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: "1",
+      PYTHONIOENCODING: "utf-8",
+      PYTHONUTF8: "1",
+      LOCALMIND_DATA_DIR: app.getPath("userData"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  backendProc = proc;
+  proc.stdout?.on("data", (b) => console.log("[py]", String(b).trim()));
+  proc.stderr?.on("data", (b) => console.warn("[py err]", String(b).trim()));
+  proc.on("exit", (code, sig) => console.warn("[py exit]", code, sig));
 }
 
 async function waitForHealthy(timeoutMs = 60000): Promise<number> {
@@ -114,10 +129,12 @@ function sendToFastAPI(port: number, license: string) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(data)
-      }
+        "Content-Length": Buffer.byteLength(data),
+      },
     },
-    (res) => { res.resume(); }
+    (res) => {
+      res.resume();
+    },
   );
   req.on("error", (err) => console.error("FastAPI error", err));
   req.write(data);
@@ -141,7 +158,11 @@ function makeDeepLinkHandler(getPort: () => Promise<number>) {
   };
 }
 
-async function loadWithRetry(win: BrowserWindow, url: string, timeoutMs = 60000): Promise<void> {
+async function loadWithRetry(
+  win: BrowserWindow,
+  url: string,
+  timeoutMs = 60000,
+): Promise<void> {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     try {
@@ -169,9 +190,14 @@ if (!gotLock) {
   const handleDeepLink = makeDeepLinkHandler(getPortOnce);
 
   app.on("second-instance", async (_evt, argv) => {
-    const deeplink = argv.find((a) => typeof a === "string" && a.startsWith("localmind://"));
+    const deeplink = argv.find(
+      (a) => typeof a === "string" && a.startsWith("localmind://"),
+    );
     if (deeplink) await handleDeepLink(deeplink);
-    if (mainWin) { if (mainWin.isMinimized()) mainWin.restore(); mainWin.focus(); }
+    if (mainWin) {
+      if (mainWin.isMinimized()) mainWin.restore();
+      mainWin.focus();
+    }
   });
 
   app.whenReady().then(async () => {
@@ -191,7 +217,11 @@ if (!gotLock) {
     const port = await getPortOnce();
     const url = `http://127.0.0.1:${port}/`;
     await loadWithRetry(mainWin, url, 60000).catch(async () => {
-      try { await mainWin!.loadURL(`${url}docs`); } catch { if (mainWin) mainWin.loadURL("about:blank"); }
+      try {
+        await mainWin!.loadURL(`${url}docs`);
+      } catch {
+        if (mainWin) mainWin.loadURL("about:blank");
+      }
     });
   });
 
@@ -201,7 +231,9 @@ if (!gotLock) {
 
   app.on("will-quit", () => {
     if (backendProc) {
-      try { backendProc.kill(); } catch {}
+      try {
+        backendProc.kill();
+      } catch {}
     }
   });
 }

@@ -1,26 +1,44 @@
 from __future__ import annotations
-import asyncio, logging, re
-from typing import Dict, List, Optional, Tuple
-from ..runtime.model_runtime import get_llm
-from ..store.index import load_index, save_index
-from ..store.base import now_iso
-from ..services.cancel import is_active, GEN_SEMAPHORE
-from ..store.chats import _load_chat
+
+import asyncio
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
+from ..runtime.model_runtime import get_llm
+from ..services.cancel import GEN_SEMAPHORE, is_active
+from ..store.base import now_iso
+from ..store.chats import _load_chat
+from ..store.index import load_index, save_index
+
+log = get_logger(__name__)
+
 
 def S(key: str):
     return SETTINGS[key]
 
-_PENDING: Dict[str, dict] = {}
+
+# Key the queue by user+session to avoid collisions across users
+def _key(uid: str, session_id: str) -> str:
+    return f"{uid}:{session_id}"
+
+
+# pending snapshot: { root, uid, session_id, messages, job_seq }
+_PENDING: dict[str, dict[str, Any]] = {}
 _ENQUEUED: set[str] = set()
 _queue: asyncio.Queue[str] = asyncio.Queue(maxsize=int(S("retitle_queue_maxsize")))
 _lock = asyncio.Lock()
 
+
 def _preview(s: str) -> str:
     n = int(S("retitle_preview_chars"))
     ell = S("retitle_preview_ellipsis")
-    s = (s or "")
+    s = s or ""
     return (s[:n] + ell) if len(s) > n else s
+
 
 def _is_substantial(text: str) -> bool:
     t = (text or "").strip()
@@ -30,7 +48,8 @@ def _is_substantial(text: str) -> bool:
         return False
     return (re.search(r"[A-Za-z]", t) is not None) if require_alpha else True
 
-def _pick_source(messages: List[dict]) -> Optional[str]:
+
+def _pick_source(messages: list[dict]) -> str | None:
     if not messages:
         return None
     min_user_len = int(S("retitle_min_user_chars"))
@@ -45,6 +64,7 @@ def _pick_source(messages: List[dict]) -> Optional[str]:
             if _is_substantial(txt):
                 return txt
     return None
+
 
 def _sanitize_title(s: str) -> str:
     if not s:
@@ -68,6 +88,7 @@ def _sanitize_title(s: str) -> str:
     if max_chars > 0 and len(s) > max_chars:
         s = s[:max_chars].rstrip()
     return s
+
 
 def _make_title(llm, src: str) -> str:
     hard = SETTINGS.get("retitle_llm_hard_prefix") or ""
@@ -94,49 +115,67 @@ def _make_title(llm, src: str) -> str:
     raw = re.sub(r"[.:;,\-\s]+$", "", raw)
     return raw
 
+
 async def start_worker():
     while True:
-        sid = await _queue.get()
+        key = await _queue.get()
         try:
-            await _process_session(sid)
+            await _process_session(key)
         except Exception:
             logging.exception("Retitle worker failed")
         finally:
             _queue.task_done()
 
-def _extract_job(snapshot: dict) -> Tuple[List[dict], int]:
+
+def _extract_job(snapshot: dict) -> tuple[list[dict], int]:
     msgs = snapshot.get("messages") or []
     job_seq = int(snapshot.get("job_seq") or 0)
     return msgs, job_seq
 
-async def _process_session(session_id: str):
+
+async def _process_session(key: str):
     if not bool(S("retitle_enable")):
         return
+
+    # small grace to avoid racing while generation is still streaming
     await asyncio.sleep(int(S("retitle_grace_ms")) / 1000.0)
+
+    # backoff if the chat is still active
     waited = 0
     backoff = int(S("retitle_active_backoff_start_ms"))
     backoff_max = int(S("retitle_active_backoff_max_ms"))
     backoff_total = int(S("retitle_active_backoff_total_ms"))
     growth = float(S("retitle_active_backoff_growth"))
+    # The is_active flag is keyed by session id; strip uid part
+    _, session_id = key.split(":", 1)
     while is_active(session_id) and waited < backoff_total:
         await asyncio.sleep(backoff / 1000.0)
         waited += backoff
         backoff = min(int(backoff * growth), backoff_max)
+
     async with _lock:
-        snapshot = _PENDING.pop(session_id, None)
-        _ENQUEUED.discard(session_id)
+        snapshot = _PENDING.pop(key, None)
+        _ENQUEUED.discard(key)
     if not snapshot:
         return
+
+    root: Path = snapshot["root"]
+    uid: str = snapshot["uid"]
+    session_id: str = snapshot["session_id"]
     messages, job_seq = _extract_job(snapshot)
+
+    # Check current seq to avoid retitling after more messages arrived
     try:
-        cur_seq = int((_load_chat(session_id) or {}).get("seq") or 0)
+        cur_seq = int((_load_chat(root, uid, session_id) or {}).get("seq") or 0)
     except Exception:
         cur_seq = job_seq
     if cur_seq > job_seq:
         return
+
     src = _pick_source(messages) or ""
     if not src.strip():
         return
+
     async with GEN_SEMAPHORE:
         llm = get_llm()
         try:
@@ -149,21 +188,30 @@ async def _process_session(session_id: str):
                 llm.reset()
             except Exception:
                 pass
+
     title = _sanitize_title(title_raw) if bool(S("retitle_enable_sanitize")) else title_raw
     if not title:
         return
-    idx = load_index()
-    row = next((r for r in idx if r.get("sessionId") == session_id), None)
+
+    # Update encrypted per-user index
+    idx = load_index(root, uid)
+    row = next(
+        (r for r in idx if r.get("sessionId") == session_id and r.get("ownerUid") == uid), None
+    )
     if not row:
         return
     if (row.get("title") or "").strip() == title:
         return
+
     row["title"] = title
     row["updatedAt"] = now_iso()
-    save_index(idx)
+    save_index(root, uid, idx)
 
-def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = None):
-    if not session_id:
+
+def enqueue(
+    root: Path, uid: str, session_id: str, messages: list[dict], *, job_seq: int | None = None
+):
+    if not session_id or not uid:
         return
     if not isinstance(messages, list):
         messages = []
@@ -172,16 +220,26 @@ def enqueue(session_id: str, messages: List[dict], *, job_seq: Optional[int] = N
             job_seq = max(int(m.get("id") or 0) for m in messages) if messages else 0
         except Exception:
             job_seq = 0
-    snap = {"messages": messages, "job_seq": int(job_seq)}
+
+    k = _key(uid, session_id)
+    snap = {
+        "root": root,
+        "uid": uid,
+        "session_id": session_id,
+        "messages": messages,
+        "job_seq": int(job_seq),
+    }
+
     async def _put():
         async with _lock:
-            _PENDING[session_id] = snap
-            if session_id not in _ENQUEUED:
-                _ENQUEUED.add(session_id)
+            _PENDING[k] = snap
+            if k not in _ENQUEUED:
+                _ENQUEUED.add(k)
                 try:
-                    _queue.put_nowait(session_id)
+                    _queue.put_nowait(k)
                 except Exception as e:
                     logging.warning(f"Failed to enqueue retitle: {e}")
+
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_put())

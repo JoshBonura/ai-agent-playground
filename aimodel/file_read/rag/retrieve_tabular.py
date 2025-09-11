@@ -1,9 +1,18 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple
-import re, os
+
+import os
+import re
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
 
-_TABLE_RE = re.compile(r"^##\s*Table:\s*(?P<sheet>[^!]+)!\s*R(?P<r1>\d+)-(?P<r2>\d+),C(?P<c1>\d+)-(?P<c2>\d+)", re.MULTILINE)
+log = get_logger(__name__)
+
+_TABLE_RE = re.compile(
+    r"^##\s*Table:\s*(?P<sheet>[^!]+)!\s*R(?P<r1>\d+)-(?P<r2>\d+),C(?P<c1>\d+)-(?P<c2>\d+)",
+    re.MULTILINE,
+)
 _ROW_RE = re.compile(r"^#{0,3}\s*Row\s+(?P<row>\d+)\s+—\s+(?P<sheet>[^\r\n]+)", re.MULTILINE)
 
 
@@ -23,25 +32,31 @@ def is_xlsx_source(src: str) -> bool:
         return False
 
 
-def _capture_table_block(text: str) -> Optional[str]:
+def _capture_table_block(text: str) -> str | None:
     m = _TABLE_RE.search(text or "")
     if not m:
         return None
     start = m.start()
     end = len(text)
-    nxt = re.search(r"^\s*$", text[m.end():], re.MULTILINE)
+    nxt = re.search(r"^\s*$", text[m.end() :], re.MULTILINE)
     if nxt:
         end = m.end() + nxt.start()
     return text[start:end].strip()
 
 
-def _capture_row_block(text: str, row_num: int, sheet: str) -> Optional[str]:
+def _capture_row_block(text: str, row_num: int, sheet: str) -> str | None:
     if not text:
         return None
-    pat = re.compile(rf"^#{0,3}\s*Row\s+{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)", re.MULTILINE | re.DOTALL)
+    pat = re.compile(
+        rf"^#{0, 3}\s*Row\s+{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)",
+        re.MULTILINE | re.DOTALL,
+    )
     m = pat.search(text)
     if not m:
-        pat2 = re.compile(rf"^\s*{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)", re.MULTILINE | re.DOTALL)
+        pat2 = re.compile(
+            rf"^\s*{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)",
+            re.MULTILINE | re.DOTALL,
+        )
         m = pat2.search(text)
         if not m:
             return None
@@ -52,24 +67,31 @@ def _capture_row_block(text: str, row_num: int, sheet: str) -> Optional[str]:
     return f"{head}\n{body}"
 
 
-def _collect_tabular_hits(hits: List[dict]) -> Dict[str, Any]:
-    headers: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]] = {}
-    rows: List[Dict[str, Any]] = []
+def _collect_tabular_hits(hits: list[dict]) -> dict[str, Any]:
+    headers: dict[tuple[str, str, int, int, int, int], dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
     for h in hits:
         src = str(h.get("source") or "")
         body = (h.get("text") or "").strip()
 
         for mt in _TABLE_RE.finditer(body):
             sheet = mt.group("sheet").strip()
-            r1 = int(mt.group("r1")); r2 = int(mt.group("r2"))
-            c1 = int(mt.group("c1")); c2 = int(mt.group("c2"))
+            r1 = int(mt.group("r1"))
+            r2 = int(mt.group("r2"))
+            c1 = int(mt.group("c1"))
+            c2 = int(mt.group("c2"))
             key = (src, sheet, r1, r2, c1, c2)
             if key not in headers:
                 tb = _capture_table_block(body)
                 headers[key] = {
-                    "source": src, "sheet": sheet,
-                    "r1": r1, "r2": r2, "c1": c1, "c2": c2,
-                    "text": tb or "", "score": float(h.get("score") or 0.0)
+                    "source": src,
+                    "sheet": sheet,
+                    "r1": r1,
+                    "r2": r2,
+                    "c1": c1,
+                    "c2": c2,
+                    "text": tb or "",
+                    "score": float(h.get("score") or 0.0),
                 }
             else:
                 headers[key]["score"] = max(headers[key]["score"], float(h.get("score") or 0.0))
@@ -77,16 +99,28 @@ def _collect_tabular_hits(hits: List[dict]) -> Dict[str, Any]:
         for mr in _ROW_RE.finditer(body):
             rn = int(mr.group("row"))
             sheet = mr.group("sheet").strip()
-            rows.append({"source": src, "sheet": sheet, "row": rn, "hit": h, "score": float(h.get("score") or 0.0)})
+            rows.append(
+                {
+                    "source": src,
+                    "sheet": sheet,
+                    "row": rn,
+                    "hit": h,
+                    "score": float(h.get("score") or 0.0),
+                }
+            )
     return {"headers": headers, "rows": rows}
 
 
-def _pair_rows_with_headers(collected: Dict[str, Any]) -> Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]]:
+def _pair_rows_with_headers(
+    collected: dict[str, Any],
+) -> dict[tuple[str, str, int, int, int, int], dict[str, Any]]:
     headers = collected["headers"]
     rows = collected["rows"]
-    groups: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]] = {}
+    groups: dict[tuple[str, str, int, int, int, int], dict[str, Any]] = {}
     for r in rows:
-        src = r["source"]; sheet = r["sheet"]; rown = r["row"]
+        src = r["source"]
+        sheet = r["sheet"]
+        rown = r["row"]
         match_key = None
         for key in headers.keys():
             s, sh, r1, r2, c1, c2 = key
@@ -101,9 +135,9 @@ def _pair_rows_with_headers(collected: Dict[str, Any]) -> Dict[Tuple[str, str, i
 
 
 def _render_tabular_groups(
-    groups: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]],
-    preferred_sources: Optional[List[str]] = None
-) -> List[str]:
+    groups: dict[tuple[str, str, int, int, int, int], dict[str, Any]],
+    preferred_sources: list[str] | None = None,
+) -> list[str]:
     total_budget = int(SETTINGS.get("rag_total_char_budget"))
     max_row_snippets = int(SETTINGS.get("rag_tabular_rows_per_table"))
     per_row_max = int(SETTINGS.get("rag_max_chars_per_chunk"))
@@ -113,7 +147,7 @@ def _render_tabular_groups(
     pref = set(s.strip().lower() for s in (preferred_sources or []) if s)
     boost = float(SETTINGS.get("rag_new_upload_score_boost"))
 
-    lines: List[str] = [preamble]
+    lines: list[str] = [preamble]
     used = len(lines[0]) + 1
 
     def _group_score(key):
@@ -134,9 +168,11 @@ def _render_tabular_groups(
         lines.append(hdr_text)
         used += hdr_cost
 
-        row_list = sorted(groups[key]["rows"], key=lambda r: r["score"], reverse=True)[:max_row_snippets]
+        row_list = sorted(groups[key]["rows"], key=lambda r: r["score"], reverse=True)[
+            :max_row_snippets
+        ]
         for r in row_list:
-            body = (r["hit"].get("text") or "")
+            body = r["hit"].get("text") or ""
             row_block = _capture_row_block(body, r["row"], r["sheet"]) or ""
             if not row_block:
                 continue
@@ -153,12 +189,15 @@ def _render_tabular_groups(
     return lines
 
 
-def make_rag_block_tabular(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> Optional[str]:
+def make_rag_block_tabular(
+    hits: list[dict], preferred_sources: list[str] | None = None
+) -> str | None:
     if not hits:
         return None
     # Only keep sources that look like CSV/Excel to avoid mixing generic text
     tabular_hits = [
-        h for h in hits
+        h
+        for h in hits
         if is_xlsx_source(str(h.get("source") or "")) or is_csv_source(str(h.get("source") or ""))
     ]
     if not tabular_hits:

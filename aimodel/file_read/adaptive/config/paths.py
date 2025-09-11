@@ -1,10 +1,16 @@
 # aimodel/file_read/paths.py
 from __future__ import annotations
-import json, os
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Any, Dict, Optional
+
+import json
+import os
 import sys
+from pathlib import Path
+from typing import Any
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+
 
 # App data dir (override with LOCALAI_DATA_DIR for dev/electron)
 def app_data_dir() -> Path:
@@ -24,18 +30,20 @@ def app_data_dir() -> Path:
 
     return Path.home() / ".localai"
 
+
 SETTINGS_PATH = app_data_dir() / "settings.json"
 
 DEFAULTS = {
     "modelsDir": str((app_data_dir() / "models").resolve()),
-    "modelPath": "",            # empty = none selected
+    "modelPath": "",  # empty = none selected
     "nCtx": 4096,
     "nThreads": 8,
     "nGpuLayers": 40,
     "nBatch": 256,
-    "ropeFreqBase": None,       # advanced (optional)
-    "ropeFreqScale": None,      # advanced (optional)
+    "ropeFreqBase": None,  # advanced (optional)
+    "ropeFreqScale": None,  # advanced (optional)
 }
+
 
 def bootstrap() -> None:
     ad = app_data_dir()
@@ -45,13 +53,15 @@ def bootstrap() -> None:
     if not SETTINGS_PATH.exists():
         SETTINGS_PATH.write_text(json.dumps(DEFAULTS, indent=2), encoding="utf-8")
 
-def _read_json(path: Path) -> Dict[str, Any]:
+
+def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
-def read_settings() -> Dict[str, Any]:
+
+def read_settings() -> dict[str, Any]:
     # precedence: ENV > settings.json > defaults
     bootstrap()
     cfg = DEFAULTS | _read_json(SETTINGS_PATH)
@@ -73,14 +83,21 @@ def read_settings() -> Dict[str, Any]:
         v = os.getenv(env)
         if v is not None and v != "":
             try:
-                cfg[key] = int(v) if key in {"nCtx","nThreads","nGpuLayers","nBatch"} else float(v) if key in {"ropeFreqBase","ropeFreqScale"} else v
+                cfg[key] = (
+                    int(v)
+                    if key in {"nCtx", "nThreads", "nGpuLayers", "nBatch"}
+                    else float(v)
+                    if key in {"ropeFreqBase", "ropeFreqScale"}
+                    else v
+                )
             except Exception:
                 cfg[key] = v
 
     return cfg
 
-def write_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
+
+def write_settings(patch: dict[str, Any]) -> dict[str, Any]:
     cfg = read_settings()
-    cfg.update({k:v for k,v in patch.items() if v is not None})
+    cfg.update({k: v for k, v in patch.items() if v is not None})
     SETTINGS_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return cfg

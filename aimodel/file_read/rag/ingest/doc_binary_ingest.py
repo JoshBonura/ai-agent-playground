@@ -1,43 +1,55 @@
-# RTF and legacy .doc/.ole helpers and extraction (no DOCX here)
 from __future__ import annotations
-from typing import Tuple, List
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
 import re
+
 from ...core.settings import SETTINGS
 
-_WS_RE = re.compile(r"[ \t]+")
+_WS_RE = re.compile("[ \\t]+")
+
+
 def _squeeze_spaces(s: str) -> str:
     s = (s or "").replace("\xa0", " ")
     s = _WS_RE.sub(" ", s)
     return s.strip()
 
+
 def _is_ole(b: bytes) -> bool:
-    return len(b) >= 8 and b[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+    return len(b) >= 8 and b[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
 
 def _dbg(msg: str):
     try:
         S = SETTINGS.effective
         if bool(S().get("doc_debug", False)):
-            print(f"[doc_ingest] {msg}")
+            log.info(f"[doc_ingest] {msg}")
     except Exception:
         pass
 
-_RTF_CTRL_RE = re.compile(r"\\[a-zA-Z]+-?\d* ?")
-_RTF_GROUP_RE = re.compile(r"[{}]")
-_RTF_UNICODE_RE = re.compile(r"\\u(-?\d+)\??")
-_RTF_HEX_RE = re.compile(r"\\'[0-9a-fA-F]{2}")
-_HEX_BLOCK_RE = re.compile(r"(?:\s*[0-9A-Fa-f]{2}){120,}")
+
+_RTF_CTRL_RE = re.compile("\\\\[a-zA-Z]+-?\\d* ?")
+_RTF_GROUP_RE = re.compile("[{}]")
+_RTF_UNICODE_RE = re.compile("\\\\u(-?\\d+)\\??")
+_RTF_HEX_RE = re.compile("\\\\'[0-9a-fA-F]{2}")
+_HEX_BLOCK_RE = re.compile("(?:\\s*[0-9A-Fa-f]{2}){120,}")
+
 
 def _rtf_to_text_simple(data: bytes, *, keep_newlines: bool = True) -> str:
     try:
         s = data.decode("latin-1", errors="ignore")
     except Exception:
         s = data.decode("utf-8", errors="ignore")
+
     def _hex_sub(m):
         try:
             return bytes.fromhex(m.group(0)[2:]).decode("latin-1", errors="ignore")
         except Exception:
             return ""
+
     s = _RTF_HEX_RE.sub(_hex_sub, s)
+
     def _uni_sub(m):
         try:
             cp = int(m.group(1))
@@ -46,15 +58,17 @@ def _rtf_to_text_simple(data: bytes, *, keep_newlines: bool = True) -> str:
             return chr(cp)
         except Exception:
             return ""
+
     s = _RTF_UNICODE_RE.sub(_uni_sub, s)
-    s = s.replace(r"\par", "\n").replace(r"\line", "\n")
+    s = s.replace("\\par", "\n").replace("\\line", "\n")
     s = _RTF_CTRL_RE.sub("", s)
     s = _RTF_GROUP_RE.sub("", s)
     s = _HEX_BLOCK_RE.sub("", s)
     s = s.replace("\r", "\n")
-    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    s = re.sub("\\n\\s*\\n\\s*\\n+", "\n\n", s)
     s = _squeeze_spaces(s)
     return s if keep_newlines else s.replace("\n", " ")
+
 
 def _rtf_to_text_via_lib(data: bytes, *, keep_newlines: bool = True) -> str:
     try:
@@ -72,6 +86,7 @@ def _rtf_to_text_via_lib(data: bytes, *, keep_newlines: bool = True) -> str:
     txt = _squeeze_spaces(txt)
     return txt if keep_newlines else txt.replace("\n", " ")
 
+
 def _generic_ole_text(data: bytes) -> str:
     S = SETTINGS.effective
     MIN_RUN = int(S().get("doc_ole_min_run_chars", 8))
@@ -81,22 +96,24 @@ def _generic_ole_text(data: bytes) -> str:
     DROP_PATHISH = bool(S().get("doc_ole_drop_pathish", True))
     DROP_SYMBOL_LINES = bool(S().get("doc_ole_drop_symbol_lines", True))
     DEDUPE_SHORT_REPEATS = bool(S().get("doc_ole_dedupe_short_repeats", True))
-    XMLISH = re.compile(r"^\s*<[^>]+>", re.I)
-    PATHISH = re.compile(r"[\\/].+\.(?:xml|rels|png|jpg|jpeg|gif|bmp|bin|dat)\b", re.I)
-    SYMBOLLINE = re.compile(r"^[\W_]{6,}$")
+    XMLISH = re.compile("^\\s*<[^>]+>", re.I)
+    PATHISH = re.compile("[\\\\/].+\\.(?:xml|rels|png|jpg|jpeg|gif|bmp|bin|dat)\\b", re.I)
+    SYMBOLLINE = re.compile("^[\\W_]{6,}$")
     s = data.replace(b"\x00", b"")
-    runs = re.findall(rb"[\t\r\n\x20-\x7E]{%d,}" % MIN_RUN, s)
+    runs = re.findall(b"[\\t\\r\\n\\x20-\\x7E]{%d,}" % MIN_RUN, s)
     if not runs:
         return ""
+
     def _dec(b: bytes) -> str:
         try:
             return b.decode("cp1252", errors="ignore")
         except Exception:
             return b.decode("latin-1", errors="ignore")
-    kept: List[str] = []
+
+    kept: list[str] = []
     for raw in runs:
         chunk = _dec(raw).replace("\r", "\n")
-        for ln in re.split(r"\n+", chunk):
+        for ln in re.split("\\n+", chunk):
             t = ln.strip()
             if not t:
                 continue
@@ -113,25 +130,26 @@ def _generic_ole_text(data: bytes) -> str:
             if DROP_SYMBOL_LINES and SYMBOLLINE.fullmatch(t):
                 continue
             if DEDUPE_SHORT_REPEATS:
-                t = re.sub(r"\b(\w{2,4})\1{2,}\b", r"\1\1", t)
+                t = re.sub("\\b(\\w{2,4})\\1{2,}\\b", "\\1\\1", t)
             kept.append(t)
     out = "\n".join(kept)
-    out = re.sub(r"\n\s*\n\s*\n+", "\n\n", out).strip()
+    out = re.sub("\\n\\s*\\n\\s*\\n+", "\n\n", out).strip()
     return out
 
-def extract_doc_binary(data: bytes) -> Tuple[str, str]:
+
+def extract_doc_binary(data: bytes) -> tuple[str, str]:
     head = (data[:64] or b"").lstrip()
     is_rtf = head.startswith(b"{\\rtf") or head.startswith(b"{\\RTF}")
     is_ole = _is_ole(data)
     _dbg(f"extract_doc_binary: bytes={len(data)} is_rtf={is_rtf} is_ole={is_ole}")
     if is_rtf:
         txt = _rtf_to_text_via_lib(data, keep_newlines=True).strip()
-        return (txt + "\n" if txt else ""), "text/plain"
+        return (txt + "\n" if txt else "", "text/plain")
     if is_ole:
         txt = _generic_ole_text(data)
-        return (txt + "\n" if txt else ""), "text/plain"
+        return (txt + "\n" if txt else "", "text/plain")
     try:
         txt = data.decode("utf-8", errors="ignore").strip()
     except Exception:
         txt = data.decode("latin-1", errors="ignore").strip()
-    return (txt + ("\n" if txt else "")), "text/plain"
+    return (txt + ("\n" if txt else ""), "text/plain")

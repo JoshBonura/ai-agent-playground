@@ -1,6 +1,9 @@
 from __future__ import annotations
-from typing import Optional, List
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
+
+log = get_logger(__name__)
 
 
 def compose_router_text(
@@ -8,9 +11,9 @@ def compose_router_text(
     latest_user_text: str,
     summary: str,
     *,
-    tail_turns: Optional[int] = None,
-    summary_chars: Optional[int] = None,
-    max_chars: Optional[int] = None,
+    tail_turns: int | None = None,
+    summary_chars: int | None = None,
+    max_chars: int | None = None,
 ) -> str:
     eff = SETTINGS.effective()
     tt = int(eff["router_tail_turns"]) if tail_turns is None else int(tail_turns)
@@ -19,7 +22,7 @@ def compose_router_text(
     context_label = eff["router_context_label"]
     summary_label = eff["router_summary_label"]
 
-    parts: List[str] = []
+    parts: list[str] = []
     if latest_user_text:
         parts.append((latest_user_text or "").strip())
 
@@ -29,7 +32,7 @@ def compose_router_text(
         recent_list = []
 
     tail_src = recent_list[-tt:] if tt > 0 else []
-    tail_lines: List[str] = []
+    tail_lines: list[str] = []
     for m in reversed(tail_src):
         if not isinstance(m, dict):
             continue

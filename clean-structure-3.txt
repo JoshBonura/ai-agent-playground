@@ -1,4 +1,128 @@
-r", block_text)
+elemetry["rag"]["sessionOnly"] = True
+            telemetry["rag"]["mode"] = "session-only"
+            telemetry["rag"]["blockChars"] = len(rag_text)
+            tok = _approx_block_tokens(llm, "assistant", rag_text)
+            if tok is not None:
+                telemetry["rag"]["sessionOnlyTokensApprox"] = tok
+            telemetry["rag"]["injected"] = True
+            ephemeral_once.append({"role": "assistant", "content": rag_text, "_ephemeral": True})
+        else:
+            telemetry["rag"]["sessionOnly"] = False
+            telemetry["rag"].setdefault("injected", False)
+        telemetry["rag"]["sessionOnlyBuildSec"] = round(time.perf_counter() - t0_att, 6)
+
+    system_text = build_system_text()
+    t_pack0 = time.perf_counter()
+    packed, st["summary"], _ = pack_with_rollup(
+        system_text=system_text,
+        summary=st["summary"],
+        recent=st["recent"],
+        max_ctx=model_ctx,
+        out_budget=out_budget_req,
+        ephemeral=ephemeral_once,
+    )
+    telemetry["pack"]["packSec"] = round(time.perf_counter() - t_pack0, 6)
+
+    return await _finish_prepare_generation_with_telemetry(
+        llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
+        force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
+        telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
+    )
+
+# ===== aimodel/file_read/services/generate_pipeline_part2.py =====
+
+# aimodel/file_read/services/generate_pipeline_part2.py
+from __future__ import annotations
+import time
+from typing import Any, Dict, Optional, List
+from .prompt_utils import chars_len
+from .generate_pipeline_support import (
+    Prep, _tok_count, _approx_block_tokens, _diff_find_inserted_block,
+    _web_breakdown, _web_unattributed, _enforce_fit
+)
+from ..rag.router_ai import decide_rag
+from .packing import maybe_inject_rag_block
+from .session_io import persist_summary
+from .budget import analyze_budget
+from ..core.packing_memory_core import PACK_TELEMETRY
+from .context_window import clamp_out_budget
+
+async def _finish_prepare_generation_with_telemetry(
+    llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
+    force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
+    telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
+) -> Prep:
+    must_inject_session = bool(
+        force_session_only and rag_session_enabled and not has_atts and not telemetry.get("web", {}).get("ephemeralBlocks")
+    )
+
+    rag_router_allowed = ((rag_session_enabled or rag_global_enabled) and not (
+        has_atts and bool(eff["disable_global_rag_on_attachments"])
+    )) or must_inject_session
+
+    # NEW: if web router said it's needed or we already injected web, skip RAG router
+    web_needed = bool((telemetry.get("web") or {}).get("needed"))
+    web_injected = bool((telemetry.get("web") or {}).get("injected"))
+    if web_needed or web_injected:
+        rag_router_allowed = False
+        telemetry.setdefault("rag", {})
+        telemetry["rag"]["routerSkipped"] = True
+        telemetry["rag"]["routerSkippedReason"] = "web_needed" if web_needed else "web_block_present"
+
+    ephemeral_once: List[Dict[str, str]] = []
+    if rag_router_allowed and bool(eff["rag_enabled"]) and not ephemeral_once:
+        rag_need = False
+        rag_query: Optional[str] = None
+
+        if must_inject_session:
+            rag_need = True
+            rag_query = (latest_user_text or base_user_text or "").strip()
+            telemetry["rag"]["routerDecideSec"] = 0.0
+            telemetry["rag"]["routerNeeded"] = True
+            telemetry["rag"]["routerForcedSession"] = True
+            telemetry["rag"]["routerQuery"] = rag_query
+        else:
+            t_router0 = time.perf_counter()
+            if auto_rag:
+                try:
+                    rag_need, rag_query = decide_rag(llm, router_text)
+                except Exception:
+                    rag_need, rag_query = (False, None)
+            telemetry["rag"]["routerDecideSec"] = round(time.perf_counter() - t_router0, 6)
+            telemetry["rag"]["routerNeeded"] = bool(rag_need)
+            if rag_query is not None:
+                telemetry["rag"]["routerQuery"] = rag_query
+
+        skip_rag = bool(ephemeral_once) or (not rag_need)
+        tokens_before = _tok_count(llm, packed)
+        t_inject0 = time.perf_counter()
+
+        print(f"[PIPE][RAG] router query: {rag_query!r} skip_rag={skip_rag}")
+        res = maybe_inject_rag_block(
+            packed,
+            session_id=session_id,
+            skip_rag=skip_rag,
+            rag_query=rag_query,
+            force_session_only=force_session_only,
+        )
+
+        telemetry["rag"]["injectBuildSec"] = round(time.perf_counter() - t_inject0, 6)
+
+        if isinstance(res, tuple):
+            packed2 = res[0]
+            tel = res[1] if len(res) > 1 and isinstance(res[1], dict) else {}
+            block_text = res[2] if len(res) > 2 and isinstance(res[2], str) else None
+        else:
+            packed2 = res
+            tel = {}
+            block_text = None
+
+        if tel:
+            telemetry["rag"].update(tel)
+        if block_text:
+            print(f"[PIPE][RAG] injected block preview: {block_text[:200]!r}")
+            telemetry["rag"]["blockChars"] = len(block_text)
+            tok = _approx_block_tokens(llm, "user", block_text)
             if tok is not None:
                 telemetry["rag"]["blockTokensApprox"] = tok
             telemetry["rag"]["injected"] = True
@@ -210,6 +334,295 @@ def _enforce_fit(llm, eff: Dict[str, Any], packed: List[Dict[str, str]], out_bud
     else:
         ob2 = min(out_budget_req, max(0, capacity - tok))
     return packed, ob2
+
+# ===== aimodel/file_read/services/licensing_service.py =====
+
+from __future__ import annotations
+from pathlib import Path
+from typing import Dict, Any
+import base64, json, os, stat, sys, time
+import httpx
+from fastapi import HTTPException
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
+
+# ===== App paths / config =====
+
+def _canon_email(s: str | None) -> str:
+    return (s or "").strip().lower()
+
+def _app_data_dir() -> Path:
+    override = os.getenv("LOCALMIND_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
+    if sys.platform.startswith("win"):
+        base = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "LocalAI"
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "LocalAI"
+    else:
+        return Path.home() / ".config" / "LocalAI"
+
+APP_DIR = _app_data_dir() / "license"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+LIC_PATH = APP_DIR / "license.json"
+THROTTLE_PATH = APP_DIR / "license.throttle.json"
+
+# migration from older location
+_old = Path(os.path.expanduser("~/.localmind/license.json"))
+if _old.exists() and not LIC_PATH.exists():
+    try:
+        print(f"[license] migrate old -> {LIC_PATH}")
+        LIC_PATH.write_text(_old.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            _old.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception as e:
+            print(f"[license] migrate unlink warn {e!r}")
+    except Exception as e:
+        print(f"[license] migrate error {e!r}")
+
+LIC_PUB_HEX = os.getenv("LIC_ED25519_PUB_HEX", "").strip()
+print(f"[license] using file {LIC_PATH}")
+print(f"[license] pubkey set={bool(LIC_PUB_HEX)}")
+
+COOLDOWN_SEC = 0                     # change if you want throttle
+EXP_SOON_SEC = 30 * 24 * 3600        # 30 days
+
+# ===== Internals =====
+
+def _b64u_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+def _verify(lic: str) -> dict:
+    print("[license] _verify: start")
+    if not lic or not lic.startswith("LM1."):
+        print("[license] _verify: bad_format")
+        raise ValueError("Bad format")
+    try:
+        _, payload_b64, sig_b64 = lic.split(".", 2)
+    except ValueError:
+        print("[license] _verify: malformed_token")
+        raise ValueError("Malformed")
+    payload = _b64u_decode(payload_b64)
+    sig = _b64u_decode(sig_b64)
+    if not LIC_PUB_HEX:
+        print("[license] _verify: missing_public_key")
+        raise ValueError("Verifier not configured")
+    vk = VerifyKey(bytes.fromhex(LIC_PUB_HEX))
+    try:
+        vk.verify(payload, sig)
+    except BadSignatureError:
+        print("[license] _verify: bad_signature")
+        raise ValueError("Invalid signature")
+    data = json.loads(payload.decode("utf-8"))
+    if "plan" not in data:
+        data["plan"] = "pro"
+    now = int(time.time())
+    exp = int(data.get("exp") or 0)
+    if exp and now > exp:
+        print(f"[license] _verify: expired exp={exp} now={now}")
+        raise ValueError("Expired")
+    print("[license] _verify: ok")
+    return data
+
+def _save_secure(path: Path, obj: dict):
+    print(f"[license] _save_secure: path={path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except Exception as e:
+        print(f"[license] _save_secure: chmod_warn {e!r}")
+
+def _load_current() -> dict | None:
+    exists = LIC_PATH.exists()
+    print(f"[license] _load_current: file={LIC_PATH} exists={exists}")
+    if not exists:
+        return None
+    with open(LIC_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _lic_base() -> str:
+    base = (os.getenv("LIC_SERVER_BASE") or "").strip()
+    print(f"[license] _lic_base: {base or 'MISSING'}")
+    if not base:
+        raise HTTPException(500, "LIC_SERVER_BASE not configured")
+    return base.rstrip("/")
+
+def _throttle_ok(kind: str) -> bool:
+    now = int(time.time())
+    rec: Dict[str, Any] = {}
+    try:
+        with open(THROTTLE_PATH, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        rec = {}
+    last = int(rec.get(kind) or 0)
+    if now - last < COOLDOWN_SEC:
+        print(f"[license] throttle: skip kind={kind} last={last} now={now}")
+        return False
+    rec[kind] = now
+    THROTTLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(THROTTLE_PATH) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(tmp, THROTTLE_PATH)
+    print(f"[license] throttle: ok kind={kind} now={now}")
+    return True
+
+def email_from_auth(auth_payload: dict | None) -> str:
+    if not auth_payload:
+        return ""
+    email = (auth_payload.get("email") or "").strip().lower()
+    return email if "@" in email else ""
+
+def apply_license_string(license_str: str) -> dict:
+    claims = _verify(license_str.strip())
+    _save_secure(LIC_PATH, {"license": license_str.strip(), "claims": claims})
+    return {"ok": True, "plan": claims.get("plan", "pro"), "exp": claims.get("exp")}
+
+def license_status_local(expected_email: str | None = None) -> dict:
+    rec = _load_current()
+    if not rec:
+        return {"plan": "free", "valid": False, "exp": None}
+
+    try:
+        claims = _verify(rec["license"])   # raises if invalid/expired
+        plan = claims.get("plan", "pro")
+        exp  = int(claims.get("exp") or 0) or None
+        sub  = _canon_email(claims.get("sub"))
+
+        if expected_email and sub and sub != _canon_email(expected_email):
+            # License belongs to a different user → treat as free for this session
+            return {"plan": "free", "valid": False, "exp": None, "mismatch": True}
+
+        return {"plan": plan, "valid": True, "exp": exp, "sub": sub}
+    except Exception:
+        return {"plan": "free", "valid": False, "exp": None}
+
+async def fetch_license_by_session(session_id: str) -> dict:
+    base = _lic_base()
+    url = f"{base}/api/license/by-session"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params={"session_id": session_id}, headers={"Accept": "application/json"})
+    if r.status_code >= 400:
+        txt = r.text[:300]
+        print(f"[license] by-session: error_body={txt!r}")
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+async def install_from_session(session_id: str) -> dict:
+    data = await fetch_license_by_session(session_id)
+    lic = (data or {}).get("license") or ""
+    if not lic:
+        raise HTTPException(404, "License not available yet")
+    claims = _verify(lic)
+    _save_secure(LIC_PATH, {"license": lic, "claims": claims})
+    return {"ok": True, "plan": claims.get("plan", "pro"), "exp": claims.get("exp")}
+
+async def recover_by_email(email: str) -> dict:
+    if not email:
+        return {"ok": True, "status": "not_found"}
+    base = _lic_base()
+    url = f"{base}/api/license/by-customer"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params={"email": email}, headers={"Accept": "application/json"})
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+    data = r.json() or {}
+    lic = data.get("license") or ""
+    if not lic:
+        return {"ok": True, "status": "not_found"}
+    claims = _verify(lic)
+    _save_secure(LIC_PATH, {"license": lic, "claims": claims})
+    return {"ok": True, "status": "installed", "plan": claims.get("plan", "pro"), "exp": claims.get("exp")}
+
+def remove_license_file() -> dict:
+    try:
+        if LIC_PATH.exists():
+            LIC_PATH.unlink()
+            print("[license] delete: removed")
+        else:
+            print("[license] delete: not_exists")
+        return {"ok": True}
+    except Exception as e:
+        print(f"[license] delete: error {e!r}")
+        raise HTTPException(500, f"Could not remove license: {e}")
+
+async def refresh_license(email: str, force: bool) -> dict:
+    email = _canon_email(email)
+    rec = _load_current()
+    if not rec:
+        # no local file → try recover by this email
+        return await recover_by_email(email)
+
+    try:
+        claims = _verify(rec["license"])
+        sub = _canon_email(claims.get("sub"))
+        now = int(time.time())
+        exp = int(claims.get("exp") or 0)
+        plan = claims.get("plan", "pro")
+
+        # If installed license belongs to another user, try replacing with this user's license.
+        if email and sub and sub != email:
+            got = await recover_by_email(email)   # may install new license or return not_found
+            if (got or {}).get("status") == "installed":
+                # installed a new license → report updated/new status
+                st = license_status_local(expected_email=email)
+                return {"ok": True, "status": "updated", **st}
+            # no license for this email → report free for this user
+            return {"ok": True, "status": "not_found", "plan": "free"}
+
+        # normal freshness check
+        if not force and exp and exp - now > EXP_SOON_SEC:
+            return {"ok": True, "status": "fresh_enough", "plan": plan, "exp": exp}
+    except Exception as e:
+        # local verify failed → try recover by this email
+        return await recover_by_email(email)
+
+    if not force and not _throttle_ok("refresh"):
+        return {"ok": True, "status": "skipped_cooldown"}
+
+    # ask server for this email
+    base = _lic_base()
+    url = f"{base}/api/license/by-customer"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params={"email": email}, headers={"Accept": "application/json"})
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+
+    data = r.json() or {}
+    lic = data.get("license") or ""
+    if not lic:
+        return {"ok": True, "status": "not_found", "plan": "free"}
+
+    new_claims = _verify(lic)
+    _save_secure(LIC_PATH, {"license": lic, "claims": new_claims})
+    return {"ok": True, "status": "updated", "plan": new_claims.get("plan", "pro"), "exp": new_claims.get("exp")}
+
+
+def read_license_claims() -> dict:
+    """Return the raw signed claims saved alongside the installed license."""
+    rec = _load_current()
+    if not rec:
+        raise HTTPException(404, "No license installed")
+    # Verify again to ensure the file hasn't gone stale/corrupted
+    _ = _verify(rec["license"])
+    # We store {"license": <LM1...>, "claims": {...}} when saving
+    claims = rec.get("claims") or {}
+    if not isinstance(claims, dict) or not claims:
+        # Fallback: parse from token if needed
+        try:
+            _, payload_b64, _ = rec["license"].split(".", 2)
+            payload = _b64u_decode(payload_b64)
+            claims = json.loads(payload.decode("utf-8")) or {}
+        except Exception:
+            claims = {}
+    return claims
 
 # ===== aimodel/file_read/services/packing.py =====
 
@@ -1353,352 +1766,6 @@ __all__ = [
   "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:"
 }
 
-# ===== aimodel/file_read/store/effective_settings.json =====
-
-{
-  "__comment_general": "=== Tokenization & Prompt Overhead ===",
-  "chars_per_token": 4,
-  "prompt_per_message_overhead": 4,
-  "__comment_memory": "=== Session / Memory Settings ===",
-  "recent_maxlen": 50,
-  "__comment_summary": "=== Summarization & Compression ===",
-  "heuristic_max_bullets": 5,
-  "heuristic_max_words": 12,
-  "bullet_prefix": "- ",
-  "use_fast_summary": true,
-  "llm_summary_max_tokens": 60,
-  "llm_summary_temperature": 0,
-  "llm_summary_top_p": 1,
-  "llm_summary_stop": [
-    "\n\n",
-    "\n\n- ",
-    "\n\n\n"
-  ],
-  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
-  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
-  "summary_user_suffix": "\n\nOutput:\n- ",
-  "summary_max_chars": 1200,
-  "summary_header_prefix": "Conversation summary so far:\n",
-  "final_shrink_summary_keep_ratio": 0.5,
-  "final_shrink_summary_min_chars": 200,
-  "__comment_system_directives": "=== System Directives for Model Output ===",
-  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
-  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
-  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
-  "__comment_context": "=== Context Window & Budgets ===",
-  "model_ctx": 2048,
-  "out_budget": 512,
-  "reserved_system_tokens": 256,
-  "min_input_budget": 512,
-  "skip_overage_lt": 128,
-  "max_peel_per_turn": 1,
-  "peel_min": 4,
-  "peel_frac": 0.33,
-  "peel_max": 12,
-  "__comment_generation_defaults": "=== Generation Defaults ===",
-  "default_temperature": 0.7,
-  "default_top_p": 0.95,
-  "default_max_tokens": 512,
-  "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": true,
-  "default_web_k": 3,
-  "web_k_min": 1,
-  "web_k_max": 8,
-  "router_tail_turns": 0,
-  "router_summary_chars": 0,
-  "router_max_chars": 900,
-  "router_context_label": "Context:",
-  "router_summary_label": "Summary:",
-  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
-  "__comment_web_provider": "=== Web Search Provider Selection & Config ===",
-  "web_search_provider": "brave",
-  "brave_api_key": "BSAJsnvyOOOULDffIM8myC1IUk34u-d",
-  "brave_worker_url": "",
-  "web_search_cache_ttl_sec": 900,
-  "web_search_cache_superset_k": 12,
-  "brave_api_base": "https://api.search.brave.com/res/v1/web/search",
-  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
-  "pack_style": "",
-  "pack_short": false,
-  "pack_bullets": false,
-  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
-  "__comment_misc": "=== Miscellaneous ===",
-  "empty_messages_response": "No messages provided.",
-  "clamp_margin": 32,
-  "default_session_id": "default",
-  "stopped_line_marker": "⏹ stopped",
-  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
-  "gen_semaphore_permits": 1,
-  "nctx_fallback": 4096,
-  "token_estimate_fallback": 1024,
-  "min_out_tokens": 16,
-  "__comment_store": "=== Chat storage ===",
-  "chat_default_title": "New Chat",
-  "chat_page_min_size": 1,
-  "chat_page_max_size": 100,
-  "web_fetch_timeout_sec": 4,
-  "web_fetch_max_chars": 2400,
-  "web_fetch_max_bytes": 1048576,
-  "web_fetch_max_parallel": 4,
-  "web_fetch_user_agent": "LocalAI/0.1 (+clean-fetch)",
-  "__comment_web_orchestrator": "=== Web Orchestrator & Block Assembly ===",
-  "web_orch_default_k": 4,
-  "web_orch_total_char_budget": 1800,
-  "web_orch_per_doc_char_budget": 600,
-  "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 2,
-  "web_orch_overfetch_min_extra": 4,
-  "web_orch_enable_js_retry": true,
-  "web_orch_js_retry_avg_q": 0.3,
-  "web_orch_js_retry_low_q": 0.18,
-  "web_orch_js_retry_lowish_ratio": 0.6,
-  "web_orch_js_retry_timeout_add": 4,
-  "web_orch_js_retry_timeout_cap": 12,
-  "web_orch_js_retry_parallel_delta": 1,
-  "web_orch_js_retry_min_parallel": 2,
-  "web_block_header": "Web findings for: {query}",
-  "web_orch_block_separator": "\n\n",
-  "web_orch_min_block_reserve": 200,
-  "web_orch_min_chunk_after_shrink": 160,
-  "web_orch_head_fraction": 0.4,
-  "web_orch_tail_min_chars": 200,
-  "web_orch_ellipsis": " … ",
-  "web_orch_bullet_prefix": "- ",
-  "web_orch_indent_prefix": "  ",
-  "web_orch_www_prefix": "www.",
-  "web_orch_fetch_cap_multiplier": 2,
-  "__comment_web_orch_scoring": "=== Hit scoring weights ===",
-  "web_orch_score_w_exact": 3,
-  "web_orch_score_w_substr": 2,
-  "web_orch_score_w_title_full": 2,
-  "web_orch_score_w_title_part": 1,
-  "web_orch_score_w_snip_touch": 1,
-  "__comment_web_orch_quality": "=== Content quality params ===",
-  "web_orch_q_len_norm_divisor": 1600,
-  "web_orch_q_len_weight": 0.55,
-  "web_orch_q_diversity_weight": 0.55,
-  "web_orch_q_penalties": [
-    {
-      "token": "<script>",
-      "mult": 50,
-      "cap": 0.3
-    },
-    {
-      "token": "function(",
-      "mult": 20,
-      "cap": 0.3
-    },
-    {
-      "token": "{",
-      "mult": 5,
-      "cap": 0.2
-    },
-    {
-      "token": "}",
-      "mult": 5,
-      "cap": 0.2
-    }
-  ],
-  "__comment_web_orch_diversity": "=== Diversity & Adaptive Chunking ===",
-  "web_orch_min_hosts": 3,
-  "__comment_web_misc": "=== Misc flags ===",
-  "web_ephemeral_only": true,
-  "web_inject_max_chars": 0,
-  "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
-  "query_sum_bypass_short_enabled": true,
-  "query_sum_short_max_chars": 32,
-  "query_sum_short_max_words": 3,
-  "query_sum_prompt": "Summarize the user's request into a concise web search query.\nKeep only the key entities and terms.\nDo not explain, and do not surround the result in quotation marks or other punctuation.\nYou may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.\nKeep the original word order. Output only the query text.\n\nUser: {text}\nQuery:",
-  "query_sum_max_tokens": 24,
-  "query_sum_temperature": 0,
-  "query_sum_top_p": 1,
-  "query_sum_stop": [
-    "\n",
-    "</s>"
-  ],
-  "query_sum_overlap_check_enabled": true,
-  "query_sum_overlap_jaccard_min": 0.6,
-  "__comment_router_decider": "=== Web Router (LLM-based) ===",
-  "router_decide_max_tokens": 64,
-  "router_decide_temperature": 0,
-  "router_decide_top_p": 1,
-  "router_decide_stop": [
-    "</s>"
-  ],
-  "__comment_router_control": "=== Router parsing & overrides ===",
-  "router_explicit_prefixes": [
-    "web:",
-    "search:"
-  ],
-  "router_default_need_when_invalid": true,
-  "router_json_extract_regex": "\\{.*?\\}",
-  "__comment_router_wrappers": "=== Router wrapper stripping ===",
-  "router_strip_wrappers_enabled": true,
-  "router_strip_header_regex": "^\\s*\\w[^:\\n]{0,40}:\\s*$",
-  "router_strip_split_on_blank": true,
-  "router_trim_whitespace": true,
-  "__comment_retitle": "=== Retitle (Chat title generation) ===",
-  "retitle_enable": true,
-  "retitle_queue_maxsize": 64,
-  "retitle_preview_chars": 60,
-  "retitle_preview_ellipsis": "…",
-  "retitle_min_substantial_chars": 12,
-  "retitle_require_alpha": true,
-  "retitle_pick_first_substantial": true,
-  "retitle_pick_latest_substantial": true,
-  "retitle_pick_first_user_fallback": true,
-  "retitle_grace_ms": 800,
-  "retitle_active_backoff_start_ms": 75,
-  "retitle_active_backoff_max_ms": 600,
-  "retitle_active_backoff_total_ms": 20000,
-  "retitle_active_backoff_growth": 1.5,
-  "retitle_llm_sys_inst": "You generate ultra-concise chat titles.\nRules: 2–5 words, Title Case, nouns/adjectives only.\nNo articles (a, an, the). No verbs. No punctuation. One line.\nOutput only the title.",
-  "retitle_user_prefix": "",
-  "retitle_user_suffix": "",
-  "retitle_llm_max_tokens": 12,
-  "retitle_llm_temperature": 0.1,
-  "retitle_llm_top_p": 1,
-  "retitle_llm_stop": [
-    "\n",
-    "."
-  ],
-  "retitle_enable_sanitize": true,
-  "retitle_sanitize_drop_prefix_regex": "^\\s*(\\\"[^\\\"]*\\\"|'[^']*'|[-*•]+|\\d+\\.)\\s*",
-  "retitle_sanitize_strip_quotes": true,
-  "retitle_sanitize_replace_not_allowed_regex": "[^\\w\\s’']",
-  "retitle_sanitize_replace_with": "",
-  "retitle_sanitize_max_words": 5,
-  "retitle_sanitize_max_chars": 40,
-  "retitle_min_user_chars": 15,
-  "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
-  "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": true,
-  "disable_web_on_attachments": true,
-  "disable_global_rag_on_attachments": true,
-  "attachments_retrieve_top_k": 6,
-  "rag_enabled": true,
-  "rag_top_k": 3,
-  "rag_max_chars_per_chunk": 900,
-  "rag_chunk_overlap_chars": 0,
-  "rag_min_chars": 300,
-  "rag_total_char_budget": 1500,
-  "rag_db_path": "corpus.sqlite",
-  "rag_block_header": "",
-  "rag_block_bullet_prefix": "- ",
-  "rag_block_indent_prefix": "  ",
-  "rag_embedding_model": "intfloat/e5-small-v2",
-  "rag_default_need_when_invalid": false,
-  "rag_block_preamble": "Local knowledge",
-  "rag_tabular_rows_per_table": 8,
-  "rag_prioritize_current_attachment": true,
-  "rag_new_upload_score_boost": 0.35,
-  "rag_rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-  "rag_rerank_top_m": 8,
-  "rag_min_score_frac": 0.6,
-  "rag_per_source_cap": 2,
-  "rag_nohit_message": "⛔ No relevant local entries found for this query. Do not guess.",
-  "rag_min_abs_rerank": -5,
-  "__comment_streaming": "=== Streaming worker tuning ===",
-  "stream_queue_maxsize": 64,
-  "stream_backpressure_sleep_sec": 0.005,
-  "stream_top_k": 40,
-  "stream_repeat_penalty": 1.25,
-  "stream_retry_min_tokens": 48,
-  "stream_retry_fraction": 0.4,
-  "stream_stop_strings": [
-    "\n⏹ stopped\n"
-  ],
-  "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2,
-  "runjson_emit": true,
-  "excel_emit_cells": false,
-  "excel_max_cells_per_sheet": 250,
-  "excel_named_range_preview": 6,
-  "excel_emit_merged": true,
-  "excel_number_sigfigs": 6,
-  "excel_decimal_max_places": 4,
-  "excel_trim_trailing_zeros": true,
-  "excel_dates_drop_time_if_midnight": true,
-  "excel_time_precision": "minute",
-  "excel_value_max_chars": 160,
-  "excel_quote_strings": true,
-  "excel_infer_max_rows": 100,
-  "excel_infer_max_cols": 26,
-  "excel_infer_min_header_fill_ratio": 0.5,
-  "excel_emit_key_values": false,
-  "excel_emit_cell_addresses": false,
-  "excel_header_normalize": true,
-  "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
-  "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
-  "router_rag_trim_whitespace": true,
-  "router_rag_strip_wrappers_enabled": true,
-  "router_rag_strip_split_on_blank": true,
-  "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
-  "router_rag_decide_max_tokens": 300,
-  "router_rag_decide_temperature": 0,
-  "router_rag_decide_top_p": 1,
-  "router_rag_decide_stop": [
-    "\n\n"
-  ],
-  "router_rag_default_need_when_invalid": false,
-  "csv_value_max_chars": 160,
-  "csv_quote_strings": true,
-  "csv_header_normalize": true,
-  "csv_infer_max_rows": 50,
-  "csv_infer_max_cols": 26,
-  "doc_debug": false,
-  "docx_heading_max_level": 3,
-  "docx_use_markdown_headings": true,
-  "docx_preserve_bullets": true,
-  "docx_include_tables": true,
-  "docx_include_headers_footers": false,
-  "docx_para_max_chars": 0,
-  "docx_drop_empty_lines": true,
-  "doc_ole_min_run_chars": 8,
-  "doc_ole_max_line_chars": 600,
-  "doc_ole_min_alpha_ratio": 0.25,
-  "doc_ole_drop_xmlish": true,
-  "doc_ole_drop_pathish": true,
-  "doc_ole_drop_symbol_lines": true,
-  "doc_ole_dedupe_short_repeats": true,
-  "pptx_use_markdown_headings": true,
-  "pptx_include_notes": true,
-  "pptx_include_tables": true,
-  "pptx_drop_empty_lines": true,
-  "pptx_para_max_chars": 0,
-  "pptx_number_slides": true,
-  "ppt_drop_empty_lines": true,
-  "ppt_dedupe_lines": true,
-  "ppt_min_alpha_ratio": 0.4,
-  "ppt_max_punct_ratio": 0.5,
-  "ppt_max_line_chars": 600,
-  "ppt_token_max_chars": 40,
-  "pdf_ocr_enable": true,
-  "pdf_ocr_when_bad": true,
-  "pdf_ocr_dpi": 300,
-  "pdf_ocr_max_pages": 0,
-  "pdf_ocr_mode": "auto",
-  "ocr_lang": "eng",
-  "ocr_psm": "3",
-  "ocr_oem": "3",
-  "ocr_min_chars_for_ok": 32,
-  "ocr_min_alnum_ratio_for_ok": 0.15,
-  "ocr_min_image_bytes": 16384,
-  "pptx_ocr_images": true,
-  "docx_ocr_images": true,
-  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe",
-  "style_sys": "You are a helpful assistant. Always follow the user's explicit instructions carefully and exactly. Do not repeat yourself. Stay coherent and complete.",
-  "style_patterns": {
-    "talk_like": "\\btalk\\s+like\\s+(?P<style>[^.;\\n]+)",
-    "respond_like": "\\brespond\\s+like\\s+(?P<style>[^.;\\n]+)",
-    "be": "\\bbe\\s+(?P<style>[^.;\\n]+)",
-    "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
-  },
-  "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
-  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:",
-  "brave_api_key_present": true
-}
-
 # ===== aimodel/file_read/store/index.py =====
 
 from __future__ import annotations
@@ -1743,349 +1810,7 @@ def refresh_index_after_change(session_id: str, messages: List[Dict]) -> None:
 
 # ===== aimodel/file_read/store/override_settings.json =====
 
-{
-  "__comment_general": "=== Tokenization & Prompt Overhead ===",
-  "chars_per_token": 4,
-  "prompt_per_message_overhead": 4,
-  "__comment_memory": "=== Session / Memory Settings ===",
-  "recent_maxlen": 50,
-  "__comment_summary": "=== Summarization & Compression ===",
-  "heuristic_max_bullets": 5,
-  "heuristic_max_words": 12,
-  "bullet_prefix": "- ",
-  "use_fast_summary": true,
-  "llm_summary_max_tokens": 60,
-  "llm_summary_temperature": 0,
-  "llm_summary_top_p": 1,
-  "llm_summary_stop": [
-    "\n\n",
-    "\n\n- ",
-    "\n\n\n"
-  ],
-  "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
-  "summary_user_prefix": "Summarize the following conversation slice.\n\n",
-  "summary_user_suffix": "\n\nOutput:\n- ",
-  "summary_max_chars": 1200,
-  "summary_header_prefix": "Conversation summary so far:\n",
-  "final_shrink_summary_keep_ratio": 0.5,
-  "final_shrink_summary_min_chars": 200,
-  "__comment_system_directives": "=== System Directives for Model Output ===",
-  "system_brief_directive": "Keep answers extremely brief: max 2 sentences OR 5 short bullets.",
-  "system_bullets_directive": "Use bullet points when possible; each bullet under 15 words.",
-  "system_follow_user_style_directive": "Always follow the user's most recent style instructions.",
-  "__comment_context": "=== Context Window & Budgets ===",
-  "model_ctx": 2048,
-  "out_budget": 512,
-  "reserved_system_tokens": 256,
-  "min_input_budget": 512,
-  "skip_overage_lt": 128,
-  "max_peel_per_turn": 1,
-  "peel_min": 4,
-  "peel_frac": 0.33,
-  "peel_max": 12,
-  "__comment_generation_defaults": "=== Generation Defaults ===",
-  "default_temperature": 0.7,
-  "default_top_p": 0.95,
-  "default_max_tokens": 512,
-  "__comment_web_search": "=== Web Search & Router ===",
-  "default_auto_web": true,
-  "default_web_k": 3,
-  "web_k_min": 1,
-  "web_k_max": 8,
-  "router_tail_turns": 0,
-  "router_summary_chars": 0,
-  "router_max_chars": 900,
-  "router_context_label": "Context:",
-  "router_summary_label": "Summary:",
-  "web_block_preamble": "Web findings (authoritative — use these to answer accurately; override older knowledge):",
-  "__comment_web_provider": "=== Web Search Provider Selection & Config ===",
-  "web_search_provider": "brave",
-  "brave_api_key": "BSAJsnvyOOOULDffIM8myC1IUk34u-d",
-  "brave_worker_url": "",
-  "web_search_cache_ttl_sec": 900,
-  "web_search_cache_superset_k": 12,
-  "brave_api_base": "https://api.search.brave.com/res/v1/web/search",
-  "__comment_packing": "=== Packing Settings (System Prompt Assembly) ===",
-  "pack_style": "",
-  "pack_short": false,
-  "pack_bullets": false,
-  "packing_guidance": "\nYou may consult the prior messages to answer questions about the conversation itself (e.g., “what did I say first?”). When web context is present, consider it as evidence, prefer newer info if it conflicts with older memory, and respond in your own words.",
-  "__comment_misc": "=== Miscellaneous ===",
-  "empty_messages_response": "No messages provided.",
-  "clamp_margin": 32,
-  "default_session_id": "default",
-  "stopped_line_marker": "⏹ stopped",
-  "__comment_runtime": "=== Runtime / Safety Fallbacks ===",
-  "gen_semaphore_permits": 1,
-  "nctx_fallback": 4096,
-  "token_estimate_fallback": 1024,
-  "min_out_tokens": 16,
-  "__comment_store": "=== Chat storage ===",
-  "chat_default_title": "New Chat",
-  "chat_page_min_size": 1,
-  "chat_page_max_size": 100,
-  "web_fetch_timeout_sec": 4,
-  "web_fetch_max_chars": 2400,
-  "web_fetch_max_bytes": 1048576,
-  "web_fetch_max_parallel": 4,
-  "web_fetch_user_agent": "LocalAI/0.1 (+clean-fetch)",
-  "__comment_web_orchestrator": "=== Web Orchestrator & Block Assembly ===",
-  "web_orch_default_k": 4,
-  "web_orch_total_char_budget": 1800,
-  "web_orch_per_doc_char_budget": 600,
-  "web_orch_max_parallel_fetch": 4,
-  "web_orch_overfetch_factor": 2,
-  "web_orch_overfetch_min_extra": 4,
-  "web_orch_enable_js_retry": true,
-  "web_orch_js_retry_avg_q": 0.3,
-  "web_orch_js_retry_low_q": 0.18,
-  "web_orch_js_retry_lowish_ratio": 0.6,
-  "web_orch_js_retry_timeout_add": 4,
-  "web_orch_js_retry_timeout_cap": 12,
-  "web_orch_js_retry_parallel_delta": 1,
-  "web_orch_js_retry_min_parallel": 2,
-  "web_block_header": "Web findings for: {query}",
-  "web_orch_block_separator": "\n\n",
-  "web_orch_min_block_reserve": 200,
-  "web_orch_min_chunk_after_shrink": 160,
-  "web_orch_head_fraction": 0.4,
-  "web_orch_tail_min_chars": 200,
-  "web_orch_ellipsis": " … ",
-  "web_orch_bullet_prefix": "- ",
-  "web_orch_indent_prefix": "  ",
-  "web_orch_www_prefix": "www.",
-  "web_orch_fetch_cap_multiplier": 2,
-  "__comment_web_orch_scoring": "=== Hit scoring weights ===",
-  "web_orch_score_w_exact": 3,
-  "web_orch_score_w_substr": 2,
-  "web_orch_score_w_title_full": 2,
-  "web_orch_score_w_title_part": 1,
-  "web_orch_score_w_snip_touch": 1,
-  "__comment_web_orch_quality": "=== Content quality params ===",
-  "web_orch_q_len_norm_divisor": 1600,
-  "web_orch_q_len_weight": 0.55,
-  "web_orch_q_diversity_weight": 0.55,
-  "web_orch_q_penalties": [
-    {
-      "token": "<script>",
-      "mult": 50,
-      "cap": 0.3
-    },
-    {
-      "token": "function(",
-      "mult": 20,
-      "cap": 0.3
-    },
-    {
-      "token": "{",
-      "mult": 5,
-      "cap": 0.2
-    },
-    {
-      "token": "}",
-      "mult": 5,
-      "cap": 0.2
-    }
-  ],
-  "__comment_web_orch_diversity": "=== Diversity & Adaptive Chunking ===",
-  "web_orch_min_hosts": 3,
-  "__comment_web_misc": "=== Misc flags ===",
-  "web_ephemeral_only": true,
-  "web_inject_max_chars": 0,
-  "__comment_web_query_summarizer": "=== Web Query Summarizer ===",
-  "query_sum_bypass_short_enabled": true,
-  "query_sum_short_max_chars": 32,
-  "query_sum_short_max_words": 3,
-  "query_sum_prompt": "Summarize the user's request into a concise web search query.\nKeep only the key entities and terms.\nDo not explain, and do not surround the result in quotation marks or other punctuation.\nYou may only delete non-essential words. Do not add, replace, reorder, or paraphrase any words.\nKeep the original word order. Output only the query text.\n\nUser: {text}\nQuery:",
-  "query_sum_max_tokens": 24,
-  "query_sum_temperature": 0,
-  "query_sum_top_p": 1,
-  "query_sum_stop": [
-    "\n",
-    "</s>"
-  ],
-  "query_sum_overlap_check_enabled": true,
-  "query_sum_overlap_jaccard_min": 0.6,
-  "__comment_router_decider": "=== Web Router (LLM-based) ===",
-  "router_decide_max_tokens": 64,
-  "router_decide_temperature": 0,
-  "router_decide_top_p": 1,
-  "router_decide_stop": [
-    "</s>"
-  ],
-  "__comment_router_control": "=== Router parsing & overrides ===",
-  "router_explicit_prefixes": [
-    "web:",
-    "search:"
-  ],
-  "router_default_need_when_invalid": true,
-  "router_json_extract_regex": "\\{.*?\\}",
-  "__comment_router_wrappers": "=== Router wrapper stripping ===",
-  "router_strip_wrappers_enabled": true,
-  "router_strip_header_regex": "^\\s*\\w[^:\\n]{0,40}:\\s*$",
-  "router_strip_split_on_blank": true,
-  "router_trim_whitespace": true,
-  "__comment_retitle": "=== Retitle (Chat title generation) ===",
-  "retitle_enable": true,
-  "retitle_queue_maxsize": 64,
-  "retitle_preview_chars": 60,
-  "retitle_preview_ellipsis": "…",
-  "retitle_min_substantial_chars": 12,
-  "retitle_require_alpha": true,
-  "retitle_pick_first_substantial": true,
-  "retitle_pick_latest_substantial": true,
-  "retitle_pick_first_user_fallback": true,
-  "retitle_grace_ms": 800,
-  "retitle_active_backoff_start_ms": 75,
-  "retitle_active_backoff_max_ms": 600,
-  "retitle_active_backoff_total_ms": 20000,
-  "retitle_active_backoff_growth": 1.5,
-  "retitle_llm_sys_inst": "You generate ultra-concise chat titles.\nRules: 2–5 words, Title Case, nouns/adjectives only.\nNo articles (a, an, the). No verbs. No punctuation. One line.\nOutput only the title.",
-  "retitle_user_prefix": "",
-  "retitle_user_suffix": "",
-  "retitle_llm_max_tokens": 12,
-  "retitle_llm_temperature": 0.1,
-  "retitle_llm_top_p": 1,
-  "retitle_llm_stop": [
-    "\n",
-    "."
-  ],
-  "retitle_enable_sanitize": true,
-  "retitle_sanitize_drop_prefix_regex": "^\\s*(\\\"[^\\\"]*\\\"|'[^']*'|[-*•]+|\\d+\\.)\\s*",
-  "retitle_sanitize_strip_quotes": true,
-  "retitle_sanitize_replace_not_allowed_regex": "[^\\w\\s’']",
-  "retitle_sanitize_replace_with": "",
-  "retitle_sanitize_max_words": 5,
-  "retitle_sanitize_max_chars": 40,
-  "retitle_min_user_chars": 15,
-  "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
-  "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": true,
-  "disable_web_on_attachments": true,
-  "disable_global_rag_on_attachments": true,
-  "attachments_retrieve_top_k": 6,
-  "rag_enabled": true,
-  "rag_top_k": 3,
-  "rag_max_chars_per_chunk": 900,
-  "rag_chunk_overlap_chars": 0,
-  "rag_min_chars": 300,
-  "rag_total_char_budget": 1500,
-  "rag_db_path": "corpus.sqlite",
-  "rag_block_header": "",
-  "rag_block_bullet_prefix": "- ",
-  "rag_block_indent_prefix": "  ",
-  "rag_embedding_model": "intfloat/e5-small-v2",
-  "rag_default_need_when_invalid": false,
-  "rag_block_preamble": "Local knowledge",
-  "rag_tabular_rows_per_table": 8,
-  "rag_prioritize_current_attachment": true,
-  "rag_new_upload_score_boost": 0.35,
-  "rag_rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-  "rag_rerank_top_m": 8,
-  "rag_min_score_frac": 0.6,
-  "rag_per_source_cap": 2,
-  "rag_nohit_message": "⛔ No relevant local entries found for this query. Do not guess.",
-  "rag_min_abs_rerank": -5,
-  "__comment_streaming": "=== Streaming worker tuning ===",
-  "stream_queue_maxsize": 64,
-  "stream_backpressure_sleep_sec": 0.005,
-  "stream_top_k": 40,
-  "stream_repeat_penalty": 1.25,
-  "stream_retry_min_tokens": 48,
-  "stream_retry_fraction": 0.4,
-  "stream_stop_strings": [
-    "\n⏹ stopped\n"
-  ],
-  "stream_emit_stopped_line": true,
-  "stream_producer_join_timeout_sec": 2,
-  "runjson_emit": true,
-  "excel_emit_cells": false,
-  "excel_max_cells_per_sheet": 250,
-  "excel_named_range_preview": 6,
-  "excel_emit_merged": true,
-  "excel_number_sigfigs": 6,
-  "excel_decimal_max_places": 4,
-  "excel_trim_trailing_zeros": true,
-  "excel_dates_drop_time_if_midnight": true,
-  "excel_time_precision": "minute",
-  "excel_value_max_chars": 160,
-  "excel_quote_strings": true,
-  "excel_infer_max_rows": 100,
-  "excel_infer_max_cols": 26,
-  "excel_infer_min_header_fill_ratio": 0.5,
-  "excel_emit_key_values": false,
-  "excel_emit_cell_addresses": false,
-  "excel_header_normalize": true,
-  "router_rag_decide_prompt": "You are a router deciding whether the user message should query the app's LOCAL knowledge (uploaded files, chat/session documents) via RAG.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- Set need=true if answering would materially benefit from the user's LOCAL knowledge base (e.g., their files, prior session uploads, or internal notes).\n- Set need=false if the answer is general knowledge or can be answered without consulting local files.\n- Do NOT consider the public web here.\n- If you set need=true and you can succinctly restate the search intent for the local KB, put that in \"query\". Otherwise leave \"query\" empty.\n\nText:\n$text\nJSON:",
-  "router_rag_json_extract_regex": "\\{[\\s\\S]*?\\}",
-  "router_rag_trim_whitespace": true,
-  "router_rag_strip_wrappers_enabled": true,
-  "router_rag_strip_split_on_blank": true,
-  "router_rag_strip_header_regex": "^(Local knowledge:|Sources:)",
-  "router_rag_decide_max_tokens": 300,
-  "router_rag_decide_temperature": 0,
-  "router_rag_decide_top_p": 1,
-  "router_rag_decide_stop": [
-    "\n\n"
-  ],
-  "router_rag_default_need_when_invalid": false,
-  "csv_value_max_chars": 160,
-  "csv_quote_strings": true,
-  "csv_header_normalize": true,
-  "csv_infer_max_rows": 50,
-  "csv_infer_max_cols": 26,
-  "doc_debug": false,
-  "docx_heading_max_level": 3,
-  "docx_use_markdown_headings": true,
-  "docx_preserve_bullets": true,
-  "docx_include_tables": true,
-  "docx_include_headers_footers": false,
-  "docx_para_max_chars": 0,
-  "docx_drop_empty_lines": true,
-  "doc_ole_min_run_chars": 8,
-  "doc_ole_max_line_chars": 600,
-  "doc_ole_min_alpha_ratio": 0.25,
-  "doc_ole_drop_xmlish": true,
-  "doc_ole_drop_pathish": true,
-  "doc_ole_drop_symbol_lines": true,
-  "doc_ole_dedupe_short_repeats": true,
-  "pptx_use_markdown_headings": true,
-  "pptx_include_notes": true,
-  "pptx_include_tables": true,
-  "pptx_drop_empty_lines": true,
-  "pptx_para_max_chars": 0,
-  "pptx_number_slides": true,
-  "ppt_drop_empty_lines": true,
-  "ppt_dedupe_lines": true,
-  "ppt_min_alpha_ratio": 0.4,
-  "ppt_max_punct_ratio": 0.5,
-  "ppt_max_line_chars": 600,
-  "ppt_token_max_chars": 40,
-  "pdf_ocr_enable": true,
-  "pdf_ocr_when_bad": true,
-  "pdf_ocr_dpi": 300,
-  "pdf_ocr_max_pages": 0,
-  "pdf_ocr_mode": "auto",
-  "ocr_lang": "eng",
-  "ocr_psm": "3",
-  "ocr_oem": "3",
-  "ocr_min_chars_for_ok": 32,
-  "ocr_min_alnum_ratio_for_ok": 0.15,
-  "ocr_min_image_bytes": 16384,
-  "pptx_ocr_images": true,
-  "docx_ocr_images": true,
-  "tesseract_cmd": "E:\\Programs\\Tesseract-OCR\\tesseract.exe",
-  "style_sys": "You are a helpful assistant. Always follow the user's explicit instructions carefully and exactly. Do not repeat yourself. Stay coherent and complete.",
-  "style_patterns": {
-    "talk_like": "\\btalk\\s+like\\s+(?P<style>[^.;\\n]+)",
-    "respond_like": "\\brespond\\s+like\\s+(?P<style>[^.;\\n]+)",
-    "be": "\\bbe\\s+(?P<style>[^.;\\n]+)",
-    "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
-  },
-  "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
-  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:",
-  "brave_api_key_present": true
-}
+
 
 # ===== aimodel/file_read/utils/streaming.py =====
 
@@ -2572,4 +2297,378 @@ class BraveProvider:
                     prov_info["errorMsg"] = str(e)
 
         prov_info["elapsedSec"] = round(time.perf_counter() - t_fetch, 6)
-        tel["provider"] = p
+        tel["provider"] = prov_info
+
+        _cache_set(ckey, hits)
+        out = hits[:k]
+        _set_hits_telemetry(tel, hits, out)
+        tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
+        if telemetry is not None:
+            telemetry.update(tel)
+        return out
+
+# ===== aimodel/file_read/web/fetch.py =====
+
+# aimodel/file_read/web/fetch.py
+from __future__ import annotations
+import asyncio
+from typing import Tuple, List, Optional, Dict, Any
+import time
+import httpx
+from urllib.parse import urlparse
+
+try:
+    from readability import Document
+except Exception:
+    Document = None  # optional
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None  # optional
+
+try:
+    from selectolax.parser import HTMLParser
+except Exception:
+    HTMLParser = None  # optional
+
+from ..core.settings import SETTINGS
+
+
+def _req(key: str):
+    return SETTINGS[key]
+
+def _ua() -> str:
+    return str(_req("web_fetch_user_agent"))
+
+def _timeout() -> float:
+    return float(_req("web_fetch_timeout_sec"))
+
+def _max_chars() -> int:
+    return int(_req("web_fetch_max_chars"))
+
+def _max_bytes() -> int:
+    return int(_req("web_fetch_max_bytes"))
+
+def _max_parallel() -> int:
+    return max(1, int(_req("web_fetch_max_parallel")))
+
+
+# -------------------- Adaptive cooldown (generic, no host hardcoding) --------------------
+# host -> (fail_count, cooldown_until_ts)
+_BAD_HOSTS: Dict[str, Tuple[int, float]] = {}
+
+def _now() -> float:
+    return time.time()
+
+def _host_of(u: str) -> str:
+    try:
+        return (urlparse(u).hostname or "").lower()
+    except Exception:
+        return ""
+
+def _cooldown_secs(fails: int) -> float:
+    # 15m, 30m, 60m, ... capped at 24h
+    base = 15 * 60.0
+    cap = 24 * 60 * 60.0
+    return min(cap, base * (2 ** max(0, fails - 1)))
+
+def _mark_bad(host: str) -> None:
+    if not host:
+        return
+    fails, until = _BAD_HOSTS.get(host, (0, 0.0))
+    fails += 1
+    _BAD_HOSTS[host] = (fails, _now() + _cooldown_secs(fails))
+
+def _mark_good(host: str) -> None:
+    if not host:
+        return
+    if host in _BAD_HOSTS:
+        fails, until = _BAD_HOSTS[host]
+        fails = max(0, fails - 1)
+        if fails == 0:
+            _BAD_HOSTS.pop(host, None)
+        else:
+            _BAD_HOSTS[host] = (fails, _now() + _cooldown_secs(fails))
+
+def _is_on_cooldown(host: str) -> bool:
+    ent = _BAD_HOSTS.get(host)
+    return bool(ent and ent[1] > _now())
+# ----------------------------------------------------------------------------------------
+
+
+async def _read_capped_bytes(resp: httpx.Response, cap_bytes: int) -> bytes:
+    out = bytearray()
+    async for chunk in resp.aiter_bytes():
+        if not chunk:
+            continue
+        remaining = cap_bytes - len(out)
+        if remaining <= 0:
+            break
+        out.extend(chunk[:remaining])
+        if len(out) >= cap_bytes:
+            break
+    return bytes(out)
+
+
+def _extract_text_from_html(raw_html: str, url: str) -> str:
+    html = raw_html or ""
+    # Try readability first (often best for article-like pages)
+    if Document is not None:
+        try:
+            doc = Document(html)
+            summary_html = doc.summary(html_partial=True) or ""
+            if summary_html:
+                if BeautifulSoup is not None:
+                    soup = BeautifulSoup(summary_html, "lxml")
+                    txt = soup.get_text(" ", strip=True)
+                    if txt:
+                        return txt
+        except Exception:
+            pass
+    # Try selectolax (fast, robust)
+    if HTMLParser is not None:
+        try:
+            tree = HTMLParser(html)
+            for bad in ("script", "style", "noscript"):
+                for n in tree.tags(bad):
+                    n.decompose()
+            txt = tree.body.text(separator=" ", strip=True) if tree.body else tree.text(separator=" ", strip=True)
+            if txt:
+                return txt
+        except Exception:
+            pass
+    # Fallback to BeautifulSoup full parse
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            for s in soup(["script", "style", "noscript"]):
+                s.extract()
+            txt = soup.get_text(" ", strip=True)
+            if txt:
+                return txt
+        except Exception:
+            pass
+    # Last resort: return raw html (will be trimmed by char cap)
+    return html
+
+
+async def fetch_clean(
+    url: str,
+    timeout_s: Optional[float] = None,
+    max_chars: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+    telemetry: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, int, str]:
+    t0 = time.perf_counter()
+    timeout = _timeout() if timeout_s is None else float(timeout_s)
+    cap_chars = _max_chars() if max_chars is None else int(max_chars)
+    cap_bytes = _max_bytes() if max_bytes is None else int(max_bytes)
+
+    headers = {"User-Agent": _ua()}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").lower()
+
+        raw_bytes = await _read_capped_bytes(r, cap_bytes)
+        enc = r.encoding or "utf-8"
+        raw_text = raw_bytes.decode(enc, errors="ignore")
+        txt = _extract_text_from_html(raw_text, str(r.url))
+        txt = (txt or "").strip().replace("\r", "")
+        if len(txt) > cap_chars:
+            txt = txt[:cap_chars]
+
+        # Generic usefulness test: skip non-HTML or extremely short bodies
+        MIN_USEFUL_CHARS = 80
+        host_final = _host_of(str(r.url))
+        if ("text/html" not in ctype) or (len(txt) < MIN_USEFUL_CHARS):
+            _mark_bad(host_final)
+        else:
+            _mark_good(host_final)
+
+        if telemetry is not None:
+            telemetry.update({
+                "reqUrl": url,
+                "finalUrl": str(r.url),
+                "status": int(r.status_code),
+                "elapsedSec": round(time.perf_counter() - t0, 6),
+                "bytes": len(raw_bytes),
+                "chars": len(txt),
+                "timeoutSec": timeout,
+                "capBytes": cap_bytes,
+                "capChars": cap_chars,
+                "contentType": ctype,
+                "cooldownFails": _BAD_HOSTS.get(host_final, (0, 0.0))[0] if host_final in _BAD_HOSTS else 0,
+            })
+        return (str(r.url), r.status_code, txt)
+
+
+async def fetch_many(
+    urls: List[str],
+    per_timeout_s: Optional[float] = None,
+    cap_chars: Optional[int] = None,
+    cap_bytes: Optional[int] = None,
+    max_parallel: Optional[int] = None,
+    telemetry: Optional[Dict[str, Any]] = None,
+):
+    t_total0 = time.perf_counter()
+    sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
+    tel_items: List[Dict[str, Any]] = []
+
+    async def _one(u: str):
+        item_tel: Dict[str, Any] = {"reqUrl": u}
+        host = _host_of(u)
+
+        # Skip hosts currently on adaptive cooldown (generic, no lists)
+        if _is_on_cooldown(host):
+            item_tel.update({
+                "ok": False,
+                "skipped": True,
+                "skipReason": "cooldown",
+                "host": host,
+            })
+            tel_items.append(item_tel)
+            return u, None
+
+        t0 = time.perf_counter()
+        async with sem:
+            try:
+                res = await fetch_clean(
+                    u,
+                    timeout_s=per_timeout_s,
+                    max_chars=cap_chars,
+                    max_bytes=cap_bytes,
+                    telemetry=item_tel,
+                )
+                item_tel.setdefault("elapsedSec", round(time.perf_counter() - t0, 6))
+                item_tel["ok"] = True
+                item_tel["host"] = host
+                tel_items.append(item_tel)
+                return u, res
+            except Exception as e:
+                _mark_bad(host)  # network/HTTP error counts as a fail
+                item_tel.update({
+                    "ok": False,
+                    "errorType": type(e).__name__,
+                    "errorMsg": str(e),
+                    "elapsedSec": round(time.perf_counter() - t0, 6),
+                    "timeoutSec": (float(per_timeout_s) if per_timeout_s is not None else _timeout()),
+                    "capBytes": (int(cap_bytes) if cap_bytes is not None else _max_bytes()),
+                    "capChars": (int(cap_chars) if cap_chars is not None else _max_chars()),
+                    "host": host,
+                })
+                tel_items.append(item_tel)
+                return u, None
+
+    tasks = [_one(u) for u in urls]
+    results = await asyncio.gather(*tasks)
+
+    if telemetry is not None:
+        ok_cnt = sum(1 for it in tel_items if it.get("ok"))
+        telemetry.update({
+            "totalSec": round(time.perf_counter() - t_total0, 6),
+            "requested": len(urls),
+            "ok": ok_cnt,
+            "miss": len(urls) - ok_cnt,
+            "items": tel_items,
+            "settings": {
+                "userAgent": _ua(),
+                "defaultTimeoutSec": _timeout(),
+                "defaultCapChars": _max_chars(),
+                "defaultCapBytes": _max_bytes(),
+                "maxParallel": _max_parallel() if max_parallel is None else int(max_parallel),
+            },
+        })
+
+    return results
+
+# ===== aimodel/file_read/web/orchestrator.py =====
+
+from __future__ import annotations
+from typing import List, Tuple, Optional, Dict, Any
+import time
+from collections import defaultdict
+
+from .brave import BraveProvider
+from .provider import SearchHit
+from .orchestrator_common import (
+    _as_int, _as_float, _as_bool, _as_str,
+    condense_doc, content_quality_score,
+    _dedupe_by_host, score_hit, _head_tail,
+    _fetch_round, _host,   # NOTE: make sure _host is imported
+)
+from ..core.request_ctx import get_x_id
+
+
+async def build_web_block(query: str, k: Optional[int] = None, per_url_timeout_s: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    tel: Dict[str, Any] = {"query": (query or "").strip()}
+    cfg_k               = (int(k) if k is not None else _as_int("web_orch_default_k"))
+    total_char_budget   = _as_int("web_orch_total_char_budget")
+    per_doc_budget      = _as_int("web_orch_per_doc_char_budget")
+    max_parallel        = _as_int("web_orch_max_parallel_fetch")
+    overfetch_factor    = _as_float("web_orch_overfetch_factor")
+    overfetch_min_extra = _as_int("web_orch_overfetch_min_extra")
+    enable_js_retry     = _as_bool("web_orch_enable_js_retry")
+    js_avg_q_thresh     = _as_float("web_orch_js_retry_avg_q")
+    js_low_q_thresh     = _as_float("web_orch_js_retry_low_q")
+    js_lowish_ratio     = _as_float("web_orch_js_retry_lowish_ratio")
+    js_timeout_add      = _as_float("web_orch_js_retry_timeout_add")
+    js_timeout_cap      = _as_float("web_orch_js_retry_timeout_cap")
+    js_parallel_delta   = _as_int("web_orch_js_retry_parallel_delta")
+    js_min_parallel     = _as_int("web_orch_js_retry_min_parallel")
+    header_tpl          = _as_str("web_block_header")
+    sep_str             = _as_str("web_orch_block_separator")
+    min_chunk_after     = _as_int("web_orch_min_chunk_after_shrink")
+    min_block_reserve   = _as_int("web_orch_min_block_reserve")
+    per_timeout = (float(per_url_timeout_s) if per_url_timeout_s is not None else _as_float("web_fetch_timeout_sec"))
+    start_time = time.perf_counter()
+
+    provider = BraveProvider()
+    # widen search result pool a bit for better host variety
+    overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
+    tel["search"] = {"requestedK": cfg_k, "overfetch": overfetch}
+    t0 = time.perf_counter()
+    try:
+        hits: List[SearchHit] = await provider.search(query, k=overfetch, telemetry=tel["search"], xid=get_x_id())
+    except Exception as e:
+        tel["error"] = {"stage": "search", "type": type(e).__name__, "msg": str(e)}
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        print("[web-block] (empty) due to search error:", tel["error"])
+        return None, tel
+    tel["search"]["elapsedSecTotal"] = round(time.perf_counter() - t0, 6)
+
+    if not hits:
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        print("[web-block] (empty) — no hits")
+        return None, tel
+
+    # score & keep uniques by URL
+    seen_urls = set()
+    scored: List[Tuple[int, SearchHit]] = []
+    for h in hits:
+        u = (h.url or "").strip()
+        if not u or u in seen_urls:
+            continue
+        seen_urls.add(u)
+        s = score_hit(h, query)
+        scored.append((s, h))
+    tel["scoring"] = {"inputHits": len(hits), "scored": len(scored)}
+
+    if not scored:
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        print("[web-block] (empty) — no scored hits")
+        return None, tel
+
+    # IMPORTANT: dedupe by host to a PREFETCH set (larger than k) to increase variety
+    prefetch = max(cfg_k * 2, cfg_k + 6)
+    top_hits = _dedupe_by_host(scored, prefetch)
+    tel["scoring"]["picked"] = len(top_hits)
+    urls = [h.url for h in top_hits]
+    meta = [(h.title or h.url, h.url) for h in top_hits]
+
+    # fetch round 1
+    t_f = time.perf_counter()
+    tel["fetch1"] = {}
+    results = await _fetch_round(
+        urls, meta, per_url_timeout_s=per_timeout, max_par

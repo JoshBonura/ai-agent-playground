@@ -1,29 +1,40 @@
 # core/schemas.py
 from __future__ import annotations
-from typing import Optional, List, Literal
+
+from typing import Literal
+
 from pydantic import BaseModel
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
 
 
 class Attachment(BaseModel):
     name: str
-    source: Optional[str] = None
-    sessionId: Optional[str] = None
+    source: str | None = None
+    sessionId: str | None = None
+
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
-    attachments: Optional[List[Attachment]] = None  
+    attachments: list[Attachment] | None = None
+
 
 class ChatMetaModel(BaseModel):
     id: int
     sessionId: str
     title: str
-    lastMessage: Optional[str] = None
+    lastMessage: str | None = None
     createdAt: str
     updatedAt: str
+    ownerUid: str | None = None
+    ownerEmail: str | None = None
+
 
 class PageResp(BaseModel):
-    content: List[ChatMetaModel]
+    content: list[ChatMetaModel]
     totalElements: int
     totalPages: int
     size: int
@@ -32,24 +43,28 @@ class PageResp(BaseModel):
     last: bool
     empty: bool
 
+
 class BatchMsgDeleteReq(BaseModel):
-    messageIds: List[int]
+    messageIds: list[int]
+
 
 class BatchDeleteReq(BaseModel):
-    sessionIds: List[str]
+    sessionIds: list[str]
+
 
 class EditMessageReq(BaseModel):
     messageId: int
     content: str
 
+
 class ChatBody(BaseModel):
-    sessionId: Optional[str] = None
-    messages: Optional[List[ChatMessage]] = None
+    sessionId: str | None = None
+    messages: list[ChatMessage] | None = None
 
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
 
-    autoWeb: Optional[bool] = None
-    webK: Optional[int] = None
-    autoRag: Optional[bool] = None   
+    autoWeb: bool | None = None
+    webK: int | None = None
+    autoRag: bool | None = None

@@ -1,21 +1,28 @@
 # aimodel/file_read/services/generate_pipeline_support.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from ..core.logging import get_logger
 from ..utils.streaming import safe_token_count_messages
+
+log = get_logger(__name__)
+
 
 @dataclass
 class Prep:
     llm: Any
     session_id: str
-    packed: List[Dict[str, str]]
-    st: Dict[str, Any]
+    packed: list[dict[str, str]]
+    st: dict[str, Any]
     out_budget: int
-    input_tokens_est: Optional[int]
-    budget_view: Dict[str, Any]
+    input_tokens_est: int | None
+    budget_view: dict[str, Any]
     temperature: float
     top_p: float
     t_request_start: float
+
 
 def _bool(v, default: bool = False) -> bool:
     try:
@@ -23,16 +30,21 @@ def _bool(v, default: bool = False) -> bool:
     except Exception:
         return bool(default)
 
-def _tok_count(llm, messages: List[Dict[str, str]]) -> Optional[int]:
+
+def _tok_count(llm, messages: list[dict[str, str]]) -> int | None:
     try:
         return int(safe_token_count_messages(llm, messages))
     except Exception:
         return None
 
-def _approx_block_tokens(llm, role: str, text: str) -> Optional[int]:
+
+def _approx_block_tokens(llm, role: str, text: str) -> int | None:
     return _tok_count(llm, [{"role": role, "content": text}])
 
-def _diff_find_inserted_block(before: List[Dict[str, str]], after: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+
+def _diff_find_inserted_block(
+    before: list[dict[str, str]], after: list[dict[str, str]]
+) -> dict[str, str] | None:
     if len(after) - len(before) != 1:
         return None
     i = 0
@@ -42,17 +54,15 @@ def _diff_find_inserted_block(before: List[Dict[str, str]], after: List[Dict[str
         return after[i]
     return None
 
-def _dump_msgs(label: str, msgs: List[Dict[str, str]], head_chars: int = 180):
-    return
 
-def _web_breakdown(web: Dict[str, Any]) -> Dict[str, float]:
+def _web_breakdown(web: dict[str, Any]) -> dict[str, float]:
     w = web or {}
     orch = w.get("orchestrator") or {}
     router = float(w.get("elapsedSec") or 0.0)
     summarize = float((w.get("summarizer") or {}).get("elapsedSec") or 0.0)
     inject = float(w.get("injectElapsedSec") or 0.0)
     search_total = 0.0
-    s1 = (orch.get("search") or {})
+    s1 = orch.get("search") or {}
     for k in ("elapsedSecTotal", "elapsedSec"):
         if isinstance(s1.get(k), (int, float)):
             search_total = float(s1[k])
@@ -76,21 +86,38 @@ def _web_breakdown(web: Dict[str, Any]) -> Dict[str, float]:
         "totalWebPreTtftSec": round(total_pre_ttft, 6),
     }
 
-def _web_unattributed(web: Dict[str, Any], breakdown: Dict[str, float]) -> float:
+
+def _web_unattributed(web: dict[str, Any], breakdown: dict[str, float]) -> float:
     total = float((web or {}).get("fetchElapsedSec") or 0.0)
-    explained = float(breakdown.get("searchSec", 0.0)) + float(breakdown.get("fetchSec", 0.0)) + float(breakdown.get("jsFetchSec", 0.0)) + float(breakdown.get("assembleSec", 0.0))
+    explained = (
+        float(breakdown.get("searchSec", 0.0))
+        + float(breakdown.get("fetchSec", 0.0))
+        + float(breakdown.get("jsFetchSec", 0.0))
+        + float(breakdown.get("assembleSec", 0.0))
+    )
     ua = total - explained
     return round(ua if ua > 0 else 0.0, 6)
 
-def _enforce_fit(llm, eff: Dict[str, Any], packed: List[Dict[str, str]], out_budget_req: int) -> tuple[list[dict], int]:
+
+def _enforce_fit(
+    llm, eff: dict[str, Any], packed: list[dict[str, str]], out_budget_req: int
+) -> tuple[list[dict], int]:
     tok = _tok_count(llm, packed) or 0
     capacity = int(eff["model_ctx"]) - int(eff["clamp_margin"])
+
     def drop_one(px):
-        keep_head = 2 if len(px) >= 2 and isinstance(px[1].get("content"), str) and px[1]["content"].startswith(eff["summary_header_prefix"]) else 1
+        keep_head = (
+            2
+            if len(px) >= 2
+            and isinstance(px[1].get("content"), str)
+            and px[1]["content"].startswith(eff["summary_header_prefix"])
+            else 1
+        )
         if len(px) > keep_head + 1:
             px.pop(keep_head)
             return True
         return False
+
     def remove_ephemeral_blocks(px):
         i = 0
         removed = False
@@ -102,6 +129,7 @@ def _enforce_fit(llm, eff: Dict[str, Any], packed: List[Dict[str, str]], out_bud
             else:
                 i += 1
         return removed
+
     if tok + out_budget_req > capacity:
         if remove_ephemeral_blocks(packed):
             tok = _tok_count(llm, packed) or 0

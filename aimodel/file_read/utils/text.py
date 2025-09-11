@@ -1,11 +1,19 @@
 from __future__ import annotations
-import re
-from typing import Optional
 
-def clean_ws(s: Optional[str]) -> str:
+import re
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+def clean_ws(s: str | None) -> str:
     return " ".join((s or "").split())
 
-def strip_wrappers(text: str, *, trim_whitespace: bool, split_on_blank: bool, header_regex: Optional[str]) -> str:
+
+def strip_wrappers(
+    text: str, *, trim_whitespace: bool, split_on_blank: bool, header_regex: str | None
+) -> str:
     t = text or ""
     if trim_whitespace:
         t = t.strip()

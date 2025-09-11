@@ -1,14 +1,20 @@
 from __future__ import annotations
+
 import asyncio
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
+from ..core.logging import get_logger
 from ..runtime.model_runtime import current_model_info, get_llm
+
+log = get_logger(__name__)
 
 RUNJSON_START = "\n[[RUNJSON]]\n"
 RUNJSON_END = "\n[[/RUNJSON]]\n"
 
 STOP_STRINGS = ["</s>", "User:", "\nUser:"]
+
 
 def strip_runjson(s: str) -> str:
     if not isinstance(s, str) or not s:
@@ -26,6 +32,7 @@ def strip_runjson(s: str) -> str:
         i = end + len(RUNJSON_END)
     return "".join(out).strip()
 
+
 def safe_token_count_text(llm: Any, text: str) -> int:
     try:
         return len(llm.tokenize(text.encode("utf-8")))
@@ -35,17 +42,20 @@ def safe_token_count_text(llm: Any, text: str) -> int:
         except Exception:
             return max(1, len(text) // 4)
 
-def safe_token_count_messages(llm: Any, msgs: List[Dict[str, str]]) -> int:
+
+def safe_token_count_messages(llm: Any, msgs: list[dict[str, str]]) -> int:
     return sum(safe_token_count_text(llm, (m.get("content") or "")) for m in msgs)
 
-def model_ident_and_cfg() -> Tuple[str, Dict[str, object]]:
+
+def model_ident_and_cfg() -> tuple[str, dict[str, object]]:
     info = current_model_info() or {}
     cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
     model_path = cfg.get("modelPath") or ""
     ident = Path(model_path).name or "local-gguf"
     return ident, cfg
 
-def derive_stop_reason(stop_set: bool, finish_reason: Optional[str], err_text: Optional[str]) -> str:
+
+def derive_stop_reason(stop_set: bool, finish_reason: str | None, err_text: str | None) -> str:
     if stop_set:
         return "user_cancel"
     if finish_reason:
@@ -54,20 +64,23 @@ def derive_stop_reason(stop_set: bool, finish_reason: Optional[str], err_text: O
         return "error"
     return "end_of_stream"
 
-def _first(obj: dict, keys: List[str]):
+
+def _first(obj: dict, keys: list[str]):
     for k in keys:
         if k in obj and obj[k] is not None:
             return obj[k]
     return None
 
-def _sec_from_ms(v: Any) -> Optional[float]:
+
+def _sec_from_ms(v: Any) -> float | None:
     try:
         x = float(v)
         return round(x / 1000.0, 6)
     except Exception:
         return None
 
-def collect_engine_timings(llm: Any) -> Optional[Dict[str, Optional[float]]]:
+
+def collect_engine_timings(llm: Any) -> dict[str, float | None] | None:
     src = None
     try:
         if hasattr(llm, "get_last_timings") and callable(llm.get_last_timings):
@@ -92,12 +105,14 @@ def collect_engine_timings(llm: Any) -> Optional[Dict[str, Optional[float]]]:
         return None
 
     load_ms = _first(src, ["load_ms", "loadMs", "model_load_ms", "load_time_ms"])
-    prompt_ms = _first(src, ["prompt_ms", "promptMs", "prompt_eval_ms", "prompt_time_ms", "prefill_ms"])
+    prompt_ms = _first(
+        src, ["prompt_ms", "promptMs", "prompt_eval_ms", "prompt_time_ms", "prefill_ms"]
+    )
     eval_ms = _first(src, ["eval_ms", "evalMs", "decode_ms", "eval_time_ms"])
     prompt_n = _first(src, ["prompt_n", "promptN", "prompt_tokens", "n_prompt_tokens"])
     eval_n = _first(src, ["eval_n", "evalN", "eval_tokens", "n_eval_tokens"])
 
-    out: Dict[str, Optional[float]] = {
+    out: dict[str, float | None] = {
         "loadSec": _sec_from_ms(load_ms),
         "promptSec": _sec_from_ms(prompt_ms),
         "evalSec": _sec_from_ms(eval_ms),
@@ -114,20 +129,21 @@ def collect_engine_timings(llm: Any) -> Optional[Dict[str, Optional[float]]]:
         out["evalN"] = None
     return out
 
+
 def build_run_json(
     *,
-    request_cfg: Dict[str, object],
+    request_cfg: dict[str, object],
     out_text: str,
     t_start: float,
-    t_first: Optional[float],
-    t_last: Optional[float],
+    t_first: float | None,
+    t_last: float | None,
     stop_set: bool,
-    finish_reason: Optional[str],
-    input_tokens_est: Optional[int],
-    budget_view: Optional[dict] = None,
-    extra_timings: Optional[dict] = None,
-    error_text: Optional[str] = None,
-) -> Dict[str, object]:
+    finish_reason: str | None,
+    input_tokens_est: int | None,
+    budget_view: dict | None = None,
+    extra_timings: dict | None = None,
+    error_text: str | None = None,
+) -> dict[str, object]:
     llm = get_llm()
     out_tokens = safe_token_count_text(llm, out_text)
     t_end = time.perf_counter()
@@ -179,7 +195,11 @@ def build_run_json(
 
     web_pre = (
         web_bd.get("totalWebPreTtftSec")
-        or ((web.get("elapsedSec") or 0) + (web.get("fetchElapsedSec") or 0) + (web.get("injectElapsedSec") or 0))
+        or (
+            (web.get("elapsedSec") or 0)
+            + (web.get("fetchElapsedSec") or 0)
+            + (web.get("injectElapsedSec") or 0)
+        )
         or 0
     )
 
@@ -187,7 +207,9 @@ def build_run_json(
     unattributed = (
         bv_break.get("unattributedTtftSec")
         if "unattributedTtftSec" in bv_break
-        else (max(0.0, (ttft_ms / 1000.0) - float(pre_accounted))) if pre_accounted is not None else None
+        else (max(0.0, (ttft_ms / 1000.0) - float(pre_accounted)))
+        if pre_accounted is not None
+        else None
     )
 
     return {
@@ -197,7 +219,10 @@ def build_run_json(
             "fields": [
                 {"key": "llm.load.llama.cpuThreadPoolSize", "value": int(cfg.get("nThreads") or 0)},
                 {"key": "llm.load.contextLength", "value": int(cfg.get("nCtx") or 4096)},
-                {"key": "llm.load.llama.acceleration.offloadRatio", "value": 1 if int(cfg.get("nGpuLayers") or 0) > 0 else 0},
+                {
+                    "key": "llm.load.llama.acceleration.offloadRatio",
+                    "value": 1 if int(cfg.get("nGpuLayers") or 0) > 0 else 0,
+                },
                 {"key": "llm.load.llama.nBatch", "value": int(cfg.get("nBatch") or 0)},
                 {"key": "llm.load.ropeFreqBase", "value": cfg.get("ropeFreqBase")},
                 {"key": "llm.load.ropeFreqScale", "value": cfg.get("ropeFreqScale")},
@@ -207,7 +232,10 @@ def build_run_json(
             "fields": [
                 {"key": "llm.prediction.temperature", "value": request_cfg.get("temperature", 0.6)},
                 {"key": "llm.prediction.topKSampling", "value": 40},
-                {"key": "llm.prediction.topPSampling", "value": {"checked": True, "value": request_cfg.get("top_p", 0.9)}},
+                {
+                    "key": "llm.prediction.topPSampling",
+                    "value": {"checked": True, "value": request_cfg.get("top_p", 0.9)},
+                },
                 {"key": "llm.prediction.repeatPenalty", "value": {"checked": True, "value": 1.25}},
                 {"key": "llm.prediction.maxTokens", "value": request_cfg.get("max_tokens", 512)},
                 {"key": "llm.prediction.stopStrings", "value": STOP_STRINGS},
@@ -264,6 +292,7 @@ def build_run_json(
             },
         },
     }
+
 
 async def watch_disconnect(request, stop_ev):
     if await request.is_disconnected():

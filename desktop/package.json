@@ -14,18 +14,23 @@
     "appId": "com.localmind.app",
     "files": [
       "dist/**/*",
-      "../.runtime/**",
-      "../frontend/dist/**",
-      "../dist/localmind-backend*", 
-      "../run_backend.py",
-      "../aimodel/**"               
+      "../frontend/dist/**/*"
     ],
     "extraResources": [
-      { "from": "../dist", "to": "dist" }
+      {
+        "from": "../dist/localmind-backend*",
+        "to": "."
+      }
     ],
-    "win": { "target": "nsis" },
-    "mac": { "target": "dmg" },
-    "linux": { "target": "AppImage" }
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
   },
   "dependencies": {
     "electron": "^31.0.0"

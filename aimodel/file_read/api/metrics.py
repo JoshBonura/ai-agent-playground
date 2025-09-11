@@ -1,17 +1,22 @@
 # aimodel/file_read/api/metrics.py
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException, Query
-from typing import Optional
-from ..runtime.model_runtime import get_llm
-from ..services.packing import build_system_text, pack_with_rollup
-from ..services.budget import analyze_budget
+
+from fastapi import APIRouter, Query
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
-from ..store import list_messages, get_summary, set_summary
+from ..runtime.model_runtime import get_llm
+from ..services.budget import analyze_budget
+from ..services.packing import build_system_text, pack_with_rollup
+from ..store import get_summary, list_messages, set_summary
+
+log = get_logger(__name__)
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
 
+
 @router.get("/budget")
-def get_budget(sessionId: Optional[str] = Query(default=None), maxTokens: Optional[int] = None):
+def get_budget(sessionId: str | None = Query(default=None), maxTokens: int | None = None):
     eff0 = SETTINGS.effective()
     sid = sessionId or eff0["default_session_id"]
     llm = get_llm()

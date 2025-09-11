@@ -1,17 +1,24 @@
 # ===== aimodel/file_read/rag/ingest/xls_ingest.py =====
 from __future__ import annotations
-from typing import Tuple, List
-from datetime import datetime, date, time
-from ...core.settings import SETTINGS
+
 import re
+from datetime import date, datetime, time
+
+from ...core.logging import get_logger
+from ...core.settings import SETTINGS
+
+log = get_logger(__name__)
 
 _WS_RE = re.compile(r"[ \t]+")
+
+
 def _squeeze_spaces_inline(s: str) -> str:
     return _WS_RE.sub(" ", (s or "")).strip()
 
-def extract_xls(data: bytes) -> Tuple[str, str]:
+
+def extract_xls(data: bytes) -> tuple[str, str]:
     try:
-        import xlrd  
+        import xlrd
     except Exception:
         return (data.decode("utf-8", errors="replace"), "text/plain")
 
@@ -75,7 +82,7 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
             s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
         s = clip(_squeeze_spaces_inline(s))
         if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
-            return f"\"{s}\""
+            return f'"{s}"'
         return s
 
     def normalize_header(h: str) -> str:
@@ -106,7 +113,7 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
             return bool(value)
         return value
 
-    lines: List[str] = []
+    lines: list[str] = []
 
     for sheet in book.sheets():
         nrows = min(sheet.nrows or 0, INFER_MAX_ROWS)
@@ -158,14 +165,14 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
                         continue
                     lines.append(f"- {k}: {v}" if k else f"- : {v}")
                 lines.append("")
-                continue 
-            
+                continue
+
         lines.append("## Inferred Table")
         if any(h for h in norm_headers):
             lines.append("headers: " + ", ".join(h for h in norm_headers if h))
 
         for r in range(start_row, nrows):
-            row_vals: List[str] = []
+            row_vals: list[str] = []
             for c in range(ncols):
                 val = fmt_val(xlrd_cell_to_py(sheet.cell(r, c)))
                 if val:

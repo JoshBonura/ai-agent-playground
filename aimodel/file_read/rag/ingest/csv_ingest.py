@@ -1,16 +1,24 @@
 # ===== aimodel/file_read/rag/ingest/csv_ingest.py =====
 from __future__ import annotations
-from typing import Tuple, List
-import io, re, csv
+
+import csv
+import io
+import re
+
+from ...core.logging import get_logger
 from ...core.settings import SETTINGS
+
+log = get_logger(__name__)
 
 _WS_RE = re.compile(r"[ \t]+")
 _PHANTOM_RX = re.compile(r"^\d+_\d+$")
 
+
 def _squeeze_spaces_inline(s: str) -> str:
     return _WS_RE.sub(" ", (s or "")).strip()
 
-def extract_csv(data: bytes) -> Tuple[str, str]:
+
+def extract_csv(data: bytes) -> tuple[str, str]:
     S = SETTINGS.effective
     max_chars = int(S().get("csv_value_max_chars"))
     quote_strings = bool(S().get("csv_quote_strings"))
@@ -31,7 +39,7 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
             s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
         s = clip(_squeeze_spaces_inline(s))
         if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
-            return f"\"{s}\""
+            return f'"{s}"'
         return s
 
     def normalize_header(h: str) -> str:
@@ -42,14 +50,14 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
         s = re.sub(r"_+", "_", s).strip("_")
         return s or h
 
-    def rightmost_nonempty_header(headers: List[str]) -> int:
+    def rightmost_nonempty_header(headers: list[str]) -> int:
         for i in range(len(headers) - 1, -1, -1):
             h = headers[i]
             if h and not h.isspace():
                 return i
         return -1
 
-    def keep_headers(headers: List[str]) -> List[int]:
+    def keep_headers(headers: list[str]) -> list[int]:
         keep = []
         for i, h in enumerate(headers):
             hn = (h or "").strip().lower()
@@ -60,7 +68,7 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
             keep.append(i)
         return keep or list(range(len(headers)))
 
-    def _row_blank_csv(row: List[str]) -> bool:
+    def _row_blank_csv(row: list[str]) -> bool:
         if row is None:
             return True
         for c in row:
@@ -83,7 +91,7 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
         return "", "text/plain"
 
     n = len(rows)
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("# Sheet: CSV")
 
     i = 0
@@ -109,20 +117,22 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
         keep_idx = keep_headers(norm_headers)
         kept_headers = [norm_headers[j] for j in keep_idx]
 
-        total_rows_block = (end - start + 1)
+        total_rows_block = end - start + 1
         use_rows = total_rows_block if max_rows <= 0 else min(total_rows_block, max_rows + 1)
         total_cols_block = len(kept_headers)
         if max_cols > 0:
             total_cols_block = min(total_cols_block, max_cols)
 
-        lines.append(f"## Table: CSV!R{start+1}-{start+use_rows},C1-{max(total_cols_block,1)}")
+        lines.append(f"## Table: CSV!R{start + 1}-{start + use_rows},C1-{max(total_cols_block, 1)}")
         if any(kept_headers):
             lines.append("headers: " + ", ".join(h for h in kept_headers if h))
         lines.append("")
 
         data_start = start + 1
         data_end = min(end, start + use_rows - 1)
-        usable_cols_for_slice = min(len(norm_headers), max_cols if max_cols > 0 else len(norm_headers))
+        usable_cols_for_slice = min(
+            len(norm_headers), max_cols if max_cols > 0 else len(norm_headers)
+        )
         for r in range(data_start, data_end + 1):
             row_vals_raw = rows[r][:usable_cols_for_slice] if r < n else []
             vals = [fmt_val(c) for c in row_vals_raw]
@@ -132,8 +142,8 @@ def extract_csv(data: bytes) -> Tuple[str, str]:
             if not any(vals):
                 continue
 
-            pairs: List[str] = []
-            for h, v in zip(kept_headers, vals):
+            pairs: list[str] = []
+            for h, v in zip(kept_headers, vals, strict=False):
                 if h and v:
                     pairs.append(f"{h}={v}")
 

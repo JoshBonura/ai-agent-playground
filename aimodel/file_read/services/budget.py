@@ -1,32 +1,39 @@
 # aimodel/file_read/services/budget.py
 from __future__ import annotations
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Any
+
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from ..core.logging import get_logger
 from .context_window import current_n_ctx, estimate_tokens
+
+log = get_logger(__name__)
+
 
 @dataclass
 class TurnBudget:
     n_ctx: int
-    input_tokens_est: Optional[int]
+    input_tokens_est: int | None
     requested_out_tokens: int
     clamped_out_tokens: int
     clamp_margin: int
-    reserved_system_tokens: Optional[int] = None
-    available_for_out_tokens: Optional[int] = None
-    headroom_tokens: Optional[int] = None
-    overage_tokens: Optional[int] = None
+    reserved_system_tokens: int | None = None
+    available_for_out_tokens: int | None = None
+    headroom_tokens: int | None = None
+    overage_tokens: int | None = None
     reason: str = "ok"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
 
 def analyze_budget(
     llm: Any,
-    messages: List[Dict[str, str]],
+    messages: list[dict[str, str]],
     *,
     requested_out_tokens: int,
     clamp_margin: int,
-    reserved_system_tokens: Optional[int] = None,
+    reserved_system_tokens: int | None = None,
 ) -> TurnBudget:
     n_ctx = current_n_ctx()
     try:

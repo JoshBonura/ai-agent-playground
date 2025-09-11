@@ -1,9 +1,18 @@
 # run_backend.py
 from __future__ import annotations
-import os, sys, json, random, socket, contextlib, pathlib, traceback
+
+import contextlib
+import json
+import os
+import pathlib
+import random
+import socket
+import sys
+import traceback
 from importlib import import_module
-import uvicorn
+
 import platformdirs
+import uvicorn
 
 print("[boot] python:", sys.executable, flush=True)
 
@@ -11,38 +20,57 @@ PREF_API = (8001, 5321)
 API_RANGE = (10240, 11240)
 BIND_HOST = "0.0.0.0"
 
-DATA_ROOT = pathlib.Path(os.getenv("LOCALMIND_DATA_DIR") or platformdirs.user_data_dir("localmind", roaming=True))
-RUNTIME_DIR = DATA_ROOT / ".runtime"; RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+print("[data] LOCALMIND_DATA_DIR =", os.getenv("LOCALMIND_DATA_DIR"))
+
+DATA_ROOT = pathlib.Path(
+    os.getenv("LOCALMIND_DATA_DIR") or platformdirs.user_data_dir("localmind", roaming=True)
+)
+
+os.environ.setdefault("LOCALMIND_DATA_DIR", str(DATA_ROOT))
+
+RUNTIME_DIR = DATA_ROOT / ".runtime"
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 PORTS_PATH = RUNTIME_DIR / "ports.json"
+
 
 def _free(p: int) -> bool:
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         try:
-            s.bind((BIND_HOST, p)); return True
+            s.bind((BIND_HOST, p))
+            return True
         except OSError:
             return False
 
+
 def choose_port() -> int:
     for p in PREF_API:
-        if _free(p): return p
+        if _free(p):
+            return p
     lo, hi = API_RANGE
     for p in random.sample(range(lo, hi), 900):
-        if _free(p): return p
+        if _free(p):
+            return p
     raise RuntimeError("No free port found")
+
 
 def lan_ip() -> str:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
     except Exception:
         ip = "127.0.0.1"
     finally:
-        try: s.close()
-        except Exception: pass
+        try:
+            s.close()
+        except Exception:
+            pass
     return ip
+
 
 def ensure_health(app):
     from fastapi import APIRouter, Request
+
     r = APIRouter()
 
     @r.get("/health")
@@ -57,11 +85,13 @@ def ensure_health(app):
 
     app.include_router(r)
 
+
 def mount_frontend(app):
-    from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import FileResponse, JSONResponse
-    from fastapi import Request
     from pathlib import Path
+
+    from fastapi import Request
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
 
     dist = Path(__file__).resolve().parent / "frontend" / "dist"
     if dist.exists():
@@ -72,10 +102,18 @@ def mount_frontend(app):
             p = request.url.path
             accept = request.headers.get("accept", "")
 
-            if p.startswith((
-                "/openapi.json", "/docs", "/docs/oauth2-redirect",
-                "/redoc", "/api", "/metrics", "/health", "/info"
-            )):
+            if p.startswith(
+                (
+                    "/openapi.json",
+                    "/docs",
+                    "/docs/oauth2-redirect",
+                    "/redoc",
+                    "/api",
+                    "/metrics",
+                    "/health",
+                    "/info",
+                )
+            ):
                 return JSONResponse({"detail": "Not Found"}, status_code=404)
 
             if "application/json" in accept or p.endswith(".json"):
@@ -83,11 +121,14 @@ def mount_frontend(app):
 
             return FileResponse(dist / "index.html")
 
+
 def preflight_openapi_or_point_to_offender(app):
     import inspect
-    from typing import Annotated, get_origin, get_args
+    from typing import Annotated, get_args, get_origin
+
     from fastapi import Request as _Req
-    from fastapi.params import Param, Query, Body, Path, Header, Cookie, File, Form
+    from fastapi.params import (Body, Cookie, File, Form, Header, Param, Path,
+                                Query)
 
     def _bad_request_param(p: inspect.Parameter) -> bool:
         ann = p.annotation
@@ -95,14 +136,16 @@ def preflight_openapi_or_point_to_offender(app):
         if inner is not _Req:
             return False
         return (
-            isinstance(p.default, (Param, Query, Body, Path, Header, Cookie, File, Form)) or
-            p.default is not inspect._empty
+            isinstance(p.default, (Param, Query, Body, Path, Header, Cookie, File, Form))
+            or p.default is not inspect._empty
         )
 
     print("[preflight] routes present:", len(getattr(app, "routes", [])))
     for r in getattr(app, "routes", []):
         fn = getattr(r, "endpoint", None)
-        print("  -", r.path, "->", getattr(fn, "__module__", "?") + "." + getattr(fn, "__name__", "?"))
+        print(
+            "  -", r.path, "->", getattr(fn, "__module__", "?") + "." + getattr(fn, "__name__", "?")
+        )
 
     try:
         app.openapi_schema = None
@@ -131,7 +174,10 @@ def preflight_openapi_or_point_to_offender(app):
             print(f"❌ {path} -> {mod}.{name} {sig}")
         print("=============================")
     else:
-        print("[preflight] no obvious offenders found; the error may come from a dynamically-composed dependency")
+        print(
+            "[preflight] no obvious offenders found; the error may come from a dynamically-composed dependency"
+        )
+
 
 if __name__ == "__main__":
     try:

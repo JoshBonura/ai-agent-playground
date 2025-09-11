@@ -1,14 +1,18 @@
 from __future__ import annotations
+
 import json
 from datetime import datetime
-from typing import Dict, List
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
 
 
 def now_str() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 
-def chars_len(msgs: List[object]) -> int:
+def chars_len(msgs: list[object]) -> int:
     total = 0
     for m in msgs:
         if isinstance(m, dict):
@@ -25,4 +29,3 @@ def chars_len(msgs: List[object]) -> int:
             except Exception:
                 pass
     return total
-

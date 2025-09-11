@@ -14,3 +14,17 @@ new_sqlite_classes = ["LicenseStore"]
 [vars]
 APP_BASE_URL = "https://lic-server.localmind.workers.dev"
 PORTAL_RETURN_URL = "https://lic-server.localmind.workers.dev/success"
+
+APP_VERSION = "1.4.2"
+MIN_BACKEND = "1.4.0"
+MIN_FRONTEND = "1.4.0"
+UPDATE_NOTES = "Bug fixes and speed-ups."
+ASSET_WIN_X64_URL = "https://cdn.example.com/app-1.4.2-win-x64.exe"
+ASSET_WIN_X64_SHA256 = "<hex>"
+ASSET_MAC_UNIVERSAL_URL = "https://cdn.example.com/app-1.4.2-mac.dmg"
+ASSET_MAC_UNIVERSAL_SHA256 = "<hex>"
+ASSET_LINUX_X64_URL = "https://cdn.example.com/app-1.4.2-linux-x64.AppImage"
+ASSET_LINUX_X64_SHA256 = "<hex>"
+UPDATE_CHANNEL = "stable"
+UPDATE_ROLLOUT_PCT = "100"
+

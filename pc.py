@@ -1,14 +1,27 @@
 from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, List
-import sys, os, argparse
+# at top
+from typing import Any, cast
+
+# before you call reconfigure
+try:
+    out = cast(Any, sys.stdout)
+    if hasattr(out, "reconfigure"):
+        out.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Chunked output config
 # ──────────────────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 10000000
-OUTPUT_PREFIX = "clean-structure"   # clean-structure-1.txt, clean-structure-2.txt, ...
-OUTPUT_DIR = "."                    # write files here
+CHUNK_SIZE = 100000
+OUTPUT_PREFIX = "clean-structure"  # clean-structure-1.txt, clean-structure-2.txt, ...
+OUTPUT_DIR = "."  # write files here
 
 # Force UTF-8 stdout on Windows so redirects don't garble output (kept for logs)
 if os.name == "nt":
@@ -21,50 +34,72 @@ if os.name == "nt":
 # Folders (relative to this script's directory) to search completely.
 # Add/remove as you like.
 # ──────────────────────────────────────────────────────────────────────────────
-SEARCH_FOLDERS = [
-    "aimodel/file_read",
-    "frontend/src/file_read",
-    "cloudflare"
-    "desktop"
-]
+SEARCH_FOLDERS = ["aimodel/file_read", "cloudflare"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional: filename/path substring matches (case-insensitive).
 # If used, any text-like file whose RELATIVE PATH contains one of these strings
 # will be printed (helpful to pull in Dockerfiles, envs, etc. anywhere).
 # ──────────────────────────────────────────────────────────────────────────────
-NAME_MATCHES: list[str] = [
-    "env.development",
-    "application.properties",
-    "requirements.txt"
-]
+NAME_MATCHES: list[str] = ["env.development", "application.properties", "requirements.txt"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Discovery rules & filters
 # ──────────────────────────────────────────────────────────────────────────────
 IGNORE_DIRS = {
-    ".git", ".venv", "node_modules", "target", "build", "dist", ".mvn",
-    ".idea", ".vscode", "__pycache__", ".cache", ".vite", ".vite-temp"
+    ".git",
+    ".venv",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".mvn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    ".cache",
+    ".vite",
+    ".vite-temp",
 }
 
 IGNORE_BASENAMES = {
     "package-lock.json",
-    "postcss.config.js"   # skip npm lockfile
+    "postcss.config.js",  # skip npm lockfile
     # add more if you want:
     # "yarn.lock", "pnpm-lock.yaml", "bun.lockb"
 }
 
 ALLOWED_EXTS = {
-    ".java", ".kt", ".kts",
+    ".java",
+    ".kt",
+    ".kts",
     ".py",
-    ".xml", ".properties", ".yml", ".yaml", ".conf", ".ini",
-    ".json", ".md", ".txt", ".env",
-    ".js", ".mjs", ".cjs",
-    ".ts", ".tsx",
-    ".css", ".scss", ".sass",
+    ".xml",
+    ".properties",
+    ".yml",
+    ".yaml",
+    ".conf",
+    ".ini",
+    ".json",
+    ".md",
+    ".txt",
+    ".env",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".css",
+    ".scss",
+    ".sass",
     ".html",
-    ".sh", ".bat", ".cmd", ".ps1",
-    ".gradle", ".pom", ".development"
+    ".sh",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".gradle",
+    ".pom",
+    ".development",
 }
 
 MAX_SIZE_BYTES = 1_000_000  # skip files > 1MB
@@ -97,11 +132,25 @@ def norm_rel(project_root: Path, p: Path) -> str:
 def _normalize_output(s: str) -> str:
     # common cp1252/utf-8 mojibake seen in prior dumps
     repl = {
-        "ΓÇÖ": "’", "ΓÇ£": "“", "ΓÇ¥": "”", "ΓÇô": "–", "ΓÇö": "—", "ΓÇª": "…",
-        "â€™": "’", "â€œ": "“", "â€�": "”", "â€“": "–", "â€”": "—", "â€¦": "…",
+        "ΓÇÖ": "’",
+        "ΓÇ£": "“",
+        "ΓÇ¥": "”",
+        "ΓÇô": "–",
+        "ΓÇö": "—",
+        "ΓÇª": "…",
+        "â€™": "’",
+        "â€œ": "“",
+        "â€�": "”",
+        "â€“": "–",
+        "â€”": "—",
+        "â€¦": "…",
         # occasional double-encoded forms
-        "Ã¢â‚¬â„¢": "’", "Ã¢â‚¬Å“": "“", "Ã¢â‚¬Â�": "”",
-        "Ã¢â‚¬â€œ": "–", "Ã¢â‚¬â€�": "—", "Ã¢â‚¬Â¦": "…",
+        "Ã¢â‚¬â„¢": "’",
+        "Ã¢â‚¬Å“": "“",
+        "Ã¢â‚¬Â�": "”",
+        "Ã¢â‚¬â€œ": "–",
+        "Ã¢â‚¬â€�": "—",
+        "Ã¢â‚¬Â¦": "…",
         # stray NBSP marker that sometimes sneaks in
         "Â ": " ",
     }
@@ -110,7 +159,7 @@ def _normalize_output(s: str) -> str:
     return s
 
 
-def dump_one(project_root: Path, p: Path, printed: set[str], out_parts: List[str]) -> None:
+def dump_one(project_root: Path, p: Path, printed: set[str], out_parts: list[str]) -> None:
     """Append file header + contents to out_parts (no printing)."""
     rel = norm_rel(project_root, p)
     if rel in printed:
@@ -171,10 +220,14 @@ def parse_args() -> argparse.Namespace:
         description="Dump project files under selected folders (and/or name matches) into 3,000-char chunked files."
     )
     g = ap.add_mutually_exclusive_group()
-    g.add_argument("--matches", action="store_true",
-                   help="Only dump files whose path contains any NAME_MATCHES.")
-    g.add_argument("--both", action="store_true",
-                   help="Dump both selected folders and NAME_MATCHES.")
+    g.add_argument(
+        "--matches",
+        action="store_true",
+        help="Only dump files whose path contains any NAME_MATCHES.",
+    )
+    g.add_argument(
+        "--both", action="store_true", help="Dump both selected folders and NAME_MATCHES."
+    )
     # default behavior: selected folders only
     return ap.parse_args()
 
@@ -192,7 +245,7 @@ def write_chunked(text: str, chunk_size: int, prefix: str, out_dir: str) -> list
         return written
 
     for i in range(0, len(text), chunk_size):
-        part = text[i:i + chunk_size]
+        part = text[i : i + chunk_size]
         out_path = out_dir_path / f"{prefix}-{(i // chunk_size) + 1}.txt"
         out_path.write_text(part, encoding="utf-8")
         written.append(out_path)
@@ -204,7 +257,7 @@ def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
     printed: set[str] = set()
-    out_parts: List[str] = []
+    out_parts: list[str] = []
 
     # Build the output in memory (headers + file contents)
     if args.matches:

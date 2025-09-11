@@ -1,30 +1,47 @@
 # aimodel/file_read/services/streaming_worker.py
 from __future__ import annotations
-import asyncio, json, time, logging
-from typing import AsyncGenerator, Optional, List
+
+import asyncio
+import json
+import logging
+import time
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+from collections.abc import AsyncGenerator
+
 from ..core.settings import SETTINGS
-from ..utils.streaming import (
-    RUNJSON_START, RUNJSON_END,
-    build_run_json, watch_disconnect, collect_engine_timings,
-)
+from ..utils.streaming import (RUNJSON_END, RUNJSON_START, build_run_json,
+                               collect_engine_timings, watch_disconnect)
 
 log = logging.getLogger("aimodel.api.generate")
 
+
 async def run_stream(
-    *, llm, messages, out_budget, stop_ev, request,
-    temperature: float, top_p: float, input_tokens_est: Optional[int],  t0_request: Optional[float] = None, budget_view: Optional[dict] = None,
+    *,
+    llm,
+    messages,
+    out_budget,
+    stop_ev,
+    request,
+    temperature: float,
+    top_p: float,
+    input_tokens_est: int | None,
+    t0_request: float | None = None,
+    budget_view: dict | None = None,
 ) -> AsyncGenerator[bytes, None]:
     q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
 
     def produce():
         t_start = t0_request or time.perf_counter()
-        t_first: Optional[float] = None
-        t_last: Optional[float] = None
-        t_call: Optional[float] = None
-        finish_reason: Optional[str] = None
-        err_text: Optional[str] = None
-        out_parts: List[str] = []
+        t_first: float | None = None
+        t_last: float | None = None
+        t_call: float | None = None
+        finish_reason: str | None = None
+        err_text: str | None = None
+        out_parts: list[str] = []
         stage: dict = {"queueWaitSec": None, "genSec": None}
 
         try:
@@ -44,11 +61,10 @@ async def run_stream(
                 if "exceed context window" in str(ve).lower():
                     retry_tokens = max(
                         SETTINGS.stream_retry_min_tokens,
-                        int(out_budget * SETTINGS.stream_retry_fraction)
+                        int(out_budget * SETTINGS.stream_retry_fraction),
                     )
                     log.warning(
-                        "generate: context overflow, retrying with max_tokens=%d",
-                        retry_tokens
+                        "generate: context overflow, retrying with max_tokens=%d", retry_tokens
                     )
                     stream = llm.create_chat_completion(
                         messages=messages,
@@ -125,6 +141,7 @@ async def run_stream(
                     stage["engine"] = engine
 
                 if isinstance(budget_view, dict):
+
                     def _fnum(x) -> float:
                         try:
                             return float(x) if x is not None else 0.0
@@ -134,8 +151,8 @@ async def run_stream(
                     ttft_raw = stage.get("ttftSec")
                     ttft_val = _fnum(ttft_raw)
 
-                    pack   = budget_view.get("pack") or {}
-                    rag    = budget_view.get("rag") or {}
+                    pack = budget_view.get("pack") or {}
+                    rag = budget_view.get("rag") or {}
                     web_bd = ((budget_view.get("web") or {}).get("breakdown")) or {}
 
                     pack_sec = _fnum(pack.get("packSec"))
@@ -152,7 +169,7 @@ async def run_stream(
                     first_build = next((v for v in build_candidates if v is not None), None)
                     rag_build_agg = _fnum(first_build)
 
-                    rag_embed  = _fnum(rag.get("embedSec"))
+                    rag_embed = _fnum(rag.get("embedSec"))
                     rag_s_chat = _fnum(rag.get("searchChatSec"))
                     rag_s_glob = _fnum(rag.get("searchGlobalSec"))
                     rag_dedupe = _fnum(rag.get("dedupeSec"))
@@ -162,15 +179,19 @@ async def run_stream(
                     else:
                         rag_pipeline_sec = rag_embed + rag_s_chat + rag_s_glob + rag_dedupe
 
-                    prep_sec    = _fnum(web_bd.get("prepSec"))
-                    web_pre     = _fnum(web_bd.get("totalWebPreTtftSec"))
+                    prep_sec = _fnum(web_bd.get("prepSec"))
+                    web_pre = _fnum(web_bd.get("totalWebPreTtftSec"))
 
                     model_queue = _fnum(stage.get("modelQueueSec"))
 
                     pre_accounted = (
-                        pack_sec + trim_sec + comp_sec
-                        + rag_router + rag_pipeline_sec
-                        + web_pre + prep_sec
+                        pack_sec
+                        + trim_sec
+                        + comp_sec
+                        + rag_router
+                        + rag_pipeline_sec
+                        + web_pre
+                        + prep_sec
                         + model_queue
                     )
                     unattr_ttft = ttft_val - pre_accounted
@@ -178,14 +199,20 @@ async def run_stream(
                         unattr_ttft = 0.0
 
                     budget_view.setdefault("breakdown", {})
-                    budget_view["breakdown"].update({
-                        "ttftSec": ttft_val,
-                        "preTtftAccountedSec": round(pre_accounted, 6),
-                        "unattributedTtftSec": round(unattr_ttft, 6),
-                    })
+                    budget_view["breakdown"].update(
+                        {
+                            "ttftSec": ttft_val,
+                            "preTtftAccountedSec": round(pre_accounted, 6),
+                            "unattributedTtftSec": round(unattr_ttft, 6),
+                        }
+                    )
 
                 run_json = build_run_json(
-                    request_cfg={"temperature": temperature, "top_p": top_p, "max_tokens": out_budget},
+                    request_cfg={
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "max_tokens": out_budget,
+                    },
                     out_text=out_text,
                     t_start=t_start,
                     t_first=t_first,
@@ -221,7 +248,7 @@ async def run_stream(
                 break
             yield (item if isinstance(item, bytes) else item.encode("utf-8"))
         if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
-            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode("utf-8")
+            yield (f"\n{SETTINGS.stopped_line_marker}\n").encode()
     finally:
         stop_ev.set()
         disconnect_task.cancel()

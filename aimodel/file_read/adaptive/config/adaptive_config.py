@@ -1,8 +1,16 @@
 # aimodel/file_read/runtime/adaptive_config.py
 from __future__ import annotations
-import os, shutil, subprocess, platform
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any
+
+import os
+import platform
+import shutil
+import subprocess
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
 
 try:
     import psutil
@@ -15,24 +23,33 @@ except Exception:
 
 from .paths import read_settings
 
-def _env_bool(k:str, default:bool)->bool:
-    v = os.getenv(k)
-    if v is None: return default
-    return v.strip().lower() in ("1","true","yes","on")
 
-def _cpu_count()->int:
+def _env_bool(k: str, default: bool) -> bool:
+    v = os.getenv(k)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _cpu_count() -> int:
     try:
         import multiprocessing as mp
+
         return max(1, mp.cpu_count() or os.cpu_count() or 1)
     except Exception:
         return os.cpu_count() or 1
 
-def _avail_ram()->Optional[int]:
-    if not psutil: return None
-    try: return int(psutil.virtual_memory().available)
-    except Exception: return None
 
-def _cuda_vram()->Optional[int]:
+def _avail_ram() -> int | None:
+    if not psutil:
+        return None
+    try:
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _cuda_vram() -> int | None:
     if torch and torch.cuda.is_available():
         try:
             dev = torch.cuda.current_device()
@@ -43,8 +60,10 @@ def _cuda_vram()->Optional[int]:
     if shutil.which("nvidia-smi"):
         try:
             out = subprocess.check_output(
-                ["nvidia-smi","--query-gpu=memory.total","--format=csv,noheader,nounits"],
-                text=True, stderr=subprocess.DEVNULL, timeout=2.0
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
             )
             mb = max(int(x.strip()) for x in out.strip().splitlines() if x.strip())
             return mb * 1024 * 1024
@@ -52,11 +71,14 @@ def _cuda_vram()->Optional[int]:
             return None
     return None
 
-def _gpu_kind()->str:
-    if _cuda_vram(): return "cuda"
-    if torch and getattr(torch.backends,"mps",None) and torch.backends.mps.is_available():
+
+def _gpu_kind() -> str:
+    if _cuda_vram():
+        return "cuda"
+    if torch and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
 
 def _safe_float(v: Any, default: float) -> float:
     try:
@@ -64,7 +86,10 @@ def _safe_float(v: Any, default: float) -> float:
     except Exception:
         return default
 
-def _pick_dtype_quant(device: str, a: Dict[str, Any], vram_bytes: Optional[int]) -> tuple[Optional[str], Optional[str]]:
+
+def _pick_dtype_quant(
+    device: str, a: dict[str, Any], vram_bytes: int | None
+) -> tuple[str | None, str | None]:
     dq = a.get("dtype_quant", {}) if isinstance(a, dict) else {}
     if device == "cuda":
         tiers = dq.get("cuda_tiers") or []
@@ -81,7 +106,8 @@ def _pick_dtype_quant(device: str, a: Dict[str, Any], vram_bytes: Optional[int])
         return dq.get("mps_default_dtype"), None
     return dq.get("cpu_default_dtype"), dq.get("cpu_default_quant")
 
-def _pick_kv(device: str, a: Dict[str, Any], vram_bytes: Optional[int]) -> Optional[str]:
+
+def _pick_kv(device: str, a: dict[str, Any], vram_bytes: int | None) -> str | None:
     kv = a.get("kv_cache", {}) if isinstance(a, dict) else {}
     if device == "cuda":
         tiers = kv.get("cuda_tiers") or []
@@ -98,7 +124,10 @@ def _pick_kv(device: str, a: Dict[str, Any], vram_bytes: Optional[int]) -> Optio
         return kv.get("mps_default")
     return kv.get("cpu_default")
 
-def _pick_capacity(device: str, a: Dict[str, Any], vram_bytes: Optional[int], threads:int) -> tuple[int,int,Optional[int]]:
+
+def _pick_capacity(
+    device: str, a: dict[str, Any], vram_bytes: int | None, threads: int
+) -> tuple[int, int, int | None]:
     cap = a.get("capacity", {}) if isinstance(a, dict) else {}
     if device == "cuda":
         tiers = cap.get("cuda_tiers") or []
@@ -109,7 +138,11 @@ def _pick_capacity(device: str, a: Dict[str, Any], vram_bytes: Optional[int], th
                 best = t
                 break
         if best:
-            return int(best.get("seq_len") or 0), int(best.get("batch") or 1), int(best.get("n_gpu_layers") or 0)
+            return (
+                int(best.get("seq_len") or 0),
+                int(best.get("batch") or 1),
+                int(best.get("n_gpu_layers") or 0),
+            )
         return 0, 1, 0
     if device == "mps":
         m = cap.get("mps", {})
@@ -127,40 +160,49 @@ def _pick_capacity(device: str, a: Dict[str, Any], vram_bytes: Optional[int], th
         batch = int(best.get("batch") or 1)
     return seq_len, batch, 0
 
-def _gpu_mem_fraction(device:str, a: Dict[str, Any]) -> float:
+
+def _gpu_mem_fraction(device: str, a: dict[str, Any]) -> float:
     table = a.get("gpu_fraction", {}) if isinstance(a, dict) else {}
     v = table.get(device)
     return _safe_float(v, 0.0)
 
-def _torch_flags(device:str, a: Dict[str, Any]) -> tuple[bool,bool]:
+
+def _torch_flags(device: str, a: dict[str, Any]) -> tuple[bool, bool]:
     flags = a.get("flags", {}) if isinstance(a, dict) else {}
     flash = bool(flags.get("enable_flash_attn_cuda")) if device == "cuda" else False
-    tc = bool(flags.get("use_torch_compile_on_cuda_linux")) if (device == "cuda" and platform.system().lower()=="linux") else False
+    tc = (
+        bool(flags.get("use_torch_compile_on_cuda_linux"))
+        if (device == "cuda" and platform.system().lower() == "linux")
+        else False
+    )
     return flash, tc
 
-def _threads(a: Dict[str, Any]) -> tuple[int,int,int,int]:
+
+def _threads(a: dict[str, Any]) -> tuple[int, int, int, int]:
     policy = a.get("cpu_threads_policy", {}) if isinstance(a, dict) else {}
     mode = str(policy.get("mode") or "").lower()
     ncpu = _cpu_count()
     if mode == "fixed":
-        v = int(policy.get("value") or max(1, ncpu-1))
+        v = int(policy.get("value") or max(1, ncpu - 1))
         t = max(1, min(v, ncpu))
     elif mode == "percent":
         pct = _safe_float(policy.get("value"), 0.0)
-        t = max(1, min(ncpu, int(round(ncpu*pct/100.0))))
-        if t < 1: t = 1
+        t = max(1, min(ncpu, int(round(ncpu * pct / 100.0))))
+        if t < 1:
+            t = 1
     else:
-        t = max(1, ncpu-1)
+        t = max(1, ncpu - 1)
     intra = t
-    inter = max(1, ncpu//2)
+    inter = max(1, ncpu // 2)
     return ncpu, t, intra, inter
+
 
 @dataclass
 class AdaptiveConfig:
     device: str
-    dtype: Optional[str]
-    quant: Optional[str]
-    kv_cache_dtype: Optional[str]
+    dtype: str | None
+    quant: str | None
+    kv_cache_dtype: str | None
     max_seq_len: int
     max_batch_size: int
     gpu_memory_fraction: float
@@ -169,17 +211,19 @@ class AdaptiveConfig:
     torch_interop_threads: int
     enable_flash_attn: bool
     use_torch_compile: bool
-    total_vram_bytes: Optional[int]
-    avail_ram_bytes: Optional[int]
+    total_vram_bytes: int | None
+    avail_ram_bytes: int | None
     cpu_count: int
-    def as_dict(self)->Dict[str,Any]:
+
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-def compute_adaptive_config()->AdaptiveConfig:
+
+def compute_adaptive_config() -> AdaptiveConfig:
     settings = read_settings()
     a = settings.get("adaptive", {}) if isinstance(settings, dict) else {}
     device = _gpu_kind()
-    vram = _cuda_vram() if device=="cuda" else None
+    vram = _cuda_vram() if device == "cuda" else None
     ram = _avail_ram()
     ncpu, threads, intra, inter = _threads(a)
     dtype, quant = _pick_dtype_quant(device, a, vram)
@@ -202,5 +246,5 @@ def compute_adaptive_config()->AdaptiveConfig:
         use_torch_compile=tcompile,
         total_vram_bytes=vram,
         avail_ram_bytes=ram,
-        cpu_count=ncpu
+        cpu_count=ncpu,
     )

@@ -1,30 +1,49 @@
 # aimodel/file_read/web/orchestrator_common.py
 from __future__ import annotations
-from typing import List, Tuple, Optional, Dict, Any
-from urllib.parse import urlparse
+
 import re
-from ..utils.text import clean_ws
+from typing import Any
+from urllib.parse import urlparse
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
-from .provider import SearchHit
+from ..utils.text import clean_ws
 from .fetch import fetch_many
+from .provider import SearchHit
+
+log = get_logger(__name__)
+
 
 def _req(key: str):
     return SETTINGS[key]
 
-def _as_int(key: str) -> int: return int(_req(key))
-def _as_float(key: str) -> float: return float(_req(key))
-def _as_bool(key: str) -> bool: return bool(_req(key))
+
+def _as_int(key: str) -> int:
+    return int(_req(key))
+
+
+def _as_float(key: str) -> float:
+    return float(_req(key))
+
+
+def _as_bool(key: str) -> bool:
+    return bool(_req(key))
+
+
 def _as_str(key: str) -> str:
     v = _req(key)
     return "" if v is None else str(v)
 
+
 def _host(url: str) -> str:
     h = (urlparse(url).hostname or "").lower()
     pref = _as_str("web_orch_www_prefix")
-    return h[len(pref):] if pref and h.startswith(pref) else h
+    return h[len(pref) :] if pref and h.startswith(pref) else h
 
-def _tokens(s: str) -> List[str]:
+
+def _tokens(s: str) -> list[str]:
     return re.findall(r"\w+", (s or "").lower())
+
 
 def _head_tail(text: str, max_chars: int) -> str:
     t = text or ""
@@ -39,7 +58,7 @@ def _head_tail(text: str, max_chars: int) -> str:
         return clean_ws(t[:max_chars])
 
     head_len = max(1, int(avail * 0.4))
-    mid_len  = max(1, int(avail * 0.2))
+    mid_len = max(1, int(avail * 0.2))
     tail_len = max(1, avail - head_len - mid_len)
 
     n = len(t)
@@ -61,12 +80,14 @@ def _head_tail(text: str, max_chars: int) -> str:
 
     return clean_ws(head + ellipsis + mid + ellipsis + tail)
 
+
 def condense_doc(title: str, url: str, text: str, *, max_chars: int) -> str:
     body = _head_tail(text or "", max_chars)
     safe_title = clean_ws(title or url)
     bullet = _as_str("web_orch_bullet_prefix") or "- "
     indent = _as_str("web_orch_indent_prefix") or "  "
     return f"{bullet}{safe_title}\n{indent}{url}\n{indent}{body}"
+
 
 def score_hit(hit: SearchHit, query: str) -> int:
     w_exact = _as_int("web_orch_score_w_exact")
@@ -96,11 +117,13 @@ def score_hit(hit: SearchHit, query: str) -> int:
             score += w_snip_touch
     return score
 
+
 def _type_ratio(text: str, sub: str) -> float:
     if not text:
         return 1.0
     cnt = text.lower().count(sub)
     return float(cnt) / max(1, len(text))
+
 
 def content_quality_score(text: str) -> float:
     if not text:
@@ -125,8 +148,9 @@ def content_quality_score(text: str) -> float:
     raw = (w_len * length_score) + (w_div * diversity) - pen
     return max(0.0, min(1.0, raw))
 
-def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[SearchHit]:
-    picked: List[SearchHit] = []
+
+def _dedupe_by_host(scored_hits: list[tuple[int, SearchHit]], k: int) -> list[SearchHit]:
+    picked: list[SearchHit] = []
     seen_hosts = set()
     for s, h in sorted(scored_hits, key=lambda x: x[0], reverse=True):
         u = (h.url or "").strip()
@@ -141,18 +165,20 @@ def _dedupe_by_host(scored_hits: List[Tuple[int, SearchHit]], k: int) -> List[Se
             break
     return picked
 
+
 async def _fetch_round(
-    urls: List[str],
-    meta: List[Tuple[str, str]],
+    urls: list[str],
+    meta: list[tuple[str, str]],
     per_url_timeout_s: float,
     max_parallel: int,
     use_js: bool = False,
-    telemetry: Optional[Dict[str, Any]] = None,
-) -> List[Tuple[str, Optional[Tuple[str, int, str]]]]:
+    telemetry: dict[str, Any] | None = None,
+) -> list[tuple[str, tuple[str, int, str] | None]]:
     fetch_fn = fetch_many
     if use_js:
         try:
             from . import fetch as _fetch_mod
+
             fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
         except Exception:
             fetch_fn = fetch_many

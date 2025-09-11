@@ -1,23 +1,26 @@
 # ===== aimodel/file_read/rag/ingest/common.py =====
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Dict, Optional
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
 import re
+from dataclasses import dataclass
+
 from ...core.settings import SETTINGS
+
 
 @dataclass
 class Chunk:
     text: str
-    meta: Dict[str, str]
+    meta: dict[str, str]
 
 
 def _utf8(data: bytes) -> str:
-
     return (data or b"").decode("utf-8", errors="ignore")
 
-def _strip_html(txt: str) -> str:
 
+def _strip_html(txt: str) -> str:
     if not txt:
         return ""
 
@@ -28,11 +31,12 @@ def _strip_html(txt: str) -> str:
     txt = re.sub(r"[ \t]+", " ", txt)
     return txt.strip()
 
+
 _HDR_RE = re.compile(r"^(#{1,3})\s+.*$", flags=re.MULTILINE)
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
 
-def _split_sections(text: str) -> List[str]:
 
+def _split_sections(text: str) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
@@ -41,7 +45,7 @@ def _split_sections(text: str) -> List[str]:
         return [text]
     if 0 not in starts:
         starts = [0] + starts
-    sections: List[str] = []
+    sections: list[str] = []
     for i, s in enumerate(starts):
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
         block = text[s:e].strip()
@@ -49,14 +53,15 @@ def _split_sections(text: str) -> List[str]:
             sections.append(block)
     return sections
 
-def _split_paragraphs(block: str) -> List[str]:
+
+def _split_paragraphs(block: str) -> list[str]:
     paras = [p.strip() for p in _PARA_SPLIT_RE.split(block or "")]
     return [p for p in paras if p]
 
-def _hard_split(text: str, max_len: int) -> List[str]:
 
+def _hard_split(text: str, max_len: int) -> list[str]:
     approx = re.split(r"(?<=[\.\!\?\;])\s+", text or "")
-    out: List[str] = []
+    out: list[str] = []
     buf = ""
     for s in approx:
         if not s:
@@ -87,9 +92,10 @@ def _hard_split(text: str, max_len: int) -> List[str]:
         out.append(buf)
     return out
 
-def _pack_with_budget(pieces: List[str], *, max_chars: int) -> List[str]:
-    chunks: List[str] = []
-    cur: List[str] = []
+
+def _pack_with_budget(pieces: list[str], *, max_chars: int) -> list[str]:
+    chunks: list[str] = []
+    cur: list[str] = []
     cur_len = 0
     for p in pieces:
         plen = len(p)
@@ -99,7 +105,7 @@ def _pack_with_budget(pieces: List[str], *, max_chars: int) -> List[str]:
         if cur_len == 0:
             cur, cur_len = [p], plen
             continue
-        if cur_len + 2 + plen <= max_chars:  
+        if cur_len + 2 + plen <= max_chars:
             cur.append(p)
             cur_len += 2 + plen
         else:
@@ -109,14 +115,14 @@ def _pack_with_budget(pieces: List[str], *, max_chars: int) -> List[str]:
         chunks.append("\n\n".join(cur).strip())
     return chunks
 
+
 def chunk_text(
     text: str,
-    meta: Optional[Dict[str, str]] = None,
+    meta: dict[str, str] | None = None,
     *,
     max_chars: int = int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
     overlap: int = int(SETTINGS.get("rag_chunk_overlap_chars", 150)),
-) -> List[Chunk]:
-
+) -> list[Chunk]:
     base_meta = (meta or {}).copy()
     text = (text or "").strip()
     if not text:
@@ -129,8 +135,8 @@ def chunk_text(
     if not sections:
         sections = [text]
 
-    chunks: List[Chunk] = []
-    last_tail: Optional[str] = None
+    chunks: list[Chunk] = []
+    last_tail: str | None = None
 
     for sec in sections:
         paras = _split_paragraphs(sec)
@@ -141,24 +147,31 @@ def chunk_text(
             if last_tail and overlap > 0:
                 tail = last_tail[-overlap:] if len(last_tail) > overlap else last_tail
                 candidate = f"{tail}\n{ch}"
-                chunks.append(Chunk(text=candidate if len(candidate) <= max_chars else ch, meta=base_meta))
+                chunks.append(
+                    Chunk(text=candidate if len(candidate) <= max_chars else ch, meta=base_meta)
+                )
             else:
                 chunks.append(Chunk(text=ch, meta=base_meta))
             last_tail = ch
 
     return chunks
 
-def build_metas(session_id: Optional[str], filename: str, chunks: List[Chunk], *, size: int = 0) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
+
+def build_metas(
+    session_id: str | None, filename: str, chunks: list[Chunk], *, size: int = 0
+) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
     for i, c in enumerate(chunks):
-        out.append({
-            "id": f"{filename}:{i}",
-            "sessionId": session_id or "",
-            "source": filename,
-            "title": filename,
-            "mime": "text/plain",
-            "size": str(size),
-            "chunkIndex": str(i),
-            "text": c.text,  
-        })
+        out.append(
+            {
+                "id": f"{filename}:{i}",
+                "sessionId": session_id or "",
+                "source": filename,
+                "title": filename,
+                "mime": "text/plain",
+                "size": str(size),
+                "chunkIndex": str(i),
+                "text": c.text,
+            }
+        )
     return out

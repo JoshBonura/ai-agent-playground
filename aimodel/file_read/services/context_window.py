@@ -1,15 +1,22 @@
 # aimodel/file_read/services/context_window.py
 from __future__ import annotations
-from typing import List, Dict, Optional, Tuple, Any
-from ..utils.streaming import safe_token_count_messages
-from ..runtime.model_runtime import current_model_info
-from ..core.settings import SETTINGS
 
-def estimate_tokens(llm, messages: List[Dict[str, str]]) -> Optional[int]:
+from typing import Any
+
+from ..core.logging import get_logger
+from ..core.settings import SETTINGS
+from ..runtime.model_runtime import current_model_info
+from ..utils.streaming import safe_token_count_messages
+
+log = get_logger(__name__)
+
+
+def estimate_tokens(llm, messages: list[dict[str, str]]) -> int | None:
     try:
         return safe_token_count_messages(llm, messages)
     except Exception:
         return None
+
 
 def current_n_ctx() -> int:
     eff = SETTINGS.effective()
@@ -20,9 +27,15 @@ def current_n_ctx() -> int:
     except Exception:
         return int(eff["nctx_fallback"])
 
+
 def clamp_out_budget(
-    *, llm, messages: List[Dict[str, str]], requested_out: int, margin: int = 32, reserved_system_tokens: Optional[int] = None
-) -> Tuple[int, Optional[int]]:
+    *,
+    llm,
+    messages: list[dict[str, str]],
+    requested_out: int,
+    margin: int = 32,
+    reserved_system_tokens: int | None = None,
+) -> tuple[int, int | None]:
     eff = SETTINGS.effective()
     inp_est = estimate_tokens(llm, messages)
     try:
@@ -36,17 +49,22 @@ def clamp_out_budget(
     safe_out = max(min_out, min(requested_out, available))
     return safe_out, (inp_est if inp_est is not None else None)
 
+
 def compute_budget_view(
     llm,
-    messages: List[Dict[str, str]],
-    requested_out: Optional[int] = None,
-    clamp_margin: Optional[int] = None,
-    reserved_system_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
+    messages: list[dict[str, str]],
+    requested_out: int | None = None,
+    clamp_margin: int | None = None,
+    reserved_system_tokens: int | None = None,
+) -> dict[str, Any]:
     eff = SETTINGS.effective()
     n_ctx = current_n_ctx()
     margin = int(clamp_margin if clamp_margin is not None else eff.get("clamp_margin", 32))
-    rst = int(reserved_system_tokens if reserved_system_tokens is not None else eff.get("reserved_system_tokens", 0))
+    rst = int(
+        reserved_system_tokens
+        if reserved_system_tokens is not None
+        else eff.get("reserved_system_tokens", 0)
+    )
     min_out = int(eff.get("min_out_tokens", 16))
     default_out = int(eff.get("out_budget", 512))
     req_out = int(requested_out if requested_out is not None else default_out)

@@ -1,0 +1,22 @@
+/* index.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Safe-area + dynamic viewport */
+:root{
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top:    env(safe-area-inset-top, 0px);
+}
+
+html, body, #root { min-height: 100dvh; }
+
+/* Reusable helpers */
+@layer utilities {
+  /* pad bottom enough so last items aren't under the Android bar */
+  .pb-safe { padding-bottom: calc(var(--safe-bottom) + 12px) !important; }
+
+  /* if you used h-screen/min-h-screen anywhere, map them to dynamic vh */
+  .h-screen     { height: 100dvh !important; }
+  .min-h-screen { min-height: 100dvh !important; }
+}

@@ -1,46 +1,70 @@
-# aimodel/file_read/services/generate_pipeline_part2.py
 from __future__ import annotations
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
 import time
-from typing import Any, Dict, Optional, List
-from .prompt_utils import chars_len
-from .generate_pipeline_support import (
-    Prep, _tok_count, _approx_block_tokens, _diff_find_inserted_block,
-    _web_breakdown, _web_unattributed, _enforce_fit
-)
-from ..rag.router_ai import decide_rag
-from .packing import maybe_inject_rag_block
-from .session_io import persist_summary
-from .budget import analyze_budget
+
 from ..core.packing_memory_core import PACK_TELEMETRY
+from ..rag.router_ai import decide_rag
+from .budget import analyze_budget
 from .context_window import clamp_out_budget
+from .generate_pipeline_support import (Prep, _approx_block_tokens,
+                                        _diff_find_inserted_block,
+                                        _enforce_fit, _tok_count,
+                                        _web_breakdown, _web_unattributed)
+from .packing import maybe_inject_rag_block
+from .prompt_utils import chars_len
+from .session_io import persist_summary
+
 
 async def _finish_prepare_generation_with_telemetry(
-    llm, eff, data, st, router_text, latest_user_text, base_user_text, has_atts,
-    force_session_only, rag_session_enabled, rag_global_enabled, auto_rag,
-    telemetry, packed, out_budget_req, temperature, top_p, t_request_start, session_id
+    llm,
+    eff,
+    data,
+    st,
+    router_text,
+    latest_user_text,
+    base_user_text,
+    has_atts,
+    force_session_only,
+    rag_session_enabled,
+    rag_global_enabled,
+    auto_rag,
+    telemetry,
+    packed,
+    out_budget_req,
+    temperature,
+    top_p,
+    t_request_start,
+    session_id,
 ) -> Prep:
     must_inject_session = bool(
-        force_session_only and rag_session_enabled and not has_atts and not telemetry.get("web", {}).get("ephemeralBlocks")
+        force_session_only
+        and rag_session_enabled
+        and (not has_atts)
+        and (not telemetry.get("web", {}).get("ephemeralBlocks"))
     )
+    rag_router_allowed = (
+        (rag_session_enabled or rag_global_enabled)
+        and (not (has_atts and bool(eff["disable_global_rag_on_attachments"])))
+    ) or must_inject_session
 
-    rag_router_allowed = ((rag_session_enabled or rag_global_enabled) and not (
-        has_atts and bool(eff["disable_global_rag_on_attachments"])
-    )) or must_inject_session
-
-    # NEW: if web router said it's needed or we already injected web, skip RAG router
     web_needed = bool((telemetry.get("web") or {}).get("needed"))
     web_injected = bool((telemetry.get("web") or {}).get("injected"))
     if web_needed or web_injected:
         rag_router_allowed = False
         telemetry.setdefault("rag", {})
         telemetry["rag"]["routerSkipped"] = True
-        telemetry["rag"]["routerSkippedReason"] = "web_needed" if web_needed else "web_block_present"
+        telemetry["rag"]["routerSkippedReason"] = (
+            "web_needed" if web_needed else "web_block_present"
+        )
 
-    ephemeral_once: List[Dict[str, str]] = []
-    if rag_router_allowed and bool(eff["rag_enabled"]) and not ephemeral_once:
+    ephemeral_once: list[dict[str, str]] = []
+
+    if rag_router_allowed and bool(eff["rag_enabled"]) and (not ephemeral_once):
         rag_need = False
-        rag_query: Optional[str] = None
-
+        rag_query: str | None = None
         if must_inject_session:
             rag_need = True
             rag_query = (latest_user_text or base_user_text or "").strip()
@@ -60,11 +84,10 @@ async def _finish_prepare_generation_with_telemetry(
             if rag_query is not None:
                 telemetry["rag"]["routerQuery"] = rag_query
 
-        skip_rag = bool(ephemeral_once) or (not rag_need)
+        skip_rag = bool(ephemeral_once) or not rag_need
         tokens_before = _tok_count(llm, packed)
         t_inject0 = time.perf_counter()
-
-        print(f"[PIPE][RAG] router query: {rag_query!r} skip_rag={skip_rag}")
+        log.info(f"[PIPE][RAG] router query: {rag_query!r} skip_rag={skip_rag}")
         res = maybe_inject_rag_block(
             packed,
             session_id=session_id,
@@ -72,7 +95,6 @@ async def _finish_prepare_generation_with_telemetry(
             rag_query=rag_query,
             force_session_only=force_session_only,
         )
-
         telemetry["rag"]["injectBuildSec"] = round(time.perf_counter() - t_inject0, 6)
 
         if isinstance(res, tuple):
@@ -86,25 +108,30 @@ async def _finish_prepare_generation_with_telemetry(
 
         if tel:
             telemetry["rag"].update(tel)
+
         if block_text:
-            print(f"[PIPE][RAG] injected block preview: {block_text[:200]!r}")
+            log.debug(f"[PIPE][RAG] injected block preview: {block_text[:200]!r}")
             telemetry["rag"]["blockChars"] = len(block_text)
             tok = _approx_block_tokens(llm, "user", block_text)
             if tok is not None:
                 telemetry["rag"]["blockTokensApprox"] = tok
             telemetry["rag"]["injected"] = True
-            telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
+            telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or (
+                "session-only" if force_session_only else "global"
+            )
         else:
             inserted = _diff_find_inserted_block(packed, packed2)
             if inserted and isinstance(inserted.get("content"), str):
-                print(f"[PIPE][RAG] diff-inserted block preview: {inserted['content'][:200]!r}")
+                log.debug(f"[PIPE][RAG] diff-inserted block preview: {inserted['content'][:200]!r}")
                 text = inserted["content"]
                 telemetry["rag"]["blockChars"] = len(text)
                 tok = _approx_block_tokens(llm, "user", text)
                 if tok is not None:
                     telemetry["rag"]["blockTokensApprox"] = tok
                 telemetry["rag"]["injected"] = True
-                telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or ("session-only" if force_session_only else "global")
+                telemetry["rag"]["mode"] = telemetry["rag"].get("mode") or (
+                    "session-only" if force_session_only else "global"
+                )
 
         tokens_after = _tok_count(llm, packed2)
         if tokens_before is not None:
@@ -113,8 +140,10 @@ async def _finish_prepare_generation_with_telemetry(
             telemetry["rag"]["packedTokensAfter"] = tokens_after
         if tokens_before is not None and tokens_after is not None:
             telemetry["rag"]["ragTokensAdded"] = max(0, tokens_after - tokens_before)
+
         packed = packed2
     else:
+        telemetry.setdefault("rag", {})
         telemetry["rag"]["routerSkipped"] = True
         if telemetry.get("web", {}).get("ephemeralBlocks"):
             telemetry["rag"]["routerSkippedReason"] = "ephemeral_block_present"
@@ -122,28 +151,43 @@ async def _finish_prepare_generation_with_telemetry(
             telemetry["rag"]["routerSkippedReason"] = "attachments_disable_global_or_rag_disabled"
         elif not bool(eff["rag_enabled"]):
             telemetry["rag"]["routerSkippedReason"] = "rag_disabled"
-        print(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
+        log.info(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
 
     packed, out_budget_adj = _enforce_fit(llm, eff, packed, out_budget_req)
+
     packed_chars = chars_len(packed)
-    telemetry["pack"]["packedChars"] = packed_chars
-    telemetry["pack"]["messages"] = len(packed)
-    telemetry["pack"]["summarySec"] = float(PACK_TELEMETRY.get("summarySec") or 0.0)
-    telemetry["pack"]["summaryTokensApprox"] = int(PACK_TELEMETRY.get("summaryTokensApprox") or 0)
-    telemetry["pack"]["summaryUsedLLM"] = bool(PACK_TELEMETRY.get("summaryUsedLLM") or False)
-    telemetry["pack"]["finalTrimSec"] = float(PACK_TELEMETRY.get("finalTrimSec") or 0.0)
-    telemetry["pack"]["compressSec"] = float(PACK_TELEMETRY.get("compressSec") or 0.0)
-    telemetry["pack"]["packInputTokensApprox"] = int(PACK_TELEMETRY.get("packInputTokensApprox") or 0)
-    telemetry["pack"]["packMsgs"] = int(PACK_TELEMETRY.get("packMsgs") or 0)
-    telemetry["pack"]["finalTrimTokensBefore"] = int(PACK_TELEMETRY.get("finalTrimTokensBefore") or 0)
-    telemetry["pack"]["finalTrimTokensAfter"] = int(PACK_TELEMETRY.get("finalTrimTokensAfter") or 0)
-    telemetry["pack"]["finalTrimDroppedMsgs"] = int(PACK_TELEMETRY.get("finalTrimDroppedMsgs") or 0)
-    telemetry["pack"]["finalTrimDroppedApproxTokens"] = int(PACK_TELEMETRY.get("finalTrimDroppedApproxTokens") or 0)
-    telemetry["pack"]["finalTrimSummaryShrunkFromChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkFromChars") or 0)
-    telemetry["pack"]["finalTrimSummaryShrunkToChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryShrunkToChars") or 0)
-    telemetry["pack"]["finalTrimSummaryDroppedChars"] = int(PACK_TELEMETRY.get("finalTrimSummaryDroppedChars") or 0)
-    telemetry["pack"]["rollStartTokens"] = int(PACK_TELEMETRY.get("rollStartTokens") or 0)
-    telemetry["pack"]["rollOverageTokens"] = int(PACK_TELEMETRY.get("rollOverageTokens") or 0)
+    telemetry["packedChars"] = packed_chars
+    telemetry["messages"] = len(packed)
+
+    # ---- pull PackTel -> telemetry['pack'] (+ optional legacy mirrors) ----
+    try:
+        pack_tel = PACK_TELEMETRY.model_dump()  # Pydantic v2
+    except AttributeError:
+        pack_tel = PACK_TELEMETRY.dict()  # Pydantic v1
+
+    telemetry.setdefault("pack", {}).update(pack_tel)
+
+    # If other code still reads these at the root, mirror them:
+    for k in (
+        "summarySec",
+        "summaryTokensApprox",
+        "summaryUsedLLM",
+        "finalTrimSec",
+        "compressSec",
+        "packInputTokensApprox",
+        "packMsgs",
+        "finalTrimTokensBefore",
+        "finalTrimTokensAfter",
+        "finalTrimDroppedMsgs",
+        "finalTrimDroppedApproxTokens",
+        "finalTrimSummaryShrunkFromChars",
+        "finalTrimSummaryShrunkToChars",
+        "finalTrimSummaryDroppedChars",
+        "rollStartTokens",
+        "rollOverageTokens",
+    ):
+        telemetry[k] = pack_tel.get(k, telemetry.get(k))
+    # ----------------------------------------------------------------------
 
     persist_summary(session_id, st["summary"])
 
@@ -157,7 +201,9 @@ async def _finish_prepare_generation_with_telemetry(
 
     wb = _web_breakdown(telemetry.get("web", {}))
     telemetry.setdefault("web", {})["breakdown"] = wb
-    telemetry["web"]["breakdown"]["unattributedWebSec"] = _web_unattributed(telemetry.get("web", {}), wb)
+    telemetry["web"]["breakdown"]["unattributedWebSec"] = _web_unattributed(
+        telemetry.get("web", {}), wb
+    )
     telemetry["web"]["breakdown"]["prepSec"] = float(telemetry.get("prepSec") or 0.0)
 
     budget_view.setdefault("web", {}).update(telemetry.get("web", {}))
@@ -167,6 +213,7 @@ async def _finish_prepare_generation_with_telemetry(
     out_budget, input_tokens_est = clamp_out_budget(
         llm=llm, messages=packed, requested_out=out_budget_adj, margin=int(eff["clamp_margin"])
     )
+
     budget_view.setdefault("request", {})
     budget_view["request"]["outBudgetRequested"] = out_budget_adj
     budget_view["request"]["temperature"] = temperature
