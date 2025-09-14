@@ -1,7 +1,6 @@
 ai-agent-playground/
   .gitattributes
   .gitignore
-  .pre-commit-config.yaml
   body.json
   clean-structure-1.txt
   clean-structure-2.txt
@@ -28,6 +27,14 @@ ai-agent-playground/
       2291756760949544248
       6625531754658329301
       9767957731831973195
+    0.13.0/
+      10736221151689408237
+      14576534490895897172
+      15613787348034623336
+      17184150777485957466
+      9070991036625101697
+      9325872977008821211
+      9397175551443099122
   .runtime/
     auth.sqlite
     ports.json
@@ -51,6 +58,7 @@ ai-agent-playground/
         auth_router.py
         billing.py
         chats.py
+        devices_router.py
         generate_router.py
         licensing_router.py
         metrics.py
@@ -77,6 +85,7 @@ ai-agent-playground/
         admin_deps.py
         auth_deps.py
         license_deps.py
+        model_deps.py
       rag/
         __init__.py
         rerank.py
@@ -116,6 +125,7 @@ ai-agent-playground/
         generate_pipeline.py
         generate_pipeline_part2.py
         generate_pipeline_support.py
+        licensing_core.py
         licensing_service.py
         packing.py
         prompt_utils.py
@@ -202,7 +212,9 @@ ai-agent-playground/
       api/
         admins.ts
         billing.ts
+        devices.ts
         license.ts
+        models.ts
       auth/
         AuthContext.tsx
         ForgotPassword.tsx
@@ -243,8 +255,13 @@ ai-agent-playground/
           ProgressBar.tsx
         Markdown/
           MarkdownMessage.tsx
+        ModelPicker/
+          ModelPicker.tsx
+          ModelPickerList.tsx
         Settings/
+          AdminDeviceManager.tsx
           AdminGuestToggle.tsx
+          AdminScopeToggle.tsx
           BraveSearchCard.tsx
           UpgradeSection.tsx
           WebSearchSection.tsx
@@ -263,6 +280,7 @@ ai-agent-playground/
         useChatsPager.ts
         useLicense.ts
         useMetrics.ts
+        useModalHealth.ts
         useMultiSelect.ts
         useRetitle.ts
         useRunState.ts

@@ -9,6 +9,9 @@ from ..utils.streaming import safe_token_count_messages
 
 log = get_logger(__name__)
 
+class PrepCancelled(Exception):
+    """Raised when stop_ev is set and we want to abort PREP immediately."""
+    pass
 
 @dataclass
 class Prep:

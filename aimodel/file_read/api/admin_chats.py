@@ -6,7 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
+# Strict gate: Admin + Personal Pro + Activated device
+from ..deps.license_deps import require_admin_pro, require_admin_personal_pro
+# Looser gate: Admin only (no Pro/activation requirement)
 from ..deps.admin_deps import require_admin
+
 from ..store import chats as store
 from ..store.base import APP_DIR, user_root
 
@@ -28,13 +32,13 @@ def _list_all_uids() -> list[str]:
         return []
 
 
-# ---------- Admin: only my chats (convenience wrapper) ----------
+# ---------- Admin: only MY chats (Admin-only; no Pro/activation needed) ----------
 @router.get("/mine/paged")
 def admin_list_mine_paged(
     page: int = 0,
     size: int = 30,
     ceiling: str | None = None,
-    user=Depends(require_admin),
+    user=Depends(require_admin_personal_pro),  # <- Admin + Pro, no activation
 ):
     uid = user.get("user_id") or user.get("sub")
     root = user_root(uid)
@@ -59,13 +63,13 @@ def admin_list_mine_paged(
     }
 
 
-# ---------- Admin: all users’ chats (default view) ----------
+# ---------- Admin: ALL users’ chats (requires Admin + Pro + Activated) ----------
 @router.get("/all/paged")
 def admin_list_all_paged(
     page: int = 0,
     size: int = 30,
     ceiling: str | None = None,
-    _user=Depends(require_admin),
+    _user=Depends(require_admin_pro),  # <- strict gate
 ):
     # Aggregate per-user indexes, sort by updatedAt desc, then paginate globally
     aggregate: list[dict[str, Any]] = []
@@ -80,7 +84,6 @@ def admin_list_all_paged(
                 d = asdict(r)
                 # enrich with owner for cross-user listing
                 d["ownerUid"] = uid
-                # ownerEmail is not available from index safely here; omit or fill if you keep it in index
                 aggregate.append(d)
         except Exception:
             # best-effort; skip bad/empty users
@@ -111,9 +114,9 @@ def admin_list_all_paged(
     }
 
 
-# ---------- Admin: read messages of a specific user’s chat ----------
+# ---------- Admin: read messages of a specific user’s chat (strict) ----------
 @router.get("/{target_uid}/{session_id}/messages")
-def admin_list_messages(target_uid: str, session_id: str, _user=Depends(require_admin)):
+def admin_list_messages(target_uid: str, session_id: str, _user=Depends(require_admin_pro)):  # strict gate
     root = user_root(target_uid)
     try:
         rows = store.list_messages(root, target_uid, session_id)

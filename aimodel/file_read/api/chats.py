@@ -12,7 +12,7 @@ from ..deps.auth_deps import require_auth
 from ..store import chats as store
 from ..store.base import user_root
 from ..utils.streaming import strip_runjson
-
+from ..deps.model_deps import require_model_ready  
 # retitle worker is optional
 try:
     from ..workers.retitle_worker import \
@@ -88,7 +88,7 @@ async def api_list_messages(session_id: str, user=Depends(require_auth)):
 
 
 @router.post("/api/chats/{session_id}/messages")
-async def api_append_message(session_id: str, msg: ChatMessage, user=Depends(require_auth)):
+async def api_append_message(session_id: str, msg: ChatMessage, user=Depends(require_auth), _=Depends(require_model_ready)):
     uid = user.get("user_id") or user.get("sub")
     root = user_root(uid)
 

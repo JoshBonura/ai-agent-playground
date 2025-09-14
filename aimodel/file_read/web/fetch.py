@@ -1,4 +1,3 @@
-# aimodel/file_read/web/fetch.py
 from __future__ import annotations
 
 import asyncio
@@ -69,7 +68,6 @@ def _host_of(u: str) -> str:
 
 
 def _cooldown_secs(fails: int) -> float:
-    # 15m, 30m, 60m, ... capped at 24h
     base = 15 * 60.0
     cap = 24 * 60 * 60.0
     return min(cap, base * (2 ** max(0, fails - 1)))
@@ -104,7 +102,6 @@ def _is_on_cooldown(host: str) -> bool:
 
 
 async def _read_capped_bytes(resp, cap_bytes: int) -> bytes:
-    """Stream response bytes up to cap_bytes."""
     out = bytearray()
     async for chunk in resp.aiter_bytes():
         if not chunk:
@@ -120,7 +117,6 @@ async def _read_capped_bytes(resp, cap_bytes: int) -> bytes:
 
 def _extract_text_from_html(raw_html: str, url: str) -> str:
     html = raw_html or ""
-    # Try readability first (often best for article-like pages)
     if Document is not None:
         try:
             doc = Document(html)
@@ -133,7 +129,6 @@ def _extract_text_from_html(raw_html: str, url: str) -> str:
                         return txt
         except Exception:
             pass
-    # Try selectolax (fast, robust)
     if HTMLParser is not None:
         try:
             tree = HTMLParser(html)
@@ -149,7 +144,6 @@ def _extract_text_from_html(raw_html: str, url: str) -> str:
                 return txt
         except Exception:
             pass
-    # Fallback to BeautifulSoup full parse
     if BeautifulSoup is not None:
         try:
             soup = BeautifulSoup(html, "lxml")
@@ -160,7 +154,6 @@ def _extract_text_from_html(raw_html: str, url: str) -> str:
                 return txt
         except Exception:
             pass
-    # Last resort: return raw html (will be trimmed by char cap)
     return html
 
 
@@ -170,7 +163,12 @@ async def fetch_clean(
     max_chars: int | None = None,
     max_bytes: int | None = None,
     telemetry: dict[str, Any] | None = None,
+    stop_ev: asyncio.Event | None = None,
 ) -> tuple[str, int, str]:
+    # fast-cancel before network
+    if stop_ev is not None and stop_ev.is_set():
+        raise ExternalServiceError(service="fetch", url=url, detail="cancelled")
+
     t0 = time.perf_counter()
     timeout = _timeout() if timeout_s is None else float(timeout_s)
     cap_chars = _max_chars() if max_chars is None else int(max_chars)
@@ -181,7 +179,7 @@ async def fetch_clean(
     try:
         r = await client.get(
             url,
-            follow_redirects=True,  # override client default per call
+            follow_redirects=True,
             timeout=timeout,
             headers=headers,
         )
@@ -205,7 +203,6 @@ async def fetch_clean(
     if len(txt) > cap_chars:
         txt = txt[:cap_chars]
 
-    # Generic usefulness test: skip non-HTML or extremely short bodies
     MIN_USEFUL_CHARS = 80
     host_final = _host_of(str(r.url))
     if ("text/html" not in ctype) or (len(txt) < MIN_USEFUL_CHARS):
@@ -241,6 +238,7 @@ async def fetch_many(
     cap_bytes: int | None = None,
     max_parallel: int | None = None,
     telemetry: dict[str, Any] | None = None,
+    stop_ev: asyncio.Event | None = None,
 ):
     t_total0 = time.perf_counter()
     sem = asyncio.Semaphore(_max_parallel() if max_parallel is None else int(max_parallel))
@@ -250,21 +248,27 @@ async def fetch_many(
         item_tel: dict[str, Any] = {"reqUrl": u}
         host = _host_of(u)
 
-        # Skip hosts currently on adaptive cooldown (generic, no lists)
+        # global fast cancel
+        if stop_ev is not None and stop_ev.is_set():
+            item_tel.update({"ok": False, "skipped": True, "skipReason": "cancelled", "host": host})
+            tel_items.append(item_tel)
+            return u, None
+
+        # Skip hosts on cooldown
         if _is_on_cooldown(host):
             item_tel.update(
-                {
-                    "ok": False,
-                    "skipped": True,
-                    "skipReason": "cooldown",
-                    "host": host,
-                }
+                {"ok": False, "skipped": True, "skipReason": "cooldown", "host": host}
             )
             tel_items.append(item_tel)
             return u, None
 
         t0 = time.perf_counter()
         async with sem:
+            # check again after waiting
+            if stop_ev is not None and stop_ev.is_set():
+                item_tel.update({"ok": False, "skipped": True, "skipReason": "cancelled", "host": host})
+                tel_items.append(item_tel)
+                return u, None
             try:
                 res = await fetch_clean(
                     u,
@@ -272,6 +276,7 @@ async def fetch_many(
                     max_chars=cap_chars,
                     max_bytes=cap_bytes,
                     telemetry=item_tel,
+                    stop_ev=stop_ev,
                 )
                 item_tel.setdefault("elapsedSec", round(time.perf_counter() - t0, 6))
                 item_tel["ok"] = True
@@ -279,7 +284,7 @@ async def fetch_many(
                 tel_items.append(item_tel)
                 return u, res
             except Exception as e:
-                _mark_bad(host)  # network/HTTP error counts as a fail
+                _mark_bad(host)
                 item_tel.update(
                     {
                         "ok": False,
@@ -296,6 +301,28 @@ async def fetch_many(
                 )
                 tel_items.append(item_tel)
                 return u, None
+
+    # If cancelled before starting, short-circuit
+    if stop_ev is not None and stop_ev.is_set():
+        if telemetry is not None:
+            telemetry.update(
+                {
+                    "totalSec": round(time.perf_counter() - t_total0, 6),
+                    "requested": len(urls),
+                    "ok": 0,
+                    "miss": len(urls),
+                    "items": [],
+                    "settings": {
+                        "userAgent": _ua(),
+                        "defaultTimeoutSec": _timeout(),
+                        "defaultCapChars": _max_chars(),
+                        "defaultCapBytes": _max_bytes(),
+                        "maxParallel": _max_parallel() if max_parallel is None else int(max_parallel),
+                    },
+                    "cancelled": True,
+                }
+            )
+        return [(u, None) for u in urls]
 
     tasks = [_one(u) for u in urls]
     results = await asyncio.gather(*tasks)

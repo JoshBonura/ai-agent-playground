@@ -1,21 +1,44 @@
+# aimodel/file_read/services/generate_pipeline_part2.py
 from __future__ import annotations
+
+import asyncio
+import time
 
 from ..core.logging import get_logger
 
 log = get_logger(__name__)
-import time
 
 from ..core.packing_memory_core import PACK_TELEMETRY
 from ..rag.router_ai import decide_rag
 from .budget import analyze_budget
 from .context_window import clamp_out_budget
-from .generate_pipeline_support import (Prep, _approx_block_tokens,
-                                        _diff_find_inserted_block,
-                                        _enforce_fit, _tok_count,
-                                        _web_breakdown, _web_unattributed)
+from .generate_pipeline_support import (
+    Prep,
+    _approx_block_tokens,
+    _diff_find_inserted_block,
+    _enforce_fit,
+    _tok_count,
+    _web_breakdown,
+    _web_unattributed,
+)
 from .packing import maybe_inject_rag_block
 from .prompt_utils import chars_len
 from .session_io import persist_summary
+from .generate_pipeline_support import PrepCancelled # ← hard-cancel signal from part1
+
+
+async def _yield_if_stopping(
+    stop_ev: asyncio.Event | None,
+    where: str,
+    *,
+    hard: bool = False,
+) -> None:
+    """Cooperative checkpoint; optionally raise to abort PREP immediately."""
+    if stop_ev and stop_ev.is_set():
+        log.info("[PIPE] stop observed at %s", where)
+        if hard:
+            raise PrepCancelled(where)
+    await asyncio.sleep(0)
 
 
 async def _finish_prepare_generation_with_telemetry(
@@ -38,6 +61,8 @@ async def _finish_prepare_generation_with_telemetry(
     top_p,
     t_request_start,
     session_id,
+    *,
+    stop_ev: asyncio.Event | None = None,  # ← propagated from PREP
 ) -> Prep:
     must_inject_session = bool(
         force_session_only
@@ -62,6 +87,9 @@ async def _finish_prepare_generation_with_telemetry(
 
     ephemeral_once: list[dict[str, str]] = []
 
+    # ---------------------
+    # RAG Router + Inject
+    # ---------------------
     if rag_router_allowed and bool(eff["rag_enabled"]) and (not ephemeral_once):
         rag_need = False
         rag_query: str | None = None
@@ -75,10 +103,12 @@ async def _finish_prepare_generation_with_telemetry(
         else:
             t_router0 = time.perf_counter()
             if auto_rag:
+                await _yield_if_stopping(stop_ev, "rag.router.start", hard=True)
                 try:
                     rag_need, rag_query = decide_rag(llm, router_text)
                 except Exception:
                     rag_need, rag_query = (False, None)
+                await _yield_if_stopping(stop_ev, "rag.router.done", hard=True)
             telemetry["rag"]["routerDecideSec"] = round(time.perf_counter() - t_router0, 6)
             telemetry["rag"]["routerNeeded"] = bool(rag_need)
             if rag_query is not None:
@@ -86,8 +116,11 @@ async def _finish_prepare_generation_with_telemetry(
 
         skip_rag = bool(ephemeral_once) or not rag_need
         tokens_before = _tok_count(llm, packed)
+
         t_inject0 = time.perf_counter()
         log.info(f"[PIPE][RAG] router query: {rag_query!r} skip_rag={skip_rag}")
+
+        await _yield_if_stopping(stop_ev, "rag.inject.start", hard=True)
         res = maybe_inject_rag_block(
             packed,
             session_id=session_id,
@@ -95,6 +128,8 @@ async def _finish_prepare_generation_with_telemetry(
             rag_query=rag_query,
             force_session_only=force_session_only,
         )
+        await _yield_if_stopping(stop_ev, "rag.inject.done", hard=True)
+
         telemetry["rag"]["injectBuildSec"] = round(time.perf_counter() - t_inject0, 6)
 
         if isinstance(res, tuple):
@@ -153,7 +188,13 @@ async def _finish_prepare_generation_with_telemetry(
             telemetry["rag"]["routerSkippedReason"] = "rag_disabled"
         log.info(f"[PIPE] rag_router_skipped reason={telemetry['rag'].get('routerSkippedReason')}")
 
+    await _yield_if_stopping(stop_ev, "rag.phase.done", hard=True)
+
+    # ---------------------
+    # Fit / Budget / Summaries
+    # ---------------------
     packed, out_budget_adj = _enforce_fit(llm, eff, packed, out_budget_req)
+    await _yield_if_stopping(stop_ev, "fit.done", hard=True)
 
     packed_chars = chars_len(packed)
     telemetry["packedChars"] = packed_chars
@@ -167,7 +208,6 @@ async def _finish_prepare_generation_with_telemetry(
 
     telemetry.setdefault("pack", {}).update(pack_tel)
 
-    # If other code still reads these at the root, mirror them:
     for k in (
         "summarySec",
         "summaryTokensApprox",
@@ -187,9 +227,9 @@ async def _finish_prepare_generation_with_telemetry(
         "rollOverageTokens",
     ):
         telemetry[k] = pack_tel.get(k, telemetry.get(k))
-    # ----------------------------------------------------------------------
 
     persist_summary(session_id, st["summary"])
+    await _yield_if_stopping(stop_ev, "summary.persisted", hard=True)
 
     budget_view = analyze_budget(
         llm=llm,
@@ -198,6 +238,7 @@ async def _finish_prepare_generation_with_telemetry(
         clamp_margin=int(eff["clamp_margin"]),
         reserved_system_tokens=int(eff.get("reserved_system_tokens") or 0),
     ).to_dict()
+    await _yield_if_stopping(stop_ev, "budget.analyzed", hard=True)
 
     wb = _web_breakdown(telemetry.get("web", {}))
     telemetry.setdefault("web", {})["breakdown"] = wb
@@ -213,6 +254,7 @@ async def _finish_prepare_generation_with_telemetry(
     out_budget, input_tokens_est = clamp_out_budget(
         llm=llm, messages=packed, requested_out=out_budget_adj, margin=int(eff["clamp_margin"])
     )
+    await _yield_if_stopping(stop_ev, "budget.clamped", hard=True)
 
     budget_view.setdefault("request", {})
     budget_view["request"]["outBudgetRequested"] = out_budget_adj

@@ -1,3 +1,5 @@
+import { getAuth } from "firebase/auth"; 
+
 export const API_BASE = (import.meta.env.VITE_API_URL || "/api").trim();
 
 export function buildUrl(path: string) {
@@ -24,17 +26,32 @@ export class HttpError extends Error {
   }
 }
 
+const BYPASS = (import.meta.env.VITE_BYPASS_AUTH || "false").toLowerCase() === "true";
+
 async function buildHeaders(init: RequestInit = {}) {
   const headers = new Headers(init.headers || {});
   if (!headers.has("Accept")) headers.set("Accept", "application/json");
   if (!headers.has("Content-Type") && typeof init.body === "string") {
-    try {
-      JSON.parse(init.body);
-      headers.set("Content-Type", "application/json");
-    } catch {}
+    try { JSON.parse(init.body); headers.set("Content-Type", "application/json"); } catch {}
+  }
+  if (!headers.has("Authorization")) {
+    if (BYPASS) {
+      headers.set("Authorization", "Bearer dev-local");
+    } else {
+      try {
+        const u = getAuth().currentUser;
+        if (u) {
+          const tok = await u.getIdToken(false);
+          if (tok) headers.set("Authorization", `Bearer ${tok}`);
+        }
+      } catch {}
+    }
   }
   return headers;
 }
+
+
+
 
 async function doFetch(
   path: string,
@@ -49,7 +66,7 @@ async function doFetch(
       ...init,
       headers,
       // cookies for same-origin calls; still fine if API_BASE is absolute
-      credentials: "same-origin",
+      credentials: "include",
       signal: controller.signal,
     });
     return res;

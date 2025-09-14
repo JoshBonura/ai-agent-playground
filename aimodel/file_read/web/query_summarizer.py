@@ -1,6 +1,7 @@
 # aimodel/file_read/web/query_summarizer.py
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any
@@ -24,9 +25,18 @@ def _as_list(v) -> list:
     return [v]
 
 
-def summarize_query(llm: Any, user_text: str) -> tuple[str, dict[str, Any]]:
+def summarize_query(
+    llm: Any,
+    user_text: str,
+    *,
+    stop_ev: asyncio.Event | None = None,
+) -> tuple[str, dict[str, Any]]:
     telemetry: dict[str, Any] = {}
     txt = (user_text or "").strip()
+
+    if stop_ev and stop_ev.is_set():
+        telemetry["cancelledAt"] = "start"
+        return txt, telemetry
 
     bypass_enabled = SETTINGS.get("query_sum_bypass_short_enabled")
     short_chars = SETTINGS.get("query_sum_short_max_chars")
@@ -54,6 +64,10 @@ def summarize_query(llm: Any, user_text: str) -> tuple[str, dict[str, Any]]:
             params["stop"] = [str(s) for s in stops if isinstance(s, str)]
         params["stream"] = False
 
+        if stop_ev and stop_ev.is_set():
+            telemetry["cancelledAt"] = "before_llm"
+            return txt, telemetry
+
         t_start = time.perf_counter()
         out = llm.create_chat_completion(
             messages=[{"role": "user", "content": prompt.format(text=txt)}],
@@ -74,6 +88,10 @@ def summarize_query(llm: Any, user_text: str) -> tuple[str, dict[str, Any]]:
             }
         )
     else:
+        return txt, telemetry
+
+    if stop_ev and stop_ev.is_set():
+        telemetry["cancelledAt"] = "after_llm"
         return txt, telemetry
 
     overlap_enabled = SETTINGS.get("query_sum_overlap_check_enabled")

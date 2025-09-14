@@ -26,6 +26,7 @@ export function uploadRagWithProgress(
     const xhr = new XMLHttpRequest();
     const url = `${API_BASE}/api/rag/upload`.replace(/([^:]\/)\/+/g, "$1");
     xhr.open("POST", url);
+    xhr.withCredentials = true;
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable)

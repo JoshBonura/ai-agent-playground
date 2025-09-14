@@ -6,10 +6,11 @@ import { useAuth } from "../auth/AuthContext";
 import UpgradeSection from "../components/Settings/UpgradeSection";
 import AdminBanner from "./AdminBanner";
 import AdminManagement from "./AdminManagement";
-import AdminScopeToggle from "./AdminScopeToggle";
-import AdminGuestToggle from "./AdminScopeToggle";
+import AdminScopeToggle from "./Settings/AdminScopeToggle";
+import AdminGuestToggle from "./Settings/AdminGuestToggle";
 import { getAdminState } from "../api/admins";
 import type { AdminState } from "../api/admins";
+import AdminDeviceManager from "./Settings/AdminDeviceManager"
 
 type Tab =
   | "general"
@@ -232,25 +233,25 @@ export default function SettingsPanel({
 
             {tab === "admin" && (
               <div className="space-y-6">
-                {/* If no admin yet (and caller has Pro), show claim banner */}
                 <AdminBanner />
-
-                {/* Shows status; only reveals admin-only bits when isAdmin */}
                 <AdminManagement />
-
-                {/* Admin-only UI prefs */}
                 <Section title="Admin controls">
                   <div className="text-xs text-gray-600 mb-2">
                     Choose whether your sidebar shows only your chats or all
                     users’ chats (admins only).
                   </div>
                   <AdminScopeToggle />
-
-                  {/* Guest access toggle (admins only; component hides itself otherwise) */}
                   <div className="mt-3">
                     <AdminGuestToggle />
                   </div>
                 </Section>
+                <Section title="Pro device access">
+                    <div className="text-xs text-gray-600 mb-2">
+                      Manage which machines are activated to use Pro. Revoking the current device
+                      will immediately switch this app to Free.
+                    </div>
+                    <AdminDeviceManager />
+                  </Section>
               </div>
             )}
 

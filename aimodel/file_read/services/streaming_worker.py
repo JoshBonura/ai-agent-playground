@@ -3,19 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
-
-from ..core.logging import get_logger
-
-log = get_logger(__name__)
 from collections.abc import AsyncGenerator
 
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
-from ..utils.streaming import (RUNJSON_END, RUNJSON_START, build_run_json,
-                               collect_engine_timings, watch_disconnect)
+from ..utils.streaming import (
+    RUNJSON_END,
+    RUNJSON_START,
+    build_run_json,
+    collect_engine_timings,
+    watch_disconnect,
+)
 
-log = logging.getLogger("aimodel.api.generate")
+log = get_logger(__name__)
 
 
 async def run_stream(
@@ -30,9 +31,24 @@ async def run_stream(
     input_tokens_est: int | None,
     t0_request: float | None = None,
     budget_view: dict | None = None,
+    emit_stats: bool = True,
 ) -> AsyncGenerator[bytes, None]:
+    """
+    Thread-safe async streamer:
+      - Runs the model's streaming call in a background thread
+      - Bridges data into an asyncio.Queue using run_coroutine_threadsafe
+      - Yields bytes to the client
+    """
+    loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
+
+    # Bridge puts from the producer thread into the event loop queue safely.
+    def put_sync(item) -> None:
+        timeout = getattr(SETTINGS, "stream_queue_thread_put_timeout_sec", 30)
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        # Block the producer thread until the item is enqueued (bounded by timeout)
+        fut.result(timeout=timeout)
 
     def produce():
         t_start = t0_request or time.perf_counter()
@@ -45,6 +61,7 @@ async def run_stream(
         stage: dict = {"queueWaitSec": None, "genSec": None}
 
         try:
+            # Create the model stream (may block; done in this worker thread)
             try:
                 t_call = time.perf_counter()
                 stream = llm.create_chat_completion(
@@ -58,13 +75,15 @@ async def run_stream(
                     stop=SETTINGS.stream_stop_strings,
                 )
             except ValueError as ve:
+                # Retry with fewer tokens on context overflow
                 if "exceed context window" in str(ve).lower():
                     retry_tokens = max(
                         SETTINGS.stream_retry_min_tokens,
                         int(out_budget * SETTINGS.stream_retry_fraction),
                     )
                     log.warning(
-                        "generate: context overflow, retrying with max_tokens=%d", retry_tokens
+                        "generate: context overflow, retrying with max_tokens=%d",
+                        retry_tokens,
                     )
                     stream = llm.create_chat_completion(
                         messages=messages,
@@ -100,18 +119,19 @@ async def run_stream(
                 t_last = now
                 out_parts.append(piece)
 
+                # Backpressure: block briefly if queue is full, until we can put
                 while not stop_ev.is_set():
                     try:
-                        q.put_nowait(piece)
+                        put_sync(piece)
                         break
-                    except asyncio.QueueFull:
+                    except Exception:
                         time.sleep(SETTINGS.stream_backpressure_sleep_sec)
 
         except Exception as e:
             err_text = str(e)
             log.exception("generate: llm stream error: %s", e)
             try:
-                q.put_nowait(f"[aimodel] error: {e}")
+                put_sync(f"[aimodel] error: {e}")
             except Exception:
                 pass
         finally:
@@ -140,6 +160,7 @@ async def run_stream(
                 if engine:
                     stage["engine"] = engine
 
+                # Populate budget_view breakdown (TTFT attribution)
                 if isinstance(budget_view, dict):
 
                     def _fnum(x) -> float:
@@ -148,8 +169,7 @@ async def run_stream(
                         except Exception:
                             return 0.0
 
-                    ttft_raw = stage.get("ttftSec")
-                    ttft_val = _fnum(ttft_raw)
+                    ttft_val = _fnum(stage.get("ttftSec"))
 
                     pack = budget_view.get("pack") or {}
                     rag = budget_view.get("rag") or {}
@@ -194,16 +214,16 @@ async def run_stream(
                         + prep_sec
                         + model_queue
                     )
-                    unattr_ttft = ttft_val - pre_accounted
-                    if unattr_ttft < 0.0:
-                        unattr_ttft = 0.0
+                    unattributed = ttft_val - pre_accounted
+                    if unattributed < 0.0:
+                        unattributed = 0.0
 
                     budget_view.setdefault("breakdown", {})
                     budget_view["breakdown"].update(
                         {
                             "ttftSec": ttft_val,
                             "preTtftAccountedSec": round(pre_accounted, 6),
-                            "unattributedTtftSec": round(unattr_ttft, 6),
+                            "unattributedTtftSec": round(unattributed, 6),
                         }
                     )
 
@@ -224,8 +244,8 @@ async def run_stream(
                     extra_timings=stage,
                     error_text=err_text,
                 )
-                if SETTINGS.runjson_emit:
-                    q.put_nowait(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
+                if SETTINGS.runjson_emit and emit_stats:
+                    put_sync(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
             except Exception:
                 pass
             finally:
@@ -234,7 +254,7 @@ async def run_stream(
                 except Exception:
                     pass
                 try:
-                    q.put_nowait(SENTINEL)
+                    put_sync(SENTINEL)
                 except Exception:
                     pass
 

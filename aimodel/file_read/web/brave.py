@@ -7,6 +7,7 @@ import hashlib
 import time
 import urllib.parse
 from typing import Any
+import asyncio
 
 from ..core.http import get_client
 from ..core.settings import SETTINGS
@@ -69,10 +70,18 @@ class BraveProvider:
         k: int = 3,
         telemetry: dict[str, Any] | None = None,
         xid: str | None = None,
+        stop_ev: asyncio.Event | None = None,
     ) -> list[SearchHit]:
         t_start = time.perf_counter()
         eff = SETTINGS.effective()
         q_norm = (query or "").strip()
+
+        # fast-cancel
+        if stop_ev is not None and stop_ev.is_set():
+            if telemetry is not None:
+                telemetry.update({"query": q_norm, "k": int(k), "supersetK": int(k), "cancelled": True})
+            return []
+
         if not q_norm:
             if telemetry is not None:
                 telemetry.update(
@@ -103,16 +112,20 @@ class BraveProvider:
             "elapsedSec": round(time.perf_counter() - t_cache, 6),
         }
         if cached is not None:
-            log.debug(
-                "BRAVE cache hit",
-                {"query": q_norm, "k": k, "base": brave_base, "keyHash": key_hash},
-            )
-            out = cached[:k]
-            _set_hits_telemetry(tel, cached, out)
-            tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
             if telemetry is not None:
+                out = cached[:k]
+                _set_hits_telemetry(tel, cached, out)
+                tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
                 telemetry.update(tel)
-            return out
+            return cached[:k]
+
+        # fast-cancel before network
+        if stop_ev is not None and stop_ev.is_set():
+            if telemetry is not None:
+                tel["cancelled"] = True
+                tel["elapsedSec"] = round(time.perf_counter() - t_start, 6)
+                telemetry.update(tel)
+            return []
 
         hits: list[SearchHit] = []
         prov_info: dict[str, Any] = {"available": True}
@@ -133,6 +146,7 @@ class BraveProvider:
                 timeout = float(eff.get("web_fetch_timeout_sec", 8))
                 log.debug("BRAVE call", {"url": url, "timeoutSec": timeout})
                 client = await get_client()
+                # if cancel triggers here, asyncio.CancelledError will bubble up
                 r = await client.get(url, headers=headers, timeout=timeout, follow_redirects=True)
                 log.debug(
                     "BRAVE resp",
@@ -173,9 +187,6 @@ class BraveProvider:
                 prov_info["errorMsg"] = None
 
             except Exception as e:
-                # Keep your non-fatal provider error path with structured info
-                # (We don't raise; we record and return whatever we could gather.)
-                # If you'd prefer to fail hard, you could raise ExternalServiceError here.
                 log.debug("BRAVE exception", {"type": type(e).__name__, "msg": str(e)})
                 prov_info["errorType"] = type(e).__name__
                 prov_info["errorMsg"] = str(e)

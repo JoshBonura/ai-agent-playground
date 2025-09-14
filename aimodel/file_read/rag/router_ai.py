@@ -16,6 +16,7 @@ log = get_logger(__name__)
 
 def _dbg(msg: str):
     log.info(f"[RAG ROUTER] {msg}")
+    print(f"[RAG ROUTER] {msg}")
 
 
 def _force_json_strict(s: str) -> dict:
@@ -23,6 +24,7 @@ def _force_json_strict(s: str) -> dict:
         return {}
     try:
         v = json.loads(s)
+        print("[_force_json_strict] parsed raw JSON")
         return v if isinstance(v, dict) else {}
     except Exception:
         pass
@@ -33,9 +35,11 @@ def _force_json_strict(s: str) -> dict:
             if m:
                 cand = m.group(0)
                 v = json.loads(cand)
+                print("[_force_json_strict] parsed with regex extract")
                 return v if isinstance(v, dict) else {}
         except Exception:
             pass
+    print("[_force_json_strict] failed to parse JSON")
     return {}
 
 
@@ -58,14 +62,18 @@ def _strip_wrappers(text: str) -> str:
                     break
                 out.append(ln)
             core = " ".join(" ".join(out).split())
+            print(f"[_strip_wrappers] stripped text={core[:100]!r}")
             return core if core else t
         except Exception:
             return head
+    print(f"[_strip_wrappers] head={head[:100]!r}")
     return head
 
 
 def _normalize_keys(d: dict) -> dict:
-    return {str(k).strip().strip('"').strip("'").strip().lower(): v for k, v in d.items()}
+    nd = {str(k).strip().strip('"').strip("'").strip().lower(): v for k, v in d.items()}
+    print(f"[_normalize_keys] keys={list(nd.keys())}")
+    return nd
 
 
 def _as_bool(v) -> bool | None:
@@ -83,6 +91,7 @@ def _as_bool(v) -> bool | None:
 def decide_rag(llm: Any, user_text: str) -> tuple[bool, str | None]:
     try:
         if not user_text or not user_text.strip():
+            print("[decide_rag] empty user_text")
             return (False, None)
         core_text = _strip_wrappers(user_text.strip())
         prompt_tpl = SETTINGS.get("router_rag_decide_prompt")
@@ -97,6 +106,7 @@ def decide_rag(llm: Any, user_text: str) -> tuple[bool, str | None]:
             the_prompt = Template(prompt_tpl).safe_substitute(text=core_text)
         else:
             the_prompt = prompt_tpl.format(text=core_text)
+        print(f"[decide_rag] the_prompt={the_prompt[:120]!r}")
         params = {
             "max_tokens": SETTINGS.get("router_rag_decide_max_tokens"),
             "temperature": SETTINGS.get("router_rag_decide_temperature"),
@@ -107,11 +117,14 @@ def decide_rag(llm: Any, user_text: str) -> tuple[bool, str | None]:
         if isinstance(stop_list, list) and stop_list:
             params["stop"] = stop_list
         params = {k: v for k, v in params.items() if v is not None}
+        print(f"[decide_rag] params={params}")
         raw = llm.create_chat_completion(
             messages=[{"role": "user", "content": the_prompt}], **params
         )
         text_out = (raw.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        print(f"[decide_rag] raw llm output={text_out[:200]!r}")
         data = _force_json_strict(text_out)
+        print(f"[decide_rag] parsed data={data}")
         if not isinstance(data, dict):
             need_default = SETTINGS.get("router_rag_default_need_when_invalid")
             return (bool(need_default) if isinstance(need_default, bool) else False, None)
@@ -120,14 +133,17 @@ def decide_rag(llm: Any, user_text: str) -> tuple[bool, str | None]:
         need_bool = _as_bool(need_raw) if not isinstance(need_raw, bool) else need_raw
         if need_bool is None:
             need_default = SETTINGS.get("router_rag_default_need_when_invalid")
+            print("[decide_rag] invalid need, using default")
             return (bool(need_default) if isinstance(need_default, bool) else False, None)
         need = bool(need_bool)
         if not need:
+            print("[decide_rag] need=False, returning early")
             return (False, None)
         query_field = data.get("query", "")
         query_clean = _strip_wrappers(str(query_field or "").strip())
         if not query_clean:
             query_clean = core_text[:512]
+        print(f"[decide_rag] final query={query_clean[:120]!r}")
         return (True, query_clean)
     except Exception as e:
         _dbg(f"FATAL {type(e).__name__}: {e}")

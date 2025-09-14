@@ -1,4 +1,3 @@
-// frontend/src/file_read/components/ChatComposer.tsx
 import { useEffect, useRef, useState } from "react";
 import ComposerActions from "./Composer/ComposerActions";
 import AttachmentChip from "./Composer/AttachmentChip";
@@ -85,12 +84,20 @@ export default function ChatComposer({
   const handleSendClick = async () => {
     const v = draft.trim();
     if (loading || queued || (!v && !anyReady) || anyUploading) return;
+
+    // 🔹 Capture attachments BEFORE we clear/reset
+    const toPost = attachmentsForPost();
+
+    // keep your scroll event semantics
     forceScroll("auto");
+
+    // Optimistic clear of the textbox + chip UI
     setDraft("");
     setInput("");
     reset();
+
     try {
-      await onSend(v, attachmentsForPost());
+      await onSend(v, toPost);
     } finally {
       onRefreshChats?.();
       requestAnimationFrame(() => forceScroll("smooth"));
@@ -104,9 +111,7 @@ export default function ChatComposer({
 
   const pickFile = () => fileRef.current?.click();
 
-  const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (
-    e,
-  ) => {
+  const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     if (!sessionId) {

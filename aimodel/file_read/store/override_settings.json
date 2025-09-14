@@ -1,5 +1,5 @@
 {
-  "brave_api_key": "",
+  "brave_api_key": "BSAJsnvyOOOULDffIM8myC1IUk34u-d",
   "web_search_provider": "brave",
   "brave_worker_url": "",
   "brave_api_key_present": true,
@@ -16,7 +16,11 @@
   "llm_summary_max_tokens": 60,
   "llm_summary_temperature": 0,
   "llm_summary_top_p": 1,
-  "llm_summary_stop": ["\n\n", "\n\n- ", "\n\n\n"],
+  "llm_summary_stop": [
+    "\n\n",
+    "\n\n- ",
+    "\n\n\n"
+  ],
   "summary_sys_inst": "Summarize ONLY as 3–5 ultra-terse bullets. No greetings, no chit-chat, no meta, no apologies. Keep facts, questions, decisions, actions. Max 12 words per bullet. Output bullets starting with '- '.",
   "summary_user_prefix": "Summarize the following conversation slice.\n\n",
   "summary_user_suffix": "\n\nOutput:\n- ",
@@ -152,16 +156,24 @@
   "query_sum_max_tokens": 24,
   "query_sum_temperature": 0,
   "query_sum_top_p": 1,
-  "query_sum_stop": ["\n", "</s>"],
+  "query_sum_stop": [
+    "\n",
+    "</s>"
+  ],
   "query_sum_overlap_check_enabled": true,
   "query_sum_overlap_jaccard_min": 0.6,
   "__comment_router_decider": "=== Web Router (LLM-based) ===",
   "router_decide_max_tokens": 64,
   "router_decide_temperature": 0,
   "router_decide_top_p": 1,
-  "router_decide_stop": ["</s>"],
+  "router_decide_stop": [
+    "</s>"
+  ],
   "__comment_router_control": "=== Router parsing & overrides ===",
-  "router_explicit_prefixes": ["web:", "search:"],
+  "router_explicit_prefixes": [
+    "web:",
+    "search:"
+  ],
   "router_default_need_when_invalid": true,
   "router_json_extract_regex": "\\{.*?\\}",
   "__comment_router_wrappers": "=== Router wrapper stripping ===",
@@ -190,7 +202,10 @@
   "retitle_llm_max_tokens": 12,
   "retitle_llm_temperature": 0.1,
   "retitle_llm_top_p": 1,
-  "retitle_llm_stop": ["\n", "."],
+  "retitle_llm_stop": [
+    "\n",
+    "."
+  ],
   "retitle_enable_sanitize": true,
   "retitle_sanitize_drop_prefix_regex": "^\\s*(\\\"[^\\\"]*\\\"|'[^']*'|[-*•]+|\\d+\\.)\\s*",
   "retitle_sanitize_strip_quotes": true,
@@ -201,7 +216,7 @@
   "retitle_min_user_chars": 15,
   "retitle_llm_hard_prefix": "You generate a concise chat title.\nReturn ONLY a short noun phrase (no verbs, no 'how to', no 'to ...'). No trailing punctuation. Max 6 words.",
   "__comment_rag": "=== Local RAG ===",
-  "default_auto_rag": false,
+  "default_auto_rag": true,
   "disable_web_on_attachments": true,
   "disable_global_rag_on_attachments": true,
   "attachments_retrieve_top_k": 6,
@@ -234,7 +249,9 @@
   "stream_repeat_penalty": 1.25,
   "stream_retry_min_tokens": 48,
   "stream_retry_fraction": 0.4,
-  "stream_stop_strings": ["\n⏹ stopped\n"],
+  "stream_stop_strings": [
+    "\n⏹ stopped\n"
+  ],
   "stream_emit_stopped_line": true,
   "stream_producer_join_timeout_sec": 2,
   "runjson_emit": true,
@@ -264,7 +281,9 @@
   "router_rag_decide_max_tokens": 300,
   "router_rag_decide_temperature": 0,
   "router_rag_decide_top_p": 1,
-  "router_rag_decide_stop": ["\n\n"],
+  "router_rag_decide_stop": [
+    "\n\n"
+  ],
   "router_rag_default_need_when_invalid": false,
   "csv_value_max_chars": 160,
   "csv_quote_strings": true,

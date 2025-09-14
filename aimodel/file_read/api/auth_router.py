@@ -12,7 +12,7 @@ from ..deps.auth_deps import require_auth
 from ..services.auth_service import (firebase_sign_in_with_password,
                                      firebase_sign_up_with_password,
                                      verify_jwt_with_google)
-from ..services.licensing_service import license_status_local, recover_by_email
+from ..services.licensing_core import license_status_local, recover_by_email
 
 router = APIRouter(prefix="/api")
 

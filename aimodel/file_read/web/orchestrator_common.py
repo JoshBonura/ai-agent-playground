@@ -1,9 +1,9 @@
-# aimodel/file_read/web/orchestrator_common.py
 from __future__ import annotations
 
 import re
 from typing import Any
 from urllib.parse import urlparse
+import asyncio
 
 from ..core.logging import get_logger
 from ..core.settings import SETTINGS
@@ -51,7 +51,6 @@ def _head_tail(text: str, max_chars: int) -> str:
         return clean_ws(t)
 
     ellipsis = _as_str("web_orch_ellipsis")
-    # 40% head, 20% middle, 40% tail (generic)
     reserve = len(ellipsis) * 2
     avail = max(0, max_chars - reserve)
     if avail <= 0:
@@ -62,20 +61,16 @@ def _head_tail(text: str, max_chars: int) -> str:
     tail_len = max(1, avail - head_len - mid_len)
 
     n = len(t)
-    # head
     h0, h1 = 0, min(head_len, n)
     head = t[h0:h1]
 
-    # middle (centered)
     m0 = max(0, (n // 2) - (mid_len // 2))
     m1 = min(n, m0 + mid_len)
-    # ensure middle starts after head if they overlap heavily
     if m0 < h1 and (h1 + mid_len) <= n:
         m0, m1 = h1, min(n, h1 + mid_len)
     mid = t[m0:m1]
 
-    # tail
-    t0 = max(m1, n - tail_len)  # avoid overlapping mid/tail
+    t0 = max(m1, n - tail_len)
     tail = t[t0:n] if tail_len > 0 else ""
 
     return clean_ws(head + ellipsis + mid + ellipsis + tail)
@@ -173,15 +168,22 @@ async def _fetch_round(
     max_parallel: int,
     use_js: bool = False,
     telemetry: dict[str, Any] | None = None,
+    stop_ev: asyncio.Event | None = None,
 ) -> list[tuple[str, tuple[str, int, str] | None]]:
     fetch_fn = fetch_many
     if use_js:
         try:
             from . import fetch as _fetch_mod
-
             fetch_fn = getattr(_fetch_mod, "fetch_many_js", fetch_many)
         except Exception:
             fetch_fn = fetch_many
+
+    # fast-cancel before spawning requests
+    if stop_ev is not None and stop_ev.is_set():
+        if telemetry is not None:
+            telemetry.update({"cancelled": True})
+        return [(u, None) for u in urls]
+
     cap_mult = _as_float("web_orch_fetch_cap_multiplier")
     per_doc_budget = _as_int("web_orch_per_doc_char_budget")
     fetch_max_chars = _as_int("web_fetch_max_chars")
@@ -193,5 +195,6 @@ async def _fetch_round(
         cap_chars=per_doc_cap,
         max_parallel=max_parallel,
         telemetry=telemetry,
+        # NOTE: fetch_many doesn't accept stop_ev; we short-circuit above instead
     )
     return results

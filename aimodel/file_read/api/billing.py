@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..core.http import ExternalServiceError, arequest_json
 from ..core.logging import get_logger
 from ..deps.auth_deps import require_auth as decode_bearer
-from ..services.licensing_service import license_status_local
+from ..services.licensing_core import license_status_local
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["billing"])

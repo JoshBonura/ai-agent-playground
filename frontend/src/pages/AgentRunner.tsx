@@ -1,4 +1,4 @@
-//frontend/src/file_read/pages/AgentRunner.tsx
+// frontend/src/file_read/pages/AgentRunner.tsx
 import { useEffect, useState } from "react";
 import ChatContainer from "../components/ChatContainer";
 import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
@@ -13,6 +13,11 @@ import SettingsPanel from "../components/SettingsPanel";
 import KnowledgePanel from "../components/KnowledgePanel";
 import { useAuth } from "../auth/AuthContext";
 
+// Model picker + API
+import ModelPicker from "../components/ModelPicker/ModelPicker";
+import { getModelHealth } from "../api/models";
+import type { Attachment } from "../types/chat";
+
 const LS_KEY = "lastSessionId";
 
 export default function AgentRunner() {
@@ -21,11 +26,69 @@ export default function AgentRunner() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [autoFollow, setAutoFollow] = useState(true);
   const { toast, show } = useToast();
-  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } =
-    useSidebar();
+  const { sidebarOpen, setSidebarOpen, openMobileDrawer, closeMobileDrawer } = useSidebar();
   const [showSettings, setShowSettings] = useState(false);
-  const { user, loading } = useAuth();
 
+  // LM-Studio–style model picker
+  const [showModelPicker, setShowModelPicker] = useState(false);
+
+  // Auth → refresh chat list after /auth/me resolves
+  const { user, loading } = useAuth();
+  useEffect(() => {
+    if (!loading && user) setRefreshKey((k) => k + 1);
+  }, [loading, user]);
+
+  // ---- Model health (polled) ----
+  const [health, setHealth] = useState<{ ok: boolean; loaded: boolean; config: any } | null>(null);
+  const modelLoaded = !!health?.loaded;
+  const modelName =
+    (health?.config?.config?.modelPath || health?.config?.modelPath || "")
+      .split(/[\\/]/)
+      .pop() || null;
+
+  useEffect(() => {
+    let alive = true;
+    let t: any;
+    const poll = async () => {
+      try {
+        const h = await getModelHealth(); // GET /api/models/health
+        if (alive) setHealth(h);
+      } catch {
+        if (alive) setHealth({ ok: false, loaded: false, config: null });
+      } finally {
+        t = setTimeout(poll, 4000);
+      }
+    };
+    poll();
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, []);
+
+  // Guard send if model not loaded (mirrors backend gating) — ACCEPT & FORWARD ARGUMENTS
+  async function safeSend(text?: string, attachments?: Attachment[]) {
+    if (!modelLoaded) {
+      show("Select & load a model to start chatting.");
+      setShowModelPicker(true);
+      return;
+    }
+    // prefer explicit text from composer; fallback to current input
+    const t = (text ?? chat.input ?? "").trim();
+    if (!t && !(attachments && attachments.length)) return;
+
+    try {
+      await chat.send(t, attachments);
+    } catch (e: any) {
+      const msg =
+        e?.message === "MODEL_NOT_LOADED"
+          ? "Model not loaded. Select a model to start."
+          : e?.message || "Unable to send. Is a model loaded?";
+      show(msg);
+    }
+  }
+
+  // Settings/Knowledge global events
   useEffect(() => {
     const openSettings = () => setShowSettings(true);
     const openKnowledge = () => setShowKnowledge(true);
@@ -40,12 +103,7 @@ export default function AgentRunner() {
     };
   }, []);
 
-  useEffect(() => {
-    if (loading) return; // wait for /auth/me
-    if (!user) return; // not logged in → do nothing
-    setRefreshKey((k) => k + 1); // triggers ChatSidebar → useChatsPager.refreshFirst()
-  }, [loading, user]);
-
+  // ----- Chat helpers -----
   async function newChat(): Promise<void> {
     const id = crypto.randomUUID();
     chat.setSessionId(id);
@@ -77,23 +135,6 @@ export default function AgentRunner() {
     if (el) el.scrollTop = el.scrollHeight;
   }
 
-  async function handleCancelSessions(ids: string[]) {
-    if (!ids?.length) return;
-    const currentId = chat.sessionIdRef.current || "";
-    const deletingActive = currentId && ids.includes(currentId);
-    if (deletingActive) {
-      chat.setSessionId("");
-      chat.setInput("");
-      chat.clearMetrics?.();
-      chat.reset();
-      localStorage.removeItem(LS_KEY);
-    }
-    setRefreshKey((k) => k + 1);
-    try {
-      window.dispatchEvent(new CustomEvent("chats:refresh"));
-    } catch {}
-  }
-
   async function refreshPreserve() {
     const sid = chat.sessionIdRef.current;
     if (!sid) return;
@@ -109,6 +150,23 @@ export default function AgentRunner() {
       }
       setAutoFollow(true);
     });
+  }
+
+  async function handleCancelSessions(ids: string[]) {
+    if (!ids?.length) return;
+    const currentId = chat.sessionIdRef.current || "";
+    const deletingActive = currentId && ids.includes(currentId);
+    if (deletingActive) {
+      chat.setSessionId("");
+      chat.setInput("");
+      chat.clearMetrics?.();
+      chat.reset();
+      localStorage.removeItem(LS_KEY);
+    }
+    setRefreshKey((k) => k + 1);
+    try {
+      window.dispatchEvent(new CustomEvent("chats:refresh"));
+    } catch {}
   }
 
   async function handleDeleteMessages(clientIds: string[]) {
@@ -169,7 +227,38 @@ export default function AgentRunner() {
         <DesktopHeader
           sidebarOpen={sidebarOpen}
           onShowSidebar={() => setSidebarOpen(true)}
+          modelLoaded={modelLoaded}
+          modelName={modelName}
+          busy={false}
+          onOpenModelPicker={() => setShowModelPicker(true)}
+          onEjectModel={async () => {
+            try {
+              await fetch("/api/models/unload", { method: "POST", credentials: "include" });
+              setHealth((h) =>
+                h ? { ...h, loaded: false } : { ok: true, loaded: false, config: null },
+              );
+            } catch {
+              show("Failed to unload model");
+            }
+          }}
         />
+
+        {!modelLoaded && (
+          <div className="px-3 md:px-6 mt-2">
+            <div className="mx-auto max-w-3xl md:max-w-4xl">
+              <div className="rounded-lg border bg-amber-50 text-amber-900 text-sm px-3 py-2">
+                No model is loaded. Click{" "}
+                <button
+                  className="ml-1 inline-flex items-center text-xs px-2 py-1 rounded border hover:bg-amber-100"
+                  onClick={() => setShowModelPicker(true)}
+                >
+                  Select a model to load
+                </button>{" "}
+                to start chatting.
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="flex-1 min-h-0">
           <div className="h-full px-3 md:px-6">
@@ -181,7 +270,7 @@ export default function AgentRunner() {
                   setInput={chat.setInput}
                   loading={chat.loading}
                   queued={chat.queued}
-                  send={chat.send}
+                  send={safeSend}               
                   stop={chat.stop}
                   runMetrics={chat.runMetrics}
                   runJson={chat.runJson}
@@ -196,6 +285,19 @@ export default function AgentRunner() {
           </div>
         </div>
       </div>
+
+      {showModelPicker && (
+        <ModelPicker
+          open={showModelPicker}
+          onClose={() => setShowModelPicker(false)}
+          onLoaded={async () => {
+            try {
+              const h = await getModelHealth();
+              setHealth(h);
+            } catch {}
+          }}
+        />
+      )}
 
       {showSettings && (
         <SettingsPanel

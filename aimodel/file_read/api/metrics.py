@@ -1,7 +1,8 @@
 # aimodel/file_read/api/metrics.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends, HTTPException
+from ..deps.license_deps import is_request_pro_activated
 
 from ..core.logging import get_logger
 from ..core.settings import SETTINGS
@@ -12,8 +13,17 @@ from ..store import get_summary, list_messages, set_summary
 
 log = get_logger(__name__)
 
-router = APIRouter(prefix="/metrics", tags=["metrics"])
 
+def _require_pro_activation():
+    if not is_request_pro_activated():
+        raise HTTPException(status_code=403, detail="Pro + Activation required")
+
+
+router = APIRouter(
+    prefix="/metrics",
+    tags=["metrics"],
+    dependencies=[Depends(_require_pro_activation)],
+)
 
 @router.get("/budget")
 def get_budget(sessionId: str | None = Query(default=None), maxTokens: int | None = None):

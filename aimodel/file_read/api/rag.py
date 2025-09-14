@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 from ..core.logging import get_logger
-
 log = get_logger(__name__)
-from threading import RLock
 
+from threading import RLock
 import numpy as np
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends, Request
 from sentence_transformers import SentenceTransformer
 
+from ..deps.license_deps import require_personal_pro_activated
 from ..rag.ingest import build_metas, chunk_text, sniff_and_extract
 from ..rag.schemas import SearchHit, SearchReq
 from ..rag.store import add_vectors, search_vectors
 from ..rag.uploads import hard_delete_source
 from ..rag.uploads import list_sources as rag_list_sources
 
-router = APIRouter(prefix="/api/rag", tags=["rag"])
+router = APIRouter(
+    prefix="/api/rag",
+    tags=["rag"],
+    dependencies=[Depends(require_personal_pro_activated)],  # Pro + Activation, no admin
+)
+
 _st_model: SentenceTransformer | None = None
 _st_lock = RLock()
 
@@ -37,28 +42,61 @@ def _embed(texts: list[str]) -> np.ndarray:
     return arr.astype("float32")
 
 
+# --------------------------------------------------------------------
+# Upload
+# --------------------------------------------------------------------
 @router.post("/upload")
-async def upload_doc(sessionId: str | None = Form(default=None), file: UploadFile = File(...)):
+async def upload_doc(
+    request: Request,
+    sessionId: str | None = Form(default=None),
+    file: UploadFile = File(...),
+):
+    # Entry log (helps prove the request actually reached this handler)
     log.info(
-        f"[RAG UPLOAD] sessionId={sessionId}, filename={file.filename}, content_type={file.content_type}"
+        "[RAG UPLOAD] entered handler method=%s path=%s ct=%s",
+        request.method,
+        request.url.path,
+        request.headers.get("content-type"),
+    )
+
+    log.info(
+        "[RAG UPLOAD] sessionId=%s, filename=%s, content_type=%s",
+        sessionId,
+        getattr(file, "filename", None),
+        getattr(file, "content_type", None),
     )
     data = await file.read()
-    log.info(f"[RAG UPLOAD] file size={len(data)} bytes")
+    log.info("[RAG UPLOAD] file size=%d bytes", len(data))
     text, mime = sniff_and_extract(file.filename, data)
-    log.info(f"[RAG UPLOAD] extracted mime={mime}, text_len={len(text)}")
+    log.info("[RAG UPLOAD] extracted mime=%s, text_len=%d", mime, len(text))
     if not text.strip():
         raise HTTPException(status_code=400, detail="Empty/unsupported file")
     chunks = chunk_text(text, {"mime": mime})
-    log.info(f"[RAG UPLOAD] chunk_count={len(chunks)}")
+    log.info("[RAG UPLOAD] chunk_count=%d", len(chunks))
     metas = build_metas(sessionId, file.filename, chunks, size=len(data))
     embeds = _embed([c.text for c in chunks])
-    log.info(f"[RAG UPLOAD] embed_shape={embeds.shape}")
+    log.info("[RAG UPLOAD] embed_shape=%s", getattr(embeds, "shape", None))
     add_vectors(sessionId, embeds, metas, dim=embeds.shape[1])
+    log.info("[RAG UPLOAD] done added=%d", len(chunks))
     return {"ok": True, "added": len(chunks)}
 
 
+# Optional: respond to OPTIONS explicitly (useful if CORS preflight is involved)
+@router.options("/upload")
+async def options_upload():
+    return {}
+
+
+# --------------------------------------------------------------------
+# Search
+# --------------------------------------------------------------------
 @router.post("/search")
-async def search(req: SearchReq):
+async def search(req: SearchReq, request: Request):
+    log.info(
+        "[RAG SEARCH] entered handler method=%s path=%s",
+        request.method,
+        request.url.path,
+    )
     q = (req.query or "").strip()
     if not q:
         return {"hits": []}
@@ -81,8 +119,19 @@ async def search(req: SearchReq):
     return {"hits": [h.model_dump() for h in out]}
 
 
+# --------------------------------------------------------------------
+# List / Dump
+# --------------------------------------------------------------------
 @router.get("/list")
-async def list_items(sessionId: str | None = None, k: int = 20):
+async def list_items(sessionId: str | None = None, k: int = 20, request: Request = None):
+    if request is not None:
+        log.info(
+            "[RAG LIST] entered handler method=%s path=%s sessionId=%s k=%d",
+            request.method,
+            request.url.path,
+            sessionId,
+            k,
+        )
     qv = _embed(["list"])[0]
     hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
     items = []
@@ -98,12 +147,20 @@ async def list_items(sessionId: str | None = None, k: int = 20):
                 "text": txt,
             }
         )
-    log.info(f"[RAG LIST] sessionId={sessionId} k={k} -> {len(items)} items")
+    log.info("[RAG LIST] sessionId=%s k=%d -> %d items", sessionId, k, len(items))
     return {"items": items}
 
 
 @router.get("/dump")
-async def dump_items(sessionId: str | None = None, k: int = 50):
+async def dump_items(sessionId: str | None = None, k: int = 50, request: Request = None):
+    if request is not None:
+        log.info(
+            "[RAG DUMP] entered handler method=%s path=%s sessionId=%s k=%d",
+            request.method,
+            request.url.path,
+            sessionId,
+            k,
+        )
     qv = _embed(["dump"])[0]
     hits = search_vectors(sessionId, qv, topk=k, dim=qv.shape[0])
     chunks = []
@@ -118,21 +175,54 @@ async def dump_items(sessionId: str | None = None, k: int = 50):
                 "text": h.get("text") or "",
             }
         )
-    log.info(f"[RAG DUMP] sessionId={sessionId} k={k} -> {len(chunks)} items")
+    log.info("[RAG DUMP] sessionId=%s k=%d -> %d items", sessionId, k, len(chunks))
     return {"chunks": chunks}
 
 
+# --------------------------------------------------------------------
+# Uploads index / delete
+# --------------------------------------------------------------------
 @router.get("/uploads")
-async def api_list_uploads(sessionId: str | None = None, scope: str = "all"):
+async def api_list_uploads(sessionId: str | None = None, scope: str = "all", request: Request = None):
+    if request is not None:
+        log.info(
+            "[RAG UPLOADS LIST] entered handler method=%s path=%s sessionId=%s scope=%s",
+            request.method,
+            request.url.path,
+            sessionId,
+            scope,
+        )
     include_global = scope != "session"
     return {"uploads": rag_list_sources(sessionId, include_global=include_global)}
 
 
+@router.options("/uploads")
+async def options_uploads():
+    return {}
+
+
 @router.post("/uploads/delete-hard")
-async def api_delete_upload_hard(body: dict[str, str]):
+async def api_delete_upload_hard(body: dict[str, str], request: Request):
+    log.info(
+        "[RAG UPLOADS DELETE] entered handler method=%s path=%s",
+        request.method,
+        request.url.path,
+    )
     source = (body.get("source") or "").strip()
     session_id = body.get("sessionId") or None
     if not source:
         return {"error": "source required"}
     out = hard_delete_source(source, session_id=session_id, embedder=_embed)
     return out
+
+
+# --------------------------------------------------------------------
+# Debug: list the routes this router actually registered
+# --------------------------------------------------------------------
+try:
+    for r in router.routes:
+        methods = sorted(list(getattr(r, "methods", []) or []))
+        path = getattr(r, "path", "")
+        log.info("[RAG ROUTER] registered %s %s", methods, path)
+except Exception as e:
+    log.error("[RAG ROUTER] failed to list router routes: %r", e)

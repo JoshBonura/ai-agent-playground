@@ -6,6 +6,7 @@ log = get_logger(__name__)
 import time
 from collections import defaultdict
 from typing import Any
+import asyncio
 
 from ..core.request_ctx import get_x_id
 from .brave import BraveProvider
@@ -17,9 +18,18 @@ from .provider import SearchHit
 
 
 async def build_web_block(
-    query: str, k: int | None = None, per_url_timeout_s: float | None = None
+    query: str,
+    k: int | None = None,
+    per_url_timeout_s: float | None = None,
+    stop_ev: asyncio.Event | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     tel: dict[str, Any] = {"query": (query or "").strip()}
+
+    # fast-cancel
+    if stop_ev is not None and stop_ev.is_set():
+        tel["cancelled"] = True
+        return (None, tel)
+
     cfg_k = int(k) if k is not None else _as_int("web_orch_default_k")
     total_char_budget = _as_int("web_orch_total_char_budget")
     per_doc_budget = _as_int("web_orch_per_doc_char_budget")
@@ -48,6 +58,13 @@ async def build_web_block(
     overfetch = max(cfg_k + overfetch_min_extra, int(round(cfg_k * overfetch_factor)))
     tel["search"] = {"requestedK": cfg_k, "overfetch": overfetch}
     t0 = time.perf_counter()
+
+    # cancel before search
+    if stop_ev is not None and stop_ev.is_set():
+        tel["cancelled"] = True
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return (None, tel)
+
     try:
         hits: list[SearchHit] = await provider.search(
             query, k=overfetch, telemetry=tel["search"], xid=get_x_id()
@@ -57,11 +74,19 @@ async def build_web_block(
         tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
         log.error("[web-block] (empty) due to search error: %s", tel["error"])
         return (None, tel)
+
+    # cancel after search
+    if stop_ev is not None and stop_ev.is_set():
+        tel["cancelled"] = True
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return (None, tel)
+
     tel["search"]["elapsedSecTotal"] = round(time.perf_counter() - t0, 6)
     if not hits:
         tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
         log.debug("[web-block] (empty) — no hits")
         return (None, tel)
+
     seen_urls = set()
     scored: list[tuple[int, SearchHit]] = []
     for h in hits:
@@ -83,6 +108,13 @@ async def build_web_block(
     meta = [(h.title or h.url, h.url) for h in top_hits]
     t_f = time.perf_counter()
     tel["fetch1"] = {}
+
+    # cancel before fetch
+    if stop_ev is not None and stop_ev.is_set():
+        tel["cancelled"] = True
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return (None, tel)
+
     results = await _fetch_round(
         urls,
         meta,
@@ -90,8 +122,16 @@ async def build_web_block(
         max_parallel=max_parallel,
         use_js=False,
         telemetry=tel["fetch1"],
+        stop_ev=stop_ev,
     )
     tel["fetch1"]["roundSec"] = round(time.perf_counter() - t_f, 6)
+
+    # cancel after fetch
+    if stop_ev is not None and stop_ev.is_set():
+        tel["cancelled"] = True
+        tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+        return (None, tel)
+
     texts: list[tuple[str, str, str]] = []
     quality_scores: list[float] = []
     for original_url, res in results:
@@ -107,6 +147,7 @@ async def build_web_block(
         "ok": len(texts),
         "qAvg": sum(quality_scores) / len(quality_scores) if quality_scores else 0.0,
     }
+
     try_js = False
     if enable_js_retry and quality_scores:
         avg_q = sum(quality_scores) / len(quality_scores)
@@ -126,7 +167,13 @@ async def build_web_block(
         }
     else:
         tel["jsRetry"] = {"considered": bool(enable_js_retry), "triggered": False}
+
     if try_js:
+        # cancel before JS retry
+        if stop_ev is not None and stop_ev.is_set():
+            tel["cancelled"] = True
+            tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+            return (None, tel)
         js_timeout = min(per_timeout + js_timeout_add, js_timeout_cap)
         js_parallel = max(js_min_parallel, max_parallel + js_parallel_delta)
         tel["fetch2"] = {"timeoutSec": js_timeout, "maxParallel": js_parallel}
@@ -137,7 +184,12 @@ async def build_web_block(
             max_parallel=js_parallel,
             use_js=True,
             telemetry=tel["fetch2"],
+            stop_ev=stop_ev,
         )
+        if stop_ev is not None and stop_ev.is_set():
+            tel["cancelled"] = True
+            tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+            return (None, tel)
         texts_js: list[tuple[str, str, str]] = []
         for original_url, res in results_js:
             if not res:
@@ -148,10 +200,12 @@ async def build_web_block(
                 texts_js.append((title, final_url, text))
         if texts_js:
             texts = texts_js
+
     if not texts:
         tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
         log.info("[web-block] (empty) — no fetched texts")
         return (None, tel)
+
     texts.sort(key=lambda t: content_quality_score(t[2]), reverse=True)
     by_host: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
     for title, url, text in texts:
@@ -171,6 +225,10 @@ async def build_web_block(
     used = 0
     included_hosts: list[str] = []
     for h in hosts_ordered:
+        if stop_ev is not None and stop_ev.is_set():
+            tel["cancelled"] = True
+            tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+            return (None, tel)
         title, url, text = by_host[h][0]
         chunk = condense_doc(title, url, text, max_chars=per_host_quota)
         sep_len = len(sep) if block_parts else 0
@@ -187,6 +245,10 @@ async def build_web_block(
             break
     layer = 1
     while used < available:
+        if stop_ev is not None and stop_ev.is_set():
+            tel["cancelled"] = True
+            tel["elapsedSec"] = round(time.perf_counter() - start_time, 6)
+            return (None, tel)
         added_any = False
         for h in hosts_ordered:
             if layer >= len(by_host[h]):
