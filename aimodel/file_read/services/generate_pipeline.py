@@ -9,11 +9,11 @@ from ..core.logging import get_logger
 
 log = get_logger(__name__)
 
+from ..runtime import model_runtime as MR
 from ..core.packing_memory_core import PACK_TELEMETRY
 from ..core.schemas import ChatBody
 from ..core.settings import SETTINGS
 from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
-from ..runtime import model_runtime as MR
 from ..web.router_ai import decide_web_and_fetch
 from .attachments import att_get
 from .generate_pipeline_part2 import _finish_prepare_generation_with_telemetry
@@ -38,11 +38,13 @@ async def prepare_generation_with_telemetry(
     data: ChatBody,
     stop_ev: asyncio.Event | None = None,  # injected from generate_flow
 ) -> Prep:
-    # Model readiness & handle early cancel
-    MR.ensure_ready()
-    await _yield_if_stopping(stop_ev, "ensure_ready.done", hard=True)
-
-    llm = MR.get_llm()
+    # Resolve LLM (worker patches MR.get_llm). Guard against main-process use.
+    await _yield_if_stopping(stop_ev, "pre.get_llm", hard=True)
+    try:
+        llm = MR.get_llm()
+    except Exception as e:
+        log.error("[PIPE] get_llm failed (likely called outside worker): %s", e)
+        raise
     await _yield_if_stopping(stop_ev, "get_llm.done", hard=True)
 
     t_request_start = time.perf_counter()

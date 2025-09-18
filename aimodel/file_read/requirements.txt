@@ -49,3 +49,4 @@ keyring
 
 psutil
 nvidia-ml-py3
+gguf

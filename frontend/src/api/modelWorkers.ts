@@ -1,17 +1,40 @@
 import { getJSON, postJSON } from "../services/http";
 
+export type WorkerHealth = {
+  ok: boolean; model: string; path: string;
+  n_ctx: number; n_threads: number; n_gpu_layers: number; n_batch: number;
+} | null;
+
 export type WorkerRow = {
   id: string;
   port: number;
   model_path: string;
   status: "loading" | "ready" | "stopped";
+   health?: WorkerHealth; 
 };
 
 export type InspectResp = {
   ok: boolean;
   workers: WorkerRow[];
   active: string | null;
-  // server may also include a "system" snapshot; we don't require it here
+};
+
+export type LlamaKwargs = {
+  n_ctx?: number;
+  n_threads?: number;
+  n_gpu_layers?: number;
+  n_batch?: number;
+  rope_freq_base?: number;
+  rope_freq_scale?: number;
+  // toggles
+  use_mmap?: boolean;
+  use_mlock?: boolean;
+  flash_attn?: boolean;
+  kv_offload?: boolean;
+  seed?: number;
+  // cache quantization (experimental)
+  type_k?: string; // e.g. "auto" | "f16" | "q8_0" | "q6_K" | "q4_0" ...
+  type_v?: string;
 };
 
 export async function inspectWorkers(): Promise<InspectResp> {
@@ -22,8 +45,8 @@ export async function listWorkers(): Promise<InspectResp> {
   return inspectWorkers();
 }
 
-export async function spawnWorker(modelPath: string) {
-  return postJSON("/api/model-workers/spawn", { modelPath });
+export async function spawnWorker(modelPath: string, llamaKwargs?: LlamaKwargs) {
+  return postJSON("/api/model-workers/spawn", { modelPath, llamaKwargs });
 }
 
 export async function activateWorker(id: string) {
@@ -38,7 +61,6 @@ export async function killAllWorkers() {
   return postJSON("/api/model-workers/kill-all", {});
 }
 
-// Active worker health via proxy (requires auth; your http helpers should attach it)
 export async function getActiveWorkerHealth(): Promise<any> {
   return getJSON("/api/aiw/health");
 }

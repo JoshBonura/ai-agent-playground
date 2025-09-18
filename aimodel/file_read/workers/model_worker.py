@@ -1,7 +1,7 @@
-# aimodel/file_read/workers/model_worker.py
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import socket
@@ -18,7 +18,6 @@ from ..core.logging import get_logger
 
 log = get_logger(__name__)
 
-
 @dataclass
 class WorkerInfo:
     id: str
@@ -26,9 +25,9 @@ class WorkerInfo:
     model_path: str
     process: subprocess.Popen
     status: str = "loading"  # loading | ready | stopped
-    host_bind: str = "127.0.0.1"    # where uvicorn binds
-    host_client: str = "127.0.0.1"  # where the proxy should dial
-
+    host_bind: str = "127.0.0.1"
+    host_client: str = "127.0.0.1"
+    kwargs: dict | None = None          # ← echo of llama kwargs sent to worker
 
 class ModelWorkerSupervisor:
     def __init__(self):
@@ -45,18 +44,12 @@ class ModelWorkerSupervisor:
         return port
 
     def _is_worker_ready(self, *args) -> bool:
-        """
-        Back-compat:
-          - _is_worker_ready(port)
-          - _is_worker_ready(host, port)
-        """
         if len(args) == 1:
             host, port = "127.0.0.1", args[0]
         elif len(args) == 2:
             host, port = args
         else:
             return False
-
         try:
             r = httpx.get(f"http://{host}:{port}/api/worker/health", timeout=1.0)
             if r.status_code != 200:
@@ -72,7 +65,6 @@ class ModelWorkerSupervisor:
             info = self._workers.get(wid)
             if not info:
                 return False
-            # if worker process died, bail
             if info.process and (info.process.poll() is not None):
                 return False
             if self._is_worker_ready(host, port):
@@ -92,31 +84,22 @@ class ModelWorkerSupervisor:
             return None
         return (info.host_client, info.port)
 
-    # Back-compat helper for existing code
     def get_port(self, wid: str) -> Optional[int]:
         info = self._workers.get(wid)
         return info.port if info else None
 
     def list(self) -> list[dict]:
-        """
-        Returns a JSON-serializable snapshot of known workers.
-        Also self-heals status: if a worker finished loading after
-        spawn wait, flip status to 'ready' here.
-        """
         out = []
         for w in self._workers.values():
-            # reflect process death
             if getattr(w, "process", None) and (w.process.poll() is not None):
                 w.status = "stopped"
             else:
-                # probe health to upgrade from 'loading' -> 'ready'
                 if w.status != "ready":
                     try:
                         if self._is_worker_ready(w.host_client, w.port):
                             w.status = "ready"
                     except Exception:
                         pass
-
             out.append(
                 {
                     "id": w.id,
@@ -124,26 +107,21 @@ class ModelWorkerSupervisor:
                     "model_path": w.model_path,
                     "status": w.status,
                     "pid": (w.process.pid if getattr(w, "process", None) else None),
+                    "kwargs": w.kwargs or {},
                 }
             )
         return out
 
-    # Older name some routes used
-    def list_workers(self) -> list[dict]:
-        return self.list()
-
     # ---------------------------
     # Lifecycle
     # ---------------------------
-    async def spawn_worker(self, model_path: str) -> WorkerInfo:
+    async def spawn_worker(self, model_path: str, llama_kwargs: dict | None = None) -> WorkerInfo:
         """Spawn a new worker process to serve a model."""
         host_bind = os.getenv("LM_WORKER_BIND_HOST", "127.0.0.1")
         host_client = os.getenv("LM_WORKER_CLIENT_HOST", "127.0.0.1")
 
         wid = os.urandom(4).hex()
         port = self._find_free_port(host_bind)
-
-        # repo root = parent of the 'aimodel' package dir
         repo_root = Path(__file__).resolve().parents[3]
         app_module = "aimodel.file_read.workers.worker_entry:app"
 
@@ -160,11 +138,35 @@ class ModelWorkerSupervisor:
             "--log-level",
             "info",
         ]
-        log.info(f"[workers] cwd={repo_root} cmd={' '.join(cmd)}")
-
         env = os.environ.copy()
         env["MODEL_PATH"] = model_path
         env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+
+        # Pass structured kwargs to the worker
+        cleaned = dict(llama_kwargs or {})
+        try:
+            env["LLAMA_KWARGS_JSON"] = json.dumps(cleaned)
+        except Exception:
+            env["LLAMA_KWARGS_JSON"] = "{}"
+
+        # For quick visibility in logs, also mirror some common ones as envs
+        def _mirror_int(key_json: str, key_env: str):
+            v = cleaned.get(key_json)
+            if isinstance(v, int):
+                env[key_env] = str(v)
+
+        def _mirror_float(key_json: str, key_env: str):
+            v = cleaned.get(key_json)
+            if isinstance(v, (int, float)):
+                env[key_env] = str(v)
+
+        _mirror_int("n_ctx", "N_CTX")
+        _mirror_int("n_threads", "N_THREADS")
+        _mirror_int("n_gpu_layers", "N_GPU_LAYERS")
+        _mirror_int("n_batch", "N_BATCH")
+        _mirror_float("rope_freq_base", "ROPE_FREQ_BASE")
+        _mirror_float("rope_freq_scale", "ROPE_FREQ_SCALE")
+
         debug = env.get("LM_WORKER_DEBUG", "0") == "1"
         if debug:
             cmd.extend(["--log-level", "debug"])
@@ -189,8 +191,8 @@ class ModelWorkerSupervisor:
             status="loading",
             host_bind=host_bind,
             host_client=host_client,
+            kwargs=cleaned or {},
         )
-        # register immediately so UI can show "loading"
         self._workers[wid] = info
 
         ready = await self._wait_ready(wid, host_client, port)
@@ -198,7 +200,6 @@ class ModelWorkerSupervisor:
         return info
 
     async def stop_worker(self, wid: str) -> bool:
-        """Stop a specific worker."""
         info = self._workers.get(wid)
         if not info:
             return False
@@ -213,11 +214,9 @@ class ModelWorkerSupervisor:
         except Exception as e:
             log.warning(f"[workers] error stopping {wid}: {e}")
         info.status = "stopped"
-        # leave record so UI can show it as stopped; caller can prune if desired
         return True
 
     async def stop_all(self) -> int:
-        """Stop all workers."""
         n = 0
         for wid in list(self._workers.keys()):
             try:
@@ -227,7 +226,6 @@ class ModelWorkerSupervisor:
             except Exception as e:
                 log.warning(f"[workers] stop_all error on {wid}: {e}")
         return n
-
 
 # Singleton supervisor
 supervisor = ModelWorkerSupervisor()

@@ -63,6 +63,7 @@ ai-agent-playground/
         admins.py
         auth_router.py
         billing.py
+        cancel_router.py
         chats.py
         devices_router.py
         generate_router.py
@@ -273,6 +274,9 @@ ai-agent-playground/
         ModelPicker/
           ModelPicker.tsx
           ModelPickerList.tsx
+          ModelPickerView.tsx
+          WorkerAdvancedPanel.tsx
+          useModelPicker.ts
         Settings/
           AdminDeviceManager.tsx
           AdminGuestToggle.tsx

@@ -1,8 +1,8 @@
-# aimodel/file_read/api/model_workers.py
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 import httpx
+
 from ..workers.model_worker import supervisor
 from ..core.logging import get_logger
 from ..services.system_snapshot import get_system_snapshot
@@ -14,26 +14,19 @@ _ACTIVE_WORKER_ID: str | None = None
 
 class SpawnReq(BaseModel):
     modelPath: str = Field(..., description="Absolute path to the GGUF model")
+    llamaKwargs: dict | None = Field(default=None, description="Extra kwargs for llama.cpp")
 
 def _list_workers() -> list[dict]:
-    """
-    Be robust to different supervisor APIs across branches.
-    Normalizes to a list[dict].
-    """
-    # Try most likely method names first
     for name in ("list", "list_workers", "snapshot", "status", "info"):
         if hasattr(supervisor, name):
             fn = getattr(supervisor, name)
             try:
                 res = fn()
             except TypeError:
-                # Some variants accept a flag; try harmless truthy
                 try:
                     res = fn(True)
                 except Exception:
                     continue
-
-            # Normalize common shapes
             if isinstance(res, dict):
                 if "workers" in res and isinstance(res["workers"], list):
                     return res["workers"]
@@ -41,18 +34,14 @@ def _list_workers() -> list[dict]:
                     return res["items"]
             if isinstance(res, list):
                 return res
-            # Last-ditch: single worker dict
             if isinstance(res, dict):
                 return [res]
-
-    # Peek at common attributes as a final fallback
     if hasattr(supervisor, "workers"):
         w = supervisor.workers
         if isinstance(w, dict):
             return list(w.values())
         if isinstance(w, list):
             return w
-
     return []
 
 def _require_active_worker_id() -> str:
@@ -85,13 +74,11 @@ async def get_active():
 @router.get("/inspect")
 async def inspect_workers():
     sys_res = await get_system_snapshot()
-
     try:
         workers = supervisor.list()
     except Exception:
         workers = []
 
-    # if registry is empty but an active id exists, try to synthesize one
     synth = None
     if (not workers) and _ACTIVE_WORKER_ID:
         try:
@@ -104,6 +91,7 @@ async def inspect_workers():
                 "port": port,
                 "model_path": h.get("path"),
                 "status": "ready" if h.get("ok") else "unknown",
+                "kwargs": h.get("kwargs") or {},
             }
         except Exception:
             pass
@@ -115,16 +103,21 @@ async def inspect_workers():
         "system": sys_res,
     }
 
-# ✅ Make sure these POST routes are present
 @router.post("/spawn")
 async def spawn_worker(req: SpawnReq):
-    info = await supervisor.spawn_worker(req.modelPath)
+    info = await supervisor.spawn_worker(req.modelPath, llama_kwargs=req.llamaKwargs or {})
     global _ACTIVE_WORKER_ID
     if _ACTIVE_WORKER_ID is None:
         _ACTIVE_WORKER_ID = info.id
     return {
         "ok": True,
-        "worker": {"id": info.id, "port": info.port, "modelPath": info.model_path, "status": info.status},
+        "worker": {
+            "id": info.id,
+            "port": info.port,
+            "modelPath": info.model_path,
+            "status": info.status,
+            "kwargs": info.kwargs or {},
+        },
         "active": _ACTIVE_WORKER_ID,
     }
 

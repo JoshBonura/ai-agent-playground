@@ -5,32 +5,21 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import {
-  AlertCircle,
-  ChevronDown,
-  HardDrive,
-  Loader2,
-  Search,
-} from "lucide-react";
+import { AlertCircle, ChevronDown, HardDrive, Loader2, Search } from "lucide-react";
 import type { ModelFile } from "../../api/models";
 
 type Props = {
   loading: boolean;
   err: string | null;
   models: ModelFile[];
-
   query: string;
   setQuery: Dispatch<SetStateAction<string>>;
-
   sortKey: "recency" | "size" | "name";
   setSortKey: Dispatch<SetStateAction<"recency" | "size" | "name">>;
-
   sortDir: "asc" | "desc";
   setSortDir: Dispatch<SetStateAction<"asc" | "desc">>;
-
   busyPath: string | null;
-  onLoad: (m: ModelFile) => void;
-  onSpawn: (m: ModelFile) => void;   // ← NEW
+  onLoad: (m: ModelFile) => void;   // ← Load = spawn
   onClose: () => void;
 };
 
@@ -46,7 +35,6 @@ export default function ModelPickerList({
   setSortDir,
   busyPath,
   onLoad,
-  onSpawn,   // ← NEW
   onClose,
 }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -65,25 +53,17 @@ export default function ModelPickerList({
     list.sort((a, b) => {
       switch (sortKey) {
         case "size":
-          return sortDir === "asc"
-            ? a.sizeBytes - b.sizeBytes
-            : b.sizeBytes - a.sizeBytes;
+          return sortDir === "asc" ? a.sizeBytes - b.sizeBytes : b.sizeBytes - a.sizeBytes;
         case "name":
-          return sortDir === "asc"
-            ? a.name.localeCompare(b.name)
-            : b.name.localeCompare(a.name);
+          return sortDir === "asc" ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name);
         case "recency":
         default:
-          // if you later plumb mtime, use that; for now, fallback to name
-          return sortDir === "asc"
-            ? a.name.localeCompare(b.name)
-            : b.name.localeCompare(a.name);
+          return sortDir === "asc" ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name);
       }
     });
     return list;
   }, [models, query, sortKey, sortDir]);
 
-  // Esc to close, Enter to load first visible
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -96,7 +76,6 @@ export default function ModelPickerList({
     return () => window.removeEventListener("keydown", onKey);
   }, [filteredSorted, busyPath, onClose, onLoad]);
 
-  // Autofocus search
   useEffect(() => {
     const t = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(t);
@@ -121,17 +100,11 @@ export default function ModelPickerList({
             <button
               className="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg border hover:bg-gray-50"
               onClick={() =>
-                setSortKey((k) =>
-                  k === "recency" ? "size" : k === "size" ? "name" : "recency",
-                )
+                setSortKey((k) => (k === "recency" ? "size" : k === "size" ? "name" : "recency"))
               }
               title="Toggle sort key (Recency → Size → Name)"
             >
-              {sortKey === "recency"
-                ? "Recency"
-                : sortKey === "size"
-                ? "Size"
-                : "Name"}{" "}
+              {sortKey === "recency" ? "Recency" : sortKey === "size" ? "Size" : "Name"}{" "}
               <ChevronDown className="w-4 h-4 opacity-60" />
             </button>
             <button
@@ -146,7 +119,7 @@ export default function ModelPickerList({
       </div>
 
       {/* List body */}
-      <div className="p-3 max-h-[60vh] md:max-h-[60vh] overflow-auto">
+      <div className="p-3 max-h-[60vh] overflow-auto">
         {loading && (
           <div className="flex items-center gap-2 text-sm text-gray-600">
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -167,7 +140,7 @@ export default function ModelPickerList({
 
         <div className="space-y-2">
           {filteredSorted.map((m) => {
-            const isBusy = busyPath === m.path || busyPath === `spawn:${m.path}`;
+            const isBusy = busyPath === m.path;
             return (
               <div key={m.path} className="rounded-lg border p-3 flex items-center justify-between">
                 <div className="min-w-0 flex items-center gap-3">
@@ -189,19 +162,9 @@ export default function ModelPickerList({
                     className={`text-xs px-3 py-1.5 rounded border ${
                       isBusy ? "opacity-60 cursor-wait" : "hover:bg-gray-100"
                     }`}
-                    title="Load into main runtime (replaces current)"
+                    title="Load model (spawns a worker)"
                   >
-                    {isBusy && busyPath === m.path ? "Loading…" : "Load"}
-                  </button>
-                  <button
-                    onClick={() => onSpawn(m)}
-                    disabled={!!busyPath}
-                    className={`text-xs px-3 py-1.5 rounded border ${
-                      isBusy ? "opacity-60 cursor-wait" : "hover:bg-gray-100"
-                    }`}
-                    title="Spawn parallel worker (keeps multiple models in VRAM)"
-                  >
-                    {isBusy && busyPath === `spawn:${m.path}` ? "Spawning…" : "Spawn"}
+                    {isBusy ? "Loading…" : "Load"}
                   </button>
                 </div>
               </div>
@@ -214,6 +177,5 @@ export default function ModelPickerList({
 }
 
 function bytesToGB(n: number): string {
-  const gb = n / (1024 ** 3);
-  return `${gb.toFixed(2)} GB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }

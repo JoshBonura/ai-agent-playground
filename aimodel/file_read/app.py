@@ -36,7 +36,8 @@ from .api.auth_router import require_auth
 from .api.auth_router import router as auth_router
 from .api.billing import router as billing_router
 from .api.chats import router as chats_router
-from .api.generate_router import router as generate_router, cancel_router
+from .api.generate_router import router as generate_router
+from .api.cancel_router import router as cancel_router
 from .api.licensing_router import router as licensing_router
 from .api.metrics import router as metrics_router
 from .api.models import router as models_router
@@ -92,6 +93,7 @@ app.include_router(cancel_router, dependencies=deps)
 app.include_router(worker_proxy_router, dependencies=deps)
 app.include_router(system_router, dependencies=deps)
 app.include_router(model_workers_router, dependencies=deps)
+app.include_router(cancel_router, dependencies=deps)
 
 # --- Route dump (after all includes/mounts) ---
 try:

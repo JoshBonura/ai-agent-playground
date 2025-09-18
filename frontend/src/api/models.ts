@@ -3,6 +3,7 @@ export type ModelFile = {
   sizeBytes: number;
   name: string;
   rel: string;
+  ctxTrain?: number | null;
   // optional metadata your backend may return
   mtime?: number;
   arch?: string | null;
