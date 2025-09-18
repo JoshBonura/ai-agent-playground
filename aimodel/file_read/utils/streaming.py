@@ -1,3 +1,4 @@
+# aimodel/file_read/utils/streaming.py
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.logging import get_logger
-from ..runtime.model_runtime import current_model_info, get_llm
+from ..runtime.model_runtime import current_model_info  # ← keep only this import
 
 log = get_logger(__name__)
 
@@ -105,9 +106,7 @@ def collect_engine_timings(llm: Any) -> dict[str, float | None] | None:
         return None
 
     load_ms = _first(src, ["load_ms", "loadMs", "model_load_ms", "load_time_ms"])
-    prompt_ms = _first(
-        src, ["prompt_ms", "promptMs", "prompt_eval_ms", "prompt_time_ms", "prefill_ms"]
-    )
+    prompt_ms = _first(src, ["prompt_ms", "promptMs", "prompt_eval_ms", "prompt_time_ms", "prefill_ms"])
     eval_ms = _first(src, ["eval_ms", "evalMs", "decode_ms", "eval_time_ms"])
     prompt_n = _first(src, ["prompt_n", "promptN", "prompt_tokens", "n_prompt_tokens"])
     eval_n = _first(src, ["eval_n", "evalN", "eval_tokens", "n_eval_tokens"])
@@ -143,8 +142,13 @@ def build_run_json(
     budget_view: dict | None = None,
     extra_timings: dict | None = None,
     error_text: str | None = None,
+    llm: Any | None = None,  # ← accept llm optionally
 ) -> dict[str, object]:
-    llm = get_llm()
+    # Resolve llm at call time if not provided to avoid stale imports when running in a worker
+    if llm is None:
+        from ..runtime import model_runtime as MR  # dynamic import to pick up worker patch
+        llm = MR.get_llm()
+
     out_tokens = safe_token_count_text(llm, out_text)
     t_end = time.perf_counter()
     ttft_ms = ((t_first or t_end) - t_start) * 1000.0

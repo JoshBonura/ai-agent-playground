@@ -1,0 +1,3176 @@
+>
+  );
+}
+
+# ===== frontend/src/components/Budget/BudgetBarPanelsExtras.tsx =====
+
+// frontend/src/file_read/components/Budget/BudgetBarPanelsExtras.tsx
+import { fmtSec, fmtTps } from "./BudgetBarPanelsCore";
+
+type RagPanelProps = {
+  rag: any;
+  ragWasInjected: boolean;
+  ragBlockBuildTime?: number;
+  ragDelta: number;
+  ragPctOfInput: number;
+  inputTokensEst: number;
+};
+
+export function RagPanel({
+  rag,
+  ragWasInjected,
+  ragBlockBuildTime,
+  ragDelta,
+  ragPctOfInput,
+  inputTokensEst,
+}: RagPanelProps) {
+  const routerNeeded = rag?.routerNeeded;
+  const routerSkipped = rag?.routerSkipped;
+  const routerSkippedReason = rag?.routerSkippedReason;
+  const routerDecideSec = rag?.routerDecideSec;
+  const embedSec = rag?.embedSec;
+  const searchChatSec = rag?.searchChatSec;
+  const searchGlobalSec = rag?.searchGlobalSec;
+  const dedupeSec = rag?.dedupeSec;
+  const topKRequested = rag?.topKRequested;
+  const hitsChat = rag?.hitsChat;
+  const hitsGlobal = rag?.hitsGlobal;
+  const blockChars = rag?.blockChars ?? rag?.sessionOnlyChars;
+  const routerQuery = rag?.routerQuery;
+
+  return (
+    <div className="mt-2 text-[11px] text-gray-700">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+          RAG: <b>{ragWasInjected ? "injected" : "skipped"}</b>{" "}
+          {rag?.mode
+            ? `(${rag.mode})`
+            : rag?.sessionOnly
+              ? "(session-only)"
+              : ""}
+        </span>
+        {"routerNeeded" in rag && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            router: <b>{routerNeeded ? "yes" : "no"}</b>
+          </span>
+        )}
+        {routerSkipped && (
+          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
+            skipped {routerSkippedReason ? `(${routerSkippedReason})` : ""}
+          </span>
+        )}
+        {"routerDecideSec" in rag && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            route {fmtSec(routerDecideSec)}
+          </span>
+        )}
+        {"embedSec" in rag && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            embed {fmtSec(embedSec)}
+          </span>
+        )}
+        {("searchChatSec" in rag || "searchGlobalSec" in rag) && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            search {fmtSec(searchChatSec)} / {fmtSec(searchGlobalSec)}
+          </span>
+        )}
+        {"dedupeSec" in rag && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            dedupe {fmtSec(dedupeSec)}
+          </span>
+        )}
+        {ragBlockBuildTime !== undefined && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            block {fmtSec(ragBlockBuildTime)}
+          </span>
+        )}
+        {topKRequested != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            k=<b>{topKRequested}</b>
+          </span>
+        )}
+        {hitsChat != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            hits chat=<b>{hitsChat}</b>
+          </span>
+        )}
+        {hitsGlobal != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            global=<b>{hitsGlobal}</b>
+          </span>
+        )}
+        {(rag.ragTokensAdded != null ||
+          rag.blockTokens != null ||
+          rag.blockTokensApprox != null ||
+          rag.sessionOnlyTokensApprox != null) && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            +RAG tokens=<b>{ragDelta}</b>
+            {inputTokensEst ? ` (${ragPctOfInput}% of input)` : ""}
+          </span>
+        )}
+        {blockChars != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            block chars=<b>{blockChars}</b>
+          </span>
+        )}
+      </div>
+      {routerQuery && (
+        <div
+          className="mt-1 text-[10px] text-gray-500 truncate"
+          title={routerQuery}
+        >
+          query: {routerQuery}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type WebPanelProps = {
+  web: any;
+};
+
+export function WebPanel({ web }: WebPanelProps) {
+  const webWasInjected = !!web?.injected;
+  const webNeeded = web?.needed;
+  const webRouteSec = web?.elapsedSec;
+  const webFetchSec = web?.fetchElapsedSec;
+  const webInjectSec = web?.injectElapsedSec;
+  const webBlockChars = web?.blockChars;
+  const webEphemeralBlocks = web?.ephemeralBlocks;
+  const summarizedQuery = web?.summarizedQuery;
+
+  return (
+    <div className="mt-2 text-[11px] text-gray-700">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+          WEB: <b>{webWasInjected ? "injected" : "skipped"}</b>
+          {webNeeded !== undefined ? (
+            <>
+              {" "}
+              (router: <b>{webNeeded ? "need" : "no"}</b>)
+            </>
+          ) : null}
+        </span>
+        {"elapsedSec" in web && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            route {fmtSec(webRouteSec)}
+          </span>
+        )}
+        {"fetchElapsedSec" in web && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            fetch {fmtSec(webFetchSec)}
+          </span>
+        )}
+        {"injectElapsedSec" in web && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            inject {fmtSec(webInjectSec)}
+          </span>
+        )}
+        {"blockChars" in web && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            block chars=<b>{webBlockChars}</b>
+          </span>
+        )}
+        {"ephemeralBlocks" in web && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            eph blocks=<b>{webEphemeralBlocks}</b>
+          </span>
+        )}
+        {web.droppedFromSummary && (
+          <span className="px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800">
+            dropped after turn
+          </span>
+        )}
+      </div>
+      {summarizedQuery && (
+        <div
+          className="mt-1 text-[10px] text-gray-500 truncate"
+          title={summarizedQuery}
+        >
+          query: {summarizedQuery}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type TimingPanelProps = {
+  timing: any;
+  enginePromptSec?: number;
+  engineEvalSec?: number;
+  engineLoadSec?: number;
+  enginePromptN?: number | null;
+  engineEvalN?: number | null;
+  preModelSec?: number;
+  modelQueueSec?: number;
+  unattributed?: number;
+  encodeTps?: number | null;
+  decodeTps?: number | null;
+  overallTps?: number | null;
+};
+
+export function TimingPanel({
+  timing,
+  enginePromptSec,
+  engineEvalSec,
+  engineLoadSec,
+  enginePromptN,
+  engineEvalN,
+  preModelSec,
+  modelQueueSec,
+  unattributed,
+  encodeTps,
+  decodeTps,
+  overallTps,
+}: TimingPanelProps) {
+  return (
+    <div className="mt-2 text-[11px] text-gray-700">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+          ttft {fmtSec(timing.ttftSec ?? undefined)}
+        </span>
+        {"queueWaitSec" in timing && timing.queueWaitSec != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            queue {fmtSec(timing.queueWaitSec)}
+          </span>
+        )}
+        {"genSec" in timing && timing.genSec != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            gen {fmtSec(timing.genSec)}
+          </span>
+        )}
+        {"totalSec" in timing && timing.totalSec != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            total {fmtSec(timing.totalSec)}
+          </span>
+        )}
+        {!!enginePromptSec && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            prefill {fmtSec(enginePromptSec)}
+          </span>
+        )}
+        {!!engineEvalSec && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            eval {fmtSec(engineEvalSec)}
+          </span>
+        )}
+        {!!engineLoadSec && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            load {fmtSec(engineLoadSec)}
+          </span>
+        )}
+        {enginePromptN != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            promptN={enginePromptN}
+          </span>
+        )}
+        {engineEvalN != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            evalN={engineEvalN}
+          </span>
+        )}
+        {!!preModelSec && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            pre-model {fmtSec(preModelSec)}
+          </span>
+        )}
+        {!!modelQueueSec && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+            model-queue {fmtSec(modelQueueSec)}
+          </span>
+        )}
+        <span className="px-1.5 py-0.5 rounded bg-gray-100 border">
+          unattributed {fmtSec(unattributed)}
+        </span>
+        {encodeTps != null && (
+          <span className="px-1.5 py-0.5 rounded bg-green-50 border border-green-200 text-green-800">
+            encode <b>{fmtTps(encodeTps)}</b> tok/s
+          </span>
+        )}
+        {decodeTps != null && (
+          <span className="px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-800">
+            decode <b>{fmtTps(decodeTps)}</b> tok/s
+          </span>
+        )}
+        {overallTps != null && (
+          <span className="px-1.5 py-0.5 rounded bg-gray-50 border">
+            overall <b>{fmtTps(overallTps)}</b> tok/s
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatBubble.tsx =====
+
+import { useState } from "react";
+import { Copy, Check, Trash2 } from "lucide-react";
+import MarkdownMessage from "./Markdown/MarkdownMessage";
+import { stripRunJson } from "../shared/lib/runjson";
+import type { Attachment } from "../types/chat"; // ✅ import Attachment type
+
+const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
+
+export default function ChatBubble({
+  role,
+  text,
+  attachments = [], // ✅ new prop
+  showActions = true,
+  onDelete,
+}: {
+  role: "user" | "assistant";
+  text: string;
+  attachments?: Attachment[]; // ✅ allow attachments
+  showActions?: boolean;
+  onDelete?: () => void;
+}) {
+  const isUser = role === "user";
+  const raw = text ?? "";
+  const { text: stripped } = stripRunJson(raw);
+  let content = stripped.trim();
+
+  if (!isUser) content = content.replace(STOP_SENTINEL_RE, "");
+
+  const hasOnlyAttachments =
+    isUser && (!content || content.length === 0) && attachments.length > 0;
+
+  if (role === "assistant" && !content && attachments.length === 0) return null;
+
+  const [copiedMsg, setCopiedMsg] = useState(false);
+  const copyWholeMessage = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedMsg(true);
+      setTimeout(() => setCopiedMsg(false), 2000);
+    } catch {}
+  };
+
+  return (
+    <div className="mb-2">
+      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+        <div
+          className={`max-w-[80%] w-fit break-words rounded-2xl px-4 py-2 shadow-sm
+                      prose prose-base max-w-none
+            ${isUser ? "bg-black text-white prose-invert" : "bg-white border text-gray-900"}`}
+        >
+          {/* ✅ Render attachments */}
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {attachments.map((att) => (
+                <div
+                  key={`${att.sessionId || "global"}:${att.source || att.name}`}
+                  className={`border rounded px-2 py-1 text-sm flex items-center gap-2 ${
+                    isUser ? "bg-white/10 border-white/30" : "bg-white"
+                  }`}
+                  title={att.name || att.source}
+                >
+                  📎 <span className="truncate max-w-[220px]">{att.name}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {content ? (
+            <div className="max-w-full">
+              <MarkdownMessage text={content} />
+            </div>
+          ) : hasOnlyAttachments ? null : isUser ? null : (
+            <span className="opacity-60">…</span>
+          )}
+        </div>
+      </div>
+
+      {showActions && (
+        <div
+          className={`mt-1 flex ${isUser ? "justify-end" : "justify-start"}`}
+        >
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={copyWholeMessage}
+              title={copiedMsg ? "Copied" : "Copy"}
+              aria-label={copiedMsg ? "Copied" : "Copy message"}
+              className="inline-flex items-center justify-center w-7 h-7 rounded border
+                         bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
+            >
+              {copiedMsg ? (
+                <Check className="w-4 h-4" />
+              ) : (
+                <Copy className="w-4 h-4" />
+              )}
+            </button>
+            {onDelete && (
+              <button
+                type="button"
+                onClick={onDelete}
+                title="Delete message"
+                aria-label="Delete message"
+                className="inline-flex items-center justify-center w-7 h-7 rounded border
+                           bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatComposer.tsx =====
+
+import { useEffect, useRef, useState } from "react";
+import ComposerActions from "./Composer/ComposerActions";
+import AttachmentChip from "./Composer/AttachmentChip";
+import { useAttachmentUploads } from "../hooks/useAttachmentUploads";
+import type { Attachment } from "../types/chat";
+import type { UIAttachment } from "../hooks/useAttachmentUploads";
+
+const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
+
+type Props = {
+  input: string;
+  setInput: (v: string) => void;
+  loading: boolean;
+  queued?: boolean;
+  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
+  onStop: () => void | Promise<void>;
+  onHeightChange?: (h: number) => void;
+  onRefreshChats?: () => void;
+  sessionId?: string;
+};
+
+export default function ChatComposer({
+  input,
+  setInput,
+  loading,
+  queued = false,
+  onSend,
+  onStop,
+  onHeightChange,
+  onRefreshChats,
+  sessionId,
+}: Props) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const MAX_HEIGHT_PX = 192;
+
+  const [isClamped, setIsClamped] = useState(false);
+  const [draft, setDraft] = useState(input);
+
+  const {
+    atts,
+    addFiles,
+    removeAtt,
+    anyUploading,
+    anyReady,
+    attachmentsForPost,
+    reset,
+  } = useAttachmentUploads(sessionId, onRefreshChats);
+
+  useEffect(() => setDraft(input), [input]);
+
+  const autogrow = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const next = Math.min(ta.scrollHeight, MAX_HEIGHT_PX);
+    ta.style.height = `${next}px`;
+    setIsClamped(ta.scrollHeight > MAX_HEIGHT_PX);
+    if (wrapRef.current && onHeightChange) {
+      onHeightChange(wrapRef.current.getBoundingClientRect().height);
+    }
+  };
+
+  useEffect(() => {
+    autogrow();
+    const onResize = () => autogrow();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    autogrow();
+  }, [draft, atts.length]);
+
+  const hasText = draft.trim().length > 0;
+
+  const forceScroll = (behavior: ScrollBehavior = "auto") => {
+    window.dispatchEvent(
+      new CustomEvent(FORCE_SCROLL_EVT, { detail: { behavior } }),
+    );
+  };
+
+  const handleSendClick = async () => {
+    const v = draft.trim();
+    if (loading || queued || (!v && !anyReady) || anyUploading) return;
+
+    // 🔹 Capture attachments BEFORE we clear/reset
+    const toPost = attachmentsForPost();
+
+    // keep your scroll event semantics
+    forceScroll("auto");
+
+    // Optimistic clear of the textbox + chip UI
+    setDraft("");
+    setInput("");
+    reset();
+
+    try {
+      await onSend(v, toPost);
+    } finally {
+      onRefreshChats?.();
+      requestAnimationFrame(() => forceScroll("smooth"));
+    }
+  };
+
+  const handleStopClick = () => {
+    if (!loading && !queued) return;
+    void Promise.resolve(onStop()).finally(() => onRefreshChats?.());
+  };
+
+  const pickFile = () => fileRef.current?.click();
+
+  const onFilePicked: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    if (!sessionId) {
+      e.target.value = "";
+      return;
+    }
+    await addFiles(files);
+    e.target.value = "";
+  };
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void handleSendClick();
+    }
+  }
+
+  const disableActions = loading || queued || anyUploading;
+  const showSend = hasText || anyReady;
+
+  return (
+    <div
+      ref={wrapRef}
+      className="relative z-10 bg-white/95 backdrop-blur border-t p-3"
+    >
+      {atts.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-2">
+          {atts.map((a: UIAttachment) => (
+            <AttachmentChip key={a.uiId} a={a} onRemove={removeAtt} />
+          ))}
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={onFilePicked}
+        />
+
+        <textarea
+          ref={taRef}
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setInput(e.target.value);
+            autogrow();
+          }}
+          onInput={autogrow}
+          onKeyDown={onKeyDown}
+          placeholder="Ask anything…"
+          className={`flex-1 border rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring ${
+            isClamped ? "overflow-y-auto" : "overflow-hidden"
+          }`}
+          rows={1}
+          style={{ maxHeight: MAX_HEIGHT_PX }}
+          disabled={queued}
+        />
+
+        <ComposerActions
+          disabledUpload={disableActions || !sessionId}
+          onPickFile={pickFile}
+          showStop={loading || queued}
+          onStop={handleStopClick}
+          showSend={showSend}
+          onSend={handleSendClick}
+        />
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatContainer.tsx =====
+
+import { useState, useRef, useEffect, useMemo } from "react";
+import ChatView from "./ChatView/ChatView";
+import ChatComposer from "./ChatComposer";
+import BudgetBar from "./Budget/BudgetBar";
+import type { ChatMsg } from "../types/chat";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+import type { Attachment } from "../types/chat";
+
+interface Props {
+  messages: ChatMsg[];
+  input: string;
+  setInput: (s: string) => void;
+  loading: boolean;
+  queued?: boolean;
+  send: (text?: string, attachments?: Attachment[]) => Promise<void>;
+  stop: () => Promise<void> | void;
+  runMetrics?: GenMetrics | null;
+  runJson?: RunJson | null;
+  onRefreshChats?: () => void;
+  onDeleteMessages?: (ids: string[]) => void;
+  autoFollow?: boolean;
+  sessionId?: string;
+}
+
+export default function ChatContainer({
+  messages,
+  input,
+  setInput,
+  loading,
+  queued = false,
+  send,
+  stop,
+  runMetrics,
+  runJson,
+  onRefreshChats,
+  onDeleteMessages,
+  autoFollow = true,
+  sessionId,
+}: Props) {
+  const [composerH, setComposerH] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [pinned, setPinned] = useState(false);
+  const list = messages ?? []; // ← guard
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const threshold = 120;
+    const isNearBottom = () =>
+      el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+    const onScroll = () => setPinned(!isNearBottom());
+    el.addEventListener("scroll", onScroll, { passive: true });
+    setPinned(!isNearBottom());
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const forceScrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  };
+
+  const handleSend = async (text?: string, attachments?: Attachment[]) => {
+    if (!pinned) forceScrollToBottom("auto");
+    await send(text, attachments);
+    onRefreshChats?.();
+    if (!pinned) requestAnimationFrame(() => forceScrollToBottom("smooth"));
+  };
+
+  const runJsonForBar = useMemo<RunJson | null>(() => {
+    if (runJson) return runJson;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m: any = list[i];
+      if (m?.role === "assistant" && m?.meta?.runJson)
+        return m.meta.runJson as RunJson;
+    }
+    return null;
+  }, [runJson, list]);
+
+  return (
+    <div className="flex flex-col h-full border rounded-lg overflow-hidden bg-white">
+      <div
+        ref={containerRef}
+        data-chat-scroll
+        className="flex-1 overflow-y-auto min-w-0"
+      >
+        <ChatView
+          messages={list}
+          loading={loading}
+          queued={queued}
+          bottomPad={composerH}
+          runMetrics={runMetrics}
+          runJson={runJson}
+          onDeleteMessages={onDeleteMessages}
+          autoFollow={autoFollow}
+        />
+      </div>
+
+      <BudgetBar runJson={runJsonForBar ?? null} />
+
+      <ChatComposer
+        input={input}
+        setInput={setInput}
+        loading={loading}
+        queued={queued}
+        onSend={handleSend}
+        onStop={stop}
+        onHeightChange={setComposerH}
+        onRefreshChats={onRefreshChats}
+        sessionId={sessionId}
+      />
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatItem.tsx =====
+
+// frontend/src/file_read/components/chat/ChatItem.tsx
+import ChatBubble from "./ChatBubble";
+import AssistantMetrics from "./AssistantMetrics";
+import { buildStatus } from "./ChatView/StatusLine";
+import type { ChatMsg } from "../types/chat";
+import type { RunJson, GenMetrics } from "../shared/lib/runjson";
+
+export default function ChatItem({
+  m,
+  idx,
+  loading,
+  lastAssistantIndex,
+  runJsonLive,
+  runMetricsLive,
+  onDelete,
+}: {
+  m: ChatMsg;
+  idx: number;
+  loading: boolean;
+  lastAssistantIndex: number;
+  runJsonLive?: RunJson | null;
+  runMetricsLive?: GenMetrics | null;
+  onDelete?: (id: string) => void;
+}) {
+  const isAssistant = m.role === "assistant";
+  const isCurrentStreamingAssistant =
+    isAssistant && loading && idx === lastAssistantIndex;
+
+  let jsonForThis: RunJson | null = null;
+  let flatForThis: GenMetrics | null = null;
+
+  if (isAssistant) {
+    // @ts-ignore meta bag
+    const meta = m.meta as
+      | { runJson?: RunJson | null; flat?: GenMetrics | null }
+      | undefined;
+    jsonForThis = meta?.runJson ?? null;
+    flatForThis = meta?.flat ?? null;
+
+    if (isCurrentStreamingAssistant) {
+      if (runJsonLive) jsonForThis = runJsonLive;
+      if (runMetricsLive) flatForThis = runMetricsLive;
+    }
+  }
+
+  const status = isAssistant ? buildStatus(jsonForThis, flatForThis) : "";
+  const showMetrics = isAssistant && (jsonForThis || flatForThis);
+
+  return (
+    <div>
+      <ChatBubble
+        role={m.role}
+        text={m.text}
+        attachments={m.attachments}
+        showActions={
+          m.role === "user" ||
+          (m.role === "assistant" && !isCurrentStreamingAssistant)
+        }
+        onDelete={onDelete ? () => onDelete(m.id) : undefined}
+      />
+      {showMetrics && (
+        <AssistantMetrics
+          status={status}
+          runJson={jsonForThis}
+          flat={flatForThis}
+        />
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatSidebar/AccountPanel.tsx =====
+
+// frontend/src/file_read/components/ChatSidebar/AccountPanel.tsx
+import { useEffect, useMemo, useState } from "react";
+import {
+  ChevronDown,
+  LogOut,
+  Settings,
+  HelpCircle,
+  Stars,
+  BookOpen,
+  Wand2,
+  Save,
+} from "lucide-react";
+import { useAuth } from "../../auth/AuthContext";
+import { buildUrl } from "../../services/http";
+
+function initials(s: string) {
+  const parts = (s || "").trim().split(/\s+/);
+  if (!parts[0]) return "AC";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+export default function AccountPanel() {
+  const { user } = useAuth(); // local auth context
+  const [open, setOpen] = useState(false);
+
+  // --- identity display (prefer context; fallback to localStorage) ---
+  const storedEmail =
+    typeof localStorage !== "undefined"
+      ? localStorage.getItem("profile_email") || ""
+      : "";
+  const display = user?.email || storedEmail || "Account";
+  const tier = "Pro";
+  const avatarText = useMemo(() => initials(display), [display]);
+
+  // --- license key management (used by proxy / app limits) ---
+  const [license, setLicense] = useState<string>("");
+  const [saved, setSaved] = useState<null | "ok" | "err">(null);
+
+  useEffect(() => {
+    try {
+      setLicense(localStorage.getItem("license_key") || "");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  function saveLicense() {
+    try {
+      if (license.trim()) {
+        localStorage.setItem("license_key", license.trim());
+      } else {
+        localStorage.removeItem("license_key");
+      }
+      setSaved("ok");
+      setTimeout(() => setSaved(null), 1500);
+    } catch {
+      setSaved("err");
+      setTimeout(() => setSaved(null), 2000);
+    }
+  }
+
+  // --- actions ---
+  function openSettings() {
+    try {
+      window.dispatchEvent(new CustomEvent("open:settings"));
+    } catch {}
+    setOpen(false);
+  }
+  function openKnowledge() {
+    try {
+      window.dispatchEvent(new CustomEvent("open:knowledge"));
+    } catch {}
+    setOpen(false);
+  }
+  function openCustomize() {
+    try {
+      window.dispatchEvent(new CustomEvent("open:customize"));
+    } catch {}
+    setOpen(false);
+  }
+  function openHelp() {
+    // Swap with your docs/help URL
+    window.open(
+      "https://yourdocs.example.com",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    setOpen(false);
+  }
+  function logout() {
+    (async () => {
+      try {
+        await fetch(buildUrl("/auth/logout"), {
+          method: "POST",
+          credentials: "include", // send the session cookie so the server can delete it
+          headers: { Accept: "application/json" },
+        });
+      } catch {}
+      try {
+        localStorage.removeItem("local_jwt");
+        // optional: also clear profile_email, license_key if you want a full reset
+        // localStorage.removeItem("profile_email");
+        // localStorage.removeItem("license_key");
+      } catch {}
+      location.reload(); // simplest way to reset all app state
+    })();
+    setOpen(false);
+  }
+  return (
+    <div className="p-2">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-3 bg-gray-100 hover:bg-gray-200 active:bg-gray-300 transition rounded-xl px-3 py-2 text-left"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <div className="w-8 h-8 rounded-lg bg-slate-800 text-white grid place-items-center text-xs font-semibold">
+          {avatarText}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium truncate">{display}</div>
+          <div className="text-[11px] text-gray-600">
+            <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px]">
+              {tier}
+            </span>
+          </div>
+        </div>
+        <ChevronDown
+          className={`w-4 h-4 transition ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {open && (
+        <div className="hidden md:block relative">
+          <div
+            className="fixed inset-0 z-30"
+            onClick={() => setOpen(false)}
+            aria-hidden
+          />
+          <div
+            role="menu"
+            className="absolute z-40 bottom-14 left-2 right-2 rounded-xl border bg-white shadow-xl overflow-hidden"
+          >
+            <div className="px-3 py-2 text-xs text-gray-600 border-b truncate">
+              {display}
+            </div>
+
+            {/* License Key (for proxy/app rate-limits) */}
+            <div className="px-3 py-3 border-b bg-gray-50/60">
+              <div className="text-[11px] font-medium text-gray-600 mb-1">
+                License key
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  value={license}
+                  onChange={(e) => setLicense(e.target.value)}
+                  placeholder="paste-your-key"
+                  className="flex-1 rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-black"
+                  spellCheck={false}
+                />
+                <button
+                  onClick={saveLicense}
+                  className="inline-flex items-center gap-1 rounded-lg border px-3 py-2 text-sm hover:bg-gray-50"
+                >
+                  <Save size={16} /> Save
+                </button>
+              </div>
+              {saved === "ok" && (
+                <div className="mt-1 text-[11px] text-green-600">Saved</div>
+              )}
+              {saved === "err" && (
+                <div className="mt-1 text-[11px] text-red-600">
+                  Couldn’t save
+                </div>
+              )}
+            </div>
+
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50"
+              onClick={() => {
+                setOpen(false);
+              }}
+            >
+              <Stars className="w-4 h-4" /> Upgrade plan
+            </button>
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50"
+              onClick={openCustomize}
+            >
+              <Wand2 className="w-4 h-4" /> Customize
+            </button>
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50"
+              onClick={openKnowledge}
+            >
+              <BookOpen className="w-4 h-4" /> Knowledge
+            </button>
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50"
+              onClick={openSettings}
+            >
+              <Settings className="w-4 h-4" /> Settings
+            </button>
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50"
+              onClick={openHelp}
+            >
+              <HelpCircle className="w-4 h-4" /> Help
+            </button>
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50 text-red-600"
+              onClick={logout}
+            >
+              <LogOut className="w-4 h-4" /> Log out
+            </button>
+          </div>
+        </div>
+      )}
+
+      {open && (
+        <div className="md:hidden">
+          <div
+            className="fixed inset-0 z-40 bg-black/30"
+            onClick={() => setOpen(false)}
+          />
+          <div className="fixed inset-x-0 bottom-0 z-50 rounded-t-2xl bg-white shadow-2xl">
+            <div className="px-4 pt-4 pb-2 text-sm text-gray-600 truncate border-b">
+              {display}
+            </div>
+
+            {/* License Key (mobile) */}
+            <div className="p-4 border-b bg-gray-50/60">
+              <div className="text-[11px] font-medium text-gray-600 mb-1">
+                License key
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  value={license}
+                  onChange={(e) => setLicense(e.target.value)}
+                  placeholder="paste-your-key"
+                  className="flex-1 rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-black"
+                  spellCheck={false}
+                />
+                <button
+                  onClick={saveLicense}
+                  className="inline-flex items-center gap-1 rounded-lg border px-3 py-2 text-sm hover:bg-gray-50"
+                >
+                  <Save size={16} /> Save
+                </button>
+              </div>
+              {saved === "ok" && (
+                <div className="mt-1 text-[11px] text-green-600">Saved</div>
+              )}
+              {saved === "err" && (
+                <div className="mt-1 text-[11px] text-red-600">
+                  Couldn’t save
+                </div>
+              )}
+            </div>
+
+            <div className="p-2">
+              <button
+                className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50"
+                onClick={() => {
+                  setOpen(false);
+                }}
+              >
+                <Stars className="w-4 h-4" /> Upgrade plan
+              </button>
+              <button
+                className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50"
+                onClick={openCustomize}
+              >
+                <Wand2 className="w-4 h-4" /> Customize
+              </button>
+              <button
+                className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50"
+                onClick={openKnowledge}
+              >
+                <BookOpen className="w-4 h-4" /> Knowledge
+              </button>
+              <button
+                className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50"
+                onClick={openSettings}
+              >
+                <Settings className="w-4 h-4" /> Settings
+              </button>
+              <button
+                className="w-full flex items-center gap-2 px-3 py-3 rounded-lg hover:bg-gray-50 text-red-600"
+                onClick={logout}
+              >
+                <LogOut className="w-4 h-4" /> Log out
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatSidebar/ChatSidebar.tsx =====
+
+import { useState } from "react";
+import { deleteChatsBatch } from "../../data/chatApi";
+import type { ChatRow } from "../../types/chat";
+import { useMultiSelect } from "../../hooks/useMultiSelect";
+import { useChatsPager } from "../../hooks/useChatsPager";
+import SidebarHeader from "./SidebarHeader";
+import SidebarListItem from "./SidebarListItem";
+import AccountPanel from "./AccountPanel";
+
+const PAGE_SIZE = 10;
+
+type Props = {
+  onOpen: (id: string) => Promise<void>;
+  onNew: () => Promise<void>;
+  refreshKey?: number;
+  activeId?: string;
+  onHideSidebar?: () => void;
+  onCancelSessions?: (ids: string[]) => Promise<void>;
+};
+
+export default function ChatSidebar({
+  onOpen,
+  onNew,
+  refreshKey,
+  activeId,
+  onHideSidebar,
+  onCancelSessions,
+}: Props) {
+  const {
+    chats,
+    page,
+    hasMore,
+    total,
+    totalPages,
+    initialLoading,
+    loadingMore,
+    scrollRef,
+    sentinelRef,
+    loadMore,
+    setChats,
+    decTotal,
+  } = useChatsPager(PAGE_SIZE, refreshKey);
+
+  const [isEditing, setIsEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [newPending, setNewPending] = useState(false);
+
+  const allIds = chats.map((c) => c.sessionId);
+  const { selected, setSelected, allSelected, toggleOne, toggleAll } =
+    useMultiSelect(allIds);
+
+  async function handleNew() {
+    if (newPending) return;
+    setNewPending(true);
+    try {
+      await onNew();
+    } finally {
+      setNewPending(false);
+    }
+  }
+
+  async function onDeleteSelected(): Promise<void> {
+    const count = selected.size;
+    if (!count || deleting) return;
+
+    const isAll = count === chats.length;
+    const ok = window.confirm(
+      isAll
+        ? `Delete ALL ${count} chats? This cannot be undone.`
+        : `Delete ${count} selected chat${count > 1 ? "s" : ""}?`,
+    );
+    if (!ok) return;
+
+    const ids = [...selected];
+    try {
+      await onCancelSessions?.(ids);
+      await Promise.resolve();
+    } catch {}
+
+    const deletingActive = activeId ? selected.has(activeId) : false;
+    const fallback = chats.find((c) => !selected.has(c.sessionId))?.sessionId;
+
+    setDeleting(true);
+    try {
+      const deleted = await deleteChatsBatch(ids);
+      if (!deleted.length) return;
+      setChats((prev) => prev.filter((c) => !deleted.includes(c.sessionId)));
+      decTotal(deleted.length);
+      setSelected(new Set());
+      setIsEditing(false);
+
+      if (deletingActive && fallback) {
+        void onOpen(fallback);
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <aside className="w-full md:w-72 h-full border-r bg-white p-0 flex flex-col">
+      <SidebarHeader
+        isEditing={isEditing}
+        setIsEditing={(v) => {
+          setIsEditing(v);
+          setSelected(new Set());
+        }}
+        newPending={newPending}
+        onNew={handleNew}
+        onHideSidebar={onHideSidebar}
+        selectedCount={selected.size}
+        deleting={deleting}
+        onDelete={onDeleteSelected}
+      />
+
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto p-2 overscroll-contain"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
+        {initialLoading && (
+          <div className="px-2 py-1 text-xs text-gray-500">Loading…</div>
+        )}
+
+        <ul className="space-y-1">
+          {chats.map((c: ChatRow) => (
+            <SidebarListItem
+              key={c.sessionId}
+              c={c}
+              isActive={activeId === c.sessionId}
+              isEditing={isEditing}
+              isChecked={selected.has(c.sessionId)}
+              onToggle={() => toggleOne(c.sessionId)}
+              onOpen={() => void onOpen(c.sessionId)}
+            />
+          ))}
+        </ul>
+
+        <div className="h-6" ref={sentinelRef} />
+
+        {hasMore && (
+          <div className="px-2 pb-2">
+            <button
+              className={`w-full text-xs px-3 py-1 rounded border ${loadingMore ? "opacity-50 cursor-wait" : ""}`}
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              title="Load next page"
+            >
+              {loadingMore
+                ? "Loading…"
+                : `Load more (${chats.length}/${total || "?"})`}
+            </button>
+          </div>
+        )}
+
+        {!hasMore && chats.length > 0 && (
+          <div className="px-2 py-2 text-[11px] text-gray-400 text-center">
+            End of list • showing {chats.length} of {total || chats.length}
+          </div>
+        )}
+      </div>
+
+      <div className="border-t px-3 py-2 text-[11px] text-gray-500">
+        <span className="uppercase tracking-wide">Chats</span>{" "}
+        <span className="text-gray-400">
+          ({chats.length}
+          {total ? `/${total}` : ""} • page {Math.max(page, 1)} of{" "}
+          {Math.max(totalPages || 1, 1)})
+        </span>
+        {isEditing && (
+          <label className="ml-2 text-[11px]">
+            <input
+              type="checkbox"
+              className="mr-1 align-middle"
+              checked={allSelected}
+              onChange={toggleAll}
+            />
+            Select all
+          </label>
+        )}
+      </div>
+
+      <div className="border-t">
+        <AccountPanel />
+      </div>
+    </aside>
+  );
+}
+
+# ===== frontend/src/components/ChatSidebar/SidebarHeader.tsx =====
+
+import { PanelLeftClose, Plus, Pencil, Trash2 } from "lucide-react";
+
+export default function SidebarHeader({
+  isEditing,
+  setIsEditing,
+  newPending,
+  onNew,
+  onHideSidebar,
+  selectedCount,
+  deleting,
+  onDelete,
+}: {
+  isEditing: boolean;
+  setIsEditing: (v: boolean) => void;
+  newPending: boolean;
+  onNew: () => Promise<void>;
+  onHideSidebar?: () => void;
+  selectedCount: number;
+  deleting: boolean;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="sticky top-0 z-10 bg-white border-b">
+      <div className="flex items-center justify-between px-3 py-2">
+        <div className="text-[11px] md:text-xs uppercase text-gray-500">
+          Chats
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            className={`h-9 px-3 inline-flex items-center gap-2 justify-center rounded border ${
+              newPending ? "opacity-50 cursor-not-allowed" : ""
+            }`}
+            onClick={async () => {
+              if (!newPending) await onNew();
+            }}
+            title="New chat"
+            disabled={newPending}
+          >
+            <Plus className="w-4 h-4" />
+            <span className="text-xs md:text-[11px] leading-none">New</span>
+          </button>
+
+          <button
+            className="h-9 px-3 inline-flex items-center gap-2 justify-center rounded border"
+            onClick={() => setIsEditing(!isEditing)}
+            aria-pressed={isEditing}
+            title={isEditing ? "Exit edit mode" : "Edit chats"}
+          >
+            <Pencil className="w-4 h-4" />
+            <span className="text-xs md:text-[11px] leading-none">
+              {isEditing ? "Done" : "Edit"}
+            </span>
+          </button>
+
+          {onHideSidebar && (
+            <button
+              className="hidden md:inline-flex h-9 w-9 items-center justify-center rounded border"
+              onClick={onHideSidebar}
+              title="Hide sidebar"
+              aria-label="Hide sidebar"
+            >
+              <PanelLeftClose className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {isEditing && (
+        <div className="px-3 py-2 border-t bg-white flex items-center gap-3">
+          <div className="text-sm text-gray-600">{selectedCount} selected</div>
+          <button
+            className={`ml-auto inline-flex items-center gap-2 text-sm px-3 py-1 rounded ${
+              selectedCount && !deleting
+                ? "bg-red-600 text-white"
+                : "bg-gray-200 text-gray-500 cursor-not-allowed"
+            }`}
+            disabled={!selectedCount || deleting}
+            onClick={onDelete}
+            title={
+              selectedCount ? "Delete selected chats" : "Select chats to delete"
+            }
+          >
+            <Trash2 className="w-4 h-4" />
+            {deleting ? "Deleting…" : `Delete (${selectedCount})`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatSidebar/SidebarListItem.tsx =====
+
+import { firstLineSmart } from "../../shared/lib/text";
+import type { ChatRow } from "../../types/chat";
+
+export default function SidebarListItem({
+  c,
+  isActive,
+  isEditing,
+  isChecked,
+  onToggle,
+  onOpen,
+}: {
+  c: ChatRow;
+  isActive: boolean;
+  isEditing: boolean;
+  isChecked: boolean;
+  onToggle: () => void;
+  onOpen: () => void;
+}) {
+  const displayTitle =
+    (c.title && c.title.trim()) ||
+    firstLineSmart(c.lastMessage || "", 48) ||
+    "New Chat";
+  const preview = c.lastMessage ? firstLineSmart(c.lastMessage, 120) : "";
+
+  return (
+    <li>
+      <div
+        className={`w-full flex items-start gap-2 px-2 py-2 rounded ${
+          isActive ? "bg-black text-white" : "hover:bg-gray-50"
+        }`}
+      >
+        {isEditing && (
+          <input
+            type="checkbox"
+            checked={isChecked}
+            onChange={onToggle}
+            className="mt-1"
+            aria-label={`Select chat ${displayTitle}`}
+          />
+        )}
+        <button
+          className="text-left flex-1"
+          aria-current={isActive ? "true" : undefined}
+          onClick={() => {
+            if (!isEditing) onOpen();
+          }}
+          title={displayTitle}
+        >
+          <div className="font-medium truncate">{displayTitle}</div>
+          {preview && (
+            <div
+              className={`text-xs line-clamp-2 ${isActive ? "text-white/80" : "text-gray-500"}`}
+            >
+              {preview}
+            </div>
+          )}
+          <div className="text-[10px] mt-1 opacity-60">
+            {new Date(c.updatedAt).toLocaleString()}
+          </div>
+        </button>
+      </div>
+    </li>
+  );
+}
+
+# ===== frontend/src/components/ChatView/ChatView.tsx =====
+
+import type { ChatMsg } from "../../types/chat";
+import type { GenMetrics, RunJson } from "../../hooks/useChatStream";
+import ChatItem from "../ChatItem";
+import TypingIndicator from "../../shared/ui/TypingIndicator";
+import { useChatAutofollow } from "../../hooks/useChatAutoFollow";
+
+export default function ChatView({
+  messages,
+  loading,
+  queued = false,
+  bottomPad,
+  runMetrics,
+  runJson,
+  onDeleteMessages,
+  autoFollow = true,
+}: {
+  messages: ChatMsg[];
+  loading: boolean;
+  queued?: boolean;
+  bottomPad: number;
+  runMetrics?: GenMetrics | null;
+  runJson?: RunJson | null;
+  onDeleteMessages?: (ids: string[]) => void;
+  autoFollow?: boolean;
+}) {
+  const list = messages ?? []; // ← guard against undefined
+
+  const { listRef, bottomRef, lastAssistantIndex } = useChatAutofollow({
+    messages: list,
+    loading,
+    autoFollow,
+    bottomPad,
+  });
+
+  const lastMsg = list[list.length - 1];
+
+  return (
+    <div
+      ref={listRef}
+      className="p-4 space-y-3 bg-gray-50 min-w-0"
+      style={{ paddingBottom: bottomPad }}
+    >
+      {list.map((m, idx) => (
+        <ChatItem
+          key={m.id}
+          m={m}
+          idx={idx}
+          loading={loading}
+          lastAssistantIndex={lastAssistantIndex}
+          runJsonLive={runJson ?? null}
+          runMetricsLive={runMetrics ?? null}
+          onDelete={onDeleteMessages ? (id) => onDeleteMessages([id]) : undefined}
+        />
+      ))}
+
+      {(loading || queued) &&
+        !(
+          lastMsg?.role === "assistant" &&
+          (lastMsg.text?.trim().length ?? 0) > 0
+        ) && <TypingIndicator />}
+
+      <div ref={bottomRef} className="h-0" />
+    </div>
+  );
+}
+
+# ===== frontend/src/components/ChatView/StatusLine.ts =====
+
+// frontend/src/file_read/components/chat/StatusLine.ts
+import type { RunJson, GenMetrics } from "../../shared/lib/runjson";
+
+const oneDec = (n?: number | null) =>
+  typeof n === "number" && Number.isFinite(n) ? n.toFixed(1) : undefined;
+
+export function buildStatus(json?: RunJson | null, flat?: GenMetrics | null) {
+  const st = json?.stats;
+  if (st) {
+    const parts: string[] = [];
+    if (st.predictedTokensCount != null)
+      parts.push(`${st.predictedTokensCount} tok`);
+    if (st.tokensPerSecond != null)
+      parts.push(`${oneDec(st.tokensPerSecond) ?? st.tokensPerSecond} tok/s`);
+    if (st.timeToFirstTokenSec != null)
+      parts.push(`TTFT ${Math.round(st.timeToFirstTokenSec * 1000)} ms`);
+    if (st.stopReason) parts.push(`stop: ${st.stopReason}`);
+    return parts.join(" • ");
+  }
+  if (flat) {
+    const parts: string[] = [];
+    if (flat.output_tokens != null) parts.push(`${flat.output_tokens} tok`);
+    if (flat.tok_per_sec != null)
+      parts.push(`${oneDec(flat.tok_per_sec) ?? flat.tok_per_sec} tok/s`);
+    if (flat.ttft_ms != null) parts.push(`TTFT ${Math.round(flat.ttft_ms)} ms`);
+    if (flat.stop_reason) parts.push(`stop: ${flat.stop_reason}`);
+    return parts.join(" • ");
+  }
+  return "";
+}
+
+# ===== frontend/src/components/Composer/AttachmentChip.tsx =====
+
+import { X, Check } from "lucide-react";
+import ProgressBar from "./ProgressBar";
+import type { Att } from "../../hooks/useAttachmentUploads";
+
+export default function AttachmentChip({
+  a,
+  onRemove,
+}: {
+  a: Att;
+  onRemove: (a: Att) => void;
+}) {
+  return (
+    <div className="min-w-[160px] max-w-[280px] border rounded-lg px-2 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="truncate text-sm" title={a.name}>
+          {a.name}
+        </div>
+        <button
+          className="p-1 rounded hover:bg-gray-100"
+          aria-label="Remove file"
+          onClick={() => onRemove(a)}
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <ProgressBar pct={a.pct} error={a.status === "error"} />
+      <div className="mt-1 text-xs text-gray-500 flex items-center gap-1">
+        {a.status === "uploading" && <span>Uploading… {a.pct}%</span>}
+        {a.status === "ready" && (
+          <>
+            <Check size={14} /> Ready
+          </>
+        )}
+        {a.status === "error" && <span>Error</span>}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Composer/ComposerActions.tsx =====
+
+import { Paperclip, Square, SendHorizonal } from "lucide-react";
+
+type Props = {
+  disabledUpload: boolean;
+  onPickFile: () => void;
+  showStop: boolean;
+  onStop: () => void;
+  showSend: boolean;
+  onSend: () => void;
+};
+
+export default function ComposerActions({
+  disabledUpload,
+  onPickFile,
+  showStop,
+  onStop,
+  showSend,
+  onSend,
+}: Props) {
+  return (
+    <div className="flex items-end gap-2">
+      <button
+        className={`p-2 rounded-lg border hover:bg-gray-50 ${disabledUpload ? "opacity-60 cursor-not-allowed" : ""}`}
+        onClick={onPickFile}
+        title="Upload to this chat"
+        aria-label="Upload to this chat"
+        disabled={disabledUpload}
+      >
+        <Paperclip size={18} />
+      </button>
+
+      {showStop ? (
+        <button
+          className="p-2 rounded-lg border hover:bg-gray-50"
+          onClick={onStop}
+          title="Stop generating"
+          aria-label="Stop generating"
+        >
+          <Square size={18} />
+        </button>
+      ) : showSend ? (
+        <button
+          className="p-2 rounded-lg bg-black text-white hover:bg-black/90 active:translate-y-px"
+          onClick={onSend}
+          title="Send"
+          aria-label="Send"
+        >
+          <SendHorizonal size={18} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Composer/ProgressBar.tsx =====
+
+export default function ProgressBar({
+  pct,
+  error,
+}: {
+  pct: number;
+  error?: boolean;
+}) {
+  return (
+    <div className="mt-2 h-1.5 w-full bg-gray-200 rounded">
+      <div
+        className={`h-1.5 rounded ${error ? "bg-red-500" : "bg-black"}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+# ===== frontend/src/components/DesktopHeader.tsx =====
+
+import { PanelLeftOpen, Loader2, Power, ChevronDown } from "lucide-react";
+
+type Props = {
+  sidebarOpen: boolean;
+  onShowSidebar: () => void;
+  title?: string;
+
+  modelLoaded: boolean;
+  modelName?: string | null;
+  busy?: boolean;
+
+  onOpenModelPicker?: () => void;
+  onEjectModel?: () => void;
+};
+
+export default function DesktopHeader({
+  sidebarOpen,
+  onShowSidebar,
+  title = "Local AI Model",
+  modelLoaded,
+  modelName,
+  busy = false,
+  onOpenModelPicker,
+  onEjectModel,
+}: Props) {
+  return (
+    <div className="hidden md:flex h-14 shrink-0 items-center justify-between px-4 border-b bg-white">
+      <div className="flex items-center gap-2">
+        {!sidebarOpen && (
+          <button
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
+            onClick={onShowSidebar}
+            aria-label="Show sidebar"
+            title="Show sidebar"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+          </button>
+        )}
+        <div className="font-semibold">{title}</div>
+      </div>
+
+      <div className="flex items-center">
+        {!modelLoaded ? (
+          <button
+            type="button"
+            onClick={() => onOpenModelPicker?.()}
+            className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border hover:bg-gray-50"
+            title="Select a model to load (Ctrl + L)"
+          >
+            <span className="h-2.5 w-2.5 rounded-full bg-gray-300" />
+            <span className="whitespace-nowrap">Select a model to load</span>
+            <ChevronDown className="w-4 h-4 opacity-60" />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onOpenModelPicker?.()}
+            className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border hover:bg-gray-50"
+            title="Change model (Ctrl + L)"
+          >
+            <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+            <span className="truncate max-w-[32ch]" title={modelName || "Model loaded"}>
+              {modelName || "Model loaded"}
+            </span>
+            <ChevronDown className="w-4 h-4 opacity-60" />
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        {busy ? (
+          <div className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border bg-gray-50">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>Working…</span>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onEjectModel?.()}
+            disabled={!modelLoaded}
+            className={`inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border ${
+              modelLoaded ? "hover:bg-gray-50" : "opacity-60 cursor-not-allowed"
+            }`}
+            title={modelLoaded ? "Eject model" : "No model loaded"}
+          >
+            <Power className="w-4 h-4" />
+            <span>Eject</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/KnowledgePanel.tsx =====
+
+import { useState, useEffect } from "react";
+import {
+  uploadRag,
+  searchRag,
+  listUploads,
+  deleteUploadHard,
+  type UploadRow,
+} from "../data/ragApi";
+
+export default function KnowledgePanel({
+  sessionId,
+  onClose,
+  toast,
+}: {
+  sessionId?: string;
+  onClose?: () => void;
+  toast?: (msg: string) => void;
+}) {
+  const [files, setFiles] = useState<FileList | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<
+    { text: string; source?: string; score: number }[]
+  >([]);
+  const [searching, setSearching] = useState(false);
+
+  const [scope, setScope] = useState<"all" | "session">("all");
+  const [uploads, setUploads] = useState<UploadRow[]>([]);
+  const [loadingUploads, setLoadingUploads] = useState(false);
+
+  useEffect(() => {
+    void refreshUploads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, sessionId]);
+
+  async function refreshUploads() {
+    setLoadingUploads(true);
+    try {
+      const out = await listUploads(sessionId, scope);
+      setUploads(out.uploads || []);
+    } catch (e: any) {
+      toast?.(e?.message || "Failed to load uploads");
+    } finally {
+      setLoadingUploads(false);
+    }
+  }
+
+  async function handleDeleteHard(source: string, ns?: string | null) {
+    try {
+      const res = await deleteUploadHard(source, ns ?? undefined);
+      toast?.(
+        `Removed ${res.removed} chunk${res.removed === 1 ? "" : "s"}. Remaining: ${res.remaining}`,
+      );
+      await refreshUploads();
+    } catch (e: any) {
+      toast?.(e?.message || "Delete failed");
+    }
+  }
+
+  async function doUpload() {
+    if (!files || !files.length) return;
+    setBusy(true);
+    try {
+      let total = 0;
+      for (const f of Array.from(files)) {
+        const out = await uploadRag(f, undefined);
+        total += (out as any)?.added || 0;
+      }
+      toast?.(`Added ${total} chunk${total === 1 ? "" : "s"}`);
+      setFiles(null);
+      await refreshUploads();
+    } catch (e: any) {
+      toast?.(e?.message || "Upload failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doSearch() {
+    const q = query.trim();
+    if (!q) return;
+    setSearching(true);
+    try {
+      const out = await searchRag(q, {
+        sessionId,
+        kChat: 6,
+        kGlobal: 4,
+        alpha: 0.5,
+      });
+      setHits(out.hits || []);
+    } catch (e: any) {
+      toast?.(e?.message || "Search failed");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
+      <div className="w-full max-w-5xl rounded-2xl bg-white shadow-xl border overflow-hidden">
+        <div className="px-4 py-3 border-b flex items-center gap-2">
+          <div className="font-semibold">Knowledge</div>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              className="text-xs px-3 py-1.5 rounded border hover:bg-gray-50"
+              onClick={onClose}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+
+        <div className="p-4 grid gap-6 md:grid-cols-2">
+          {/* Upload */}
+          <div>
+            <div className="font-medium mb-2">Upload documents</div>
+            <input
+              type="file"
+              multiple
+              className="block w-full text-sm"
+              onChange={(e) => setFiles(e.target.files)}
+            />
+            <button
+              className={`mt-2 text-sm px-3 py-1.5 rounded ${busy ? "opacity-60 cursor-not-allowed" : "bg-black text-white"}`}
+              disabled={busy || !files || files.length === 0}
+              onClick={doUpload}
+            >
+              {busy ? "Uploading…" : "Upload"}
+            </button>
+            <div className="text-[11px] text-gray-500 mt-2">
+              Tip: CSV, TXT, MD, PDF (text extracted). Uploads can be global or
+              per chat.
+            </div>
+
+            <div className="mt-6">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="font-medium">Your uploads</div>
+                <select
+                  className="ml-auto border rounded px-2 py-1 text-xs"
+                  value={scope}
+                  onChange={(e) =>
+                    setScope(e.target.value as "all" | "session")
+                  }
+                  title="Scope"
+                >
+                  <option value="all">All (global + this chat)</option>
+                  <option value="session">This chat only</option>
+                </select>
+                <button
+                  className="text-xs px-2 py-1 rounded border hover:bg-gray-50"
+                  onClick={refreshUploads}
+                  disabled={loadingUploads}
+                >
+                  {loadingUploads ? "Refreshing…" : "Refresh"}
+                </button>
+              </div>
+
+              <ul className="space-y-2 max-h-64 overflow-auto">
+                {uploads.length === 0 && (
+                  <li className="text-xs text-gray-500">No uploads yet.</li>
+                )}
+                {uploads.map((u, i) => (
+                  <li
+                    key={`${u.source}-${u.sessionId ?? "global"}-${i}`}
+                    className="p-2 border rounded bg-gray-50"
+                  >
+                    <div className="flex items-center gap-2">
+                      <div className="font-mono text-xs break-all">
+                        {u.source}
+                      </div>
+                      <span className="text-[11px] text-gray-500">
+                        {u.sessionId ? "session" : "global"} • {u.chunks} chunk
+                        {u.chunks === 1 ? "" : "s"}
+                      </span>
+                      <button
+                        className="ml-auto text-xs px-2 py-1 rounded border hover:bg-gray-100"
+                        title="Delete (hard delete by Source)"
+                        onClick={() =>
+                          handleDeleteHard(u.source, u.sessionId ?? undefined)
+                        }
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          {/* Search */}
+          <div>
+            <div className="font-medium mb-2">Quick search</div>
+            <div className="flex gap-2">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Find in your knowledge…"
+                className="flex-1 border rounded px-2 py-1.5 text-sm"
+              />
+              <button
+                className={`text-sm px-3 py-1.5 rounded ${searching ? "opacity-60 cursor-wait" : "border hover:bg-gray-50"}`}
+                onClick={doSearch}
+                disabled={searching}
+              >
+                {searching ? "Searching…" : "Search"}
+              </button>
+            </div>
+
+            <ul className="mt-3 space-y-2 max-h-64 overflow-auto">
+              {hits.map((h, i) => (
+                <li key={i} className="p-2 border rounded bg-gray-50">
+                  <div className="text-[11px] text-gray-500 mb-1">
+                    {h.source || "uploaded"} • score{" "}
+                    {Number.isFinite(h.score) ? h.score.toFixed(3) : "—"}
+                  </div>
+                  <div className="text-sm whitespace-pre-wrap">{h.text}</div>
+                </li>
+              ))}
+              {!hits.length && (
+                <li className="text-xs text-gray-500">No results yet.</li>
+              )}
+            </ul>
+          </div>
+        </div>
+
+        <div className="px-4 py-3 border-t text-[11px] text-gray-500">
+          “Delete” performs a hard delete: removes chunks for that Source and
+          rebuilds the index.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Markdown/MarkdownMessage.tsx =====
+
+// frontend/src/file_read/components/MarkdownMessage.tsx
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github.css";
+import CodeCopyButton from "../../shared/ui/CodeCopyButton";
+
+type Props = { text: string };
+
+export default function MarkdownMessage({ text }: Props) {
+  return (
+    <>
+      {/* keep pre spacing at zero; don't overwrite token colors */}
+      <style>{`
+        pre { margin: 0 !important; padding: 0 !important; background: transparent !important; }
+        pre code { display: block; margin: 0 !important; padding: 0 !important; }
+        .hljs { background: transparent !important; }
+      `}</style>
+
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[
+          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+        ]}
+        components={{
+          code({
+            inline,
+            className,
+            children,
+            ...props
+          }: {
+            inline?: boolean;
+            className?: string;
+            children?: React.ReactNode;
+          }) {
+            const raw = String(children ?? "");
+            const lang = (className || "").replace("language-", "");
+
+            if (inline) {
+              return (
+                <code
+                  className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-900 font-mono text-[14px]"
+                  {...props}
+                >
+                  {children}
+                </code>
+              );
+            }
+
+            return (
+              <div className="relative w-full">
+                <pre className="m-0 p-0 w-full overflow-x-auto rounded-md border border-gray-300">
+                  {/* Let hljs theme color tokens; no text color override here */}
+                  <code
+                    className={`${className ?? ""} hljs font-mono text-sm`}
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                </pre>
+
+                <div className="absolute top-2 right-2 flex items-center gap-1">
+                  {lang && (
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-200 text-gray-700">
+                      {lang}
+                    </span>
+                  )}
+                  <CodeCopyButton text={raw} />
+                </div>
+              </div>
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </>
+  );
+}
+
+# ===== frontend/src/components/MetricsHoverCard.tsx =====
+
+// frontend/src/file_read/components/MetricsHoverCard.tsx
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Info } from "lucide-react";
+import MetricsHoverCardPanel from "./MetricsHoverCardPanel";
+
+type Props = {
+  data: unknown;
+  title?: string;
+  align?: "left" | "right";
+  maxWidthPx?: number;
+  compact?: boolean;
+};
+
+export default function MetricsHoverCard({
+  data,
+  title = "Run details",
+  align = "right",
+  maxWidthPx = 460,
+  compact = true,
+}: Props) {
+  const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [panelStyle, setPanelStyle] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
+
+  useLayoutEffect(() => {
+    function place() {
+      if (!open || !btnRef.current) return;
+      const margin = 8;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const width = Math.min(maxWidthPx, vw - margin * 2);
+      const btnBox = btnRef.current.getBoundingClientRect();
+      let left = align === "right" ? btnBox.right - width : btnBox.left;
+      left = Math.max(margin, Math.min(left, vw - margin - width));
+      let top = btnBox.bottom + margin;
+      let panelH = panelRef.current?.offsetHeight || 0;
+      if (!panelH) panelH = 360 + 44;
+      if (top + panelH > vh - margin)
+        top = Math.max(margin, btnBox.top - margin - panelH);
+      setPanelStyle({ top, left, width });
+    }
+    place();
+    if (!open) return;
+    const onReflow = () => place();
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
+    return () => {
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open, align, maxWidthPx]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+        btnRef.current?.focus();
+      }
+    };
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (btnRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative inline-block">
+      <button
+        ref={btnRef}
+        type="button"
+        className={`inline-flex items-center justify-center rounded border bg-white text-gray-700 shadow-sm hover:bg-gray-50 transition ${compact ? "h-7 w-7" : "h-8 w-8"}`}
+        title="Show run JSON"
+        aria-haspopup="dialog"
+        aria-expanded={open ? "true" : "false"}
+        onClick={() => setOpen((v) => !v)}
+        onMouseEnter={() => setOpen(true)}
+      >
+        <Info className={compact ? "w-4 h-4" : "w-5 h-5"} />
+      </button>
+      {open && panelStyle && (
+        <div
+          ref={panelRef}
+          role="dialog"
+          aria-label={title}
+          className="fixed z-50"
+          style={{
+            top: panelStyle.top,
+            left: panelStyle.left,
+            width: panelStyle.width,
+          }}
+          onMouseLeave={() => setOpen(false)}
+        >
+          <MetricsHoverCardPanel data={data} title={title} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/MetricsHoverCardPanel.tsx =====
+
+// frontend/src/file_read/components/MetricsHoverCardPanel.tsx
+import { useMemo, useState } from "react";
+import { Copy, Check, X } from "lucide-react";
+import type { RunJson } from "../shared/lib/runjson";
+import {
+  getNormalizedBudget,
+  getRagTelemetry,
+  getWebTelemetry,
+  getTimingMetrics,
+  getPackTelemetry,
+} from "../shared/lib/runjson";
+
+type PanelProps = {
+  data: unknown;
+  title: string;
+};
+
+const num0 = (v: unknown) =>
+  typeof v === "number" && Number.isFinite(v) ? v : 0;
+
+export default function MetricsHoverCardPanel({ data, title }: PanelProps) {
+  const [copied, setCopied] = useState(false);
+
+  const json = useMemo(() => {
+    try {
+      const r = (data ?? null) as RunJson | null;
+      if (!r || typeof r !== "object") return JSON.stringify(data, null, 2);
+
+      const nb = getNormalizedBudget(r);
+      const rag = getRagTelemetry(r) as any | null;
+      const web = getWebTelemetry(r) as any | null;
+      const pack = getPackTelemetry(r) as any | null;
+      const timing = getTimingMetrics(r) as any | null;
+
+      const modelCtx = nb ? num0(nb.modelCtx) : null;
+      const clampMargin = nb ? num0(nb.clampMargin) : null;
+      const inputTokensEst = nb ? num0(nb.inputTokensEst) : null;
+      const outBudgetChosen = nb ? num0(nb.outBudgetChosen) : null;
+      const outActual = num0((r as any)?.stats?.predictedTokensCount);
+      const outShown = outActual || (outBudgetChosen ?? 0);
+
+      const webRouteSec = web?.elapsedSec;
+      const webFetchSec = web?.fetchElapsedSec;
+      const webInjectSec = web?.injectElapsedSec;
+      const webPre =
+        num0(web?.breakdown?.totalWebPreTtftSec) ||
+        num0(webRouteSec) + num0(webFetchSec) + num0(webInjectSec);
+
+      const ragDelta = Math.max(
+        0,
+        num0((rag as any)?.ragTokensAdded) ||
+          num0((rag as any)?.blockTokens) ||
+          num0((rag as any)?.blockTokensApprox) ||
+          num0((rag as any)?.sessionOnlyTokensApprox),
+      );
+      const ragPctOfInput =
+        inputTokensEst && inputTokensEst > 0
+          ? Math.round((ragDelta / inputTokensEst) * 100)
+          : 0;
+
+      const packPackSec = num0(pack?.packSec);
+      const packSummarySec = num0(pack?.summarySec);
+      const packFinalTrimSec = num0(pack?.finalTrimSec);
+      const packCompressSec = num0(pack?.compressSec);
+
+      const preModelSec = num0(timing?.preModelSec);
+      const modelQueueSec = num0(timing?.modelQueueSec);
+      const genSec = num0(timing?.genSec);
+      const ttftSec = num0(timing?.ttftSec);
+
+      const breakdown =
+        (r as any)?.budget_view?.breakdown ||
+        (r as any)?.stats?.budget?.breakdown ||
+        null;
+
+      const preAccountedFromBackend = breakdown?.preTtftAccountedSec;
+      const accountedFallback =
+        webPre +
+        num0((rag as any)?.routerDecideSec) +
+        num0(
+          (rag as any)?.injectBuildSec ??
+            (rag as any)?.blockBuildSec ??
+            (rag as any)?.sessionOnlyBuildSec,
+        ) +
+        packPackSec +
+        packSummarySec +
+        packFinalTrimSec +
+        packCompressSec +
+        preModelSec +
+        modelQueueSec;
+
+      const accounted = Number.isFinite(preAccountedFromBackend)
+        ? preAccountedFromBackend
+        : accountedFallback;
+
+      const unattributed =
+        breakdown && Number.isFinite(breakdown.unattributedTtftSec)
+          ? breakdown.unattributedTtftSec
+          : Math.max(0, ttftSec - accounted);
+
+      const promptTok =
+        num0((r as any)?.stats?.promptTokensCount) || (inputTokensEst ?? 0);
+      const decodeTok = num0((r as any)?.stats?.predictedTokensCount);
+      const encodeTps = modelQueueSec > 0 ? promptTok / modelQueueSec : null;
+      const decodeTps = genSec > 0 ? decodeTok / genSec : null;
+
+      const totalTok =
+        typeof (r as any)?.stats?.totalTokensCount === "number"
+          ? ((r as any).stats.totalTokensCount as number)
+          : promptTok + decodeTok;
+      const totalSecForOverall =
+        typeof (r as any)?.stats?.totalTimeSec === "number"
+          ? ((r as any).stats.totalTimeSec as number)
+          : num0(timing?.totalSec);
+      const overallTps =
+        totalSecForOverall > 0 ? totalTok / totalSecForOverall : null;
+
+      const usedCtx = (inputTokensEst ?? 0) + outShown + (clampMargin ?? 0);
+      const ctxPct =
+        modelCtx && modelCtx > 0
+          ? Math.max(0, Math.min(100, (usedCtx / modelCtx) * 100))
+          : null;
+
+      const augmented = {
+        ...r,
+        _derived: {
+          context: {
+            modelCtx,
+            clampMargin,
+            inputTokensEst,
+            outBudgetChosen,
+            outActual,
+            outShown,
+            usedCtx,
+            ctxPct,
+          },
+          rag: { ragDelta, ragPctOfInput },
+          web: { webPre },
+          timing: {
+            accountedPreTtftSec: accounted,
+            unattributedPreTtftSec: unattributed,
+            preModelSec,
+            modelQueueSec,
+            genSec,
+            ttftSec,
+          },
+          throughput: {
+            encodeTokPerSec: encodeTps,
+            decodeTokPerSec: decodeTps,
+            overallTokPerSec: overallTps,
+          },
+        },
+      };
+
+      return JSON.stringify(augmented, null, 2);
+    } catch {
+      return String(data ?? "");
+    }
+  }, [data]);
+
+  return (
+    <div className="rounded-xl border bg-white shadow-xl overflow-hidden">
+      <div className="px-3 py-2 border-b flex items-center justify-between bg-gray-50">
+        <div className="text-xs font-semibold text-gray-700">{title}</div>
+        <div className="flex items-center gap-1">
+          <button
+            className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+            onClick={() => {
+              navigator.clipboard.writeText(json);
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1500);
+            }}
+            title="Copy JSON"
+          >
+            {copied ? (
+              <Check className="w-4 h-4" />
+            ) : (
+              <Copy className="w-4 h-4" />
+            )}
+          </button>
+          <button
+            className="inline-flex items-center justify-center h-7 w-7 rounded border bg-white text-gray-700 hover:bg-gray-50"
+            onClick={() => {}}
+            title="Close"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* JSON only; badges removed */}
+      <div className="p-3">
+        <pre
+          className="m-0 p-0 text-xs leading-relaxed overflow-auto"
+          style={{ maxHeight: 360 }}
+        >
+          <code>{json}</code>
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/MobileDrawer.tsx =====
+
+import { PanelLeftOpen } from "lucide-react";
+import ChatSidebar from "./ChatSidebar/ChatSidebar";
+
+export default function MobileDrawer({ ...props }) {
+  const {
+    onOpenSession,
+    onNewChat,
+    refreshKey,
+    activeId,
+    openMobileDrawer,
+    closeMobileDrawer,
+  } = props;
+
+  return (
+    <>
+      {/* Mobile top bar */}
+      <div className="md:hidden fixed top-0 left-0 right-0 z-40 bg-white border-b">
+        <div className="h-14 flex items-center justify-between px-3">
+          <button
+            className="inline-flex items-center justify-center h-9 w-9 rounded-lg border hover:bg-gray-50"
+            onClick={() => {
+              openMobileDrawer();
+            }}
+            aria-label="Open sidebar"
+            title="Open sidebar"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+          </button>
+          <div className="font-semibold">Local AI Model</div>
+          <div className="w-9" />
+        </div>
+      </div>
+
+      {/* Backdrop */}
+      <div
+        id="mobile-backdrop"
+        className="md:hidden fixed inset-0 z-40 bg-black/40 hidden"
+        onClick={() => {
+          closeMobileDrawer();
+        }}
+      />
+
+      {/* Drawer */}
+      <aside
+        id="mobile-drawer"
+        role="dialog"
+        aria-modal="true"
+        className="
+          md:hidden fixed inset-y-0 left-0 z-50
+          w-80 max-w-[85vw]
+          bg-white border-r shadow-xl
+          hidden animate-[slideIn_.2s_ease-out]
+          h-[100dvh] pb-safe flex flex-col
+        "
+      >
+        <div className="h-14 flex items-center justify-between px-3 border-b">
+          <div className="font-medium">Chats</div>
+          <button
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
+            onClick={() => {
+              closeMobileDrawer();
+            }}
+            aria-label="Close sidebar"
+          >
+            <span className="rotate-45 text-xl leading-none">+</span>
+          </button>
+        </div>
+
+        {/* Fill remaining height; ChatSidebar manages its own scrolling */}
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <ChatSidebar
+            onOpen={async (id) => {
+              await onOpenSession(id);
+              closeMobileDrawer();
+            }}
+            onNew={async () => {
+              await onNewChat();
+              closeMobileDrawer();
+            }}
+            refreshKey={refreshKey}
+            activeId={activeId}
+          />
+        </div>
+      </aside>
+
+      <style>{`@keyframes slideIn{from{transform:translateX(-12px);opacity:.0}to{transform:translateX(0);opacity:1}}`}</style>
+    </>
+  );
+}
+
+# ===== frontend/src/components/ModelPicker/ModelPicker.tsx =====
+
+import { useEffect, useRef, useState } from "react";
+import { CheckCircle2, X } from "lucide-react";
+import { getModels, loadModel, unloadModel, type ModelFile } from "../../api/models";
+import ModelPickerList from "./ModelPickerList";
+import { cancelModelLoad } from "../../api/models";
+import { getJSON, postJSON } from "../../services/http";
+
+// ✅ use the API's type + function (normalized shape)
+import { getResources, type Resources as ApiResources } from "../../api/system";
+
+type Props = {
+  open: boolean;
+  onClose: () => void;
+  onLoaded?: () => void; // called after successful load/unload
+};
+
+/* ---------- local types for workers ---------- */
+
+type WorkerHealth = {
+  ok: boolean;
+  model: string;
+  path: string;
+  n_ctx: number;
+  n_threads: number;
+  n_gpu_layers: number;
+  n_batch: number;
+} | null;
+
+type WorkerRow = {
+  id: string;
+  port: number;
+  model_path: string;
+  status: "loading" | "ready" | "stopped";
+  health?: WorkerHealth;
+};
+
+export default function ModelPicker({ open, onClose, onLoaded }: Props) {
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [models, setModels] = useState<ModelFile[]>([]);
+
+  // current model status (name/path only for header)
+  const [currentLoaded, setCurrentLoaded] = useState<boolean>(false);
+  const [currentPath, setCurrentPath] = useState<string | null>(null);
+
+  // workers + resources
+  const [workers, setWorkers] = useState<WorkerRow[]>([]);
+  const [activeWorkerId, setActiveWorkerId] = useState<string | null>(null);
+  const [res, setRes] = useState<ApiResources | null>(null);
+
+  // list UI state
+  const [query, setQuery] = useState("");
+  const [sortKey, setSortKey] = useState<"recency" | "size" | "name">("size");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [busyPath, setBusyPath] = useState<string | null>(null);
+
+  // manual params
+  const [manual, setManual] = useState(false);
+  const [nCtx, setNCtx] = useState<string>("");
+  const [nThreads, setNThreads] = useState<string>("");
+  const [nGpuLayers, setNGpuLayers] = useState<string>("");
+  const [nBatch, setNBatch] = useState<string>("");
+  const [ropeFreqBase, setRopeFreqBase] = useState<string>("");
+  const [ropeFreqScale, setRopeFreqScale] = useState<string>("");
+
+  const mountedRef = useRef(false);
+
+  // Initial fetch when opened + live polling for resources/workers/health
+  useEffect(() => {
+    if (!open) return;
+    mountedRef.current = true;
+
+    let alive = true;
+    let t: any;
+
+    const bootstrap = async () => {
+      try {
+        setErr(null);
+        setLoading(true);
+        const data = await getModels(); // GET /api/models (available + current + settings)
+        if (!mountedRef.current) return;
+
+        setModels(data.available || []);
+
+        const cfg = (data.current?.config as any) || null;
+        const path =
+          (cfg?.config?.modelPath as string) ||
+          (cfg?.modelPath as string) ||
+          null;
+
+        setCurrentPath(path);
+        setCurrentLoaded(!!data.current?.loaded);
+      } catch (e: any) {
+        if (!mountedRef.current) return;
+        setErr(e?.message || "Failed to load models");
+      } finally {
+        if (mountedRef.current) setLoading(false);
+      }
+    };
+
+    const tick = async () => {
+      try {
+        // poll workers + resources while modal is open
+        const [w, r] = await Promise.all([
+          getJSON<{ ok: boolean; workers: WorkerRow[]; active: string | null }>("/api/model-workers/inspect"),
+          getResources(), // ✅ normalized ApiResources
+        ]);
+        if (!alive) return;
+        setWorkers(w?.workers ?? []);
+        setActiveWorkerId(w?.active ?? null);
+
+        // small smoothing to avoid CPU=0% flicker when instantaneous sample is idle
+        setRes((prev) => ({
+          ...(r || {}),
+          cpuPct: r.cpuPct ?? prev?.cpuPct ?? null,
+        }));
+      } catch {
+        if (!alive) return;
+        setWorkers([]);
+        setRes(null);
+      } finally {
+        t = setTimeout(tick, 30000);
+      }
+    };
+
+    bootstrap().then(tick);
+
+    return () => {
+      mountedRef.current = false;
+      clearTimeout(t);
+      // keep UI state intact until next open
+    };
+  }, [open]);
+
+  // Hotkey: Alt+L toggles manual panel (while modal open)
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.altKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        setManual((m) => !m);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  function parseNum(s: string): number | undefined {
+    const t = s.trim();
+    if (!t) return undefined;
+    const v = Number(t);
+    return Number.isFinite(v) ? v : undefined;
+  }
+
+  // Load into the single in-process runtime (mutually exclusive)
+  async function handleLoad(m: ModelFile) {
+    if (busyPath) return;
+    setBusyPath(m.path);
+    setErr(null);
+    try {
+      await loadModel({
+        modelPath: m.path,
+        nCtx: parseNum(nCtx),
+        nThreads: parseNum(nThreads),
+        nGpuLayers: parseNum(nGpuLayers),
+        nBatch: parseNum(nBatch),
+        ropeFreqBase: parseNum(ropeFreqBase) ?? null,
+        ropeFreqScale: parseNum(ropeFreqScale) ?? null,
+        resetDefaults: !manual,
+      }); // POST /api/models/load (single-runtime)
+      onLoaded?.();
+      onClose();
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load model");
+    } finally {
+      setBusyPath(null);
+    }
+  }
+
+  // Spawn a parallel worker (lets you keep multiple models in VRAM—LM Studio style)
+  async function handleSpawn(m: ModelFile) {
+    if (busyPath) return;
+    setBusyPath(`spawn:${m.path}`);
+    setErr(null);
+    try {
+      await postJSON("/api/model-workers/spawn", { modelPath: m.path });
+      onLoaded?.();
+      // don't close — user may want to spawn more
+    } catch (e: any) {
+      setErr(e?.message || "Failed to spawn worker");
+    } finally {
+      setBusyPath(null);
+    }
+  }
+
+  async function handleUnload() {
+    if (busyPath) return;
+    setBusyPath("__unload__");
+    setErr(null);
+    try {
+      await unloadModel(); // POST /api/models/unload (single-runtime)
+      onLoaded?.();
+    } catch (e: any) {
+      setErr(e?.message || "Failed to unload model");
+    } finally {
+      setBusyPath(null);
+    }
+  }
+
+  async function handleCancelLoad() {
+    try {
+      await cancelModelLoad();
+    } catch {
+      // ignore
+    } finally {
+      setBusyPath(null);
+      setErr(null);
+    }
+  }
+
+  async function handleKillWorker(id: string) {
+    if (!id) return;
+    try {
+      await postJSON(`/api/model-workers/kill/${encodeURIComponent(id)}`, {});
+      onLoaded?.();
+    } catch (e: any) {
+      setErr(e?.message || "Failed to stop worker");
+    }
+  }
+
+  // NEW: activate a worker so the proxy targets it by default
+  async function handleActivateWorker(id: string) {
+    if (!id) return;
+    try {
+      await postJSON(`/api/model-workers/activate/${encodeURIComponent(id)}`, {});
+      // refresh immediately so badge updates
+      const w = await getJSON<{ ok: boolean; workers: WorkerRow[]; active: string | null }>(
+        "/api/model-workers/inspect"
+      );
+      setWorkers(w?.workers ?? []);
+      setActiveWorkerId(w?.active ?? null);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to activate worker");
+    }
+  }
+
+  const loadedName = (currentPath || "").split(/[\\/]/).pop() || null;
+
+  // compute VRAM totals from normalized GPU list
+  const vram = (() => {
+    if (!res?.gpus?.length) return { used: null as number | null, total: null as number | null };
+    const total = res.gpus.reduce((s, g) => s + (g.total || 0), 0);
+    const used  = res.gpus.reduce((s, g) => s + (g.used  || 0), 0);
+    return { used, total };
+  })();
+
+  // ---- Active worker readiness + label
+  const activeWorker = workers.find((w) => w.id === activeWorkerId) || null;
+  const hasReadyActiveWorker = !!activeWorkerId && !!activeWorker && activeWorker.status === "ready";
+  const activeWorkerName =
+    (activeWorker?.model_path || "").split(/[\\/]/).pop() ||
+    activeWorker?.model_path ||
+    null;
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/40 flex items-start justify-center p-3">
+      <div className="w-full max-w-3xl mt-8 rounded-2xl overflow-hidden bg-white shadow-xl border">
+        {/* Header */}
+        <div className="p-3 border-b bg-gray-50/60 flex items-center justify-between">
+          <div className="font-medium text-sm">Select a model to load</div>
+          <button
+            onClick={onClose}
+            className="inline-flex items-center gap-2 text-sm px-3 py-2 rounded-lg border hover:bg-gray-50"
+            title="Close (Esc)"
+          >
+            <X className="w-4 h-4" />
+            Close
+          </button>
+        </div>
+
+        {/* Ready via worker banner */}
+        {hasReadyActiveWorker && !currentLoaded && (
+          <div className="px-3 pt-3">
+            <div className="rounded-lg border bg-emerald-50 text-emerald-900 flex items-center justify-between p-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <div className="text-sm truncate">
+                  <b>Active worker ready</b>
+                  {activeWorkerName ? (
+                    <>
+                      : <span className="truncate align-middle">{activeWorkerName}</span>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+              <button
+                className="text-xs px-3 py-1.5 rounded border border-emerald-300 hover:bg-emerald-100"
+                onClick={() => {
+                  onLoaded?.();
+                  onClose();
+                }}
+                title="Close and start chatting using the active worker"
+              >
+                Use active worker
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Resource bar (normalized fields) */}
+        <div className="px-3 py-2 border-b text-xs flex items-center gap-4 bg-gray-50/60">
+          <span>
+            CPU:&nbsp;
+            <b>{res?.cpuPct != null ? `${res.cpuPct}%` : "—"}</b>
+          </span>
+          <span>
+            RAM:&nbsp;
+            <b>{fmtGB(res?.ram?.used)} / {fmtGB(res?.ram?.total)}</b>
+          </span>
+          <span>
+            VRAM:&nbsp;
+            <b>
+              {fmtGB(vram.used)} / {fmtGB(vram.total)}
+              {res?.gpus?.length ? ` (${res.gpus.map((g) => g.name).join(", ")})` : ""}
+            </b>
+          </span>
+        </div>
+
+        {/* Currently Loaded (single runtime) + workers */}
+        <div className="px-3 py-2 border-b">
+          <div className="text-xs font-medium mb-2">Currently Loaded</div>
+          <div className="space-y-2">
+            {currentLoaded ? (
+              <div className="rounded-lg border p-3 flex items-center justify-between bg-indigo-50/40">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium truncate" title={loadedName || undefined}>
+                    {loadedName}
+                  </div>
+                  <div className="text-xs text-gray-600">
+                    GGUF (main runtime)
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleUnload}
+                    disabled={!!busyPath}
+                    className={`text-xs px-3 py-1.5 rounded border ${busyPath ? "opacity-60 cursor-not-allowed" : "hover:bg-gray-100"}`}
+                    title="Unload from main runtime"
+                  >
+                    Eject
+                  </button>
+                  {busyPath && (
+                    <button
+                      onClick={handleCancelLoad}
+                      className="text-xs px-3 py-1.5 rounded border hover:bg-gray-100"
+                      title="Cancel in-progress load"
+                    >
+                      Cancel load
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="text-xs text-gray-600">Nothing in main runtime.</div>
+            )}
+
+            {/* Worker rows */}
+            {workers
+              .filter((w) => w.status !== "stopped")
+              .map((w) => {
+                const h = w.health;
+                const title = (h?.model || w.model_path.split(/[\\/]/).pop() || w.model_path);
+                const isActive = w.id === activeWorkerId;
+                return (
+                  <div key={w.id} className="rounded-lg border p-3 flex items-center justify-between bg-violet-50/40">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium truncate" title={title}>
+                        {title}
+                      </div>
+                      <div className="text-xs text-gray-600">
+                        ctx={h?.n_ctx ?? "—"} · gpuLayers={h?.n_gpu_layers ?? "—"} · batch={h?.n_batch ?? "—"} · port={w.port}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {isActive ? (
+                        <span className="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 border border-emerald-200">
+                          active
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => handleActivateWorker(w.id)}
+                          className="text-xs px-3 py-1.5 rounded border hover:bg-gray-100"
+                          title="Make this the default worker"
+                        >
+                          Activate
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleKillWorker(w.id)}
+                        className="text-xs px-3 py-1.5 rounded border hover:bg-gray-100"
+                        title="Stop worker (frees VRAM)"
+                      >
+                        Eject
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            {!currentLoaded && workers.filter((w) => w.status !== "stopped").length === 0 && (
+              <div className="text-xs text-gray-600">Nothing loaded.</div>
+            )}
+          </div>
+        </div>
+
+        {/* Manual params */}
+        {manual && (
+          <div className="px-3 py-3 border-b grid grid-cols-2 gap-3 bg-gray-50/50">
+            <NumberField label="Context (nCtx)" value={nCtx} setValue={setNCtx} placeholder="4096" />
+            <NumberField label="Threads (nThreads)" value={nThreads} setValue={setNThreads} placeholder="8" />
+            <NumberField label="GPU Layers (nGpuLayers)" value={nGpuLayers} setValue={setNGpuLayers} placeholder="40" />
+            <NumberField label="Batch (nBatch)" value={nBatch} setValue={setNBatch} placeholder="256" />
+            <NumberField label="ropeFreqBase" value={ropeFreqBase} setValue={setRopeFreqBase} placeholder="(optional)" />
+            <NumberField label="ropeFreqScale" value={ropeFreqScale} setValue={setRopeFreqScale} placeholder="(optional)" />
+          </div>
+        )}
+
+        {/* List + search/sort */}
+        <ModelPickerList
+          loading={loading}
+          err={err}
+          models={models}
+          query={query}
+          setQuery={setQuery}
+          sortKey={sortKey}
+          setSortKey={setSortKey}
+          sortDir={sortDir}
+          setSortDir={setSortDir}
+          busyPath={busyPath}
+          onLoad={handleLoad}
+          onSpawn={handleSpawn}
+          onClose={onClose}
+        />
+
+        <div className="px-3 py-2 border-t text-[11px] text-gray-500">
+          Press <b>Esc</b> to close · <b>Enter</b> loads the first filtered
+          {hasReadyActiveWorker && !currentLoaded ? (
+            <>
+              {" "}
+              · Active worker is ready — you can close and start chatting.
+            </>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NumberField({
+  label,
+  value,
+  setValue,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  setValue: (s: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <label className="text-xs block">
+      <div className="mb-1 text-gray-600">{label}</div>
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        inputMode="numeric"
+        className="w-full px-2 py-1.5 rounded border text-sm"
+        placeholder={placeholder}
+      />
+    </label>
+  );
+}
+
+function fmtGB(n?: number | null) {
+  if (n == null) return "—";
+  return (n / (1024 ** 3)).toFixed(2) + " GB";
+}
+
+# ===== frontend/src/components/ModelPicker/ModelPickerList.tsx =====
+
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
+import {
+  AlertCircle,
+  ChevronDown,
+  HardDrive,
+  Loader2,
+  Search,
+} from "lucide-react";
+import type { ModelFile } from "../../api/models";
+
+type Props = {
+  loading: boolean;
+  err: string | null;
+  models: ModelFile[];
+
+  query: string;
+  setQuery: Dispatch<SetStateAction<string>>;
+
+  sortKey: "recency" | "size" | "name";
+  setSortKey: Dispatch<SetStateAction<"recency" | "size" | "name">>;
+
+  sortDir: "asc" | "desc";
+  setSortDir: Dispatch<SetStateAction<"asc" | "desc">>;
+
+  busyPath: string | null;
+  onLoad: (m: ModelFile) => void;
+  onSpawn: (m: ModelFile) => void;   // ← NEW
+  onClose: () => void;
+};
+
+export default function ModelPickerList({
+  loading,
+  err,
+  models,
+  query,
+  setQuery,
+  sortKey,
+  setSortKey,
+  sortDir,
+  setSortDir,
+  busyPath,
+  onLoad,
+  onSpawn,   // ← NEW
+  onClose,
+}: Props) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const filteredSorted = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    let list = !q
+      ? models.slice()
+      : models.filter(
+          (m) =>
+            m.name.toLowerCase().includes(q) ||
+            m.path.toLowerCase().includes(q) ||
+            (m.rel || "").toLowerCase().includes(q),
+        );
+
+    list.sort((a, b) => {
+      switch (sortKey) {
+        case "size":
+          return sortDir === "asc"
+            ? a.sizeBytes - b.sizeBytes
+            : b.sizeBytes - a.sizeBytes;
+        case "name":
+          return sortDir === "asc"
+            ? a.name.localeCompare(b.name)
+            : b.name.localeCompare(a.name);
+        case "recency":
+        default:
+          // if you later plumb mtime, use that; for now, fallback to name
+          return sortDir === "asc"
+            ? a.name.localeCompare(b.name)
+            : b.name.localeCompare(a.name);
+      }
+    });
+    return list;
+  }, [models, query, sortKey, sortDir]);
+
+  // Esc to close, Enter to load first visible
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      if (e.key === "Enter") {
+        const first = filteredSorted[0];
+        if (first && !busyPath) onLoad(first);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [filteredSorted, busyPath, onClose, onLoad]);
+
+  // Autofocus search
+  useEffect(() => {
+    const t = setTimeout(() => inputRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, []);
+
+  return (
+    <>
+      {/* Search + sort row */}
+      <div className="p-3 border-b bg-gray-50/60">
+        <div className="flex items-center gap-2">
+          <div className="flex-1 relative">
+            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+            <input
+              ref={inputRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Type to filter models…"
+              className="w-full pl-9 pr-3 py-2 rounded-lg border bg-white text-sm"
+            />
+          </div>
+          <div className="flex items-center gap-1">
+            <button
+              className="inline-flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg border hover:bg-gray-50"
+              onClick={() =>
+                setSortKey((k) =>
+                  k === "recency" ? "size" : k === "size" ? "name" : "recency",
+                )
+              }
+              title="Toggle sort key (Recency → Size → Name)"
+            >
+              {sortKey === "recency"
+                ? "Recency"
+                : sortKey === "size"
+                ? "Size"
+                : "Name"}{" "}
+              <ChevronDown className="w-4 h-4 opacity-60" />
+            </button>
+            <button
+              className="inline-flex items-center text-sm px-2 py-2 rounded-lg border hover:bg-gray-50"
+              onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+              title={`Sort ${sortDir === "asc" ? "ascending" : "descending"}`}
+            >
+              {sortDir === "asc" ? "↑" : "↓"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* List body */}
+      <div className="p-3 max-h-[60vh] md:max-h-[60vh] overflow-auto">
+        {loading && (
+          <div className="flex items-center gap-2 text-sm text-gray-600">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Loading models…
+          </div>
+        )}
+
+        {!!err && (
+          <div className="flex items-center gap-2 text-sm text-red-600 mb-3">
+            <AlertCircle className="w-4 h-4" />
+            {err}
+          </div>
+        )}
+
+        {!loading && filteredSorted.length === 0 && (
+          <div className="text-sm text-gray-600">No models match your filter.</div>
+        )}
+
+        <div className="space-y-2">
+          {filteredSorted.map((m) => {
+            const isBusy = busyPath === m.path || busyPath === `spawn:${m.path}`;
+            return (
+              <div key={m.path} className="rounded-lg border p-3 flex items-center justify-between">
+                <div className="min-w-0 flex items-center gap-3">
+                  <HardDrive className="w-4 h-4 text-gray-500" />
+                  <div className="truncate">
+                    <div className="truncate font-medium" title={m.name}>
+                      {m.name}
+                    </div>
+                    <div className="text-xs text-gray-500 truncate" title={m.path}>
+                      {m.rel || m.path}
+                

@@ -30,6 +30,7 @@ type Props = {
 
   busyPath: string | null;
   onLoad: (m: ModelFile) => void;
+  onSpawn: (m: ModelFile) => void;   // ← NEW
   onClose: () => void;
 };
 
@@ -45,6 +46,7 @@ export default function ModelPickerList({
   setSortDir,
   busyPath,
   onLoad,
+  onSpawn,   // ← NEW
   onClose,
 }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -72,7 +74,7 @@ export default function ModelPickerList({
             : b.name.localeCompare(a.name);
         case "recency":
         default:
-          // no mtime provided; fallback to name ordering
+          // if you later plumb mtime, use that; for now, fallback to name
           return sortDir === "asc"
             ? a.name.localeCompare(b.name)
             : b.name.localeCompare(a.name);
@@ -144,7 +146,7 @@ export default function ModelPickerList({
       </div>
 
       {/* List body */}
-      <div className="p-3 max-h=[60vh] md:max-h-[60vh] overflow-auto">
+      <div className="p-3 max-h-[60vh] md:max-h-[60vh] overflow-auto">
         {loading && (
           <div className="flex items-center gap-2 text-sm text-gray-600">
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -165,7 +167,7 @@ export default function ModelPickerList({
 
         <div className="space-y-2">
           {filteredSorted.map((m) => {
-            const isBusy = busyPath === m.path;
+            const isBusy = busyPath === m.path || busyPath === `spawn:${m.path}`;
             return (
               <div key={m.path} className="rounded-lg border p-3 flex items-center justify-between">
                 <div className="min-w-0 flex items-center gap-3">
@@ -179,17 +181,27 @@ export default function ModelPickerList({
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <div className="text-xs text-gray-500">{kbToGb(m.sizeBytes)}</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-xs text-gray-500">{bytesToGB(m.sizeBytes)}</div>
                   <button
                     onClick={() => onLoad(m)}
                     disabled={!!busyPath}
                     className={`text-xs px-3 py-1.5 rounded border ${
                       isBusy ? "opacity-60 cursor-wait" : "hover:bg-gray-100"
                     }`}
-                    title="Load this model"
+                    title="Load into main runtime (replaces current)"
                   >
-                    {isBusy ? "Loading…" : "Load"}
+                    {isBusy && busyPath === m.path ? "Loading…" : "Load"}
+                  </button>
+                  <button
+                    onClick={() => onSpawn(m)}
+                    disabled={!!busyPath}
+                    className={`text-xs px-3 py-1.5 rounded border ${
+                      isBusy ? "opacity-60 cursor-wait" : "hover:bg-gray-100"
+                    }`}
+                    title="Spawn parallel worker (keeps multiple models in VRAM)"
+                  >
+                    {isBusy && busyPath === `spawn:${m.path}` ? "Spawning…" : "Spawn"}
                   </button>
                 </div>
               </div>
@@ -201,7 +213,7 @@ export default function ModelPickerList({
   );
 }
 
-function kbToGb(n: number): string {
+function bytesToGB(n: number): string {
   const gb = n / (1024 ** 3);
   return `${gb.toFixed(2)} GB`;
 }

@@ -11,6 +11,7 @@ from ..runtime.model_runtime import (
     list_local_models,
     load_model,
     unload_model,
+    request_cancel_load,
 )
 
 router = APIRouter(prefix="/api", tags=["models"])
@@ -36,17 +37,26 @@ async def api_list_models():
 @router.get("/models/health")
 def models_health():
     info = current_model_info()
-    return {"ok": True, "loaded": info["loaded"], "config": info["config"]}
+    return {
+        "ok": True,
+        "loaded": info["loaded"],
+        "config": info["config"],
+        "loading": info.get("loading"),
+        "loadingPath": info.get("loadingPath"),
+    }
 
 @router.post("/models/load")
-async def api_load_model(req: LoadReq):
+def api_load_model(req: LoadReq):  # sync def
     try:
         payload = req.model_dump(exclude_none=True)
-        # IMPORTANT: pass as a single dict (no ** expansion)
         info = load_model(payload)
         return info
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        msg = str(e).strip()
+        # Distinguish user cancel vs error
+        if msg.upper() == "CANCELLED":
+            return JSONResponse({"cancelled": True}, status_code=499)
+        return JSONResponse({"error": msg}, status_code=400)
 
 @router.post("/models/unload")
 async def api_unload_model():
@@ -57,3 +67,8 @@ async def api_unload_model():
 async def api_update_model_settings(patch: dict[str, object]):
     s = write_settings(patch)
     return s
+
+@router.post("/models/cancel-load")
+async def api_cancel_model_load():
+    did = request_cancel_load()
+    return {"ok": True, "cancelled": did}

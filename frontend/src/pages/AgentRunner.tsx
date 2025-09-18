@@ -1,22 +1,13 @@
-// frontend/src/file_read/pages/AgentRunner.tsx
 import { useEffect, useState } from "react";
-import ChatContainer from "../components/ChatContainer";
-import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
 import { useChatStream } from "../hooks/useChatStream";
 import { useSidebar } from "../hooks/useSidebar";
 import { useToast } from "../hooks/useToast";
-import DesktopHeader from "../components/DesktopHeader";
-import MobileDrawer from "../components/MobileDrawer";
-import Toast from "../shared/ui/Toast";
 import { createChat, deleteMessagesBatch } from "../data/chatApi";
-import SettingsPanel from "../components/SettingsPanel";
-import KnowledgePanel from "../components/KnowledgePanel";
 import { useAuth } from "../auth/AuthContext";
-
-// Model picker + API
-import ModelPicker from "../components/ModelPicker/ModelPicker";
 import { getModelHealth } from "../api/models";
+import { getJSON } from "../services/http"; // removed postJSON
 import type { Attachment } from "../types/chat";
+import AgentRunnerView from "./AgentRunnerView";
 
 const LS_KEY = "lastSessionId";
 
@@ -38,10 +29,10 @@ export default function AgentRunner() {
     if (!loading && user) setRefreshKey((k) => k + 1);
   }, [loading, user]);
 
-  // ---- Model health (polled) ----
+  // ---- Single-runtime health ----
   const [health, setHealth] = useState<{ ok: boolean; loaded: boolean; config: any } | null>(null);
-  const modelLoaded = !!health?.loaded;
-  const modelName =
+  const singleRuntimeLoaded = !!health?.loaded;
+  const singleRuntimeModelName =
     (health?.config?.config?.modelPath || health?.config?.modelPath || "")
       .split(/[\\/]/)
       .pop() || null;
@@ -51,12 +42,12 @@ export default function AgentRunner() {
     let t: any;
     const poll = async () => {
       try {
-        const h = await getModelHealth(); // GET /api/models/health
+        const h = await getModelHealth();
         if (alive) setHealth(h);
       } catch {
         if (alive) setHealth({ ok: false, loaded: false, config: null });
       } finally {
-        t = setTimeout(poll, 4000);
+        t = setTimeout(poll, 40000);
       }
     };
     poll();
@@ -66,19 +57,76 @@ export default function AgentRunner() {
     };
   }, []);
 
-  // Guard send if model not loaded (mirrors backend gating) — ACCEPT & FORWARD ARGUMENTS
+  // ---- Worker readiness (active+ready) ----
+  const [workerActiveReady, setWorkerActiveReady] = useState(false);
+  const [workerModelName, setWorkerModelName] = useState<string | null>(null);
+
+  async function refreshWorkerReady() {
+    try {
+      const info = await getJSON<{ ok: boolean; workers: any[]; active: string | null }>(
+        "/api/model-workers/inspect"
+      );
+      const activeId = info?.active || null;
+      const active = info?.workers?.find((w) => w.id === activeId) || null;
+      const ready = !!active && active.status === "ready";
+      setWorkerActiveReady(ready);
+      if (ready && active) {
+        const nm = (active.model_path || "").split(/[\\/]/).pop() || active.model_path || "";
+        setWorkerModelName(nm || null);
+      } else {
+        setWorkerModelName(null);
+      }
+    } catch {
+      setWorkerActiveReady(false);
+      setWorkerModelName(null);
+    }
+  }
+
+  useEffect(() => {
+    let alive = true;
+    let t: any;
+    const poll = async () => {
+      if (!alive) return;
+      await refreshWorkerReady();
+      t = setTimeout(poll, 30000);
+    };
+    poll();
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, []);
+
+  // 👇 Treat either single-runtime OR active worker as “ready”
+  const modelLoaded = singleRuntimeLoaded || workerActiveReady;
+  const modelName = workerActiveReady ? workerModelName : singleRuntimeModelName;
+
+  // Send message: unified streaming path
   async function safeSend(text?: string, attachments?: Attachment[]) {
+    const raw = (text ?? chat.input ?? "").trim();
+
     if (!modelLoaded) {
-      show("Select & load a model to start chatting.");
+      show("Select a model or activate a worker to start.");
       setShowModelPicker(true);
       return;
     }
-    // prefer explicit text from composer; fallback to current input
-    const t = (text ?? chat.input ?? "").trim();
-    if (!t && !(attachments && attachments.length)) return;
+    if (!raw && !(attachments && attachments.length)) return;
+
+    // ensure session exists
+    let sid = chat.sessionIdRef.current;
+    if (!sid) {
+      sid = crypto.randomUUID();
+      chat.setSessionId(sid);
+      try {
+        await createChat(sid, "New Chat");
+      } catch {}
+      localStorage.setItem(LS_KEY, sid);
+      setRefreshKey((k) => k + 1);
+    }
 
     try {
-      await chat.send(t, attachments);
+      // always stream; backend proxies to worker if one is active
+      await chat.send(raw, attachments);
     } catch (e: any) {
       const msg =
         e?.message === "MODEL_NOT_LOADED"
@@ -178,9 +226,7 @@ export default function AgentRunner() {
       .filter((m: any) => toDelete.has(m.id) && m.serverId != null)
       .map((m: any) => m.serverId as number);
     const remaining = current.filter((m) => !toDelete.has(m.id));
-    if ((chat as any).setMessagesForSession) {
-      (chat as any).setMessagesForSession(sid, () => remaining);
-    }
+    (chat as any).setMessagesForSession?.(sid, () => remaining);
     try {
       if (serverIds.length) {
         await deleteMessagesBatch(sid, serverIds);
@@ -198,120 +244,56 @@ export default function AgentRunner() {
     }
   }
 
+  async function handleEjectModel() {
+    try {
+      await fetch("/api/models/unload", { method: "POST", credentials: "include" });
+      setHealth((h) => (h ? { ...h, loaded: false } : { ok: true, loaded: false, config: null }));
+    } catch {
+      show("Failed to unload model");
+    } finally {
+      await refreshWorkerReady();
+    }
+  }
+
+  async function refreshHealth() {
+    try {
+      const h = await getModelHealth();
+      setHealth(h);
+      await refreshWorkerReady();
+    } catch {}
+  }
+
   return (
-    <div className="h-screen w-full flex bg-gray-50">
-      {sidebarOpen && (
-        <div className="hidden md:flex h-full">
-          <ChatSidebar
-            onOpen={openSession}
-            onNew={newChat}
-            refreshKey={refreshKey}
-            activeId={chat.sessionIdRef.current}
-            onHideSidebar={() => setSidebarOpen(false)}
-            onCancelSessions={handleCancelSessions}
-          />
-        </div>
-      )}
-
-      <MobileDrawer
-        onOpenSession={openSession}
-        onNewChat={newChat}
-        refreshKey={refreshKey}
-        activeId={chat.sessionIdRef.current}
-        openMobileDrawer={openMobileDrawer}
-        closeMobileDrawer={closeMobileDrawer}
-      />
-      <div className="md:hidden h-14 shrink-0" />
-
-      <div className="flex-1 min-w-0 flex flex-col">
-        <DesktopHeader
-          sidebarOpen={sidebarOpen}
-          onShowSidebar={() => setSidebarOpen(true)}
-          modelLoaded={modelLoaded}
-          modelName={modelName}
-          busy={false}
-          onOpenModelPicker={() => setShowModelPicker(true)}
-          onEjectModel={async () => {
-            try {
-              await fetch("/api/models/unload", { method: "POST", credentials: "include" });
-              setHealth((h) =>
-                h ? { ...h, loaded: false } : { ok: true, loaded: false, config: null },
-              );
-            } catch {
-              show("Failed to unload model");
-            }
-          }}
-        />
-
-        {!modelLoaded && (
-          <div className="px-3 md:px-6 mt-2">
-            <div className="mx-auto max-w-3xl md:max-w-4xl">
-              <div className="rounded-lg border bg-amber-50 text-amber-900 text-sm px-3 py-2">
-                No model is loaded. Click{" "}
-                <button
-                  className="ml-1 inline-flex items-center text-xs px-2 py-1 rounded border hover:bg-amber-100"
-                  onClick={() => setShowModelPicker(true)}
-                >
-                  Select a model to load
-                </button>{" "}
-                to start chatting.
-              </div>
-            </div>
-          </div>
-        )}
-
-        <div className="flex-1 min-h-0">
-          <div className="h-full px-3 md:px-6">
-            <div className="h-full w-full mx-auto max-w-3xl md:max-w-4xl relative">
-              <div id="chat-scroll-container" className="h-full">
-                <ChatContainer
-                  messages={chat.messages}
-                  input={chat.input}
-                  setInput={chat.setInput}
-                  loading={chat.loading}
-                  queued={chat.queued}
-                  send={safeSend}               
-                  stop={chat.stop}
-                  runMetrics={chat.runMetrics}
-                  runJson={chat.runJson}
-                  onRefreshChats={() => {}}
-                  onDeleteMessages={handleDeleteMessages}
-                  autoFollow={autoFollow}
-                  sessionId={chat.sessionIdRef.current}
-                />
-              </div>
-              <Toast message={toast} />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {showModelPicker && (
-        <ModelPicker
-          open={showModelPicker}
-          onClose={() => setShowModelPicker(false)}
-          onLoaded={async () => {
-            try {
-              const h = await getModelHealth();
-              setHealth(h);
-            } catch {}
-          }}
-        />
-      )}
-
-      {showSettings && (
-        <SettingsPanel
-          sessionId={chat.sessionIdRef.current}
-          onClose={() => setShowSettings(false)}
-        />
-      )}
-      {showKnowledge && (
-        <KnowledgePanel
-          sessionId={chat.sessionIdRef.current}
-          onClose={() => setShowKnowledge(false)}
-          toast={show}
-        />
-      )}
-    </div>
+    <AgentRunnerView
+      // sidebar
+      sidebarOpen={sidebarOpen}
+      setSidebarOpen={setSidebarOpen}
+      openMobileDrawer={openMobileDrawer}
+      closeMobileDrawer={closeMobileDrawer}
+      // chat + ui state
+      chat={chat}
+      toast={toast}
+      autoFollow={autoFollow}
+      refreshKey={refreshKey}
+      // model
+      modelLoaded={modelLoaded}
+      modelName={modelName}
+      showModelPicker={showModelPicker}
+      setShowModelPicker={setShowModelPicker}
+      onEjectModel={handleEjectModel}
+      onHealthRefresh={refreshHealth}
+      // panels
+      showSettings={showSettings}
+      setShowSettings={setShowSettings}
+      showKnowledge={showKnowledge}
+      setShowKnowledge={setShowKnowledge}
+      // handlers
+      onOpenSession={openSession}
+      onNewChat={newChat}
+      onCancelSessions={handleCancelSessions}
+      onDeleteMessages={handleDeleteMessages}
+      safeSend={safeSend}
+      showToast={show}
+    />
   );
 }

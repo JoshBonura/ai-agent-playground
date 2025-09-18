@@ -1,0 +1,3336 @@
+    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="text-xs text-gray-500">{bytesToGB(m.sizeBytes)}</div>
+                  <button
+                    onClick={() => onLoad(m)}
+                    disabled={!!busyPath}
+                    className={`text-xs px-3 py-1.5 rounded border ${
+                      isBusy ? "opacity-60 cursor-wait" : "hover:bg-gray-100"
+                    }`}
+                    title="Load into main runtime (replaces current)"
+                  >
+                    {isBusy && busyPath === m.path ? "Loading…" : "Load"}
+                  </button>
+                  <button
+                    onClick={() => onSpawn(m)}
+                    disabled={!!busyPath}
+                    className={`text-xs px-3 py-1.5 rounded border ${
+                      isBusy ? "opacity-60 cursor-wait" : "hover:bg-gray-100"
+                    }`}
+                    title="Spawn parallel worker (keeps multiple models in VRAM)"
+                  >
+                    {isBusy && busyPath === `spawn:${m.path}` ? "Spawning…" : "Spawn"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function bytesToGB(n: number): string {
+  const gb = n / (1024 ** 3);
+  return `${gb.toFixed(2)} GB`;
+}
+
+# ===== frontend/src/components/SearchTester.tsx =====
+
+import { PanelLeftOpen, Loader2, Power, ChevronDown } from "lucide-react";
+
+type Props = {
+  sidebarOpen: boolean;
+  onShowSidebar: () => void;
+  title?: string;
+
+  // Optional model UI (safe defaults so AgentRunner can omit them)
+  modelLoaded?: boolean;
+  modelName?: string | null;
+  busy?: boolean;
+
+  // Optional actions (if not provided, the center/right controls are hidden)
+  onOpenModelPicker?: () => void;
+  onEjectModel?: () => void;
+};
+
+export default function DesktopHeader({
+  sidebarOpen,
+  onShowSidebar,
+  title = "Local AI Model",
+
+  // defaults make these truly optional
+  modelLoaded = false,
+  modelName = null,
+  busy = false,
+
+  onOpenModelPicker,
+  onEjectModel,
+}: Props) {
+  return (
+    <div className="hidden md:flex h-14 shrink-0 items-center justify-between px-4 border-b bg-white">
+      {/* Left: sidebar toggle + title */}
+      <div className="flex items-center gap-2">
+        {!sidebarOpen && (
+          <button
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border hover:bg-gray-50"
+            onClick={onShowSidebar}
+            aria-label="Show sidebar"
+            title="Show sidebar"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+          </button>
+        )}
+        <div className="font-semibold">{title}</div>
+      </div>
+
+      {/* Center: model status / picker (only if a picker handler is supplied) */}
+      <div className="flex items-center">
+        {onOpenModelPicker ? (
+          !modelLoaded ? (
+            <button
+              type="button"
+              onClick={onOpenModelPicker}
+              className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border hover:bg-gray-50"
+              title="Select a model to load"
+            >
+              <span className="h-2.5 w-2.5 rounded-full bg-gray-300" />
+              <span className="whitespace-nowrap">Select a model to load</span>
+              <ChevronDown className="w-4 h-4 opacity-60" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenModelPicker}
+              className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border hover:bg-gray-50"
+              title="Change model"
+            >
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+              <span
+                className="truncate max-w-[32ch]"
+                title={modelName || "Model loaded"}
+              >
+                {modelName || "Model loaded"}
+              </span>
+              <ChevronDown className="w-4 h-4 opacity-60" />
+            </button>
+          )
+        ) : (
+          // If no picker handler, keep layout balanced with an empty spacer
+          <div className="w-0" />
+        )}
+      </div>
+
+      {/* Right: eject / busy indicator (only if an eject handler is supplied) */}
+      <div className="flex items-center gap-2">
+        {busy ? (
+          <div className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border bg-gray-50">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>Working…</span>
+          </div>
+        ) : onEjectModel ? (
+          <button
+            type="button"
+            onClick={onEjectModel}
+            disabled={!modelLoaded}
+            className={`inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg border ${
+              modelLoaded ? "hover:bg-gray-50" : "opacity-60 cursor-not-allowed"
+            }`}
+            title={modelLoaded ? "Unload model" : "No model loaded"}
+          >
+            <Power className="w-4 h-4" />
+            <span>Eject</span>
+          </button>
+        ) : (
+          <div className="w-0" />
+        )}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Settings/AdminDeviceManager.tsx =====
+
+// frontend/src/file_read/settings/AdminDeviceManager.tsx
+import { useEffect, useState } from "react";
+import { listDevices, revokeDevice, renameDevice, recheckActivation, type DeviceRec } from "../../api/devices";
+
+export default function AdminDeviceManager() {
+  const [rows, setRows] = useState<DeviceRec[]>([]);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [draftName, setDraftName] = useState<string>("");
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  async function reload() {
+    setErr(null);
+    setLoading(true);
+    try {
+      const data = await listDevices();
+      setRows(data);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load devices");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void reload(); }, []);
+
+  async function onRevoke(id: string) {
+    setBusyId(id);
+    setErr(null);
+    try {
+      await revokeDevice(id);
+      const wasCurrent = rows.find(r => r.id === id)?.isCurrent;
+      await reload();
+      if (wasCurrent) {
+        await recheckActivation();
+        location.reload();
+      }
+    } catch (e: any) {
+      setErr(e?.message || "Failed to revoke device");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  function startRename(r: DeviceRec) {
+    setRenamingId(r.id);
+    setDraftName(r.name ?? "");
+  }
+
+  async function saveRename(id: string) {
+    setBusyId(id);
+    setErr(null);
+    try {
+      await renameDevice(id, draftName);
+      await reload();
+      setRenamingId(null);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to rename device");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  if (loading) return <div className="text-xs text-gray-500">Loading devices…</div>;
+  if (err) return <div className="text-xs text-red-600">{err}</div>;
+  if (!rows.length) return <div className="text-sm text-gray-600">No activated devices yet.</div>;
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-gray-600">
+            <th className="py-2 pr-3">Name</th>
+            <th className="py-2 pr-3">Device ID</th>
+            <th className="py-2 pr-3">Platform</th>
+            <th className="py-2 pr-3">App</th>
+            <th className="py-2 pr-3">Last seen</th>
+            <th className="py-2 pr-3">Status</th>
+            <th className="py-2 pr-3"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.id} className="border-t">
+              <td className="py-2 pr-3">
+                {renamingId === r.id ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="border rounded px-2 py-1 text-xs w-40"
+                      value={draftName}
+                      onChange={(e) => setDraftName(e.target.value)}
+                      placeholder="Optional name"
+                      disabled={!!busyId}
+                    />
+                    <button
+                      className="text-xs px-2 py-1 rounded border hover:bg-gray-50 disabled:opacity-50"
+                      disabled={!!busyId}
+                      onClick={() => saveRename(r.id)}
+                    >
+                      Save
+                    </button>
+                    <button
+                      className="text-xs px-2 py-1 rounded border hover:bg-gray-50"
+                      onClick={() => setRenamingId(null)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span>{r.name || <span className="text-gray-400">—</span>}</span>
+                    <button
+                      className="text-xs px-2 py-0.5 rounded border hover:bg-gray-50"
+                      onClick={() => startRename(r)}
+                      title="Rename device"
+                    >
+                      Rename
+                    </button>
+                  </div>
+                )}
+              </td>
+              <td className="py-2 pr-3 font-mono text-[11px] break-all">{r.id}</td>
+              <td className="py-2 pr-3">{r.platform || "—"}</td>
+              <td className="py-2 pr-3">{r.appVersion || "—"}</td>
+              <td className="py-2 pr-3">{r.lastSeen ? new Date(r.lastSeen).toLocaleString() : "—"}</td>
+              <td className="py-2 pr-3">
+                {r.isCurrent ? (
+                  <span className="inline-flex items-center rounded bg-emerald-600/10 text-emerald-700 px-2 py-0.5 text-xs">Current</span>
+                ) : (
+                  <span className="inline-flex items-center rounded bg-gray-200 px-2 py-0.5 text-xs">Other</span>
+                )}
+              </td>
+              <td className="py-2 pr-3 text-right">
+                <button
+                  className="text-xs px-2 py-1 rounded border hover:bg-gray-50 disabled:opacity-50"
+                  disabled={!!busyId}
+                  onClick={() => onRevoke(r.id)}
+                  title={r.isCurrent ? "Revoke this device (you will drop to Free here)" : "Revoke this device"}
+                >
+                  {busyId === r.id ? "Revoking…" : r.isCurrent ? "Revoke this device" : "Revoke"}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Settings/AdminGuestToggle.tsx =====
+
+import { useEffect, useState } from "react";
+import { getAdminState, setGuestEnabled } from "../../api/admins";
+
+export default function AdminGuestToggle() {
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await getAdminState();
+        if (!cancelled) {
+          setIsAdmin(!!s.isAdmin);
+          setEnabled(!!s.guestEnabled);
+        }
+      } catch (e: any) {
+        if (!cancelled) setErr(e?.message || "Failed to load admin state");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!isAdmin) return null;
+
+  return (
+    <div className="flex items-center gap-3 text-sm">
+      <label className="inline-flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={async (e) => {
+            const next = e.target.checked;
+            setBusy(true);
+            setErr(null);
+            try {
+              const res = await setGuestEnabled(next);
+              setEnabled(res.enabled);
+            } catch (e: any) {
+              setErr(e?.message || "Failed to update guest access");
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+        Allow guest access on my network
+      </label>
+      {busy && <span className="text-xs text-gray-500">Saving…</span>}
+      {err && <span className="text-xs text-red-600">{err}</span>}
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Settings/AdminScopeToggle.tsx =====
+
+import { useEffect, useState } from "react";
+import { getAdminState } from "../../api/admins";
+import { getAdminChatScope, setAdminChatScope } from "../../hooks/adminChatsApi";
+import type { AdminChatScope } from "../../hooks/adminChatsApi";
+
+export default function AdminScopeToggle() {
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [scope, setScope] = useState<AdminChatScope>(() => getAdminChatScope());
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await getAdminState();
+        if (!cancelled) setIsAdmin(!!s.isAdmin);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!isAdmin) return null;
+
+  function choose(next: AdminChatScope) {
+    setScope(next);
+    setAdminChatScope(next); // persists + dispatches "admin:scope"
+  }
+
+  return (
+    <div
+      className="inline-flex rounded-lg border overflow-hidden text-xs"
+      role="group"
+      aria-label="Admin chat scope"
+    >
+      <button
+        onClick={() => choose("mine")}
+        className={`px-2 py-1 ${scope === "mine" ? "bg-black text-white" : "bg-white hover:bg-gray-50"}`}
+        title="Show only your own chats"
+      >
+        Mine
+      </button>
+      <button
+        onClick={() => choose("all")}
+        className={`px-2 py-1 ${scope === "all" ? "bg-black text-white" : "bg-white hover:bg-gray-50"}`}
+        title="Show all users’ chats"
+      >
+        All
+      </button>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Settings/BraveSearchCard.tsx =====
+
+import { useEffect, useState } from "react";
+import { getEffective, patchOverrides } from "../../data/settingsApi";
+
+export default function BraveSearchCard() {
+  const [loading, setLoading] = useState(true);
+  const [, setProvider] = useState("brave");
+  const [useWorker, setUseWorker] = useState(false);
+  const [workerUrl, setWorkerUrl] = useState("");
+
+  // we don’t prefill the API key for security; we only show a “present” flag
+  const [hasKey, setHasKey] = useState<boolean>(false);
+  const [apiKey, setApiKey] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const eff = await getEffective();
+        setProvider(String(eff.web_search_provider ?? "brave"));
+        setWorkerUrl(String(eff.brave_worker_url ?? ""));
+        setUseWorker(Boolean(eff.brave_worker_url));
+        // backend will mask the key and expose only boolean presence
+        setHasKey(Boolean(eff.brave_api_key_present));
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  async function save() {
+    const patch: Record<string, any> = {
+      web_search_provider: "brave",
+      // if worker is used, clear server-side key (we’ll route via worker instead)
+      brave_api_key: useWorker ? "" : apiKey,
+      brave_worker_url: useWorker ? workerUrl : "",
+    };
+    await patchOverrides(patch);
+    // don’t keep key in memory after save
+    setApiKey("");
+    setHasKey(!useWorker && !!patch.brave_api_key);
+  }
+
+  if (loading) return null;
+
+  return (
+    <div className="rounded-2xl p-4 border">
+      <h3 className="font-semibold mb-2">Web Search (Brave)</h3>
+
+      <div className="mb-3">
+        <label className="block text-sm mb-1">
+          Route via Cloudflare Worker
+        </label>
+        <input
+          type="checkbox"
+          checked={useWorker}
+          onChange={(e) => setUseWorker(e.target.checked)}
+        />
+      </div>
+
+      {useWorker ? (
+        <div className="mb-3">
+          <label className="block text-sm mb-1">Worker URL</label>
+          <input
+            className="w-full border rounded p-2"
+            placeholder="https://your-worker.workers.dev/brave"
+            value={workerUrl}
+            onChange={(e) => setWorkerUrl(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            Your Worker holds the Brave API key. The app doesn’t store it.
+          </p>
+        </div>
+      ) : (
+        <div className="mb-3">
+          <label className="block text-sm mb-1">Brave API Key</label>
+          <input
+            className="w-full border rounded p-2"
+            placeholder="X-Subscription-Token"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            spellCheck={false}
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            {hasKey ? "Key is stored on the server." : "No key stored yet."}
+          </p>
+        </div>
+      )}
+
+      <button
+        className="mt-2 px-3 py-2 rounded bg-black text-white"
+        onClick={save}
+      >
+        Save
+      </button>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Settings/UpgradeSection.tsx =====
+
+import { useEffect, useMemo, useState } from "react";
+import { getBillingStatus, openPortal, startCheckout } from "../../api/billing";
+import { buildUrl } from "../../services/http";
+
+type Props = { userEmail?: string | null };
+
+function openExternal(url: string) {
+  // @ts-ignore
+  if (window?.electron?.openExternal) return window.electron.openExternal(url);
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+export default function UpgradeSection({ userEmail }: Props) {
+  const [billing, setBilling] = useState<null | {
+    status: string;
+    current_period_end: number;
+  }>(null);
+  const [license, setLicense] = useState<{
+    plan: string;
+    valid: boolean;
+    exp?: number;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const isPro = useMemo(() => {
+    const s = (billing?.status || "").toLowerCase();
+    const billActive = s === "active" || s === "trialing" || s === "past_due";
+    const licActive =
+      Boolean(license?.valid) &&
+      (license?.plan || "pro").toLowerCase() !== "free";
+    return billActive || licActive;
+  }, [billing, license]);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      setLoading(true);
+      setErr(null);
+      try {
+        const [b, l] = await Promise.all([
+          getBillingStatus(), // cookie-auth; 401 if not logged in
+          fetch(buildUrl("/license/status"), {
+            method: "GET",
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          }).then((r) => {
+            if (!r.ok) throw new Error("license status failed");
+            return r.json();
+          }),
+        ]);
+        if (mounted) {
+          setBilling(b);
+          setLicense(l);
+        }
+      } catch (e: any) {
+        if (mounted) setErr(e?.message || "Failed to load billing/license");
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [userEmail]); // re-run when user changes
+
+  async function handleUpgrade() {
+    if (!userEmail) {
+      setErr("Please sign in to upgrade.");
+      return;
+    }
+    try {
+      setErr(null);
+      const priceId =
+        (import.meta.env.VITE_STRIPE_PRICE_PRO_MONTHLY as string | undefined) ||
+        undefined;
+      const { url } = await startCheckout(priceId);
+      openExternal(url);
+    } catch (e: any) {
+      setErr(e?.message || "Could not start checkout");
+    }
+  }
+
+  async function handleManage() {
+    if (!userEmail) {
+      setErr("Please sign in to manage billing.");
+      return;
+    }
+    try {
+      setErr(null);
+      const { url } = await openPortal();
+      openExternal(url);
+    } catch (e: any) {
+      setErr(e?.message || "Could not open billing portal");
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div className="font-semibold">Upgrade</div>
+        <span
+          className={
+            "inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs " +
+            (isPro ? "bg-green-600 text-white" : "bg-gray-200 text-gray-800")
+          }
+        >
+          {isPro ? "Pro (active)" : loading ? "Loading…" : "Free"}
+        </span>
+      </div>
+
+      {err && (
+        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {err}
+        </div>
+      )}
+
+      <div className="grid gap-6 md:grid-cols-2">
+        <PlanCard
+          title="Free"
+          price="$0"
+          features={["Local model", "Basic settings"]}
+          ctaLabel="Current Plan"
+          ctaDisabled
+        />
+        <PlanCard
+          title="Pro"
+          price="$12/mo"
+          subtitle="or $96/year"
+          features={[
+            "Pro features via license",
+            "Priority updates",
+            "Manage billing in portal",
+          ]}
+          ctaLabel={isPro ? "Manage Billing" : "Go Pro"}
+          onClick={isPro ? handleManage : handleUpgrade}
+          highlight
+        />
+      </div>
+
+      <div className="mt-6 rounded-xl border bg-gray-50 p-3 text-xs text-gray-700">
+        <div className="font-medium mb-1">License</div>
+        <div>
+          Plan: <strong>{license?.plan ?? "free"}</strong>{" "}
+          {license?.valid === false && "(invalid/expired)"}
+        </div>
+        {license?.exp ? (
+          <div>Exp: {new Date(license.exp * 1000).toLocaleDateString()}</div>
+        ) : null}
+        {userEmail && (
+          <div className="mt-2 text-gray-600">
+            Signed in as <strong>{userEmail}</strong>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PlanCard({
+  title,
+  price,
+  subtitle,
+  features,
+  ctaLabel,
+  ctaDisabled,
+  onClick,
+  highlight,
+}: {
+  title: string;
+  price: string;
+  subtitle?: string;
+  features: string[];
+  ctaLabel: string;
+  ctaDisabled?: boolean;
+  onClick?: () => void;
+  highlight?: boolean;
+}) {
+  return (
+    <div
+      className={
+        "rounded-2xl border bg-white p-6 shadow-sm " +
+        (highlight ? "ring-2 ring-indigo-500" : "")
+      }
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <div className="text-lg font-semibold">{title}</div>
+        {highlight && (
+          <span className="rounded-full bg-indigo-100 px-2 py-1 text-xs text-indigo-700">
+            Best Value
+          </span>
+        )}
+      </div>
+      <div className="mb-1 text-3xl font-bold">{price}</div>
+      {subtitle && <div className="mb-4 text-sm text-gray-500">{subtitle}</div>}
+      <ul className="mb-6 space-y-2 text-sm text-gray-700">
+        {features.map((f) => (
+          <li key={f}>• {f}</li>
+        ))}
+      </ul>
+      <button
+        disabled={ctaDisabled}
+        onClick={onClick}
+        className={
+          "w-full rounded-xl px-4 py-2 font-medium " +
+          (ctaDisabled
+            ? "cursor-not-allowed border text-gray-500"
+            : highlight
+              ? "bg-indigo-600 text-white hover:bg-indigo-700"
+              : "border hover:bg-gray-50")
+        }
+      >
+        {ctaLabel}
+      </button>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/Settings/WebSearchSection.tsx =====
+
+import { useEffect, useState } from "react";
+import { getEffective, patchOverrides } from "../../data/settingsApi";
+
+export default function WebSearchSection({
+  onSaved,
+}: {
+  onSaved?: () => void;
+}) {
+  const [apiKey, setApiKey] = useState("");
+  const [masked, setMasked] = useState(true);
+  const [status, setStatus] = useState<null | { ok: boolean; msg: string }>(
+    null,
+  );
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const eff = await getEffective();
+        setApiKey(eff.brave_api_key || "");
+      } catch {
+        // fallback if no settings
+      }
+    })();
+  }, []);
+
+  async function save() {
+    try {
+      await patchOverrides({ brave_api_key: apiKey.trim() });
+      setStatus({ ok: true, msg: "Saved" });
+      onSaved?.();
+    } catch (e: any) {
+      setStatus({ ok: false, msg: e?.message || "Failed to save" });
+    }
+  }
+
+  function clearKey() {
+    patchOverrides({ brave_api_key: "" });
+    setApiKey("");
+    setStatus({ ok: true, msg: "Key cleared" });
+    onSaved?.();
+  }
+
+  const displayVal =
+    masked && apiKey ? "•".repeat(Math.min(apiKey.length, 24)) : apiKey;
+
+  return (
+    <div className="space-y-4">
+      <div className="text-sm text-gray-600">
+        Enable web search via your own <b>Brave Search API</b> key. Stored in
+        settings, not in local storage.
+      </div>
+
+      <div className="space-y-2">
+        <label className="block text-sm">Brave API key</label>
+        <div className="flex items-stretch gap-2">
+          <input
+            className="flex-1 border rounded px-3 py-2 text-sm"
+            placeholder="X-Subscription-Token"
+            value={displayVal}
+            onChange={(e) => setApiKey(e.target.value)}
+            onFocus={() => setMasked(false)}
+            onBlur={() => setMasked(true)}
+          />
+          <button
+            className="px-3 py-2 rounded border text-sm hover:bg-gray-50"
+            onClick={() => setMasked((m) => !m)}
+            title={masked ? "Show" : "Hide"}
+          >
+            {masked ? "Show" : "Hide"}
+          </button>
+          <button
+            className="px-3 py-2 rounded border text-sm hover:bg-gray-50"
+            onClick={clearKey}
+            title="Clear key"
+          >
+            Clear
+          </button>
+          <button
+            className="px-3 py-2 rounded bg-black text-white text-sm"
+            onClick={save}
+          >
+            Save
+          </button>
+        </div>
+        {status && (
+          <div
+            className={`text-xs ${status.ok ? "text-green-600" : "text-red-600"}`}
+          >
+            {status.msg}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+# ===== frontend/src/components/SettingsPanel.tsx =====
+
+// frontend/src/file_read/settings/SettingsPanel.tsx
+import { useEffect, useMemo, useState } from "react";
+import { useSettings } from "../hooks/useSettings";
+import WebSearchSection from "../components/Settings/WebSearchSection";
+import { useAuth } from "../auth/AuthContext";
+import UpgradeSection from "../components/Settings/UpgradeSection";
+import AdminBanner from "./AdminBanner";
+import AdminManagement from "./AdminManagement";
+import AdminScopeToggle from "./Settings/AdminScopeToggle";
+import AdminGuestToggle from "./Settings/AdminGuestToggle";
+import { getAdminState } from "../api/admins";
+import type { AdminState } from "../api/admins";
+import AdminDeviceManager from "./Settings/AdminDeviceManager"
+
+type Tab =
+  | "general"
+  | "notifications"
+  | "personalization"
+  | "connectors"
+  | "schedules"
+  | "datacontrols"
+  | "security"
+  | "account"
+  | "developer"
+  | "admin";
+
+const BASE_NAV: { key: Tab; label: string }[] = [
+  { key: "general", label: "General" },
+  { key: "notifications", label: "Notifications" },
+  { key: "personalization", label: "Personalization" },
+  { key: "connectors", label: "Connectors" },
+  { key: "schedules", label: "Schedules" },
+  { key: "datacontrols", label: "Data controls" },
+  { key: "security", label: "Security" },
+  { key: "account", label: "Account" },
+  { key: "developer", label: "Developer" },
+];
+
+export default function SettingsPanel({
+  sessionId,
+  onClose,
+}: {
+  sessionId?: string;
+  onClose?: () => void;
+}) {
+  const {
+    loading,
+    error,
+    effective,
+    overrides,
+    defaults,
+    adaptive,
+    saveOverrides,
+    runAdaptive,
+    reload,
+  } = useSettings(sessionId);
+
+  const { user } = useAuth();
+  const [tab, setTab] = useState<Tab>("general");
+
+  // ---- Admin state for nav gating ----
+  const [adminState, setAdminState] = useState<AdminState | null>(null);
+  const [adminErr, setAdminErr] = useState<string | null>(null);
+
+  async function reloadAdminState() {
+    try {
+      const s = await getAdminState();
+      setAdminState(s);
+      setAdminErr(null);
+    } catch (e: any) {
+      setAdminState(null);
+      setAdminErr(e?.message || "Failed to load admin state");
+    }
+  }
+
+  useEffect(() => {
+    void reloadAdminState();
+  }, []);
+
+  const navItems = useMemo(() => {
+    const canSelfPromote = !!adminState?.canSelfPromote;
+    const isAdmin = !!adminState?.isAdmin;
+    const items: { key: Tab; label: string }[] = [...BASE_NAV];
+    if (isAdmin || canSelfPromote) {
+      // Insert Admin right after General
+      items.splice(1, 0, { key: "admin", label: "Admin" });
+    }
+    return items;
+  }, [adminState]);
+
+  // ---- Dev JSON editor state ----
+  const [devSubtab, setDevSubtab] = useState<
+    "effective" | "overrides" | "adaptive" | "defaults"
+  >("effective");
+  const [draft, setDraft] = useState(() =>
+    JSON.stringify(overrides ?? {}, null, 2),
+  );
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDraft(JSON.stringify(overrides ?? {}, null, 2));
+  }, [overrides]);
+
+  const devView = useMemo(() => {
+    switch (devSubtab) {
+      case "effective":
+        return effective;
+      case "adaptive":
+        return adaptive;
+      case "defaults":
+        return defaults;
+      case "overrides":
+        return null;
+    }
+  }, [devSubtab, effective, adaptive, defaults]);
+
+  async function onSaveDev(method: "patch" | "put") {
+    setSaveErr(null);
+    setSaveBusy(true);
+    try {
+      const parsed = draft.trim() ? JSON.parse(draft) : {};
+      await saveOverrides(parsed, method);
+    } catch (e: any) {
+      setSaveErr(e?.message || "Invalid JSON or save failed");
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
+      <div className="w-full max-w-5xl h-[90vh] rounded-2xl bg-white shadow-xl border overflow-hidden flex">
+        {/* Sidebar */}
+        <aside className="w-60 border-r bg-gray-50/60">
+          <div className="px-4 py-3 text-sm font-semibold">Settings</div>
+          <nav className="px-2 pb-3 space-y-1">
+            {navItems.map((item) => (
+              <button
+                key={item.key}
+                onClick={() => setTab(item.key)}
+                className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
+                  tab === item.key ? "bg-black text-white" : "hover:bg-gray-100"
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </nav>
+          <div className="px-3 pt-2 mt-auto hidden md:block">
+            <button
+              className="w-full text-xs px-3 py-2 rounded border hover:bg-gray-100"
+              onClick={() => reload()}
+              title="Reload settings"
+            >
+              Reload
+            </button>
+            <button
+              className="w-full mt-2 text-xs px-3 py-2 rounded border hover:bg-gray-100"
+              onClick={() => runAdaptive()}
+              title="Recompute adaptive"
+            >
+              Recompute Adaptive
+            </button>
+            <button
+              className="w-full mt-2 text-xs px-3 py-2 rounded border hover:bg-gray-100"
+              onClick={onClose}
+              title="Close"
+            >
+              Close
+            </button>
+          </div>
+        </aside>
+
+        {/* Main */}
+        <section className="flex-1 min-w-0 flex flex-col">
+          <header className="px-5 py-4 border-b">
+            <div className="text-base font-semibold capitalize">
+              {tab.replace(/([a-z])([A-Z])/g, "$1 $2")}
+            </div>
+            {loading && (
+              <div className="text-xs text-gray-500 mt-1">Loading…</div>
+            )}
+            {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+            {adminErr && tab === "admin" && (
+              <div className="text-xs text-red-600 mt-1">{adminErr}</div>
+            )}
+          </header>
+
+          <div className="flex-1 overflow-auto p-5">
+            {tab === "general" && (
+              <div className="space-y-6">
+                <Section title="Appearance">
+                  <Row label="Theme">
+                    <select className="border rounded px-2 py-1 text-sm">
+                      <option>System</option>
+                      <option>Light</option>
+                      <option>Dark</option>
+                    </select>
+                  </Row>
+                  <Row label="Accent color">
+                    <select className="border rounded px-2 py-1 text-sm">
+                      <option>Default</option>
+                      <option>Blue</option>
+                      <option>Green</option>
+                      <option>Purple</option>
+                    </select>
+                  </Row>
+                  <Row label="Language">
+                    <select className="border rounded px-2 py-1 text-sm">
+                      <option>Auto-detect</option>
+                      <option>English</option>
+                      <option>Spanish</option>
+                      <option>French</option>
+                    </select>
+                  </Row>
+                </Section>
+
+                <Section title="Web & Integrations">
+                  <WebSearchSection
+                    onSaved={() => {
+                      // reflect to backend that web search is enabled (no key transmitted)
+                      saveOverrides({
+                        web_search_provider: "brave",
+                        brave_worker_url: "",
+                        brave_api_key_present: true,
+                      });
+                    }}
+                  />
+                </Section>
+              </div>
+            )}
+
+            {tab === "admin" && (
+              <div className="space-y-6">
+                <AdminBanner />
+                <AdminManagement />
+                <Section title="Admin controls">
+                  <div className="text-xs text-gray-600 mb-2">
+                    Choose whether your sidebar shows only your chats or all
+                    users’ chats (admins only).
+                  </div>
+                  <AdminScopeToggle />
+                  <div className="mt-3">
+                    <AdminGuestToggle />
+                  </div>
+                </Section>
+                <Section title="Pro device access">
+                    <div className="text-xs text-gray-600 mb-2">
+                      Manage which machines are activated to use Pro. Revoking the current device
+                      will immediately switch this app to Free.
+                    </div>
+                    <AdminDeviceManager />
+                  </Section>
+              </div>
+            )}
+
+            {tab === "account" && (
+              <div className="space-y-6">
+                <UpgradeSection userEmail={user?.email ?? ""} />
+              </div>
+            )}
+
+            {tab === "developer" && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  {(
+                    ["effective", "overrides", "adaptive", "defaults"] as const
+                  ).map((k) => (
+                    <button
+                      key={k}
+                      onClick={() => setDevSubtab(k)}
+                      className={`text-xs mr-2 px-3 py-1.5 rounded ${
+                        devSubtab === k
+                          ? "bg-black text-white"
+                          : "border hover:bg-gray-50"
+                      }`}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+
+                {devSubtab !== "overrides" && (
+                  <pre className="text-xs bg-gray-50 border rounded p-3 overflow-auto max-h-[60vh]">
+                    {JSON.stringify(devView ?? {}, null, 2)}
+                  </pre>
+                )}
+
+                {devSubtab === "overrides" && (
+                  <div className="space-y-2">
+                    <div className="text-xs text-gray-600">
+                      Edit <code>user_overrides</code> JSON. Use <b>Patch</b> to
+                      merge or <b>Replace</b> to overwrite.
+                    </div>
+                    <textarea
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      className="w-full h-[50vh] border rounded p-2 font-mono text-xs"
+                      spellCheck={false}
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        className={`text-xs px-3 py-1.5 rounded ${
+                          saveBusy
+                            ? "opacity-60 cursor-not-allowed"
+                            : "bg-black text-white"
+                        }`}
+                        disabled={saveBusy}
+                        onClick={() => onSaveDev("patch")}
+                        title="Deep-merge with existing overrides"
+                      >
+                        Save (Patch)
+                      </button>
+                      <button
+                        className={`text-xs px-3 py-1.5 rounded border ${
+                          saveBusy
+                            ? "opacity-60 cursor-not-allowed"
+                            : "hover:bg-gray-50"
+                        }`}
+                        disabled={saveBusy}
+                        onClick={() => onSaveDev("put")}
+                        title="Replace overrides entirely"
+                      >
+                        Save (Replace)
+                      </button>
+                      {saveErr && (
+                        <div className="text-xs text-red-600 ml-2">
+                          {saveErr}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Stubs for other tabs */}
+            {tab !== "general" &&
+              tab !== "developer" &&
+              tab !== "account" &&
+              tab !== "admin" && (
+                <div className="text-sm text-gray-500">
+                  This section is coming soon.
+                </div>
+              )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function Section({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-2xl border p-4">
+      <div className="font-semibold mb-3">{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <div className="w-44 text-sm text-gray-600">{label}</div>
+      <div className="flex-1">{children}</div>
+    </div>
+  );
+}
+
+# ===== frontend/src/data/chatApi.ts =====
+
+import type { Attachment, ChatRow, ChatMessageRow } from "../types/chat";
+import { request } from "../services/http";
+import { getAdminState } from "../api/admins";
+import {
+  adminListAllChatsPage,
+  adminListMineChatsPage,
+  adminListMessages,
+  getAdminChatScope,
+} from "../hooks/adminChatsApi";
+
+// Spring Page<T> type
+export type PageResp<T> = {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  size: number;
+  number: number; // current page index (0-based)
+  first: boolean;
+  last: boolean;
+  empty: boolean;
+};
+
+let _isAdmin: boolean | null = null;
+async function ensureIsAdmin(): Promise<boolean> {
+  if (_isAdmin !== null) return _isAdmin;
+  try {
+    const s = await getAdminState();
+    _isAdmin = !!s.isAdmin;
+  } catch {
+    _isAdmin = false;
+  }
+  return _isAdmin;
+}
+
+export async function createChat(sessionId: string, title: string) {
+  return request<ChatRow>("/api/chats", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, title }),
+  });
+}
+
+export function updateChatLast(
+  sessionId: string,
+  lastMessage: string,
+  title?: string,
+) {
+  return request<ChatRow>(`/api/chats/${encodeURIComponent(sessionId)}/last`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lastMessage, title: title || "" }),
+  });
+}
+
+// Legacy (unused after pagination in sidebar)
+export function listChats() {
+  return request<ChatRow[]>("/api/chats");
+}
+
+// ADMIN-AWARE: if admin scope === 'all', hit admin endpoint; if 'mine', you can use either admin "mine" or normal.
+export async function listChatsPage(page = 0, size = 30, ceiling?: string) {
+  const isAdmin = await ensureIsAdmin();
+  const scope = getAdminChatScope();
+
+  if (isAdmin) {
+    if (scope === "all") {
+      return adminListAllChatsPage(page, size, ceiling);
+    } else {
+      // use admin's "mine" so rows also contain ownerUid/ownerEmail consistently
+      return adminListMineChatsPage(page, size, ceiling);
+    }
+  }
+  // regular users
+  const qs = new URLSearchParams({ page: String(page), size: String(size) });
+  if (ceiling) qs.set("ceiling", ceiling);
+  return request<PageResp<ChatRow>>(`/api/chats/paged?${qs.toString()}`);
+}
+
+/**
+ * Admin-aware messages fetch.
+ * - Normal users: GET /api/chats/:session/messages
+ * - Admin viewing others: pass ownerUid to hit the admin endpoint.
+ */
+export function listMessages(sessionId: string, ownerUid?: string) {
+  if (ownerUid && ownerUid.trim()) {
+    return adminListMessages(ownerUid.trim(), sessionId);
+  }
+  return request<ChatMessageRow[]>(
+    `/api/chats/${encodeURIComponent(sessionId)}/messages`,
+  );
+}
+
+export async function appendMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string,
+  attachments?: Attachment[],
+) {
+  const body: any = { role, content };
+  if (attachments && attachments.length) body.attachments = attachments;
+
+  return request<ChatMessageRow>(`/api/chats/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteChatsBatch(sessionIds: string[]) {
+  const data = await request<{ deleted: string[] }>("/api/chats/batch", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionIds }),
+  });
+  return data.deleted;
+}
+
+export function deleteMessage(sessionId: string, messageId: string | number) {
+  return request<{ deleted: number }>(
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Delete a batch of messages. Backend returns { deleted: number[] } */
+export function deleteMessagesBatch(
+  sessionId: string,
+  messageIds: (number | string)[],
+) {
+  const ids = messageIds
+    .map((id) => (typeof id === "string" ? Number(id) : id))
+    .filter((n) => Number.isFinite(n)) as number[];
+
+  return request<{ deleted: number[] }>(
+    `/api/chats/${encodeURIComponent(sessionId)}/messages/batch`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messageIds: ids }),
+    },
+  );
+}
+
+# ===== frontend/src/data/ragApi.ts =====
+
+// frontend/src/file_read/data/ragApi.ts
+import { request, API_BASE } from "../services/http";
+
+export function uploadRag(file: File, sessionId?: string, forceGlobal = false) {
+  const form = new FormData();
+  form.append("file", file);
+  if (sessionId && !forceGlobal) form.append("sessionId", sessionId);
+
+  return request<{ ok: boolean; added: number }>("/api/rag/upload", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export function uploadRagWithProgress(
+  file: File,
+  sessionId: string,
+  onProgress: (pct: number) => void,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; added: number }> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("sessionId", sessionId);
+
+    const xhr = new XMLHttpRequest();
+    const url = `${API_BASE}/api/rag/upload`.replace(/([^:]\/)\/+/g, "$1");
+    xhr.open("POST", url);
+    xhr.withCredentials = true;
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable)
+        onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          resolve({ ok: true, added: 0 });
+        }
+      } else {
+        reject(new Error(`Upload failed (${xhr.status})`));
+      }
+    };
+
+    // treat abort as a silent resolution, not an error
+    xhr.onabort = () => resolve({ ok: false, added: 0 });
+    xhr.onerror = () => reject(new Error("Network error"));
+
+    if (signal) {
+      if (signal.aborted) {
+        xhr.abort();
+        return resolve({ ok: false, added: 0 });
+      }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+
+    xhr.send(form);
+  });
+}
+
+export function searchRag(
+  query: string,
+  opts?: {
+    sessionId?: string;
+    kChat?: number;
+    kGlobal?: number;
+    alpha?: number; // hybrid_alpha
+  },
+) {
+  const body = {
+    query,
+    sessionId: opts?.sessionId ?? undefined,
+    kChat: opts?.kChat ?? 6,
+    kGlobal: opts?.kGlobal ?? 4,
+    hybrid_alpha: opts?.alpha ?? 0.5,
+  };
+
+  return request<{
+    hits: Array<{
+      id?: string;
+      score: number;
+      source?: string;
+      title?: string;
+      text: string;
+      sessionId?: string | null;
+    }>;
+  }>(
+    "/api/rag/search", // ✅ relative path, request() adds API_BASE
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export type UploadRow = {
+  source: string;
+  sessionId?: string | null;
+  chunks: number;
+};
+
+export async function listUploads(
+  sessionId?: string,
+  scope: "all" | "session" = "all",
+) {
+  const p = new URLSearchParams();
+  if (sessionId) p.set("sessionId", sessionId);
+  if (scope) p.set("scope", scope);
+
+  return request<{ uploads: UploadRow[] }>(`/api/rag/uploads?${p.toString()}`, {
+    method: "GET",
+  });
+}
+
+export async function deleteUploadHard(source: string, sessionId?: string) {
+  return request<{ ok: boolean; removed: number; remaining: number }>(
+    `/api/rag/uploads/delete-hard`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, sessionId }),
+    },
+  );
+}
+
+# ===== frontend/src/data/settingsApi.ts =====
+
+// frontend/src/file_read/data/settingsApi.ts
+import { request } from "../services/http";
+
+export function getDefaults() {
+  return request<Record<string, any>>("/api/settings/defaults");
+}
+
+export function getAdaptive(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<Record<string, any>>(`/api/settings/adaptive${qs}`);
+}
+
+export function getOverrides() {
+  return request<Record<string, any>>("/api/settings/overrides");
+}
+
+export function getEffective(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<Record<string, any>>(`/api/settings/effective${qs}`);
+}
+
+export function putOverrides(overrides: Record<string, any>) {
+  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(overrides), // ← send raw object
+  });
+}
+
+export function patchOverrides(patch: Record<string, any>) {
+  return request<{ ok: boolean; overrides: any }>("/api/settings/overrides", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch), // ← send raw object
+  });
+}
+
+export function recomputeAdaptive(sessionId?: string) {
+  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<{ ok: boolean; adaptive: any }>(
+    `/api/settings/adaptive/recompute${qs}`,
+    { method: "POST" },
+  );
+}
+
+# ===== frontend/src/hooks/adminChatsApi.ts =====
+
+import { request } from "../services/http";
+import type { PageResp } from "../data/chatApi"; // ✅ fix path
+import type { ChatRow, ChatMessageRow } from "../types/chat";
+
+export function adminListAllChatsPage(page = 0, size = 30, ceiling?: string) {
+  const qs = new URLSearchParams({ page: String(page), size: String(size) });
+  if (ceiling) qs.set("ceiling", ceiling);
+  return request<PageResp<ChatRow>>(
+    `/api/admins/chats/all/paged?${qs.toString()}`,
+  );
+}
+
+export function adminListMineChatsPage(page = 0, size = 30, ceiling?: string) {
+  const qs = new URLSearchParams({ page: String(page), size: String(size) });
+  if (ceiling) qs.set("ceiling", ceiling);
+  return request<PageResp<ChatRow>>(
+    `/api/admins/chats/mine/paged?${qs.toString()}`,
+  );
+}
+
+export function adminListMessages(targetUid: string, sessionId: string) {
+  return request<ChatMessageRow[]>(
+    `/api/admins/chats/${encodeURIComponent(targetUid)}/${encodeURIComponent(sessionId)}/messages`,
+  );
+}
+
+/** Scope helpers (persisted locally) */
+export type AdminChatScope = "mine" | "all";
+const KEY = "admin_chat_scope";
+
+export function getAdminChatScope(): AdminChatScope {
+  try {
+    const v = (localStorage.getItem(KEY) || "mine").toLowerCase();
+    return v === "all" ? "all" : "mine";
+  } catch {
+    return "mine";
+  }
+}
+
+export function setAdminChatScope(scope: AdminChatScope) {
+  try {
+    localStorage.setItem(KEY, scope);
+  } catch {}
+  try {
+    window.dispatchEvent(new CustomEvent("admin:scope", { detail: scope }));
+  } catch {}
+}
+
+# ===== frontend/src/hooks/stream/core/buffer.ts =====
+
+// frontend/src/file_read/hooks/stream/core/buffer.ts
+import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
+import { extractRunJsonFromBuffer } from "../../../shared/lib/runjson";
+import { STOP_SENTINEL_AT_END } from "./constants";
+
+export type BufferStep = {
+  cleanText: string;
+  delta: string;
+  metrics?: { json?: RunJson; flat?: GenMetrics };
+};
+
+export function processChunk(prevClean: string, rawBufIn: string): BufferStep {
+  let rawBuf = rawBufIn;
+  if (STOP_SENTINEL_AT_END.test(rawBuf)) {
+    rawBuf = rawBuf.replace(STOP_SENTINEL_AT_END, "");
+  }
+  const { clean, json, flat } = extractRunJsonFromBuffer(rawBuf);
+  const delta = clean.slice(prevClean.length);
+  return {
+    cleanText: clean,
+    delta,
+    metrics: json || flat ? { json, flat } : undefined,
+  };
+}
+
+# ===== frontend/src/hooks/stream/core/cancel.ts =====
+
+import { postCancel } from "./network";
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
+
+type Deps = {
+  getVisibleSid: () => string;
+  setLoadingFor: (sid: string, v: boolean) => void;
+  setQueuedFor: (sid: string, v: boolean) => void;
+  getController: () => AbortController | null;
+  getReader: () => ReadableStreamDefaultReader<Uint8Array> | null;
+  setCancelForSid: (sid: string | null) => void;
+  isActiveSid: (sid: string) => boolean;
+  dropJobsForSid: (sid: string) => void;
+};
+
+export function createCanceller(d: Deps) {
+  async function cancelBySessionId(id: string) {
+    // Mark as canceled so read loop can react, but DO NOT abort fetch yet.
+    d.setCancelForSid(id);
+
+    // Tell the backend to stop gracefully (flush metrics + close).
+    postCancel(id).catch(() => {});
+
+    if (d.isActiveSid(id)) {
+      // Drop any queued jobs for this session, but keep loading true —
+      // runStreamOnce will turn loading off in its finally after the stream ends.
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+
+      // Safety net: if server doesn’t flush within timeout, hard-abort.
+      window.setTimeout(() => {
+        if (d.isActiveSid(id)) {
+          try {
+            d.getReader()?.cancel();
+          } catch {}
+          try {
+            d.getController()?.abort();
+          } catch {}
+        }
+      }, STOP_FLUSH_TIMEOUT_MS + 500);
+    } else {
+      // Not active: just clear queued jobs and cancel flag.
+      d.dropJobsForSid(id);
+      d.setQueuedFor(id, false);
+      d.setCancelForSid(null);
+    }
+  }
+
+  async function stopVisible() {
+    const id = d.getVisibleSid();
+    await cancelBySessionId(id);
+  }
+
+  return { cancelBySessionId, stopVisible };
+}
+
+# ===== frontend/src/hooks/stream/core/constants.ts =====
+
+// frontend/src/file_read/hooks/stream/core/constants.ts
+export const STOP_SENTINEL_AT_END = /(?:\r?\n)?\u23F9 stopped(?:\r?\n)?$/u;
+export const STOP_FLUSH_TIMEOUT_MS = 3500;
+
+# ===== frontend/src/hooks/stream/core/controller.ts =====
+
+import { appendMessage } from "../../../data/chatApi";
+import type { StreamController, StreamCoreOpts } from "./types";
+import { createScheduler, type QueueItem } from "./queue";
+import { createCanceller } from "./cancel";
+import { runStreamOnce } from "./runner";
+import type { Attachment } from "../../../types/chat";
+
+export function createStreamController(opts: StreamCoreOpts): StreamController {
+  let cancelForSid: string | null = null;
+  let controllerRef: AbortController | null = null;
+  let readerRef: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  const scheduler = createScheduler(async (job: QueueItem) => {
+    try {
+      opts.setQueuedFor(job.sid, false);
+    } catch {}
+    await runStreamOnce(job, {
+      opts,
+      getCancelForSid: () => cancelForSid,
+      clearCancelIf: (sid) => {
+        if (cancelForSid === sid) cancelForSid = null;
+      },
+      setController: (c) => {
+        controllerRef = c;
+      },
+      setReader: (r) => {
+        readerRef = r;
+      },
+    });
+  });
+
+  const canceller = createCanceller({
+    getVisibleSid: opts.getSessionId,
+    setLoadingFor: opts.setLoadingFor,
+    setQueuedFor: opts.setQueuedFor,
+    getController: () => controllerRef,
+    getReader: () => readerRef,
+    setCancelForSid: (sid) => {
+      cancelForSid = sid;
+    },
+    isActiveSid: scheduler.isActiveSid,
+    dropJobsForSid: scheduler.dropJobsForSid,
+  });
+
+  async function send(override?: string, attachments?: Attachment[]) {
+    const prompt = (override ?? "").trim();
+    const atts = (attachments ?? []).filter(Boolean);
+    if (!prompt && atts.length === 0) return; // allow attachments-only, but not truly empty
+
+    await opts.ensureChatCreated();
+    const sid = opts.getSessionId();
+
+    const userCid = crypto.randomUUID();
+    const asstCid = crypto.randomUUID();
+
+    // optimistic bubbles
+    opts.setMessagesFor(sid, (prev) => {
+      const list = prev || [];      // ← guard
+      return [
+        ...list,
+        {
+          id: userCid,
+          serverId: null,
+          role: "user",
+          text: prompt,
+          attachments: atts.length ? atts : undefined,
+        },
+        { id: asstCid, serverId: null, role: "assistant", text: "" },
+      ];
+    });
+    opts.setInput("");
+
+    // persist user
+    appendMessage(sid, "user", prompt, atts.length ? atts : undefined)
+      .then((row) => {
+        if (row?.id != null) {
+          opts.setServerIdFor(sid, userCid, Number(row.id));
+          try {
+            window.dispatchEvent(
+              new CustomEvent("chats:refresh", {
+                detail: {
+                  sessionId: sid,
+                  lastMessage: prompt,
+                  updatedAt: new Date().toISOString(),
+                },
+              }),
+            );
+          } catch {}
+        }
+      })
+      .catch(() => {});
+
+    // enqueue generation with attachments
+    try {
+      opts.setQueuedFor(sid, true);
+    } catch {}
+    scheduler.enqueue({
+      sid,
+      prompt,
+      asstId: asstCid,
+      attachments: atts.length ? atts : undefined,
+    });
+  }
+
+  async function stop() {
+    await canceller.stopVisible();
+  }
+  async function cancelBySessionId(id: string) {
+    await canceller.cancelBySessionId(id);
+  }
+  function dispose() {
+    try {
+      controllerRef?.abort();
+    } catch {}
+    try {
+      readerRef?.cancel();
+    } catch {}
+    controllerRef = null;
+    readerRef = null;
+  }
+
+  return { send, stop, cancelBySessionId, dispose };
+}
+
+# ===== frontend/src/hooks/stream/core/network.ts =====
+
+import { buildUrl, requestRaw } from "../../../services/http";
+
+export async function postStream(body: unknown, signal: AbortSignal) {
+  const url = buildUrl("/ai/generate/stream");
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  const res = await requestRaw(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${res.statusText} ${t}`);
+  }
+  return res.body.getReader();
+}
+
+export async function postCancel(sessionId: string) {
+  try {
+    const url = buildUrl(`/ai/cancel/${encodeURIComponent(sessionId)}`);
+    await requestRaw(url, { method: "POST" });
+  } catch {}
+}
+
+# ===== frontend/src/hooks/stream/core/queue.ts =====
+
+// frontend/src/file_read/hooks/stream/core/queue.ts
+import type { Attachment } from "../../../types/chat";
+
+export type QueueItem = {
+  sid: string;
+  prompt: string; // may be empty when attachments-only
+  asstId: string; // client id of the assistant bubble to stream into
+  attachments?: Attachment[]; // optional attachments for this turn
+};
+
+export type RunJob = (job: QueueItem) => Promise<void>;
+
+export function createScheduler(runJob: RunJob) {
+  const q: QueueItem[] = [];
+  let active: { sid: string } | null = null;
+
+  async function startNext() {
+    if (active || q.length === 0) return;
+    const job = q.shift()!;
+    active = { sid: job.sid };
+    try {
+      await runJob(job);
+    } finally {
+      active = null;
+      if (q.length) void startNext();
+    }
+  }
+
+  return {
+    enqueue(job: QueueItem) {
+      q.push(job);
+      void startNext();
+    },
+    isActiveSid: (sid: string) => active?.sid === sid,
+    dropJobsForSid(sid: string) {
+      for (let i = q.length - 1; i >= 0; i--) {
+        if (q[i].sid === sid) q.splice(i, 1);
+      }
+    },
+    getActiveSid: () => active?.sid ?? null,
+  };
+}
+
+# ===== frontend/src/hooks/stream/core/runner.ts =====
+
+// frontend/src/file_read/hooks/stream/core/runner.ts
+import { postStream } from "./network";
+import {
+  ensureAssistantPlaceholder,
+  snapshotPendingAssistant,
+} from "./updater";
+import type { ChatMsg } from "../../../types/chat";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { readStreamLoop } from "./runner_stream";
+import {
+  pinLiveMetricsToSession,
+  pinLiveMetricsToBubble,
+  pinFallbackToSessionAndBubble,
+} from "./runner_metrics";
+import { persistAssistantTurn } from "./runner_persist";
+import type { QueueItem } from "./queue";
+import { listChatsPage } from "../../../data/chatApi";
+
+export type RunnerDeps = {
+  opts: {
+    ensureChatCreated: () => Promise<void>;
+    getSessionId: () => string;
+    getMessagesFor: (sid: string) => ChatMsg[];
+    setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+    setInput: (v: string) => void;
+    setLoadingFor: (sid: string, v: boolean) => void;
+    setQueuedFor: (sid: string, v: boolean) => void;
+    resetMetricsFor: (sid: string) => void;
+    setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+    setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+    onRetitle: (sid: string, finalText: string) => Promise<void>;
+    setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+  };
+  getCancelForSid: () => string | null;
+  clearCancelIf: (sid: string) => void;
+  setController: (c: AbortController | null) => void;
+  setReader: (r: ReadableStreamDefaultReader<Uint8Array> | null) => void;
+};
+
+export async function runStreamOnce(job: QueueItem, d: RunnerDeps) {
+  const { sid, prompt, asstId, attachments } = job;
+  const { opts } = d;
+  const wasCanceled = () => d.getCancelForSid() === sid;
+
+  opts.resetMetricsFor(sid);
+  opts.setLoadingFor(sid, true);
+
+  ensureAssistantPlaceholder(
+    {
+      getMessagesFor: opts.getMessagesFor,
+      setMessagesFor: opts.setMessagesFor,
+    },
+    sid,
+    asstId,
+  );
+
+  const MAX_HISTORY = 10;
+  const history = opts
+    .getMessagesFor(sid)
+    .slice(-MAX_HISTORY)
+    .map((m) => ({
+      role: m.role,
+      content: m.text || "",
+      attachments:
+        m.attachments && m.attachments.length ? m.attachments : undefined,
+    }))
+    .filter(
+      (m) =>
+        (m.content && m.content.trim().length > 0) ||
+        (m.attachments && m.attachments.length > 0),
+    );
+
+  const userTurn = {
+    role: "user" as const,
+    content: prompt,
+    attachments: attachments && attachments.length ? attachments : undefined,
+  };
+
+  const controller = new AbortController();
+  d.setController(controller);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  try {
+    reader = await postStream(
+      { sessionId: sid, messages: [...history, userTurn] },
+      controller.signal,
+    );
+    d.setReader(reader);
+
+    const { finalText, gotMetrics, lastRunJson } = await readStreamLoop(
+      reader,
+      {
+        wasCanceled,
+        onDelta: (delta) => {
+          opts.setMessagesFor(sid, (prev) => {
+            const idx = prev.findIndex((m) => m.id === asstId);
+            if (idx === -1) return prev;
+            const next = [...prev];
+            next[idx] = { ...next[idx], text: (next[idx].text || "") + delta };
+            return next;
+          });
+        },
+        onMetrics: (json, flat) => {
+          pinLiveMetricsToSession(opts, sid, json, flat);
+          pinLiveMetricsToBubble(opts, sid, asstId, json, flat);
+        },
+        onCancelTimeout: (cleanSoFar) => {
+          opts.setMetricsFallbackFor(sid, "user_cancel_timeout", cleanSoFar);
+        },
+      },
+    );
+
+    let persistJson: RunJson | null = gotMetrics ? lastRunJson : null;
+
+    if (!gotMetrics) {
+      const reason = wasCanceled() ? "user_cancel" : "end_of_stream_no_metrics";
+      const fallback = pinFallbackToSessionAndBubble(
+        opts,
+        sid,
+        asstId,
+        reason,
+        finalText,
+      );
+      if (!wasCanceled()) persistJson = fallback;
+    }
+
+    if (!wasCanceled() && finalText.trim()) {
+      const newServerId = await persistAssistantTurn(
+        sid,
+        finalText,
+        persistJson,
+      );
+      if (newServerId != null) {
+        opts.setServerIdFor(sid, asstId, newServerId);
+      }
+
+      try {
+        await opts.onRetitle(sid, finalText);
+      } catch {}
+      try {
+        window.dispatchEvent(
+          new CustomEvent("chats:refresh", {
+            detail: {
+              sessionId: sid,
+              lastMessage: finalText,
+              updatedAt: new Date().toISOString(),
+            },
+          }),
+        );
+      } catch {}
+
+      const pokeForTitle = (delayMs: number) => {
+        window.setTimeout(async () => {
+          try {
+            const ceil = new Date().toISOString();
+            const page = await listChatsPage(0, 30, ceil);
+            const row = page.content.find((r: any) => r.sessionId === sid);
+            if (row?.title) {
+              window.dispatchEvent(
+                new CustomEvent("chats:refresh", {
+                  detail: {
+                    sessionId: sid,
+                    title: row.title,
+                    updatedAt: row.updatedAt,
+                  },
+                }),
+              );
+            }
+          } catch {}
+        }, delayMs);
+      };
+      pokeForTitle(3000);
+      pokeForTitle(8000);
+    }
+  } catch (e: any) {
+    const localAbort =
+      e?.name === "AbortError" && (wasCanceled() || controller.signal.aborted);
+    const reason = localAbort
+      ? "client_abort_after_stop"
+      : e?.name || "client_error";
+
+    const last = snapshotPendingAssistant(opts.getMessagesFor(sid));
+    opts.setMetricsFallbackFor(sid, reason, last);
+    pinFallbackToSessionAndBubble(opts, sid, asstId, reason, last);
+
+    opts.setMessagesFor(sid, (prev) => {
+      const end = prev[prev.length - 1];
+      if (end?.role === "assistant" && !end.text.trim()) {
+        return prev.map((m, i) =>
+          i === prev.length - 1 ? { ...m, text: "[stream error]" } : m,
+        );
+      }
+      return prev;
+    });
+  } finally {
+    if (d.getCancelForSid() === sid) d.clearCancelIf(sid);
+    opts.setLoadingFor(sid, false);
+    d.setController(null);
+    d.setReader(null);
+  }
+}
+
+# ===== frontend/src/hooks/stream/core/runner_metrics.ts =====
+
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import type { ChatMsg } from "../../../types/chat";
+
+type Opts = {
+  setMetricsFor: (sid: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMessagesFor: (sid: string, fn: (prev: ChatMsg[]) => ChatMsg[]) => void;
+  setMetricsFallbackFor: (sid: string, reason: string, text: string) => void;
+};
+
+export function pinLiveMetricsToSession(
+  opts: Opts,
+  sid: string,
+  json?: RunJson,
+  flat?: GenMetrics,
+) {
+  opts.setMetricsFor(sid, json, flat);
+}
+
+export function pinLiveMetricsToBubble(
+  opts: Opts,
+  sid: string,
+  asstId: string,
+  json?: RunJson,
+  flat?: GenMetrics,
+) {
+  opts.setMessagesFor(sid, (prev) =>
+    prev.map((m) =>
+      m.id === asstId
+        ? {
+            ...m,
+            meta: {
+              ...(m.meta ?? {}),
+              runJson: json ?? m.meta?.runJson,
+              flat: flat ?? m.meta?.flat,
+            },
+          }
+        : m,
+    ),
+  );
+}
+
+/** Also returns the synthesized RunJson so caller can persist if needed. */
+export function pinFallbackToSessionAndBubble(
+  opts: Opts,
+  sid: string,
+  asstId: string,
+  reason: string,
+  finalText: string,
+): RunJson {
+  const json: RunJson = {
+    stats: {
+      stopReason: reason,
+      tokensPerSecond: null,
+      timeToFirstTokenSec: null,
+      totalTimeSec: null,
+      promptTokensCount: null,
+      predictedTokensCount: finalText ? finalText.length : 0,
+      totalTokensCount: null,
+    },
+  };
+  const flat: GenMetrics = {
+    stop_reason: reason,
+    tok_per_sec: null,
+    ttft_ms: null,
+    output_tokens: null,
+    input_tokens_est: null,
+    total_tokens_est: null,
+  };
+
+  opts.setMetricsFallbackFor(sid, reason, finalText);
+  opts.setMessagesFor(sid, (prev) =>
+    prev.map((m) =>
+      m.id === asstId
+        ? { ...m, meta: { ...(m.meta ?? {}), runJson: json, flat } }
+        : m,
+    ),
+  );
+  return json;
+}
+
+# ===== frontend/src/hooks/stream/core/runner_persist.ts =====
+
+import { appendMessage, updateChatLast } from "../../../data/chatApi";
+import type { RunJson } from "../../../shared/lib/runjson";
+import { MET_START, MET_END } from "../../../shared/lib/runjson";
+
+/**
+ * Persist assistant turn; returns the new server message id (or null).
+ */
+export async function persistAssistantTurn(
+  sid: string,
+  finalText: string,
+  json: RunJson | null,
+): Promise<number | null> {
+  let toPersist = finalText;
+  if (json) {
+    toPersist = `${finalText}\n${MET_START}\n${JSON.stringify(json)}\n${MET_END}\n`;
+  }
+  try {
+    const row = await appendMessage(sid, "assistant", toPersist);
+    await updateChatLast(sid, finalText, "").catch(() => {});
+    return row?.id != null ? Number(row.id) : null;
+  } catch {
+    return null;
+  }
+}
+
+# ===== frontend/src/hooks/stream/core/runner_stream.ts =====
+
+import { STOP_FLUSH_TIMEOUT_MS } from "./constants";
+import type { RunJson, GenMetrics } from "../../../shared/lib/runjson";
+import { processChunk } from "./buffer";
+
+type LoopDeps = {
+  wasCanceled: () => boolean;
+  onDelta: (delta: string, cleanSoFar: string) => void;
+  onMetrics: (json?: RunJson, flat?: GenMetrics) => void;
+  onCancelTimeout: (cleanSoFar: string) => void;
+};
+
+export async function readStreamLoop(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  d: LoopDeps,
+): Promise<{
+  finalText: string;
+  gotMetrics: boolean;
+  lastRunJson: RunJson | null;
+}> {
+  const decoder = new TextDecoder();
+  let rawBuf = "";
+  let cleanSoFar = "";
+  let gotMetrics = false;
+  let lastRunJson: RunJson | null = null;
+  let stopTimeout: number | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    if (value) {
+      rawBuf += decoder.decode(value, { stream: true });
+      const step = processChunk(cleanSoFar, rawBuf);
+
+      if (step.metrics) {
+        gotMetrics = true;
+        if (step.metrics.json) lastRunJson = step.metrics.json;
+        d.onMetrics(step.metrics.json, step.metrics.flat);
+      }
+      if (step.delta) {
+        cleanSoFar = step.cleanText;
+        d.onDelta(step.delta, cleanSoFar);
+      }
+    }
+
+    // If user canceled, schedule a final flush check, but DO NOT break early
+    if (d.wasCanceled() && stopTimeout === null) {
+      stopTimeout = window.setTimeout(() => {
+        if (!gotMetrics) d.onCancelTimeout(cleanSoFar);
+      }, STOP_FLUSH_TIMEOUT_MS) as unknown as number;
+    }
+  }
+
+  if (stopTimeout !== null) {
+    // If we scheduled a timeout but finished before it fired, synthesize now.
+    if (!gotMetrics && d.wasCanceled()) {
+      d.onCancelTimeout(cleanSoFar);
+    }
+    window.clearTimeout(stopTimeout);
+  }
+
+  return { finalText: cleanSoFar, gotMetrics, lastRunJson };
+}
+
+# ===== frontend/src/hooks/stream/core/types.ts =====
+
+// frontend/src/file_read/hooks/stream/core/types.ts
+import type { ChatMsg, Attachment } from "../../../types/chat";
+import type { GenMetrics, RunJson } from "../../../shared/lib/runjson";
+
+export type MsgAccessor = {
+  getMessagesFor: (sessionId: string) => ChatMsg[];
+  setMessagesFor: (
+    sessionId: string,
+    updater: (prev: ChatMsg[]) => ChatMsg[],
+  ) => void;
+};
+
+export type UiHooks = {
+  setInput: (v: string) => void;
+  setLoadingFor: (sessionId: string, v: boolean) => void;
+  setQueuedFor: (sessionId: string, v: boolean) => void;
+  setMetricsFor: (sessionId: string, json?: RunJson, flat?: GenMetrics) => void;
+  setMetricsFallbackFor: (
+    sessionId: string,
+    reason: string,
+    partialOut: string,
+  ) => void;
+
+  /** patch the server id for a bubble identified by clientId */
+  setServerIdFor: (sid: string, clientId: string, serverId: number) => void;
+};
+
+export type SessionPlumbing = {
+  getSessionId: () => string;
+  ensureChatCreated: () => Promise<void>;
+  onRetitle: (sessionId: string, latestAssistant: string) => Promise<void>;
+  resetMetricsFor: (sessionId: string) => void;
+};
+
+export type StreamCoreOpts = MsgAccessor & UiHooks & SessionPlumbing;
+
+export type StreamController = {
+  /** text can be empty if attachments are present */
+  send: (override?: string, attachments?: Attachment[]) => Promise<void>;
+  stop: () => Promise<void>;
+  cancelBySessionId: (sid: string) => Promise<void>;
+  dispose: () => void;
+};
+
+# ===== frontend/src/hooks/stream/core/updater.ts =====
+
+import type { ChatMsg } from "../../../types/chat";
+import type { MsgAccessor } from "./types";
+
+export function appendAssistantDelta(
+  access: MsgAccessor,
+  sessionId: string,
+  asstId: string,
+  delta: string,
+) {
+  if (!delta) return;
+  access.setMessagesFor(sessionId, (prev) => {
+    const idx = prev.findIndex((m) => m.id === asstId);
+    if (idx === -1) return prev;
+    const next = [...prev];
+    const cur = next[idx];
+    next[idx] = { ...cur, text: (cur.text || "") + delta };
+    return next;
+  });
+}
+
+export function ensureAssistantPlaceholder(
+  access: MsgAccessor,
+  sessionId: string,
+  asstId: string,
+) {
+  access.setMessagesFor(sessionId, (prev) => {
+    const idx = prev.findIndex((m) => m.id === asstId);
+    if (idx !== -1) return prev;
+    return [
+      ...prev,
+      { id: asstId, serverId: null, role: "assistant", text: "" } as ChatMsg,
+    ];
+  });
+}
+
+export function snapshotPendingAssistant(msgs: ChatMsg[]): string {
+  if (!msgs.length) return "";
+  const last = msgs[msgs.length - 1];
+  return last.role === "assistant" ? last.text : "";
+}
+
+# ===== frontend/src/hooks/useAttachmentUploads.ts =====
+
+import { useCallback, useMemo, useRef, useState } from "react";
+import type { Attachment } from "../types/chat";
+import { requestRaw } from "../services/http";
+
+// Local UI id for keys & removal
+const makeUiId = () =>
+  Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+
+export type UIAttachment = {
+  uiId: string;
+  name: string;
+
+  // UI state
+  status: "uploading" | "ready" | "error";
+  pct: number; // 0..100
+  error?: string;
+
+  // Optional extras
+  size?: number;
+  mime?: string;
+  url?: string;
+  serverId?: string; // if backend returns an id
+};
+
+type ReturnShape = {
+  atts: UIAttachment[];
+  addFiles: (files: FileList | File[]) => Promise<void>;
+  removeAtt: (arg: string | UIAttachment) => void; // accepts uiId or whole object
+  anyUploading: boolean;
+  anyReady: boolean;
+  attachmentsForPost: () => Attachment[]; // what your API expects
+  reset: () => void;
+};
+
+export function useAttachmentUploads(
+  sessionId?: string,
+  onRefreshChats?: () => void,
+): ReturnShape {
+  const [atts, setAtts] = useState<UIAttachment[]>([]);
+  const triedEndpoints = useRef<string[] | null>(null);
+
+  const detectAndUpload = useCallback(
+    async (file: File): Promise<UIAttachment> => {
+      const endpoints = triedEndpoints.current ?? [
+        "/api/rag/upload",
+        "/api/rag/uploads",
+        "/api/uploads",
+      ];
+
+      let lastErr: unknown = null;
+
+      for (const ep of endpoints) {
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          if (sessionId) fd.append("sessionId", sessionId);
+
+          const res = await requestRaw(ep, { method: "POST", body: fd });
+          const text = await res.text();
+          if (!res.ok)
+            throw new Error(
+              `Upload failed (${res.status}) ${res.statusText} ${text || ""}`.trim(),
+            );
+
+          let data: any = {};
+          try {
+            data = text ? JSON.parse(text) : {};
+          } catch {}
+
+          const ui: UIAttachment = {
+            uiId: makeUiId(),
+            name: (data.name ?? file.name) as string,
+            status: "ready",
+            pct: 100,
+            size: Number(data.size ?? file.size) || file.size,
+            mime: (data.contentType ?? data.mime ?? file.type) as string,
+            url: (data.url ?? data.location ?? undefined) as string | undefined,
+            serverId: (data.id ?? data.fileId ?? data.uploadId)?.toString(),
+          };
+
+          if (!triedEndpoints.current) {
+            triedEndpoints.current = [ep, ...endpoints.filter((e) => e !== ep)];
+          }
+          return ui;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr ?? new Error("No working upload endpoint found");
+    },
+    [sessionId],
+  );
+
+  const addFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const arr = Array.from(files);
+      if (arr.length === 0) return;
+
+      // optimistic rows
+      const optimistic: UIAttachment[] = arr.map((f) => ({
+        uiId: makeUiId(),
+        name: f.name,
+        status: "uploading",
+        pct: 0,
+        size: f.size,
+        mime: f.type,
+      }));
+      setAtts((cur) => [...cur, ...optimistic]);
+
+      await Promise.all(
+        arr.map(async (file, i) => {
+          const tempUiId = optimistic[i].uiId;
+          try {
+            const finalUi: UIAttachment = sessionId
+              ? await detectAndUpload(file)
+              : {
+                  uiId: makeUiId(),
+                  name: file.name,
+                  status: "ready",
+                  pct: 100,
+                  size: file.size,
+                  mime: file.type,
+                };
+
+            setAtts((cur) =>
+              cur.map((a) => (a.uiId === tempUiId ? finalUi : a)),
+            );
+          } catch (e: any) {
+            setAtts((cur) =>
+              cur.map((a) =>
+                a.uiId === tempUiId
+                  ? {
+                      ...a,
+                      status: "error",
+                      pct: 0,
+                      error: e?.message ?? "Upload failed.",
+                    }
+                  : a,
+              ),
+            );
+          }
+        }),
+      );
+
+      onRefreshChats?.();
+    },
+    [detectAndUpload, onRefreshChats, sessionId],
+  );
+
+  const removeAtt = useCallback((arg: string | UIAttachment) => {
+    const uiId = typeof arg === "string" ? arg : arg.uiId;
+    setAtts((cur) => cur.filter((a) => a.uiId !== uiId));
+  }, []);
+
+  const anyUploading = useMemo(
+    () => atts.some((a) => a.status === "uploading"),
+    [atts],
+  );
+  const anyReady = useMemo(
+    () => atts.some((a) => a.status === "ready"),
+    [atts],
+  );
+
+  const attachmentsForPost = useCallback((): Attachment[] => {
+    return atts
+      .filter((a) => a.status === "ready")
+      .map<Attachment>((a) => {
+        const out = { name: a.name } as Attachment;
+        // If your Attachment type supports these, you can add them:
+        // (out as any).url = a.url;
+        // (out as any).contentType = a.mime;
+        // (out as any).bytes = a.size;
+        // (out as any).id = a.serverId;
+        return out;
+      });
+  }, [atts]);
+
+  const reset = useCallback(() => setAtts([]), []);
+
+  return {
+    atts,
+    addFiles,
+    removeAtt,
+    anyUploading,
+    anyReady,
+    attachmentsForPost,
+    reset,
+  };
+}
+
+// Back-compat alias if you want to import as Att
+export type Att = UIAttachment;
+
+# ===== frontend/src/hooks/useChatAutoFollow.ts =====
+
+import { useEffect, useMemo, useRef } from "react";
+import type { ChatMsg } from "../types/chat";
+
+const SCROLL_THRESHOLD_VH = 0.75;
+const MIN_THRESHOLD_PX = 24;
+const FORCE_SCROLL_EVT = "chat:force-scroll-bottom";
+
+export function useChatAutofollow({
+  messages,
+  loading,
+  autoFollow = true,
+  bottomPad = 0,
+}: {
+  messages: ChatMsg[];
+  loading: boolean;
+  autoFollow?: boolean;
+  bottomPad?: number;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const prevLoadingRef = useRef<boolean>(loading);
+  const prevAsstLenRef = useRef<number>(0);
+  const didInitialAutoscrollRef = useRef(false);
+
+  function getScrollEl(): HTMLElement | null {
+    const el = listRef.current;
+    if (!el) return null;
+    return el.closest<HTMLElement>("[data-chat-scroll]") ?? el;
+  }
+
+  function isNearBottom(ratio = SCROLL_THRESHOLD_VH): boolean {
+    const el = getScrollEl();
+    if (!el) return true;
+    const threshold = Math.max(MIN_THRESHOLD_PX, el.clientHeight * ratio);
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return dist <= threshold;
+  }
+
+  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    bottomRef.current?.scrollIntoView({ behavior, block: "end" });
+  };
+
+  useEffect(() => {
+    if (didInitialAutoscrollRef.current) return;
+    if (messages.length === 0) return;
+    didInitialAutoscrollRef.current = true;
+    scrollToBottom("auto");
+    requestAnimationFrame(() => scrollToBottom("auto"));
+  }, [messages.length]);
+
+  useEffect(() => {
+    const handler = (evt: Event) => {
+      const behavior =
+        (evt as CustomEvent<{ behavior?: ScrollBehavior }>).detail?.behavior ??
+        "smooth";
+      bottomRef.current?.scrollIntoView({ behavior, block: "end" });
+    };
+    window.addEventListener(FORCE_SCROLL_EVT, handler as EventListener);
+    return () =>
+      window.removeEventListener(FORCE_SCROLL_EVT, handler as EventListener);
+  }, []);
+
+  const lastAssistantIndex = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return i;
+    }
+    return -1;
+  }, [messages]);
+
+  const asstText =
+    lastAssistantIndex >= 0 ? (messages[lastAssistantIndex]?.text ?? "") : "";
+
+  useEffect(() => {
+    if (lastAssistantIndex < 0) return;
+    const len = asstText.length;
+    const prev = prevAsstLenRef.current || 0;
+    prevAsstLenRef.current = len;
+    if (!autoFollow) return;
+    if (len > prev && isNearBottom()) scrollToBottom("auto");
+  }, [lastAssistantIndex, asstText, autoFollow]);
+
+  useEffect(() => {
+    const prev = prevLoadingRef.current;
+    const cur = loading;
+    prevLoadingRef.current = cur;
+    if (prev && !cur && autoFollow && isNearBottom()) scrollToBottom("smooth");
+  }, [loading, autoFollow]);
+
+  useEffect(() => {
+    if (autoFollow && isNearBottom()) {
+      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }
+  }, [bottomPad, autoFollow]);
+
+  return { listRef, bottomRef, lastAssistantIndex };
+}
+
+# ===== frontend/src/hooks/useChatsPager.ts =====
+
+// frontend/src/file_read/hooks/useChatsPager.ts
+import { useEffect, useMemo, useRef, useState } from "react";
+import { listChatsPage } from "../data/chatApi";
+import type { ChatRow } from "../types/chat";
+import { getAdminState } from "../api/admins";
+import {
+  adminListAllChatsPage,
+  adminListMineChatsPage,
+  getAdminChatScope,
+  type AdminChatScope,
+} from "./adminChatsApi";
+
+type PageResp = {
+  content: ChatRow[];
+  totalElements: number;
+  totalPages: number;
+  last: boolean;
+};
+
+type PageFetcher = (
+  page: number,
+  size: number,
+  ceiling?: string,
+) => Promise<PageResp>;
+
+export function useChatsPager(pageSize = 10, refreshKey?: number) {
+  const [chats, setChats] = useState<ChatRow[]>([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const [ceiling, setCeiling] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
+
+  const seenIds = useMemo(
+    () => new Set(chats.map((c) => c.sessionId)),
+    [chats],
+  );
+
+  // Choose which endpoint to use based on admin + scope
+  function pickFetcher(
+    adminFlag: boolean | null,
+    scope: AdminChatScope,
+  ): PageFetcher {
+    if (!adminFlag) return listChatsPage; // not admin → regular endpoint
+    return scope === "all" ? adminListAllChatsPage : adminListMineChatsPage;
+  }
+
+  async function ensureIsAdmin(): Promise<boolean> {
+    if (isAdmin !== null) return isAdmin;
+    try {
+      const s = await getAdminState();
+      const flag = !!s.isAdmin;
+      setIsAdmin(flag);
+      return flag;
+    } catch {
+      setIsAdmin(false);
+      return false;
+    }
+  }
+
+  // Return a valid ISO ceiling or undefined (never an empty string)
+  function ensureCeiling(nowIfMissing = false): string | undefined {
+    if (ceiling) return ceiling;
+    if (nowIfMissing) {
+      const c = new Date().toISOString();
+      setCeiling(c);
+      return c;
+    }
+    return undefined;
+  }
+
+  async function fetchPage(pageNum: number, replace: boolean) {
+    const adminFlag = await ensureIsAdmin();
+    const scope = getAdminChatScope();
+    const fetcher = pickFetcher(adminFlag, scope);
+
+    // On replace, take a fresh pagination watermark
+    const c = replace ? new Date().toISOString() : ensureCeiling(true);
+    if (replace && c) setCeiling(c);
+
+    let res: PageResp;
+    try {
+      res = await fetcher(pageNum, pageSize, c);
+    } catch (e: any) {
+      // If "all" is not allowed (403), fallback to "mine" (admin view), then to user view
+      const isForbidden = e?.status === 403 || e?.statusCode === 403;
+      if (scope === "all" && isForbidden) {
+        try {
+          res = await adminListMineChatsPage(pageNum, pageSize, c);
+        } catch {
+          res = await listChatsPage(pageNum, pageSize, c);
+        }
+      } else {
+        throw e;
+      }
+    }
+
+    if (replace) {
+      setChats(res.content);
+      setPage(1);
+    } else {
+      const next = res.content.filter((r) => !seenIds.has(r.sessionId));
+      setChats((prev) => [...prev, ...next]);
+      setPage((p) => p + 1);
+    }
+    setHasMore(!res.last);
+    setTotal(res.totalElements ?? 0);
+    setTotalPages(res.totalPages ?? 0);
+  }
+
+  async function loadFirst() {
+    setInitialLoading(true);
+    try {
+      await fetchPage(0, true);
+    } catch {
+      setChats([]);
+      setPage(0);
+      setHasMore(false);
+      setTotal(0);
+      setTotalPages(0);
+    } finally {
+      setInitialLoading(false);
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMoreRef.current || loadingMore || !hasMore) return;
+
+    // If ceiling isn't established (rare), bootstrap first page
+    if (!ceiling) {
+      await loadFirst();
+      return;
+    }
+
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      await fetchPage(page, false);
+    } catch {
+      setHasMore(false);
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }
+
+  async function refreshFirst() {
+    setChats([]);
+    setPage(0);
+    setHasMore(true);
+    setTotal(0);
+    setTotalPages(0);
+    setCeiling(null);
+    await loadFirst();
+  }
+
+  // Hydrate when auth is ready
+  useEffect(() => {
+    const onAuthReady = () => {
+      void refreshFirst();
+    };
+    window.addEventListener("auth:ready", onAuthReady as EventListener);
+    return () =>
+      window.removeEventListener("auth:ready", onAuthReady as EventListener);
+  }, []);
+
+  // React to admin scope changes
+  useEffect(() => {
+    const onScopeChange = () => {
+      void refreshFirst();
+    };
+    window.addEventListener("admin:scope", onScopeChange as EventListener);
+    return () =>
+      window.removeEventListener("admin:scope", onScopeChange as EventListener);
+  }, []);
+
+  // External refresh trigger
+  const didMountRef = useRef(false);
+  useEffect(() => {
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+      return;
+    }
+    if (typeof refreshKey !== "undefined") void refreshFirst();
+  }, [refreshKey]);
+
+  // Live updates for a specific chat (retitle / lastMessage)
+  useEffect(() => {
+    const handler = (evt: Event) => {
+      const detail = (evt as CustomEvent<any>).detail;
+      if (!detail?.sessionId) return;
+      const sid = String(detail.sessionId);
+
+      setChats((prev) => {
+        const ix = prev.findIndex((c) => c.sessionId === sid);
+        const shouldMoveToTop = typeof detail.lastMessage === "string";
+
+        if (ix === -1) {
+          if (!shouldMoveToTop) return prev;
+          const injected: ChatRow = {
+            sessionId: sid,
+            id: -1,
+            title: detail.title ?? "New Chat",
+            lastMessage: detail.lastMessage ?? "",
+            createdAt: new Date().toISOString(),
+            updatedAt: detail.updatedAt ?? new Date().toISOString(),
+          };
+          return [injected, ...prev];
+        }
+
+        const cur = prev[ix];
+        const patched: ChatRow = {
+          ...cur,
+          lastMessage: detail.lastMessage ?? cur.lastMessage,
+          title: detail.title ?? cur.title,
+          updatedAt: detail.updatedAt ?? cur.updatedAt,
+        };
+
+        const rest = prev.filter((_, i) => i !== ix);
+        return shouldMoveToTop
+          ? [patched, ...rest]
+          : [...prev.slice(0, ix), patched, ...prev.slice(ix + 1)];
+      });
+    };
+
+    window.addEventListener("chats:refresh", handler as EventListener);
+    return () =>
+      window.removeEventListener("chats:refresh", handler as EventListener);
+  }, []);
+
+  // Infinite scroll
+  useEffect(() => {
+    const rootEl = scrollRef.current;
+    const sentinel = sentinelRef.current;
+    if (!rootEl || !sentinel) return;
+
+    const hasOverflow = rootEl.scrollHeight - rootEl.clientHeight > 8;
+    if (!hasOverflow) return;
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (entry?.isIntersecting) void loadMore();
+      },
+      { root: rootEl, rootMargin: "96px 0px", threshold: 0.01 },
+    );
+
+    io.observe(sentinel);
+    return () => io.disconnect();
+  }, [chats.length, page, hasMore, ceiling]);
+
+  function decTotal(count: number) {
+    setTotal((prev) => {
+      const next = Math.max(0, prev - count);
+      setTotalPages(Math.max(1, Math.ceil(next / pageSize)));
+      return next;
+    });
+  }
+
+  return {
+    chats,
+    page,
+    hasMore,
+    total,
+    totalPages,
+    initialLoading,
+    loadingMore,
+    scrollRef,
+    sentinelRef,
+    loadMore,
+    refreshFirst,
+    setChats,
+    decTotal,
+  };
+}
+
+# ===== frontend/src/hooks/useChatState.ts =====
+
+import { useState } from "react";
+import type { ChatMsg } from "../types/chat";
+
+type BySession<T> = Record<string, T>;
+
+export function useChatState() {
+  const [bySession, setBySession] = useState<BySession<ChatMsg[]>>({});
+  const [input, setInput] = useState("");
+
+  const getMsgs = (sid: string) => bySession[sid] ?? [];
+  const setMsgs = (
+    sid: string,
+    upd: ((prev: ChatMsg[]) => ChatMsg[]) | ChatMsg[],
+  ) => {
+    setBySession((prev) => {
+      const cur = prev[sid] ?? [];
+      const next = Array.isArray(upd) ? upd : upd(cur);
+      return next === cur ? prev : { ...prev, [sid]: next };
+    });
+  };
+
+  const resetMsgs = (sid: string) =>
+    setBySession((prev) => (prev[sid] ? { ...prev, [sid]: [] } : prev));
+
+  return { bySession, input, setInput, getMsgs, setMsgs, resetMsgs };
+}
+
+# ===== frontend/src/hooks/useChatStream.ts =====
+
+import { useMemo } from "react";
+import type { ChatMsg } from "../types/chat";
+import { useSession } from "./useSession";
+import { useStream } from "./useStream";
+import { useChatState } from "./useChatState";
+import { useRunState } from "./useRunState";
+import { useMetrics } from "./useMetrics";
+// Retitle disabled for now
+// import { useRetitle } from "./useRetitle";
+
+export type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+export function useChatStream() {
+  // state slices
+  const chat = useChatState();
+  const run = useRunState();
+  const met = useMetrics();
+  // Retitle disabled
+  // const { retitleNow } = useRetitle(true);
+
+  // session plumbing
+  const {
+    sessionIdRef,
+    ensureChatCreated,
+    loadHistory,
+    setSessionId,
+    resetSession,
+  } = useSession({
+    setMessagesForSession: (sid: string, msgs: ChatMsg[]) =>
+      chat.setMsgs(sid, msgs),
+    getMessagesForSession: (sid: string) => chat.getMsgs(sid),
+    isStreaming: (sid: string) => !!run.loadingBy[sid],
+  });
+
+  // stream controller
+  const { send, stop, cancelBySessionId } = useStream({
+    messages: chat.getMsgs(sessionIdRef.current), // keeps deps stable
+    setMessagesForSession: (sid, updater) => {
+    const prev = chat.getMsgs(sid) || [];   // ← guard
+    chat.setMsgs(sid, updater(prev));
+    },
+    getMessagesForSession: chat.getMsgs,
+    setInput: chat.setInput,
+    sessionId: () => sessionIdRef.current,
+    ensureChatCreated,
+
+    // 🔕 Retitle disabled: provide a no-op with the expected signature
+    onRetitle: async (_sessionId: string, _latestAssistant: string) => {
+      /* no-op */
+    },
+
+    setLoadingForSession: run.setLoadingFor,
+    setQueuedForSession: run.setQueuedFor,
+    setMetricsForSession: met.setMetricsFor,
+    setMetricsFallbackForSession: met.setMetricsFallbackFor,
+    resetMetricsForSession: met.resetMetricsFor,
+  });
+
+  async function cancelSessions(ids: string[]) {
+    await Promise.all(ids.map(cancelBySessionId));
+  }
+
+  // derived (active session)
+    const activeId = sessionIdRef.current;
+      const messages = useMemo(
+        () => chat.getMsgs(activeId) || [],   // ← never undefined
+        [chat.bySession, activeId],
+      );
+
+  const loading = !!run.loadingBy[activeId];
+  const queued = !!run.queuedBy[activeId];
+  const runJson = met.metricsBy[activeId]?.runJson ?? null;
+  const runMetrics = met.metricsBy[activeId]?.flat ?? null;
+
+  function reset() {
+    chat.setInput("");
+    met.resetMetricsFor(activeId);
+    resetSession();
+  }
+
+  function snapshotPendingAssistant(): string {
+    const msgs = chat.getMsgs(activeId);
+    const last = msgs[msgs.length - 1];
+    return last?.role === "assistant" ? (last.text ?? "") : "";
+  }
+
+  // 👉 New: allow non-streaming worker calls to add messages locally
+  function appendLocal(role: "user" | "assistant", text: string) {
+    const sid = sessionIdRef.current;
+    if (!sid || !text) return;
+    const prev = chat.getMsgs(sid) || [];
+    const msg: ChatMsg = {
+      id: crypto.randomUUID(),
+      role,
+      text,
+      // optional fields your UI tolerates:
+      serverId: null as any,
+      createdAt: Date.now() as any,
+    } as any;
+    chat.setMsgs(sid, [...prev, msg]);
+  }
+
+  return {
+    // chat state
+    messages,
+    input: chat.input,
+    setInput: chat.setInput,
+    loading,
+    queued,
+
+    // actions
+    send,
+    stop,
+    cancelSessions,
+
+    // session ctl
+    setSessionId,
+    sessionIdRef,
+    loadHistory,
+    reset,
+    snapshotPendingAssistant,
+
+    // metrics (active only)
+    runMetrics,
+    runJson,
+    clearMetrics: () => met.resetMetricsFor(activeId),
+
+    // 👉 expose local append for worker non-stream calls
+    appendLocal,
+  };
+}
+
+# ===== frontend/src/hooks/useLicense.ts =====
+
+
+
+# ===== frontend/src/hooks/useMetrics.ts =====
+
+import { useState } from "react";
+import type { GenMetrics, RunJson } from "../shared/lib/runjson";
+
+type BySession<T> = Record<string, T>;
+type Pair = { runJson: RunJson | null; flat: GenMetrics | null };
+
+export function useMetrics() {
+  const [metricsBy, setMetricsBy] = useState<BySession<Pair>>({});
+
+  function resetMetricsFor(sid: string) {
+    setMetricsBy((prev) => ({ ...prev, [sid]: { runJson: null, flat: null } }));
+  }
+
+  function setMetricsFor(sid: string, json?: RunJson, flat?: GenMetrics) {
+    setMetricsBy((prev) => {
+      const cur = prev[sid] ?? { runJson: null, flat: null };
+      return {
+        ...prev,
+        [sid]: { runJson: json ?? cur.runJson, flat: flat ?? cur.flat },
+      };
+    });
+  }
+
+  function setMetricsFallbackFor(
+    sid: string,
+    reason: string,
+    partialOut: string,
+  ) {
+    const json: RunJson = {
+      stats: {
+        stopReason: reason,
+        tokensPerSecond: null,
+        timeToFirstTokenSec: null,
+        totalTimeSec: null,
+        promptTokensCount: null,
+        predictedTokensCount: partialOut ? partialOut.length : 0,
+        totalTokensCount: null,
+      },
+    };
+    const flat: GenMetrics = {
+      stop_reason: reason,
+      tok_per_sec: null,
+      ttft_ms: null,
+      output_tokens: null,
+      input_tokens_est: null,
+      total_tokens_est: null,
+    };
+    setMetricsFor(sid, json, flat);
+  }
+
+  return { metricsBy, resetMetricsFor, setMetricsFor, setMetricsFallbackFor };
+}
+
+# ===== frontend/src/hooks/useModalHealth.ts =====
+
+import { useEffect, useState } from "react";
+import { getModelHealth } from "../api/models";
+
+export function useModelHealth(pollMs = 5000) {
+  const [loaded, setLoaded] = useState<boolean>(true); // default optimistic
+  useEffect(() => {
+    let alive = true, t: any;
+    const tick = async () => {
+      try { const h = await getModelHealth(); if (alive) setLoaded(!!h.loaded); }
+      catch { if (alive) setLoaded(false); }
+      t = setTimeout(tick, pollMs);
+    };
+    tick();
+    return () => { alive = false; clearTimeout(t); };
+  }, [pollMs]);
+  return loaded;
+}
+
+# ===== frontend/src/hooks/useMultiSelect.ts =====
+
+// frontend/src/file_read/hooks/useMultiSelect.ts
+import { useEffect, useMemo, useState } from "react";
+
+export function useMultiSelect(allIds: string[]) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // keep selection pruned when the list of ids changes
+  useEffect(() => {
+    setSelected((prev) => {
+      const next = new Set([...prev].filter((id) => allIds.includes(id)));
+      // only update if it actually changed
+      return next.size === prev.size ? prev : next;
+    });
+  }, [allIds]);
+
+  const allSelected = useMemo(
+    () => selected.size > 0 && selected.size === allIds.length,
+    [selected, allIds.length],
+  );
+
+  const toggleOne = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelected((prev) =>
+      prev.size === allIds.length ? new Set() : new Set(allIds),
+    );
+  };
+
+  return { selected, setSelected, allSelected, toggleOne, toggleAll };
+}
+
+# ===== frontend/src/hooks/useRetitle.ts =====
+
+// frontend/src/file_read/hooks/useRetitle.ts
+import { API_BASE } from "../services/http";
+import { listMessages, updateChatLast } from "../data/chatApi";
+import { stripRunJson } from "../shared/lib/runjson";
+
+const TITLE_MAX_WORDS = 6;
+
+function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
+  let t = raw.split(/\r?\n/)[0] ?? "";
+  t = t.replace(/[^\p{L}\p{N} ]+/gu, " ");
+  t = t.replace(/\s+/g, " ").trim();
+  t = t.split(" ").slice(0, maxWords).join(" ").trim();
+  return t;
+}
+
+export function useRetitle(enabled = true) {
+  async function retitleNow(sessionId: string, latestAssistant: string) {
+    console.log("1");
+    if (!enabled) return;
+
+    try {
+      // Build a minimal transcript to title on
+      const rows = await listMessages(sessionId);
+      const textDump = rows
+        .map((r) => `${r.role === "user" ? "User" : "Assistant"}: ${r.content}`)
+        .join("\n");
+
+      // Ask the local model for a very short title
+      const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: `${sessionId}::titlebot`,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You output ultra-concise, neutral chat titles and nothing else.",
+            },
+            {
+              role: "user",
+              content:
+                "Write ONE short title summarizing the conversation below.\n" +
+                "Rules: at most 6 words — sentence or title case — no punctuation — no emojis — no quotes — return ONLY the title\n\n" +
+                textDump +
+                "\n\nTitle:",
+            },
+          ],
+          max_tokens: 24,
+          temperature: 0.2,
+          top_p: 0.9,
+        }),
+      });
+
+      if (!res.ok || !res.body) return;
+
+      // Gather the streamed text + strip runjson
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let raw = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) raw += decoder.decode(value, { stream: true });
+      }
+
+      const { text } = stripRunJson(raw);
+      const title = sanitizeTitle(text);
+      if (!title) return;
+
+      // Save title + lastMessage (lastMessage stays the full assistant text)
+      await updateChatLast(sessionId, latestAssistant, title).catch(() => {});
+      // Nudge sidebar so it shows new title immediately
+      try {
+        window.dispatchEvent(new CustomEvent("chats:refresh"));
+      } catch {}
+    } catch (e) {
+      console.warn("retitleNow failed:", e);
+    }
+  }
+
+  return { retitleNow };
+}
+
+# ===== frontend/src/hooks/useRunState.ts =====
+
+import { useState } from "react";
+
+type BySession<T> = Record<string, T>;
+
+export function useRunState() {
+  const [loadingBy, setLoadingBy] = useState<BySession<boolean>>({});
+  const [queuedBy, setQueuedBy] = useState<BySession<boolean>>({});
+
+  const setBool =
+    (setter: React.Dispatch<React.SetStateAction<BySession<boolean>>>) =>
+    (sid: string, v: boolean) =>
+      setter((prev) => (prev[sid] === v ? prev : { ...prev, [sid]: v }));
+
+  return {
+    loadingBy,
+    queuedBy,
+    setLoadingFor: setBool(setLoadingBy),
+    setQueuedFor: setBool(setQueuedBy),
+  };
+}
+
+# ===== frontend/src/hooks/useSession.ts =====
+
+// frontend/src/file_read/hooks/useSession.ts
+import { useRef } from "react";
+import type { ChatMsg, ChatMessageRow } from "../types/chat";
+import { createChat, listMessages } f

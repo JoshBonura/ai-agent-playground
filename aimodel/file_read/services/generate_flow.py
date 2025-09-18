@@ -64,6 +64,18 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
     stopped_marker = eff0.get("stopped_line_marker") or ""
     early_sid = getattr(data, "sessionId", None) or eff0["default_session_id"]
 
+    # Log settings/flags early so we can compare main vs worker processes
+    try:
+        log.info(
+            "[gen] startup flags sid=%s runjson_emit=%s stopped_line=%s pro=%s",
+            early_sid,
+            bool(SETTINGS.runjson_emit),
+            bool(SETTINGS.stream_emit_stopped_line),
+            bool(is_request_pro_activated()),
+        )
+    except Exception:
+        pass
+
     stop_ev = cancel_event(early_sid)
     if stop_ev.is_set():
         log.info("[gen] clearing stale stop at start sid=%s ev_id=%s", early_sid, id(stop_ev))
@@ -106,7 +118,6 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
                     if SETTINGS.stream_emit_stopped_line:
                         yield _sse(data=stopped_marker)
                     return
-
 
                 if prep_task in done:
                     try:
@@ -168,10 +179,24 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
                     return
                 s = chunk_bytes.decode("utf-8", errors="ignore")
                 if RUNJSON_START in s and RUNJSON_END in s:
+                    # For troubleshooting: record we saw a runjson frame in-flight
+                    log.info("[gen] runjson: marker_seen sid=%s", sid)
                     return
                 if s.strip() == stopped_marker:
                     return
                 out_buf.extend(chunk_bytes)
+
+            # ---- NEW: compute and log the emit gate we pass to the worker/main streamer
+            try:
+                runjson_emit_setting = bool(SETTINGS.runjson_emit)
+                pro_gate = bool(is_request_pro_activated())
+                emit_stats_flag = runjson_emit_setting and pro_gate
+                log.info(
+                    "[gen] emit_check sid=%s runjson_emit=%s pro=%s -> emit_stats=%s",
+                    sid, runjson_emit_setting, pro_gate, emit_stats_flag
+                )
+            except Exception:
+                emit_stats_flag = bool(SETTINGS.runjson_emit)
 
             try:
                 async for chunk in run_stream(
@@ -185,8 +210,17 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
                     input_tokens_est=prep.input_tokens_est,   # type: ignore[attr-defined]
                     t0_request=prep.t_request_start,    # type: ignore[attr-defined]
                     budget_view=prep.budget_view,       # type: ignore[attr-defined]
-                    emit_stats=is_request_pro_activated(),
+                    emit_stats=emit_stats_flag,         # <- what ultimately governs RUNJSON emission
                 ):
+                    # Optional: very lightweight peek for markers (helps prove whether upstream appended)
+                    if isinstance(chunk, (bytes, bytearray)):
+                        s = None
+                        try:
+                            s = chunk.decode("utf-8", errors="ignore")
+                        except Exception:
+                            s = None
+                        if s and (RUNJSON_START in s or RUNJSON_END in s):
+                            log.info("[gen] runjson: chunk_contains_marker sid=%s", sid)
                     _accum_visible(chunk if isinstance(chunk, (bytes, bytearray)) else chunk.encode("utf-8"))
                     yield chunk
             finally:

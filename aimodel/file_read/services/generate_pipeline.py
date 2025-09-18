@@ -13,7 +13,7 @@ from ..core.packing_memory_core import PACK_TELEMETRY
 from ..core.schemas import ChatBody
 from ..core.settings import SETTINGS
 from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
-from ..runtime.model_runtime import ensure_ready, get_llm
+from ..runtime import model_runtime as MR
 from ..web.router_ai import decide_web_and_fetch
 from .attachments import att_get
 from .generate_pipeline_part2 import _finish_prepare_generation_with_telemetry
@@ -39,10 +39,10 @@ async def prepare_generation_with_telemetry(
     stop_ev: asyncio.Event | None = None,  # injected from generate_flow
 ) -> Prep:
     # Model readiness & handle early cancel
-    ensure_ready()
+    MR.ensure_ready()
     await _yield_if_stopping(stop_ev, "ensure_ready.done", hard=True)
 
-    llm = get_llm()
+    llm = MR.get_llm()
     await _yield_if_stopping(stop_ev, "get_llm.done", hard=True)
 
     t_request_start = time.perf_counter()

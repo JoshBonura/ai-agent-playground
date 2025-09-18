@@ -6,7 +6,12 @@ ai-agent-playground/
   clean-structure-2.txt
   clean-structure-3.txt
   clean-structure-4.txt
+  clean-structure-5.txt
+  clean-structure-6.txt
+  clean-structure-7.txt
+  clean-structure-8.txt
   fs.py
+  llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
   my-structure.txt
   package-lock.json
   package.json
@@ -14,6 +19,7 @@ ai-agent-playground/
   pyproject.toml
   pytest.ini
   run_backend.py
+  test.py
   .git/
   .ruff_cache/
     .gitignore
@@ -62,9 +68,12 @@ ai-agent-playground/
         generate_router.py
         licensing_router.py
         metrics.py
+        model_workers.py
         models.py
+        proxy_generate.py
         rag.py
         settings.py
+        system.py
       backend/
         .runtime/
           ports.json
@@ -132,6 +141,8 @@ ai-agent-playground/
         router_text.py
         session_io.py
         streaming_worker.py
+        system_collectors.py
+        system_snapshot.py
       store/
         __init__.py
         base.py
@@ -169,7 +180,9 @@ ai-agent-playground/
         query_summarizer.py
         router_ai.py
       workers/
+        model_worker.py
         retitle_worker.py
+        worker_entry.py
   cloudflare/
     .gitignore
     license-do.ts
@@ -214,7 +227,9 @@ ai-agent-playground/
         billing.ts
         devices.ts
         license.ts
+        modelWorkers.ts
         models.ts
+        system.ts
       auth/
         AuthContext.tsx
         ForgotPassword.tsx
@@ -295,6 +310,7 @@ ai-agent-playground/
             cancel.ts
             constants.ts
             controller.ts
+            debug.ts
             network.ts
             queue.ts
             runner.ts
@@ -305,6 +321,7 @@ ai-agent-playground/
             updater.ts
       pages/
         AgentRunner.tsx
+        AgentRunnerView.tsx
       services/
         http.ts
       shared/

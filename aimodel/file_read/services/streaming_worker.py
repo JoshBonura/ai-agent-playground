@@ -19,6 +19,15 @@ from ..utils.streaming import (
 log = get_logger(__name__)
 
 
+def _preview(s: str, n: int = 80) -> str:
+    """single-line preview for log lines."""
+    try:
+        s = s.replace("\n", "\\n")
+    except Exception:
+        pass
+    return (s[:n] + "…") if len(s) > n else s
+
+
 async def run_stream(
     *,
     llm,
@@ -39,6 +48,16 @@ async def run_stream(
       - Bridges data into an asyncio.Queue using run_coroutine_threadsafe
       - Yields bytes to the client
     """
+    # Entry diagnostics
+    log.info(
+        "[run] enter emit_stats=%s runjson_emit_setting=%s q_max=%s top_k=%s repeat_penalty=%s",
+        emit_stats,
+        bool(SETTINGS.runjson_emit),
+        SETTINGS.stream_queue_maxsize,
+        SETTINGS.stream_top_k,
+        SETTINGS.stream_repeat_penalty,
+    )
+
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue(maxsize=SETTINGS.stream_queue_maxsize)
     SENTINEL = object()
@@ -64,6 +83,13 @@ async def run_stream(
             # Create the model stream (may block; done in this worker thread)
             try:
                 t_call = time.perf_counter()
+                log.info(
+                    "[run] model.call max_tokens=%s temp=%.3f top_p=%.3f stops=%s",
+                    out_budget,
+                    temperature,
+                    top_p,
+                    SETTINGS.stream_stop_strings,
+                )
                 stream = llm.create_chat_completion(
                     messages=messages,
                     stream=True,
@@ -82,8 +108,9 @@ async def run_stream(
                         int(out_budget * SETTINGS.stream_retry_fraction),
                     )
                     log.warning(
-                        "generate: context overflow, retrying with max_tokens=%d",
+                        "[run] context overflow; retrying with max_tokens=%d (was %d)",
                         retry_tokens,
+                        out_budget,
                     )
                     stream = llm.create_chat_completion(
                         messages=messages,
@@ -100,6 +127,7 @@ async def run_stream(
 
             for chunk in stream:
                 if stop_ev.is_set():
+                    log.info("[run] stop_ev set; breaking producer loop")
                     break
 
                 try:
@@ -119,12 +147,24 @@ async def run_stream(
                 t_last = now
                 out_parts.append(piece)
 
+                # fine-grained piece preview
+                try:
+                    log.debug(
+                        "[run] piece len=%d total_so_far=%d preview='%s'",
+                        len(piece),
+                        sum(len(p) for p in out_parts),
+                        _preview(piece),
+                    )
+                except Exception:
+                    pass
+
                 # Backpressure: block briefly if queue is full, until we can put
                 while not stop_ev.is_set():
                     try:
                         put_sync(piece)
                         break
-                    except Exception:
+                    except Exception as _e:
+                        log.warning("[run] backpressure; retrying put_sync: %s", _e)
                         time.sleep(SETTINGS.stream_backpressure_sleep_sec)
 
         except Exception as e:
@@ -153,6 +193,7 @@ async def run_stream(
                 if isinstance(budget_view, dict) and "queueWaitSec" in budget_view:
                     stage["queueWaitSec"] = budget_view.get("queueWaitSec")
 
+                # Collect engine timings (llama.cpp etc.)
                 try:
                     engine = collect_engine_timings(llm)
                 except Exception:
@@ -160,73 +201,7 @@ async def run_stream(
                 if engine:
                     stage["engine"] = engine
 
-                # Populate budget_view breakdown (TTFT attribution)
-                if isinstance(budget_view, dict):
-
-                    def _fnum(x) -> float:
-                        try:
-                            return float(x) if x is not None else 0.0
-                        except Exception:
-                            return 0.0
-
-                    ttft_val = _fnum(stage.get("ttftSec"))
-
-                    pack = budget_view.get("pack") or {}
-                    rag = budget_view.get("rag") or {}
-                    web_bd = ((budget_view.get("web") or {}).get("breakdown")) or {}
-
-                    pack_sec = _fnum(pack.get("packSec"))
-                    trim_sec = _fnum(pack.get("finalTrimSec"))
-                    comp_sec = _fnum(pack.get("compressSec"))
-
-                    rag_router = _fnum(rag.get("routerDecideSec"))
-
-                    build_candidates = (
-                        rag.get("injectBuildSec"),
-                        rag.get("sessionOnlyBuildSec"),
-                        rag.get("blockBuildSec"),
-                    )
-                    first_build = next((v for v in build_candidates if v is not None), None)
-                    rag_build_agg = _fnum(first_build)
-
-                    rag_embed = _fnum(rag.get("embedSec"))
-                    rag_s_chat = _fnum(rag.get("searchChatSec"))
-                    rag_s_glob = _fnum(rag.get("searchGlobalSec"))
-                    rag_dedupe = _fnum(rag.get("dedupeSec"))
-
-                    if rag_build_agg > 0.0:
-                        rag_pipeline_sec = rag_build_agg
-                    else:
-                        rag_pipeline_sec = rag_embed + rag_s_chat + rag_s_glob + rag_dedupe
-
-                    prep_sec = _fnum(web_bd.get("prepSec"))
-                    web_pre = _fnum(web_bd.get("totalWebPreTtftSec"))
-
-                    model_queue = _fnum(stage.get("modelQueueSec"))
-
-                    pre_accounted = (
-                        pack_sec
-                        + trim_sec
-                        + comp_sec
-                        + rag_router
-                        + rag_pipeline_sec
-                        + web_pre
-                        + prep_sec
-                        + model_queue
-                    )
-                    unattributed = ttft_val - pre_accounted
-                    if unattributed < 0.0:
-                        unattributed = 0.0
-
-                    budget_view.setdefault("breakdown", {})
-                    budget_view["breakdown"].update(
-                        {
-                            "ttftSec": ttft_val,
-                            "preTtftAccountedSec": round(pre_accounted, 6),
-                            "unattributedTtftSec": round(unattributed, 6),
-                        }
-                    )
-
+                # Build runjson payload
                 run_json = build_run_json(
                     request_cfg={
                         "temperature": temperature,
@@ -244,10 +219,29 @@ async def run_stream(
                     extra_timings=stage,
                     error_text=err_text,
                 )
+
+                # gate + append diagnostics
                 if SETTINGS.runjson_emit and emit_stats:
-                    put_sync(RUNJSON_START + json.dumps(run_json) + RUNJSON_END)
+                    try:
+                        payload = RUNJSON_START + json.dumps(run_json) + RUNJSON_END
+                        log.info(
+                            "[run] runjson.append size=%d out_len=%d ttft=%.3fs gen=%.3fs",
+                            len(payload),
+                            len(out_text or ""),
+                            float(stage.get("ttftSec") or 0.0),
+                            float(stage.get("genSec") or 0.0),
+                        )
+                        put_sync(payload)
+                    except Exception as e:
+                        log.error("[run] runjson.append failed: %s", e)
+                else:
+                    log.info(
+                        "[run] runjson.skipped runjson_emit=%s emit_stats=%s",
+                        bool(SETTINGS.runjson_emit),
+                        bool(emit_stats),
+                    )
             except Exception:
-                pass
+                log.exception("[run] finalize error while building/appending runjson")
             finally:
                 try:
                     llm.reset()
@@ -265,14 +259,58 @@ async def run_stream(
         while True:
             item = await q.get()
             if item is SENTINEL:
+                log.info("[run] sentinel received; consumer exiting")
                 break
+
+            # Log chunk boundaries + marker presence
+            try:
+                if isinstance(item, (bytes, bytearray)):
+                    s = None
+                    try:
+                        s = item.decode("utf-8", errors="ignore")
+                    except Exception:
+                        s = None
+                    if s:
+                        has_start = RUNJSON_START in s
+                        has_end = RUNJSON_END in s
+                        if has_start or has_end:
+                            log.info(
+                                "[run] consumer chunk contains marker start=%s end=%s len=%d",
+                                has_start,
+                                has_end,
+                                len(s),
+                            )
+                        else:
+                            log.debug("[run] consumer chunk len=%d preview='%s'", len(s), _preview(s))
+                else:
+                    # string chunk
+                    s = str(item)
+                    if RUNJSON_START in s or RUNJSON_END in s:
+                        log.info(
+                            "[run] consumer chunk contains marker (str) start=%s end=%s len=%d",
+                            RUNJSON_START in s,
+                            RUNJSON_END in s,
+                            len(s),
+                        )
+                    else:
+                        log.debug("[run] consumer chunk len=%d preview='%s'", len(s), _preview(s))
+            except Exception:
+                pass
+
             yield (item if isinstance(item, bytes) else item.encode("utf-8"))
+
         if stop_ev.is_set() and SETTINGS.stream_emit_stopped_line:
             yield (f"\n{SETTINGS.stopped_line_marker}\n").encode()
     finally:
-        stop_ev.set()
-        disconnect_task.cancel()
+        try:
+            stop_ev.set()
+        except Exception:
+            pass
+        try:
+            disconnect_task.cancel()
+        except Exception:
+            pass
         try:
             await asyncio.wait_for(producer, timeout=SETTINGS.stream_producer_join_timeout_sec)
         except Exception:
-            pass
+            log.warning("[run] producer join timed out")

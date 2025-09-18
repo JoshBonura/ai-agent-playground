@@ -70,3 +70,12 @@ export async function getModelHealth(): Promise<{ ok: boolean; loaded: boolean; 
 // (optional) convenience helper if you want a single call to reset to defaults:
 export const loadModelWithDefaults = (modelPath: string) =>
   loadModel({ modelPath, resetDefaults: true });
+
+export async function cancelModelLoad() {
+  const res = await fetch(`/api/models/cancel-load`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`cancelModelLoad ${res.status}`);
+  return res.json();
+}

@@ -1,68 +1,1777 @@
-ntinue
+  *list(recent),
+        ]
+
+    # Final safety trim to budget
+    t0_trim = time.time()
+    packed = _final_safety_trim(packed, input_budget)
+    PACK_TELEMETRY["finalTrimSec"] += float(time.time() - t0_trim)
+
+    end_tokens = count_prompt_tokens(packed)
+    PACK_TELEMETRY["rollEndTokens"] = int(end_tokens)
+    return packed, summary
+
+# ===== aimodel/file_read/core/request_ctx.py =====
+
+# aimodel/file_read/core/request_ctx.py
+from contextvars import ContextVar
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+
+x_id_ctx: ContextVar[str] = ContextVar("x_id_ctx", default="")
+id_token_ctx: ContextVar[str] = ContextVar("id_token_ctx", default="")
+user_email_ctx: ContextVar[str] = ContextVar("user_email_ctx", default="")
+
+
+def get_x_id() -> str:
+    return x_id_ctx.get()
+
+
+def set_x_id(val: str):
+    x_id_ctx.set((val or "").strip())
+
+
+def get_id_token() -> str:
+    return id_token_ctx.get()
+
+
+def set_id_token(val: str):
+    id_token_ctx.set((val or "").strip())
+
+
+def get_user_email() -> str:
+    return user_email_ctx.get()
+
+
+def set_user_email(val: str):
+    user_email_ctx.set((val or "").strip())
+
+# ===== aimodel/file_read/core/schemas.py =====
+
+# core/schemas.py
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+class Attachment(BaseModel):
+    name: str
+    source: str | None = None
+    sessionId: str | None = None
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+    attachments: list[Attachment] | None = None
+
+
+class ChatMetaModel(BaseModel):
+    id: int
+    sessionId: str
+    title: str
+    lastMessage: str | None = None
+    createdAt: str
+    updatedAt: str
+    ownerUid: str | None = None
+    ownerEmail: str | None = None
+
+
+class PageResp(BaseModel):
+    content: list[ChatMetaModel]
+    totalElements: int
+    totalPages: int
+    size: int
+    number: int
+    first: bool
+    last: bool
+    empty: bool
+
+
+class BatchMsgDeleteReq(BaseModel):
+    messageIds: list[int]
+
+
+class BatchDeleteReq(BaseModel):
+    sessionIds: list[str]
+
+
+class EditMessageReq(BaseModel):
+    messageId: int
+    content: str
+
+
+class ChatBody(BaseModel):
+    sessionId: str | None = None
+    messages: list[ChatMessage] | None = None
+
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+
+    autoWeb: bool | None = None
+    webK: int | None = None
+    autoRag: bool | None = None
+
+# ===== aimodel/file_read/core/settings.py =====
+
+from __future__ import annotations
+
+import json
+from threading import RLock
+from typing import Any
+
+from ..core.logging import get_logger
+
+log = get_logger(__name__)
+from .files import (DEFAULTS_SETTINGS_FILE, OVERRIDES_SETTINGS_FILE,
+                    load_json_file, save_json_file)
+
+
+def _deep_merge(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
+    out = dict(dst)
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+class _SettingsManager:
+    """
+    Sources of truth:
+      - defaults:    read-only from DEFAULTS_SETTINGS_FILE
+      - overrides:   persisted to OVERRIDES_SETTINGS_FILE
+      - adaptive:    in-memory (per-session or global)
+    Effective settings are computed on the fly: defaults <- adaptive <- overrides.
+    """
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._defaults: dict[str, Any] = self._load_defaults()
+        self._overrides: dict[str, Any] = self._load_overrides()
+        self._adaptive_by_session: dict[str, dict[str, Any]] = {}
+
+    # ----- I/O -----
+    def _load_defaults(self) -> dict[str, Any]:
+        return load_json_file(DEFAULTS_SETTINGS_FILE, default={})
+
+    def _load_overrides(self) -> dict[str, Any]:
+        return load_json_file(OVERRIDES_SETTINGS_FILE, default={})
+
+    def _save_overrides_unlocked(self) -> None:
+        save_json_file(OVERRIDES_SETTINGS_FILE, self._overrides)
+
+    # ----- Effective -----
+    def _effective_unlocked(self, session_id: str | None = None) -> dict[str, Any]:
+        eff = _deep_merge(
+            self._defaults, self._adaptive_by_session.get(session_id or "_global_", {})
+        )
+        eff = _deep_merge(eff, self._overrides)
+        return eff
+
+    def _get_unlocked(self, key: str, default: Any = None, *, session_id: str | None = None) -> Any:
+        eff = self._effective_unlocked(session_id)
+        if key in eff:
+            return eff[key]
+        if default is not None:
+            return default
+        raise AttributeError(f"_SettingsManager has no key '{key}'")
+
+    # ----- Public API -----
+    @property
+    def defaults(self) -> dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._defaults))
+
+    @property
+    def overrides(self) -> dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._overrides))
+
+    def adaptive(self, session_id: str | None = None) -> dict[str, Any]:
+        key = session_id or "_global_"
+        with self._lock:
+            return json.loads(json.dumps(self._adaptive_by_session.get(key, {})))
+
+    def effective(self, session_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            return self._effective_unlocked(session_id)
+
+    def __getattr__(self, name: str) -> Any:
+        with self._lock:
+            return self._get_unlocked(name)
+
+    def __getitem__(self, key: str) -> Any:
+        with self._lock:
+            return self._get_unlocked(key)
+
+    def get(self, key: str, default: Any = None, *, session_id: str | None = None) -> Any:
+        with self._lock:
+            try:
+                return self._get_unlocked(key, default=default, session_id=session_id)
+            except AttributeError:
+                return default
+
+    # ----- Mutations -----
+    def patch_overrides(self, patch: dict[str, Any]) -> None:
+        if not isinstance(patch, dict):
+            return
+        with self._lock:
+            self._overrides = _deep_merge(self._overrides, patch)
+            self._save_overrides_unlocked()
+
+    def replace_overrides(self, new_overrides: dict[str, Any]) -> None:
+        if not isinstance(new_overrides, dict):
+            new_overrides = {}
+        with self._lock:
+            self._overrides = json.loads(json.dumps(new_overrides))
+            self._save_overrides_unlocked()
+
+    def reload_overrides(self) -> None:
+        with self._lock:
+            self._overrides = self._load_overrides()
+
+    def set_adaptive_for_session(self, session_id: str | None, values: dict[str, Any]) -> None:
+        key = session_id or "_global_"
+        if not isinstance(values, dict):
+            values = {}
+        with self._lock:
+            self._adaptive_by_session[key] = json.loads(json.dumps(values))
+
+    def recompute_adaptive(self, session_id: str | None = None) -> None:
+        # Kept for API compatibility; effective is always computed on demand.
+        return None
+
+
+SETTINGS = _SettingsManager()
+
+# ===== aimodel/file_read/core/style.py =====
+
+from __future__ import annotations
+
+import re
+
+from ..core.logging import get_logger
+from .settings import SETTINGS
+
+log = get_logger(__name__)
+
+
+def get_style_sys() -> str:
+    return SETTINGS.get("style_sys", "")
+
+
+def extract_style_and_prefs(user_text: str) -> tuple[str | None, bool, bool]:
+    S = SETTINGS.effective()
+    pats = S.get("style_patterns", {})
+    template = S.get("style_template", "You must talk like {style}.")
+
+    compiled = []
+    for key in ["talk_like", "respond_like", "from_now", "be"]:
+        if key in pats:
+            compiled.append(re.compile(pats[key], re.I))
+
+    t = user_text.strip()
+    style_match = None
+    for pat in compiled:
+        style_match = pat.search(t)
+        if style_match:
+            break
+
+    style_inst: str | None = None
+    if style_match:
+        raw = style_match.group("style").strip().rstrip(".")
+        style_inst = template.format(style=raw)
+
+    return style_inst, False, False
+
+# ===== aimodel/file_read/deps/admin_deps.py =====
+
+# aimodel/file_read/deps/admin_deps.py
+from __future__ import annotations
+
+from fastapi import Depends, HTTPException
+
+from ..core import admins as reg
+from .auth_deps import require_auth
+
+
+async def require_admin(user=Depends(require_auth)):
+    uid = user.get("user_id") or user.get("sub")
+    if uid and reg.is_admin(uid):
+        return user
+    raise HTTPException(403, "Admin required")
+
+# ===== aimodel/file_read/deps/auth_deps.py =====
+
+# aimodel/file_read/deps/auth_deps.py
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from fastapi import Cookie, Header, HTTPException, Request, status
+
+from ..core.logging import get_logger
+from ..services.auth_service import verify_jwt_with_google
+
+log = get_logger(__name__)
+
+ID_COOKIE_NAME = "fb_id"
+LEGACY_COOKIE_NAME = "fb_session"
+AUTH_ORG_ID = (os.getenv("AUTH_ORG_ID") or "").strip() or None
+
+
+async def require_auth(
+    request: Request,
+    authorization: str | None = Header(None),
+    fb_id_cookie: str | None = Cookie(None, alias=ID_COOKIE_NAME),
+    fb_session_cookie: str | None = Cookie(None, alias=LEGACY_COOKIE_NAME),
+) -> dict[str, Any]:
+    # ---- Dev bypass (local only) ----
+    if os.getenv("DEV_AUTH_BYPASS", "").lower() in ("1", "true", "yes"):
+        user = {"email": "dev@local", "user_id": "dev", "sub": "dev"}
+        request.state.auth_error_reason = "BYPASS_DEV"
+        return user
+
+    reasons: list[str] = []
+
+    async def _try(token: str, origin: str) -> dict[str, Any] | None:
+        try:
+            claims = await verify_jwt_with_google(token)
+            if not isinstance(claims, dict) or not claims.get("email"):
+                reasons.append(f"{origin}:NO_EMAIL")
+                return None
+            # Optional org gate
+            if AUTH_ORG_ID and str(claims.get("org_id") or "").strip() != AUTH_ORG_ID:
+                reasons.append(f"{origin}:ORG_MISMATCH")
+                return None
+            return claims
+        except HTTPException as e:  # your verifier may raise HTTPException(401, "…")
+            # Common: TOKEN_EXPIRED / INVALID_SIGNATURE / INVALID_AUD, etc.
+            reasons.append(f"{origin}:{e.detail or 'HTTP_401'}")
+            log.debug("[auth] verify error (%s): %s", origin, e.detail)
+            return None
+        except Exception as e:
+            reasons.append(f"{origin}:INVALID:{type(e).__name__}")
+            log.debug("[auth] verify exception (%s): %r", origin, e)
+            return None
+
+    # 1) First-choice: fb_id cookie
+    if fb_id_cookie:
+        claims = await _try(fb_id_cookie, f"cookie:{ID_COOKIE_NAME}")
+        if claims:
+            return claims
+
+    # 2) Legacy fallback cookie
+    if fb_session_cookie:
+        claims = await _try(fb_session_cookie, f"cookie:{LEGACY_COOKIE_NAME}")
+        if claims:
+            return claims
+
+    # 3) Authorization: Bearer <token>
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(None, 1)[1].strip()
+        if token:
+            claims = await _try(token, "authz:bearer")
+            if claims:
+                return claims
+        else:
+            reasons.append("authz:bearer:EMPTY")
+
+    # No valid auth presented or all attempts failed
+    request.state.auth_error_reason = ";".join(reasons) if reasons else "NO_CREDENTIALS"
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=request.state.auth_error_reason)
+
+# ===== aimodel/file_read/deps/license_deps.py =====
+
+from __future__ import annotations
+
+import time
+from fastapi import Depends, HTTPException
+
+from ..core.request_ctx import get_user_email
+from ..services.licensing_core import email_from_auth, license_status_local
+from ..services.licensing_service import (
+    get_activation_status,
+    refresh_activation,
+    remove_activation_file,
+)
+from .admin_deps import require_admin as _require_admin
+from .auth_deps import require_auth
+
+PRO_PLANS = {"pro", "enterprise"}
+
+
+def _is_plan_pro(st: dict) -> bool:
+    return bool(st.get("valid")) and (str(st.get("plan", "")).lower() in PRO_PLANS)
+
+
+def has_personal_pro(email: str | None) -> bool:
+    email = (email or "").strip().lower()
+    st = license_status_local(expected_email=email if email else None)
+    return _is_plan_pro(st)
+
+
+async def _ensure_device_active() -> None:
+    """
+    Require local activation token. If close to expiry, try refreshing.
+    If the licensing server rejects (401/403/404), delete the local token.
+    """
+    st = get_activation_status()
+    if not st.get("present"):
+        raise HTTPException(403, "Device not activated")
+
+    now = int(time.time())
+    exp = int(st.get("exp") or 0)
+    needs_refresh = (not exp) or (exp - now < 7 * 24 * 3600)
+
+    if needs_refresh:
+        try:
+            await refresh_activation()
+        except HTTPException as e:
+            if e.status_code in (401, 403, 404):
+                remove_activation_file()
+                raise HTTPException(403, "Device activation revoked")
+
+
+# ---------- Exported FastAPI dependencies ----------
+
+async def require_activation(user=Depends(require_auth)):
+    """
+    Device-scoped Pro: requires this device to be activated.
+    Any authenticated user on this device passes.
+    """
+    await _ensure_device_active()
+    return user
+
+
+# Back-compat alias (some modules import require_pro)
+require_pro = require_activation
+
+
+async def require_personal_pro(user=Depends(require_auth)):
+    """
+    Personal Pro only (no device activation check).
+    Use for actions tied to the user's own subscription.
+    """
+    email = email_from_auth(user)
+    if not has_personal_pro(email):
+        raise HTTPException(403, "Personal Pro required")
+    return user
+
+
+async def require_personal_pro_activated(user=Depends(require_auth)):
+    """
+    Personal Pro + Activated device (no admin). Use for RAG/Web endpoints.
+    """
+    email = email_from_auth(user)
+    if not has_personal_pro(email):
+        raise HTTPException(403, "Personal Pro required")
+    await _ensure_device_active()
+    return user
+
+
+async def require_admin(user=Depends(_require_admin)):
+    return user
+
+
+async def require_admin_personal_pro(user=Depends(_require_admin)):
+    """
+    Admin + Personal Pro (NO device activation).
+    Use when the action is admin-scoped but shouldn't force device activation.
+    """
+    email = email_from_auth(user)
+    if not has_personal_pro(email):
+        raise HTTPException(403, "Personal Pro required for admin action")
+    return user
+
+
+async def require_admin_pro(user=Depends(_require_admin)):
+    """
+    Admin + Personal Pro + Activated device.
+    """
+    email = email_from_auth(user)
+    if not has_personal_pro(email):
+        raise HTTPException(403, "Personal Pro required for admin action")
+    await _ensure_device_active()
+    return user
+
+
+def is_request_pro_activated() -> bool:
+    """
+    Synchronous check for code paths that can't use FastAPI Depends.
+    Requires BOTH: device activation AND personal Pro for the current request user.
+    """
+    try:
+        # Device must be activated
+        if not get_activation_status().get("present"):
+            return False
+        # Caller must be Pro (use request context email if available)
+        email = (get_user_email() or "").strip().lower()
+        return has_personal_pro(email)
+    except Exception:
+        return False
+
+# ===== aimodel/file_read/deps/model_deps.py =====
+
+# deps/model_deps.py
+from fastapi import HTTPException
+from ..runtime.model_runtime import ensure_ready
+
+# NEW: import quick worker check
+import httpx
+from ..api.model_workers import get_active_worker_addr  # lightweight helper
+
+def _worker_ready() -> bool:
+    try:
+        host, port = get_active_worker_addr()
+    except Exception:
+        return False
+    try:
+        # fast health probe (no auth needed for internal hop)
+        url = f"http://{host}:{port}/api/worker/health"
+        r = httpx.get(url, timeout=1.5)
+        return r.status_code == 200 and r.json().get("ok") is True
+    except Exception:
+        return False
+
+def require_model_ready():
+    # If main runtime is ready, we're good.
+    try:
+        ensure_ready()
+        return
+    except Exception:
+        pass
+
+    # Otherwise, accept an active worker.
+    if _worker_ready():
+        return
+
+    # Neither is ready → preserve your original 409 shape.
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "MODEL_NOT_LOADED", "message": "No model loaded (runtime) and no active worker."}
+    )
+
+# ===== aimodel/file_read/rag/__init__.py =====
+
+
+
+# ===== aimodel/file_read/rag/ingest/__init__.py =====
+
+# aimodel/file_read/rag/ingest/__init__.py
+
+from __future__ import annotations
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+import csv
+import hashlib
+import io
+import json
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, time
+from typing import Dict, List, Optional, Tuple
+
+import pypdfium2 as pdfium
+import pytesseract
+from PIL import Image
+
+from ...core.settings import SETTINGS
+from .common import Chunk, _strip_html, _utf8, build_metas, chunk_text
+from .csv_ingest import extract_csv
+from .doc_binary_ingest import extract_doc_binary
+from .docx_ingest import extract_docx
+from .excel_ingest import extract_excel
+from .excel_ingest_core import (rightmost_nonempty_header,
+                                scan_blocks_by_blank_rows, select_indices)
+from .main import sniff_and_extract
+from .ocr import is_bad_text, ocr_image_bytes, ocr_pdf
+from .pdf_ingest import extract_pdf
+from .ppt_ingest import extract_ppt, extract_pptx
+from .xls_ingest import extract_xls
+
+__all__ = [
+    "SETTINGS",
+    "Chunk",
+    "Dict",
+    "Image",
+    "List",
+    "Optional",
+    "Tuple",
+    "_strip_html",
+    "_utf8",
+    "build_metas",
+    "chunk_text",
+    "csv",
+    "dataclass",
+    "date",
+    "datetime",
+    "extract_csv",
+    "extract_doc_binary",
+    "extract_docx",
+    "extract_excel",
+    "extract_pdf",
+    "extract_ppt",
+    "extract_pptx",
+    "extract_xls",
+    "hashlib",
+    "io",
+    "is_bad_text",
+    "json",
+    "ocr_image_bytes",
+    "ocr_pdf",
+    "pdfium",
+    "pytesseract",
+    "re",
+    "rightmost_nonempty_header",
+    "scan_blocks_by_blank_rows",
+    "select_indices",
+    "sniff_and_extract",
+    "time",
+]
+
+# ===== aimodel/file_read/rag/ingest/common.py =====
+
+# ===== aimodel/file_read/rag/ingest/common.py =====
+from __future__ import annotations
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+import re
+from dataclasses import dataclass
+
+from ...core.settings import SETTINGS
+
+
+@dataclass
+class Chunk:
+    text: str
+    meta: dict[str, str]
+
+
+def _utf8(data: bytes) -> str:
+    return (data or b"").decode("utf-8", errors="ignore")
+
+
+def _strip_html(txt: str) -> str:
+    if not txt:
+        return ""
+
+    txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", txt)
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?is)</p>", "\n\n", txt)
+    txt = re.sub(r"(?is)<.*?>", " ", txt)
+    txt = re.sub(r"[ \t]+", " ", txt)
+    return txt.strip()
+
+
+_HDR_RE = re.compile(r"^(#{1,3})\s+.*$", flags=re.MULTILINE)
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
+
+
+def _split_sections(text: str) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    starts = [m.start() for m in _HDR_RE.finditer(text)]
+    if not starts:
+        return [text]
+    if 0 not in starts:
+        starts = [0] + starts
+    sections: list[str] = []
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(text)
+        block = text[s:e].strip()
+        if block:
+            sections.append(block)
+    return sections
+
+
+def _split_paragraphs(block: str) -> list[str]:
+    paras = [p.strip() for p in _PARA_SPLIT_RE.split(block or "")]
+    return [p for p in paras if p]
+
+
+def _hard_split(text: str, max_len: int) -> list[str]:
+    approx = re.split(r"(?<=[\.\!\?\;])\s+", text or "")
+    out: list[str] = []
+    buf = ""
+    for s in approx:
+        if not s:
+            continue
+        if len(buf) + (1 if buf else 0) + len(s) <= max_len:
+            buf = s if not buf else (buf + " " + s)
+        else:
+            if buf:
+                out.append(buf)
+            if len(s) <= max_len:
+                out.append(s)
+            else:
+                words = re.split(r"\s+", s)
+                cur = ""
+                for w in words:
+                    if not w:
+                        continue
+                    if len(cur) + (1 if cur else 0) + len(w) <= max_len:
+                        cur = w if not cur else (cur + " " + w)
+                    else:
+                        if cur:
+                            out.append(cur)
+                        cur = w
+                if cur:
+                    out.append(cur)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _pack_with_budget(pieces: list[str], *, max_chars: int) -> list[str]:
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for p in pieces:
+        plen = len(p)
+        if plen > max_chars:
+            chunks.extend(_hard_split(p, max_chars))
+            continue
+        if cur_len == 0:
+            cur, cur_len = [p], plen
+            continue
+        if cur_len + 2 + plen <= max_chars:
+            cur.append(p)
+            cur_len += 2 + plen
+        else:
+            chunks.append("\n\n".join(cur).strip())
+            cur, cur_len = [p], plen
+    if cur_len:
+        chunks.append("\n\n".join(cur).strip())
+    return chunks
+
+
+def chunk_text(
+    text: str,
+    meta: dict[str, str] | None = None,
+    *,
+    max_chars: int = int(SETTINGS.get("rag_max_chars_per_chunk", 800)),
+    overlap: int = int(SETTINGS.get("rag_chunk_overlap_chars", 150)),
+) -> list[Chunk]:
+    base_meta = (meta or {}).copy()
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [Chunk(text=text, meta=base_meta)]
+
+    sections = _split_sections(text)
+    if not sections:
+        sections = [text]
+
+    chunks: list[Chunk] = []
+    last_tail: str | None = None
+
+    for sec in sections:
+        paras = _split_paragraphs(sec)
+        if not paras:
+            continue
+        packed = _pack_with_budget(paras, max_chars=max_chars)
+        for ch in packed:
+            if last_tail and overlap > 0:
+                tail = last_tail[-overlap:] if len(last_tail) > overlap else last_tail
+                candidate = f"{tail}\n{ch}"
+                chunks.append(
+                    Chunk(text=candidate if len(candidate) <= max_chars else ch, meta=base_meta)
+                )
+            else:
+                chunks.append(Chunk(text=ch, meta=base_meta))
+            last_tail = ch
+
+    return chunks
+
+
+def build_metas(
+    session_id: str | None, filename: str, chunks: list[Chunk], *, size: int = 0
+) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for i, c in enumerate(chunks):
+        out.append(
+            {
+                "id": f"{filename}:{i}",
+                "sessionId": session_id or "",
+                "source": filename,
+                "title": filename,
+                "mime": "text/plain",
+                "size": str(size),
+                "chunkIndex": str(i),
+                "text": c.text,
+            }
+        )
+    return out
+
+# ===== aimodel/file_read/rag/ingest/csv_ingest.py =====
+
+# ===== aimodel/file_read/rag/ingest/csv_ingest.py =====
+from __future__ import annotations
+
+import csv
+import io
+import re
+
+from ...core.logging import get_logger
+from ...core.settings import SETTINGS
+
+log = get_logger(__name__)
+
+_WS_RE = re.compile(r"[ \t]+")
+_PHANTOM_RX = re.compile(r"^\d+_\d+$")
+
+
+def _squeeze_spaces_inline(s: str) -> str:
+    return _WS_RE.sub(" ", (s or "")).strip()
+
+
+def extract_csv(data: bytes) -> tuple[str, str]:
+    S = SETTINGS.effective
+    max_chars = int(S().get("csv_value_max_chars"))
+    quote_strings = bool(S().get("csv_quote_strings"))
+    header_normalize = bool(S().get("csv_header_normalize"))
+    max_rows = int(S().get("csv_infer_max_rows"))
+    max_cols = int(S().get("csv_infer_max_cols"))
+
+    def clip(s: str) -> str:
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + "…"
+        return s
+
+    def fmt_val(v) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        if "\n" in s or "\r" in s:
+            s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+        s = clip(_squeeze_spaces_inline(s))
+        if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
+            return f'"{s}"'
+        return s
+
+    def normalize_header(h: str) -> str:
+        if not header_normalize:
+            return h
+        s = (h or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or h
+
+    def rightmost_nonempty_header(headers: list[str]) -> int:
+        for i in range(len(headers) - 1, -1, -1):
+            h = headers[i]
+            if h and not h.isspace():
+                return i
+        return -1
+
+    def keep_headers(headers: list[str]) -> list[int]:
+        keep = []
+        for i, h in enumerate(headers):
+            hn = (h or "").strip().lower()
+            if not hn:
+                continue
+            if _PHANTOM_RX.fullmatch(hn) or hn in {"0"}:
+                continue
+            keep.append(i)
+        return keep or list(range(len(headers)))
+
+    def _row_blank_csv(row: list[str]) -> bool:
+        if row is None:
+            return True
+        for c in row:
+            if c is None:
+                continue
+            if str(c).strip():
+                return False
+        return True
+
+    txt = io.StringIO(data.decode("utf-8", errors="ignore"))
+    sample = txt.read(2048)
+    txt.seek(0)
+    try:
+        dialect = csv.Sniffer().sniff(sample) if sample else csv.excel
+    except Exception:
+        dialect = csv.excel
+    reader = csv.reader(txt, dialect)
+    rows = list(reader)
+    if not rows:
+        return "", "text/plain"
+
+    n = len(rows)
+    lines: list[str] = []
+    lines.append("# Sheet: CSV")
+
+    i = 0
+    while i < n:
+        while i < n and _row_blank_csv(rows[i]):
+            i += 1
+        if i >= n:
+            break
+
+        start = i
+        while i < n and not _row_blank_csv(rows[i]):
+            i += 1
+        end = i - 1
+        if start > end:
+            continue
+
+        headers_raw = (rows[start] if start < n else [])[:max_cols]
+        norm_headers = [normalize_header(fmt_val(h)) for h in headers_raw]
+        rmax = rightmost_nonempty_header(norm_headers)
+        if rmax >= 0:
+            norm_headers = norm_headers[: rmax + 1]
+        norm_headers = norm_headers[:max_cols]
+        keep_idx = keep_headers(norm_headers)
+        kept_headers = [norm_headers[j] for j in keep_idx]
+
+        total_rows_block = end - start + 1
+        use_rows = total_rows_block if max_rows <= 0 else min(total_rows_block, max_rows + 1)
+        total_cols_block = len(kept_headers)
+        if max_cols > 0:
+            total_cols_block = min(total_cols_block, max_cols)
+
+        lines.append(f"## Table: CSV!R{start + 1}-{start + use_rows},C1-{max(total_cols_block, 1)}")
+        if any(kept_headers):
+            lines.append("headers: " + ", ".join(h for h in kept_headers if h))
+        lines.append("")
+
+        data_start = start + 1
+        data_end = min(end, start + use_rows - 1)
+        usable_cols_for_slice = min(
+            len(norm_headers), max_cols if max_cols > 0 else len(norm_headers)
+        )
+        for r in range(data_start, data_end + 1):
+            row_vals_raw = rows[r][:usable_cols_for_slice] if r < n else []
+            vals = [fmt_val(c) for c in row_vals_raw]
+            vals = [vals[j] if j < len(vals) else "" for j in keep_idx]
+            while vals and (vals[-1] == "" or vals[-1] is None):
+                vals.pop()
+            if not any(vals):
+                continue
+
+            pairs: list[str] = []
+            for h, v in zip(kept_headers, vals, strict=False):
+                if h and v:
+                    pairs.append(f"{h}={v}")
+
+            excel_row_num = r + 1
+            lines.append(f"### Row {excel_row_num} — CSV")
+            lines.append(", ".join(pairs) if pairs else ", ".join(vals))
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n", "text/plain"
+
+# ===== aimodel/file_read/rag/ingest/doc_binary_ingest.py =====
+
+from __future__ import annotations
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+import re
+
+from ...core.settings import SETTINGS
+
+_WS_RE = re.compile("[ \\t]+")
+
+
+def _squeeze_spaces(s: str) -> str:
+    s = (s or "").replace("\xa0", " ")
+    s = _WS_RE.sub(" ", s)
+    return s.strip()
+
+
+def _is_ole(b: bytes) -> bool:
+    return len(b) >= 8 and b[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _dbg(msg: str):
+    try:
+        S = SETTINGS.effective
+        if bool(S().get("doc_debug", False)):
+            log.info(f"[doc_ingest] {msg}")
+    except Exception:
+        pass
+
+
+_RTF_CTRL_RE = re.compile("\\\\[a-zA-Z]+-?\\d* ?")
+_RTF_GROUP_RE = re.compile("[{}]")
+_RTF_UNICODE_RE = re.compile("\\\\u(-?\\d+)\\??")
+_RTF_HEX_RE = re.compile("\\\\'[0-9a-fA-F]{2}")
+_HEX_BLOCK_RE = re.compile("(?:\\s*[0-9A-Fa-f]{2}){120,}")
+
+
+def _rtf_to_text_simple(data: bytes, *, keep_newlines: bool = True) -> str:
+    try:
+        s = data.decode("latin-1", errors="ignore")
+    except Exception:
+        s = data.decode("utf-8", errors="ignore")
+
+    def _hex_sub(m):
+        try:
+            return bytes.fromhex(m.group(0)[2:]).decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+
+    s = _RTF_HEX_RE.sub(_hex_sub, s)
+
+    def _uni_sub(m):
+        try:
+            cp = int(m.group(1))
+            if cp < 0:
+                cp = 65536 + cp
+            return chr(cp)
+        except Exception:
+            return ""
+
+    s = _RTF_UNICODE_RE.sub(_uni_sub, s)
+    s = s.replace("\\par", "\n").replace("\\line", "\n")
+    s = _RTF_CTRL_RE.sub("", s)
+    s = _RTF_GROUP_RE.sub("", s)
+    s = _HEX_BLOCK_RE.sub("", s)
+    s = s.replace("\r", "\n")
+    s = re.sub("\\n\\s*\\n\\s*\\n+", "\n\n", s)
+    s = _squeeze_spaces(s)
+    return s if keep_newlines else s.replace("\n", " ")
+
+
+def _rtf_to_text_via_lib(data: bytes, *, keep_newlines: bool = True) -> str:
+    try:
+        from striprtf.striprtf import rtf_to_text
+    except Exception:
+        return _rtf_to_text_simple(data, keep_newlines=keep_newlines)
+    try:
+        s = data.decode("latin-1", errors="ignore")
+    except Exception:
+        s = data.decode("utf-8", errors="ignore")
+    try:
+        txt = rtf_to_text(s)
+    except Exception:
+        txt = _rtf_to_text_simple(data, keep_newlines=keep_newlines)
+    txt = _squeeze_spaces(txt)
+    return txt if keep_newlines else txt.replace("\n", " ")
+
+
+def _generic_ole_text(data: bytes) -> str:
+    S = SETTINGS.effective
+    MIN_RUN = int(S().get("doc_ole_min_run_chars", 8))
+    MAX_LINE = int(S().get("doc_ole_max_line_chars", 600))
+    MIN_ALPHA_RATIO = float(S().get("doc_ole_min_alpha_ratio", 0.25))
+    DROP_XMLISH = bool(S().get("doc_ole_drop_xmlish", True))
+    DROP_PATHISH = bool(S().get("doc_ole_drop_pathish", True))
+    DROP_SYMBOL_LINES = bool(S().get("doc_ole_drop_symbol_lines", True))
+    DEDUPE_SHORT_REPEATS = bool(S().get("doc_ole_dedupe_short_repeats", True))
+    XMLISH = re.compile("^\\s*<[^>]+>", re.I)
+    PATHISH = re.compile("[\\\\/].+\\.(?:xml|rels|png|jpg|jpeg|gif|bmp|bin|dat)\\b", re.I)
+    SYMBOLLINE = re.compile("^[\\W_]{6,}$")
+    s = data.replace(b"\x00", b"")
+    runs = re.findall(b"[\\t\\r\\n\\x20-\\x7E]{%d,}" % MIN_RUN, s)
+    if not runs:
+        return ""
+
+    def _dec(b: bytes) -> str:
+        try:
+            return b.decode("cp1252", errors="ignore")
+        except Exception:
+            return b.decode("latin-1", errors="ignore")
+
+    kept: list[str] = []
+    for raw in runs:
+        chunk = _dec(raw).replace("\r", "\n")
+        for ln in re.split("\\n+", chunk):
+            t = ln.strip()
+            if not t:
+                continue
+            if MAX_LINE > 0 and len(t) > MAX_LINE:
+                t = t[:MAX_LINE].rstrip()
+            t = _squeeze_spaces(t)
+            letters = sum(1 for c in t if c.isalpha())
+            if letters / max(1, len(t)) < MIN_ALPHA_RATIO:
+                continue
+            if DROP_XMLISH and XMLISH.search(t):
+                continue
+            if DROP_PATHISH and PATHISH.search(t):
+                continue
+            if DROP_SYMBOL_LINES and SYMBOLLINE.fullmatch(t):
+                continue
+            if DEDUPE_SHORT_REPEATS:
+                t = re.sub("\\b(\\w{2,4})\\1{2,}\\b", "\\1\\1", t)
+            kept.append(t)
+    out = "\n".join(kept)
+    out = re.sub("\\n\\s*\\n\\s*\\n+", "\n\n", out).strip()
+    return out
+
+
+def extract_doc_binary(data: bytes) -> tuple[str, str]:
+    head = (data[:64] or b"").lstrip()
+    is_rtf = head.startswith(b"{\\rtf") or head.startswith(b"{\\RTF}")
+    is_ole = _is_ole(data)
+    _dbg(f"extract_doc_binary: bytes={len(data)} is_rtf={is_rtf} is_ole={is_ole}")
+    if is_rtf:
+        txt = _rtf_to_text_via_lib(data, keep_newlines=True).strip()
+        return (txt + "\n" if txt else "", "text/plain")
+    if is_ole:
+        txt = _generic_ole_text(data)
+        return (txt + "\n" if txt else "", "text/plain")
+    try:
+        txt = data.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        txt = data.decode("latin-1", errors="ignore").strip()
+    return (txt + ("\n" if txt else ""), "text/plain")
+
+# ===== aimodel/file_read/rag/ingest/docx_ingest.py =====
+
+# DOCX-only extraction (no .doc/RTF here)
+from __future__ import annotations
+
+import io
+import re
+
+from ...core.logging import get_logger
+from ...core.settings import SETTINGS
+from .ocr import ocr_image_bytes
+
+log = get_logger(__name__)
+
+_WS_RE = re.compile(r"[ \t]+")
+
+
+def _squeeze_spaces(s: str) -> str:
+    s = (s or "").replace("\xa0", " ")
+    s = _WS_RE.sub(" ", s)
+    return s.strip()
+
+
+def _is_heading(style_name: str) -> int | None:
+    if not style_name:
+        return None
+    m = re.match(r"Heading\s+(\d+)", style_name, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return max(1, min(6, int(m.group(1))))
+    except Exception:
+        return None
+
+
+def _is_list_style(style_name: str) -> bool:
+    return bool(style_name) and any(k in style_name.lower() for k in ("list", "bullet", "number"))
+
+
+def _extract_paragraph_text(p) -> str:
+    return _squeeze_spaces(p.text)
+
+
+def _docx_image_blobs(doc) -> list[bytes]:
+    blobs: list[bytes] = []
+    seen_rids = set()
+    try:
+        part = doc.part
+
+        # inline images
+        for ish in getattr(doc, "inline_shapes", []) or []:
+            try:
+                rId = ish._inline.graphic.graphicData.pic.blipFill.blip.embed
+                if rId and rId not in seen_rids:
+                    blob = part.related_parts[rId].blob
+                    if blob:
+                        blobs.append(blob)
+                        seen_rids.add(rId)
+            except Exception:
+                pass
+
+        for p in doc.paragraphs:
+            for r in p.runs:
+                for d in getattr(r._element, "xpath", lambda *_: [])(".//a:blip"):
+                    try:
+                        rId = d.get(
+                            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+                        )
+                        if rId and rId not in seen_rids:
+                            blob = part.related_parts[rId].blob
+                            if blob:
+                                blobs.append(blob)
+                                seen_rids.add(rId)
+                    except Exception:
+                        pass
+
+    except Exception:
+        pass
+    return blobs
+
+
+def extract_docx(data: bytes) -> tuple[str, str]:
+    from docx import Document
+
+    S = SETTINGS.effective
+    HEADING_MAX_LEVEL = int(S().get("docx_heading_max_level", 3))
+    USE_MARKDOWN_HEADINGS = bool(S().get("docx_use_markdown_headings", True))
+    PRESERVE_BULLETS = bool(S().get("docx_preserve_bullets", True))
+    INCLUDE_TABLES = bool(S().get("docx_include_tables", True))
+    INCLUDE_HEADERS_FOOTERS = bool(S().get("docx_include_headers_footers", False))
+    MAX_PARA_CHARS = int(S().get("docx_para_max_chars", 0))
+    DROP_EMPTY_LINES = bool(S().get("docx_drop_empty_lines", True))
+
+    doc = Document(io.BytesIO(data))
+    lines: list[str] = []
+
+    try:
+        title = (getattr(doc, "core_properties", None) or {}).title
+        if title:
+            lines.append(f"# {title}")
+            lines.append("")
+    except Exception:
+        pass
+
+    def _clip(s: str) -> str:
+        if MAX_PARA_CHARS > 0 and len(s) > MAX_PARA_CHARS:
+            return s[:MAX_PARA_CHARS] + "…"
+        return s
+
+    if INCLUDE_HEADERS_FOOTERS:
+        try:
+            for i, sec in enumerate(getattr(doc, "sections", []) or []):
+                if i > 0:
+                    break
+                try:
+                    hdr_ps = getattr(sec.header, "paragraphs", []) or []
+                    hdr_text = "\n".join(
+                        _squeeze_spaces(p.text) for p in hdr_ps if _squeeze_spaces(p.text)
+                    )
+                    if hdr_text:
+                        lines.append("## Header")
+                        lines.append(_clip(hdr_text))
+                        lines.append("")
+                except Exception:
+                    pass
+                try:
+                    ftr_ps = getattr(sec.footer, "paragraphs", []) or []
+                    ftr_text = "\n".join(
+                        _squeeze_spaces(p.text) for p in ftr_ps if _squeeze_spaces(p.text)
+                    )
+                    if ftr_text:
+                        lines.append("## Footer")
+                        lines.append(_clip(ftr_text))
+                        lines.append("")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    for p in doc.paragraphs:
+        txt = _extract_paragraph_text(p)
+        if not txt and DROP_EMPTY_LINES:
+            continue
+        style_name = getattr(p.style, "name", "") or ""
+        lvl = _is_heading(style_name)
+        if lvl and lvl <= HEADING_MAX_LEVEL and USE_MARKDOWN_HEADINGS:
+            prefix = "#" * max(1, min(6, lvl))
+            lines.append(f"{prefix} {txt}".strip())
+            continue
+        if PRESERVE_BULLETS and _is_list_style(style_name):
+            if txt:
+                lines.append(f"- {_clip(txt)}")
+            continue
+        if txt:
+            lines.append(_clip(txt))
+        elif not DROP_EMPTY_LINES:
+            lines.append("")
+
+    if INCLUDE_TABLES and getattr(doc, "tables", None):
+        for t_idx, tbl in enumerate(doc.tables):
+            try:
+                non_empty = any(
+                    _squeeze_spaces(cell.text) for row in tbl.rows for cell in row.cells
+                )
+            except Exception:
+                non_empty = True
+            if not non_empty:
+                continue
+            lines.append("")
+            lines.append(f"## Table {t_idx + 1}")
+            try:
+                for row in tbl.rows:
+                    cells = [_squeeze_spaces(c.text) for c in row.cells]
+                    if any(cells):
+                        lines.append(" | ".join(c for c in cells if c))
+            except Exception:
+                pass
+
+    if bool(S().get("docx_ocr_images", False)):
+        min_bytes = int(S().get("ocr_min_image_bytes", 16384))
+        seen_ocr_text = set()
+        for blob in _docx_image_blobs(doc):
+            if len(blob) >= min_bytes:
+                t = (ocr_image_bytes(blob) or "").strip()
+                if t:
+                    key = t.lower()
+                    if key not in seen_ocr_text:
+                        lines.append(t)
+                        seen_ocr_text.add(key)
+
+    text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
+    return (text + "\n" if text else ""), "text/plain"
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest.py =====
+from __future__ import annotations
+
+import hashlib
+import io
+import re
+from datetime import date, datetime, time
+
+from ...core.logging import get_logger
+from ...core.settings import SETTINGS
+from .excel_ingest_core import (rightmost_nonempty_header,
+                                scan_blocks_by_blank_rows, select_indices)
+
+log = get_logger(__name__)
+
+_WS_RE = re.compile(r"[ \t]+")
+
+
+def _squeeze_spaces_inline(s: str) -> str:
+    return _WS_RE.sub(" ", (s or "")).strip()
+
+
+def extract_excel(data: bytes) -> tuple[str, str]:
+    from openpyxl import load_workbook
+    from openpyxl.utils import range_boundaries
+    from openpyxl.utils.datetime import from_excel as _from_excel
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    S = SETTINGS.effective
+
+    sig = int(S().get("excel_number_sigfigs"))
+    maxp = int(S().get("excel_decimal_max_places"))
+    trim = bool(S().get("excel_trim_trailing_zeros"))
+    drop_midnight = bool(S().get("excel_dates_drop_time_if_midnight"))
+    time_prec = str(S().get("excel_time_precision"))
+    max_chars = int(S().get("excel_value_max_chars"))
+    quote_strings = bool(S().get("excel_quote_strings"))
+
+    INFER_MAX_ROWS = int(S().get("excel_infer_max_rows"))
+    INFER_MAX_COLS = int(S().get("excel_infer_max_cols"))
+    INFER_MIN_HEADER_FILL = float(S().get("excel_infer_min_header_fill_ratio", 0.5))
+    HEADER_NORMALIZE = bool(S().get("excel_header_normalize"))
+
+    def clip(s: str) -> str:
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + "…"
+        return s
+
+    def fmt_number(v) -> str:
+        try:
+            s = format(float(v), f".{sig}g") if sig > 0 else f"{float(v):.{maxp}f}"
+        except Exception:
+            s = str(v)
+        if "e" in s.lower():
+            try:
+                s = f"{float(v):.{maxp}f}"
+            except Exception:
+                pass
+        if trim and "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+
+    def fmt_date(dt: datetime) -> str:
+        if drop_midnight and dt.time() == time(0, 0, 0):
+            return dt.date().isoformat()
+        return dt.strftime("%Y-%m-%d %H:%M" if time_prec == "minute" else "%Y-%m-%d %H:%M:%S")
+
+    def fmt_time(t: time) -> str:
+        return t.strftime("%H:%M" if time_prec == "minute" else "%H:%M:%S")
+
+    def fmt_val(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return fmt_number(v)
+        if isinstance(v, datetime):
+            return fmt_date(v)
+        if isinstance(v, date):
+            return v.isoformat()
+        if isinstance(v, time):
+            return fmt_time(v)
+        s = str(v)
+        if "\n" in s or "\r" in s:
+            s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+        s = clip(_squeeze_spaces_inline(s))
+        if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
+            return f'"{s}"'
+        return s
+
+    def normalize_header(h: str) -> str:
+        if not HEADER_NORMALIZE:
+            return h
+        s = (h or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or h
+
+    def _sheet_used_range(ws: Worksheet):
+        if callable(getattr(ws, "calculate_dimension", None)):
+            dim_ref = ws.calculate_dimension()
+            try:
+                min_c, min_r, max_c, max_r = range_boundaries(dim_ref)
+                return min_c, min_r, max_c, max_r
+            except Exception:
+                pass
+        return 1, 1, ws.max_column or 1, ws.max_row or 1
+
+    def _cap_rows(min_r: int, max_r: int) -> int:
+        return max_r if INFER_MAX_ROWS <= 0 else min(max_r, min_r + INFER_MAX_ROWS - 1)
+
+    def _keep_and_rename_phantom(headers: list[str]) -> tuple[list[int], list[str]]:
+        if (
+            len(headers) >= 2
+            and re.fullmatch(r"\d+_\d+$", (headers[1] or ""))
+            and (headers[0] or "")
+        ):
+            keep_idx = [0, 1]
+            new_headers = headers[:]
+            new_headers[1] = "value"
+            return keep_idx, new_headers
+        keep_idx = [i for i, h in enumerate(headers) if h and not re.fullmatch(r"\d+_\d+$", h)]
+        new_headers = [headers[i] for i in keep_idx]
+        return keep_idx, new_headers
+
+    wb_vals = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+
+    def _coerce_excel_datetime(cell, v):
+        try:
+            if getattr(cell, "is_date", False) and isinstance(v, (int, float)):
+                return _from_excel(v, wb_vals.epoch)
+        except Exception:
+            pass
+        return v
+
+    lines: list[str] = []
+    ingest_id = hashlib.sha1(data).hexdigest()[:16]
+    lines.append(f"# Ingest-ID: {ingest_id}")
+
+    def _emit_inferred_table(ws: Worksheet, sheet_name: str, min_c, min_r, max_c, max_r):
+        lines.append(f"# Sheet: {sheet_name}")
+        max_c_eff = min(max_c, min_c + INFER_MAX_COLS - 1)
+        max_r_eff = _cap_rows(min_r, max_r)
+        headers: list[str] = []
+        header_fill = 0
+        for c in range(min_c, max_c_eff + 1):
+            val = ws.cell(row=min_r, column=c).value
+            s = fmt_val("" if val is None else str(val).strip())
+            if s:
+                header_fill += 1
+            headers.append(s)
+        fill_ratio = header_fill / max(1, (max_c_eff - min_c + 1))
+        if fill_ratio < INFER_MIN_HEADER_FILL and (min_r + 1) <= max_r_eff:
+            headers = []
+            hdr_r = min_r + 1
+            for c in range(min_c, max_c_eff + 1):
+                val = ws.cell(row=hdr_r, column=c).value
+                s = fmt_val("" if val is None else str(val).strip())
+                headers.append(s)
+            min_r = hdr_r
+        norm_headers = [normalize_header(h) for h in headers]
+        rmax = rightmost_nonempty_header(norm_headers)
+        if rmax >= 0:
+            norm_headers = norm_headers[: rmax + 1]
+            max_c_eff = min(max_c_eff, min_c + rmax)
+        keep_idx, norm_headers = _keep_and_rename_phantom(norm_headers)
+        lines.append("## Table: " + f"{sheet_name}!R{min_r}-{max_r_eff},C{min_c}-{max_c_eff}")
+        if any(h for h in norm_headers):
+            lines.append("headers: " + ", ".join(h for h in norm_headers if h))
+        lines.append("")
+        for r in range(min_r + 1, max_r_eff + 1):
+            raw_vals: list[str] = []
+            for c in range(min_c, max_c_eff + 1):
+                cell = ws.cell(row=r, column=c)
+                vv = _coerce_excel_datetime(cell, cell.value)
+                raw_vals.append(fmt_val(vv))
+            row_vals = select_indices(raw_vals, keep_idx)
+            while row_vals and (row_vals[-1] == "" or row_vals[-1] is None):
+                row_vals.pop()
+            if not any(v for v in row_vals):
+                continue
+            pairs: list[str] = []
+            for h, v in zip(norm_headers, row_vals, strict=False):
+                if h and v:
+                    pairs.append(f"{h}={v}")
+            lines.append(f"### Row {r} — {sheet_name}")
+            lines.append(", ".join(pairs) if pairs else ", ".join(row_vals))
+            lines.append("")
+
+    for sheet_name in wb_vals.sheetnames:
+        ws_v: Worksheet = wb_vals[sheet_name]
+        min_c, min_r, max_c, max_r = _sheet_used_range(ws_v)
+        max_c = min(max_c, min_c + INFER_MAX_COLS - 1)
+        for b_min_c, b_min_r, b_max_c, b_max_r in scan_blocks_by_blank_rows(
+            ws_v, min_c, min_r, max_c, max_r
+        ):
+            if b_min_r > b_max_r:
+                continue
+            _emit_inferred_table(ws_v, sheet_name, b_min_c, b_min_r, b_max_c, b_max_r)
+
+    text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
+    return (text + "\n" if text else ""), "text/plain"
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest_core.py =====
+
+# ===== aimodel/file_read/rag/ingest/excel_ingest_core.py =====
+from __future__ import annotations
+
+import re
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+
+_PHANTOM_RX = re.compile(r"^\d+_\d+$")
+
+
+def row_blank(ws, r: int, min_c: int, max_c: int) -> bool:
+    for c in range(min_c, max_c + 1):
+        v = ws.cell(row=r, column=c).value
+        if v not in (None, "") and not (isinstance(v, str) and not v.strip()):
+            return False
+    return True
+
+
+def scan_blocks_by_blank_rows(ws, min_c: int, min_r: int, max_c: int, max_r: int):
+    r = min_r
+    while r <= max_r:
+        while r <= max_r and row_blank(ws, r, min_c, max_c):
+            r += 1
+        if r > max_r:
+            break
+        start = r
+        while r <= max_r and not row_blank(ws, r, min_c, max_c):
+            r += 1
+        end = r - 1
+        yield (min_c, start, max_c, end)
+
+
+def rightmost_nonempty_header(headers: list[str]) -> int:
+    for i in range(len(headers) - 1, -1, -1):
+        h = headers[i]
+        if h and not h.isspace():
+            return i
+    return -1
+
+
+def drop_bad_columns(headers: list[str]) -> list[int]:
+    keep = []
+    for i, h in enumerate(headers):
+        hn = (h or "").strip().lower()
+        if not hn:
+            continue
+        if _PHANTOM_RX.fullmatch(hn) or hn in {"0"}:
+            continue
+        keep.append(i)
+    return keep or list(range(len(headers)))
+
+
+def select_indices(seq: list[str], idxs: list[int]) -> list[str]:
+    out = []
+    for i in idxs:
+        out.append(seq[i] if i < len(seq) else "")
+    return out
+
+# ===== aimodel/file_read/rag/ingest/main.py =====
+
+from __future__ import annotations
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+import json
+
+from ...core.settings import SETTINGS
+from .common import Chunk, _strip_html, _utf8, build_metas, chunk_text
+from .csv_ingest import extract_csv
+from .doc_binary_ingest import extract_doc_binary
+from .docx_ingest import extract_docx
+from .excel_ingest import extract_excel
+from .pdf_ingest import extract_pdf
+from .ppt_ingest import extract_ppt, extract_pptx
+from .xls_ingest import extract_xls
+
+__all__ = ["Chunk", "build_metas", "chunk_text", "sniff_and_extract"]
+
+
+def _ing_dbg(*args):
+    try:
+        if bool(SETTINGS.effective().get("ingest_debug", False)):
+            log.debug("[ingest]", *args)
+    except Exception:
+        pass
+
+
+def sniff_and_extract(filename: str, data: bytes) -> tuple[str, str]:
+    name = (filename or "").lower()
+    _ing_dbg("route:", name, "bytes=", len(data))
+    if name.endswith((".pptx", ".pptm")):
+        _ing_dbg("-> pptx/pptm")
+        return extract_pptx(data)
+    if name.endswith(".ppt"):
+        _ing_dbg("-> ppt (ole)")
+        return extract_ppt(data)
+    if name.endswith((".xlsx", ".xlsm")):
+        _ing_dbg("-> excel")
+        return extract_excel(data)
+    if name.endswith(".xls"):
+        _ing_dbg("-> excel (xls via xlrd)")
+        return extract_xls(data)
+    if name.endswith((".csv", ".tsv")):
+        _ing_dbg("-> csv/tsv")
+        return extract_csv(data)
+    if name.endswith(".docx"):
+        _ing_dbg("-> docx")
+        try:
+            return extract_docx(data)
+        except Exception as e:
+            _ing_dbg("docx err:", repr(e))
+            return (_utf8(data), "text/plain")
+    if name.endswith(".doc"):
+        _ing_dbg("-> doc (binary/rtf)")
+        try:
+            return extract_doc_binary(data)
+        except Exception as e:
+            _ing_dbg("doc err:", repr(e))
+            return (_utf8(data), "text/plain")
+    if name.endswith(".rtf"):
+        _ing_dbg("-> rtf (via doc_binary)")
+        try:
+            return extract_doc_binary(data)
+        except Exception as e:
+            _ing_dbg("rtf err:", repr(e))
+            return (_utf8(data), "text/plain")
+    if name.endswith(".pdf"):
+        _ing_dbg("-> pdf (delegating to extract_pdf)")
+        return extract_pdf(data)
+    if name.endswith(".json"):
+        _ing_dbg("-> json")
+        try:
+            return (json.dumps(json.loads(_utf8(data)), ensure_ascii=False, indent=2), "text/plain")
+        except Exception as e:
+            _ing_dbg("json err:", repr(e))
+            return (_utf8(data), "text/plain")
+    if name.endswith((".jsonl", ".jsonlines")):
+        _ing_dbg("-> jsonl")
+        lines = _utf8(data).splitlines()
+        out = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
             try:
                 out.append(json.dumps(json.loads(ln), ensure_ascii=False, indent=2))
             except Exception:
                 out.append(ln)
-        return "\n".join(out).strip(), "text/plain"
-
+        return ("\n".join(out).strip(), "text/plain")
     if name.endswith((".yaml", ".yml")):
         _ing_dbg("-> yaml")
         try:
             import yaml
+
             obj = yaml.safe_load(_utf8(data))
-            return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
+            return (json.dumps(obj, ensure_ascii=False, indent=2), "text/plain")
         except Exception as e:
             _ing_dbg("yaml err:", repr(e))
-            return _utf8(data), "text/plain"
-
+            return (_utf8(data), "text/plain")
     if name.endswith(".toml"):
         _ing_dbg("-> toml")
         try:
             try:
                 import tomllib
+
                 obj = tomllib.loads(_utf8(data))
             except Exception:
                 import toml
+
                 obj = toml.loads(_utf8(data))
-            return json.dumps(obj, ensure_ascii=False, indent=2), "text/plain"
+            return (json.dumps(obj, ensure_ascii=False, indent=2), "text/plain")
         except Exception as e:
             _ing_dbg("toml err:", repr(e))
-            return _utf8(data), "text/plain"
-
+            return (_utf8(data), "text/plain")
     if name.endswith((".htm", ".html", ".xml")):
         _ing_dbg("-> html/xml")
-        return _strip_html(_utf8(data)), "text/plain"
-
-    if name.endswith((
-        ".txt", ".log", ".md",
-        ".c", ".cpp", ".h", ".hpp",
-        ".py", ".js", ".ts", ".jsx", ".tsx",
-        ".sh", ".ps1",
-        ".rs", ".java", ".go", ".rb", ".php",
-        ".swift", ".kt", ".scala", ".lua", ".perl",
-    )):
+        return (_strip_html(_utf8(data)), "text/plain")
+    if name.endswith(
+        (
+            ".txt",
+            ".log",
+            ".md",
+            ".c",
+            ".cpp",
+            ".h",
+            ".hpp",
+            ".py",
+            ".js",
+            ".ts",
+            ".jsx",
+            ".tsx",
+            ".sh",
+            ".ps1",
+            ".rs",
+            ".java",
+            ".go",
+            ".rb",
+            ".php",
+            ".swift",
+            ".kt",
+            ".scala",
+            ".lua",
+            ".perl",
+        )
+    ):
         _ing_dbg("-> plaintext/code")
-        return _utf8(data), "text/plain"
-
+        return (_utf8(data), "text/plain")
     _ing_dbg("-> default fallback")
-    return _utf8(data), "text/plain"
+    return (_utf8(data), "text/plain")
 
 # ===== aimodel/file_read/rag/ingest/ocr.py =====
 
-# aimodel/file_read/rag/ingest/ocr.py
 from __future__ import annotations
-from typing import List
-import io, re
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+import io
+import re
+
+import pypdfium2 as pdfium
 import pytesseract
 from PIL import Image
-import pypdfium2 as pdfium
+
 from ...core.settings import SETTINGS
 
 _cmd = str(SETTINGS.effective().get("tesseract_cmd", "")).strip()
 if _cmd:
     pytesseract.pytesseract.tesseract_cmd = _cmd
+_ALNUM = re.compile("[A-Za-z0-9]")
 
-_ALNUM = re.compile(r"[A-Za-z0-9]")
 
 def _alnum_ratio(s: str) -> float:
     if not s:
@@ -70,12 +1779,14 @@ def _alnum_ratio(s: str) -> float:
     a = len(_ALNUM.findall(s))
     return a / max(1, len(s))
 
+
 def is_bad_text(s: str) -> bool:
     S = SETTINGS.effective
     min_len = int(S().get("ocr_min_chars_for_ok", 32))
     min_ratio = float(S().get("ocr_min_alnum_ratio_for_ok", 0.15))
     s = (s or "").strip()
-    return (len(s) < min_len) or (_alnum_ratio(s) < min_ratio)
+    return len(s) < min_len or _alnum_ratio(s) < min_ratio
+
 
 def ocr_image_bytes(img_bytes: bytes) -> str:
     S = SETTINGS.effective
@@ -87,6 +1798,7 @@ def ocr_image_bytes(img_bytes: bytes) -> str:
         im = im.convert("L")
         return pytesseract.image_to_string(im, lang=lang, config=cfg) or ""
 
+
 def ocr_pdf(data: bytes) -> str:
     S = SETTINGS.effective
     dpi = int(S().get("pdf_ocr_dpi", 300))
@@ -94,13 +1806,13 @@ def ocr_pdf(data: bytes) -> str:
     lang = str(S().get("ocr_lang", "eng"))
     oem = str(S().get("ocr_oem", "3"))
     psm_default = str(S().get("ocr_psm", "6"))
-    try_psm = [psm_default, "4", "7", "3"]  
-    min_side = 1200  
+    try_psm = [psm_default, "4", "7", "3"]
+    min_side = 1200
 
     def _dbg(*args):
         try:
             if bool(S().get("ingest_debug", False)):
-                print("[ocr_pdf]", *args, flush=True)
+                log.debug("[ocr_pdf]", *args)
         except Exception:
             pass
 
@@ -109,153 +1821,163 @@ def ocr_pdf(data: bytes) -> str:
     except Exception as e:
         _dbg("PdfDocument ERROR:", repr(e))
         return ""
-
     n = len(doc)
     limit = n if max_pages <= 0 else min(n, max_pages)
     _dbg(f"pages={n}", f"limit={limit}", f"dpi={dpi}", f"lang={lang}", f"psm_default={psm_default}")
-
-    out: List[str] = []
+    out: list[str] = []
     for i in range(limit):
         try:
             page = doc[i]
-            pil = page.render(scale=dpi/72, rotation=0).to_pil().convert("L")
-            base_w, base_h = pil.width, pil.height
-
+            pil = page.render(scale=dpi / 72, rotation=0).to_pil().convert("L")
+            base_w, base_h = (pil.width, pil.height)
             variants = []
-
             img1 = pil
             if min(base_w, base_h) < min_side:
                 f = max(1.0, min_side / float(min(base_w, base_h)))
                 img1 = pil.resize((int(base_w * f), int(base_h * f)))
             variants.append(("gray", img1))
-
             img2 = img1.point(lambda x: 255 if x > 180 else 0)
             variants.append(("bin180", img2))
-
             img3 = img1.point(lambda x: 255 - x)
             variants.append(("inv", img3))
-
             got = ""
             for tag, imgv in variants:
                 for psm in try_psm:
-                    cfg = f"--oem {oem} --psm {psm}"   
+                    cfg = f"--oem {oem} --psm {psm}"
                     txt = pytesseract.image_to_string(imgv, lang=lang, config=cfg) or ""
                     txt = txt.strip()
-                    _dbg(f"page={i+1}/{limit}", f"{tag} {imgv.width}x{imgv.height}", f"psm={psm}", f"len={len(txt)}", f"prev={repr(txt[:80])}")
+                    _dbg(
+                        f"page={i + 1}/{limit}",
+                        f"{tag} {imgv.width}x{imgv.height}",
+                        f"psm={psm}",
+                        f"len={len(txt)}",
+                        f"prev={txt[:80]!r}",
+                    )
                     if txt:
                         got = txt
                         break
                 if got:
                     break
-
             if got:
                 out.append(got)
         except Exception as e:
-            _dbg(f"page={i+1} ERROR:", repr(e))
-
+            _dbg(f"page={i + 1} ERROR:", repr(e))
     final = "\n\n".join(out).strip()
     _dbg("final_len=", len(final))
     return final
 
 # ===== aimodel/file_read/rag/ingest/pdf_ingest.py =====
 
-# aimodel/file_read/rag/ingest/pdf_ingest.py
 from __future__ import annotations
-from typing import Tuple
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
 import io
+
 from ...core.settings import SETTINGS
-from .ocr import is_bad_text, ocr_pdf
 from .common import _utf8
+from .ocr import is_bad_text, ocr_pdf
+
 
 def _dbg(*args):
     try:
         if bool(SETTINGS.effective().get("ingest_debug", False)):
-            print("[pdf_ingest]", *args, flush=True)
+            log.debug("[pdf_ingest]", *args)
     except Exception:
         pass
 
-def extract_pdf(data: bytes) -> Tuple[str, str]:
-    print("[pdf_ingest] ENTER extract_pdf", flush=True)
 
+def extract_pdf(data: bytes) -> tuple[str, str]:
+    log.debug("[pdf_ingest] ENTER extract_pdf")
     S = SETTINGS.effective
     OCR_ENABLED = bool(S().get("pdf_ocr_enable", False))
-    OCR_MODE = str(S().get("pdf_ocr_mode", "auto")).lower()   
-    WHEN_BAD  = bool(S().get("pdf_ocr_when_bad", True))
-    DPI       = int(S().get("pdf_ocr_dpi", 300))
+    OCR_MODE = str(S().get("pdf_ocr_mode", "auto")).lower()
+    WHEN_BAD = bool(S().get("pdf_ocr_when_bad", True))
+    DPI = int(S().get("pdf_ocr_dpi", 300))
     MAX_PAGES = int(S().get("pdf_ocr_max_pages", 0))
-
-    print(f"[pdf_ingest] cfg ocr_enabled={OCR_ENABLED} mode={OCR_MODE} when_bad={WHEN_BAD} dpi={DPI} max_pages={MAX_PAGES}", flush=True)
+    log.debug(
+        f"[pdf_ingest] cfg ocr_enabled={OCR_ENABLED} mode={OCR_MODE} when_bad={WHEN_BAD} dpi={DPI} max_pages={MAX_PAGES}"
+    )
 
     def _do_ocr() -> str:
-        print("[pdf_ingest] OCR_CALL begin", flush=True)  
+        log.debug("[pdf_ingest] OCR_CALL begin")
         txt = (ocr_pdf(data) or "").strip()
-        print(f"[pdf_ingest] OCR_CALL end text_len={len(txt)} preview={repr(txt[:120])}", flush=True)
+        log.debug(f"[pdf_ingest] OCR_CALL end text_len={len(txt)} preview={txt[:120]!r}")
         return txt
 
     if OCR_ENABLED and OCR_MODE == "force":
         _dbg("mode=force -> OCR first")
         ocr_txt = _do_ocr()
         if ocr_txt:
-            print("[pdf_ingest] EXIT (force OCR success)", flush=True)
-            return ocr_txt, "text/plain"
+            log.debug("[pdf_ingest] EXIT (force OCR success)")
+            return (ocr_txt, "text/plain")
         _dbg("mode=force -> OCR empty, trying text extract")
-
     txt = ""
     try:
         from pdfminer.high_level import extract_text
-        txt = (extract_text(io.BytesIO(data)) or "").strip()
-        print(f"[pdf_ingest] pdfminer text_len={len(txt)} preview={repr(txt[:120])}", flush=True)
-    except Exception as e:
-        print(f"[pdf_ingest] pdfminer ERROR {repr(e)}", flush=True)
-        txt = ""
 
+        txt = (extract_text(io.BytesIO(data)) or "").strip()
+        log.debug(f"[pdf_ingest] pdfminer text_len={len(txt)} preview={txt[:120]!r}")
+    except Exception as e:
+        log.error(f"[pdf_ingest] pdfminer ERROR {e!r}")
+        txt = ""
     if OCR_ENABLED and OCR_MODE != "never":
-        try_ocr = (not txt) or (WHEN_BAD and is_bad_text(txt))
-        print(f"[pdf_ingest] auto-eval try_ocr={try_ocr} has_text={bool(txt)} is_bad={(is_bad_text(txt) if txt else 'n/a')}", flush=True)
+        try_ocr = not txt or (WHEN_BAD and is_bad_text(txt))
+        log.debug(
+            f"[pdf_ingest] auto-eval try_ocr={try_ocr} has_text={bool(txt)} is_bad={(is_bad_text(txt) if txt else 'n/a')}"
+        )
         if try_ocr:
             ocr_txt = _do_ocr()
             if ocr_txt:
-                print("[pdf_ingest] EXIT (auto OCR success)", flush=True)
-                return ocr_txt, "text/plain"
-
+                log.debug("[pdf_ingest] EXIT (auto OCR success)")
+                return (ocr_txt, "text/plain")
     if not txt:
         try:
             from PyPDF2 import PdfReader
+
             r = PdfReader(io.BytesIO(data))
             pages = [(p.extract_text() or "").strip() for p in r.pages]
             txt = "\n\n".join([p for p in pages if p]).strip()
-            print(f"[pdf_ingest] pypdf2 text_len={len(txt)} preview={repr((txt or '')[:120])}", flush=True)
+            log.debug(f"[pdf_ingest] pypdf2 text_len={len(txt)} preview={(txt or '')[:120]!r}")
         except Exception as e2:
-            print(f"[pdf_ingest] pypdf2 ERROR {repr(e2)}", flush=True)
+            log.error(f"[pdf_ingest] pypdf2 ERROR {e2!r}")
             txt = _utf8(data)
-            print(f"[pdf_ingest] bytes-fallback text_len={len(txt)}", flush=True)
-
-    final = (txt.strip() if txt else "")
-    print(f"[pdf_ingest] EXIT (returned_len={len(final)})", flush=True)
-    return final, "text/plain"
+            log.debug(f"[pdf_ingest] bytes-fallback text_len={len(txt)}")
+    final = txt.strip() if txt else ""
+    log.debug(f"[pdf_ingest] EXIT (returned_len={len(final)})")
+    return (final, "text/plain")
 
 # ===== aimodel/file_read/rag/ingest/ppt_ingest.py =====
 
-# OCR-enabled PPT ingest (minimal changes per request)
 from __future__ import annotations
-from typing import Tuple, List
-import io, re
+
+from ...core.logging import get_logger
+
+log = get_logger(__name__)
+import io
+import re
+
 from ...core.settings import SETTINGS
 from .ocr import ocr_image_bytes
 
-_WS_RE = re.compile(r"[ \t]+")
+_WS_RE = re.compile("[ \\t]+")
+
+
 def _squeeze(s: str) -> str:
     s = (s or "").replace("\xa0", " ")
     s = _WS_RE.sub(" ", s)
     return s.strip()
+
 
 def _clip(s: str, limit: int) -> str:
     if limit > 0 and len(s) > limit:
         return s[:limit] + "…"
     return s
 
-def _shape_text(shape) -> List[str]:
-    out: List[str] = []
+
+def _shape_text(shape) -> list[str]:
+    out: list[str] = []
     if getattr(shape, "has_text_frame", False):
         for p in shape.text_frame.paragraphs:
             txt = _squeeze("".join(r.text for r in p.runs))
@@ -281,17 +2003,19 @@ def _shape_text(shape) -> List[str]:
                 img = getattr(shape, "image", None)
                 blob = getattr(img, "blob", None) if img is not None else None
                 if blob and len(blob) >= int(S().get("ocr_min_image_bytes", 16384)):
-                    print("[OCR] candidate image size:", len(blob))
+                    log.info("[OCR] candidate image size:", len(blob))
                     t = (ocr_image_bytes(blob) or "").strip()
-                    print("[OCR] result:", repr(t[:200]))
+                    log.info("[OCR] result:", repr(t[:200]))
                     if t:
                         out.append(t)
     except Exception as e:
-        print("[OCR] error:", e)
+        log.error("[OCR] error:", e)
     return out
 
-def extract_pptx(data: bytes) -> Tuple[str, str]:
+
+def extract_pptx(data: bytes) -> tuple[str, str]:
     from pptx import Presentation
+
     S = SETTINGS.effective
     USE_MD = bool(S().get("pptx_use_markdown_headings", True))
     INCLUDE_NOTES = bool(S().get("pptx_include_notes", True))
@@ -299,38 +2023,34 @@ def extract_pptx(data: bytes) -> Tuple[str, str]:
     DROP_EMPTY = bool(S().get("pptx_drop_empty_lines", True))
     MAX_PARA = int(S().get("pptx_para_max_chars", 0))
     NUMBER_SLIDES = bool(S().get("pptx_number_slides", True))
-
     prs = Presentation(io.BytesIO(data))
-    lines: List[str] = []
-
+    lines: list[str] = []
     for i, slide in enumerate(prs.slides, start=1):
         title = ""
         try:
             if getattr(slide, "shapes", None):
                 for sh in slide.shapes:
-                    if getattr(sh, "is_placeholder", False) and str(getattr(sh, "placeholder_format", "").type).lower().endswith("title"):
+                    if getattr(sh, "is_placeholder", False) and str(
+                        getattr(sh, "placeholder_format", "").type
+                    ).lower().endswith("title"):
                         title = _squeeze(getattr(sh, "text", "") or "")
                         break
         except Exception:
             pass
-
         head = f"Slide {i}" + (f": {title}" if title else "")
         if USE_MD:
             lines.append(("## " if NUMBER_SLIDES else "## ") + head)
         else:
             lines.append(head)
-
-        body: List[str] = []
+        body: list[str] = []
         for sh in getattr(slide, "shapes", []):
-            if getattr(sh, "has_table", False) and not INCLUDE_TABLES:
+            if getattr(sh, "has_table", False) and (not INCLUDE_TABLES):
                 continue
             body.extend(_shape_text(sh))
-
         for t in body:
             t = _clip(t, MAX_PARA)
             if t or not DROP_EMPTY:
                 lines.append(t)
-
         if INCLUDE_NOTES:
             try:
                 notes = slide.notes_slide
@@ -345,14 +2065,14 @@ def extract_pptx(data: bytes) -> Tuple[str, str]:
                                 lines.append(_clip(ln, MAX_PARA))
             except Exception:
                 pass
-
         lines.append("")
-
     text = "\n".join(line.rstrip() for line in lines if line is not None).strip()
-    return (text + "\n" if text else ""), "text/plain"
+    return (text + "\n" if text else "", "text/plain")
 
-def extract_ppt(data: bytes) -> Tuple[str, str]:
+
+def extract_ppt(data: bytes) -> tuple[str, str]:
     from .doc_binary_ingest import _generic_ole_text
+
     S = SETTINGS.effective
     DROP_EMPTY = bool(S().get("ppt_drop_empty_lines", True))
     DEDUPE = bool(S().get("ppt_dedupe_lines", True))
@@ -360,17 +2080,15 @@ def extract_ppt(data: bytes) -> Tuple[str, str]:
     MIN_ALPHA = float(S().get("ppt_min_alpha_ratio", 0.4))
     MAX_PUNCT = float(S().get("ppt_max_punct_ratio", 0.5))
     TOKEN_MAX = int(S().get("ppt_token_max_chars", 40))
-
     raw = _generic_ole_text(data)
     if not raw:
         try:
             raw = data.decode("utf-8", errors="ignore")
         except Exception:
             raw = ""
-
-    out: List[str] = []
+    out: list[str] = []
     seen = set()
-    for ln in (raw.splitlines() if raw else []):
+    for ln in raw.splitlines() if raw else []:
         s = _squeeze(ln)
         if not s and DROP_EMPTY:
             continue
@@ -381,10 +2099,10 @@ def extract_ppt(data: bytes) -> Tuple[str, str]:
             alen = max(1, len(s))
             if letters / alen < MIN_ALPHA:
                 continue
-            punct = sum(1 for c in s if not c.isalnum() and not c.isspace())
+            punct = sum(1 for c in s if not c.isalnum() and (not c.isspace()))
             if punct / alen > MAX_PUNCT:
                 continue
-            if " " not in s and len(s) <= TOKEN_MAX and re.fullmatch(r"[\w.\-]+", s):
+            if " " not in s and len(s) <= TOKEN_MAX and re.fullmatch("[\\w.\\-]+", s):
                 continue
         if DEDUPE:
             if s in seen:
@@ -392,26 +2110,32 @@ def extract_ppt(data: bytes) -> Tuple[str, str]:
             seen.add(s)
         if s or not DROP_EMPTY:
             out.append(s)
-
     text = "\n".join(out).strip()
-    return (text + "\n" if text else ""), "text/plain"
+    return (text + "\n" if text else "", "text/plain")
 
 # ===== aimodel/file_read/rag/ingest/xls_ingest.py =====
 
 # ===== aimodel/file_read/rag/ingest/xls_ingest.py =====
 from __future__ import annotations
-from typing import Tuple, List
-from datetime import datetime, date, time
-from ...core.settings import SETTINGS
+
 import re
+from datetime import date, datetime, time
+
+from ...core.logging import get_logger
+from ...core.settings import SETTINGS
+
+log = get_logger(__name__)
 
 _WS_RE = re.compile(r"[ \t]+")
+
+
 def _squeeze_spaces_inline(s: str) -> str:
     return _WS_RE.sub(" ", (s or "")).strip()
 
-def extract_xls(data: bytes) -> Tuple[str, str]:
+
+def extract_xls(data: bytes) -> tuple[str, str]:
     try:
-        import xlrd  
+        import xlrd
     except Exception:
         return (data.decode("utf-8", errors="replace"), "text/plain")
 
@@ -475,7 +2199,7 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
             s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
         s = clip(_squeeze_spaces_inline(s))
         if quote_strings and re.search(r"[^A-Za-z0-9_.-]", s):
-            return f"\"{s}\""
+            return f'"{s}"'
         return s
 
     def normalize_header(h: str) -> str:
@@ -506,7 +2230,7 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
             return bool(value)
         return value
 
-    lines: List[str] = []
+    lines: list[str] = []
 
     for sheet in book.sheets():
         nrows = min(sheet.nrows or 0, INFER_MAX_ROWS)
@@ -558,14 +2282,14 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
                         continue
                     lines.append(f"- {k}: {v}" if k else f"- : {v}")
                 lines.append("")
-                continue 
-            
+                continue
+
         lines.append("## Inferred Table")
         if any(h for h in norm_headers):
             lines.append("headers: " + ", ".join(h for h in norm_headers if h))
 
         for r in range(start_row, nrows):
-            row_vals: List[str] = []
+            row_vals: list[str] = []
             for c in range(ncols):
                 val = fmt_val(xlrd_cell_to_py(sheet.cell(r, c)))
                 if val:
@@ -580,11 +2304,18 @@ def extract_xls(data: bytes) -> Tuple[str, str]:
 # ===== aimodel/file_read/rag/rerank.py =====
 
 from __future__ import annotations
-from typing import List, Dict, Optional
+
+import logging
+
+log = logging.getLogger(__name__)
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
 
+log = get_logger(__name__)
 _RERANKER = None
 _RERANKER_NAME = None
+
 
 def _load_reranker():
     global _RERANKER, _RERANKER_NAME
@@ -595,45 +2326,45 @@ def _load_reranker():
         return _RERANKER
     try:
         from sentence_transformers import CrossEncoder
+
         _RERANKER = CrossEncoder(model_name)
         _RERANKER_NAME = model_name
         return _RERANKER
     except Exception as e:
-        print(f"[RAG RERANK] failed to load reranker {model_name}: {e}")
+        log.error(f"[RAG RERANK] failed to load reranker {model_name}: {e}")
         _RERANKER = None
         _RERANKER_NAME = None
         return None
 
-def rerank_hits(query: str, hits: List[dict], *, top_m: Optional[int] = None) -> List[dict]:
+
+def rerank_hits(query: str, hits: list[dict], *, top_m: int | None = None) -> list[dict]:
     if not hits:
         return hits
     model = _load_reranker()
     if model is None:
         return hits
-
-    pairs = [(query, (h.get("text") or "")) for h in hits]
+    pairs = [(query, h.get("text") or "") for h in hits]
     try:
         scores = model.predict(pairs)
     except Exception as e:
-        print(f"[RAG RERANK] predict failed: {e}")
+        log.error(f"[RAG RERANK] predict failed: {e}")
         return hits
-
-    out: List[dict] = []
-    for h, s in zip(hits, scores):
+    out: list[dict] = []
+    for h, s in zip(hits, scores, strict=False):
         hh = dict(h)
         hh["rerankScore"] = float(s)
         out.append(hh)
-
     out.sort(key=lambda x: x.get("rerankScore", 0.0), reverse=True)
     if isinstance(top_m, int) and top_m > 0:
         out = out[:top_m]
     return out
 
-def cap_per_source(hits: List[dict], per_source_cap: int) -> List[dict]:
+
+def cap_per_source(hits: list[dict], per_source_cap: int) -> list[dict]:
     if per_source_cap is None or per_source_cap <= 0:
         return hits
     bucket: dict[str, int] = {}
-    out: List[dict] = []
+    out: list[dict] = []
     for h in hits:
         src = str(h.get("source") or "")
         seen = bucket.get(src, 0)
@@ -642,7 +2373,8 @@ def cap_per_source(hits: List[dict], per_source_cap: int) -> List[dict]:
             bucket[src] = seen + 1
     return out
 
-def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
+
+def min_score_fraction(hits: list[dict], key: str, frac: float) -> list[dict]:
     if not hits:
         return hits
     vals = []
@@ -652,14 +2384,12 @@ def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
         except Exception:
             v = 0.0
         vals.append(v)
-
     s_min = min(vals)
     s_max = max(vals)
     if s_max == s_min:
         return hits
-
     kept = []
-    for h, v in zip(hits, vals):
+    for h, v in zip(hits, vals, strict=False):
         norm = (v - s_min) / (s_max - s_min)
         if norm >= float(frac):
             kept.append(h)
@@ -667,42 +2397,48 @@ def min_score_fraction(hits: List[Dict], key: str, frac: float) -> List[Dict]:
 
 # ===== aimodel/file_read/rag/retrieve_common.py =====
 
-# aimodel/file_read/rag/retrieve_common.py
 from __future__ import annotations
+
+import logging
+
+log = logging.getLogger(__name__)
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
 from .retrieve_tabular import make_rag_block_tabular
 
+log = get_logger(__name__)
+
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10 
+PRINT_MAX = 10
+
 
 def _get_embedder():
     global _EMBEDDER, _EMBEDDER_NAME
     try:
         from sentence_transformers import SentenceTransformer
     except Exception as e:
-        print(f"[RAG] sentence_transformers unavailable: {e}")
-        return None, None
-
+        log.info(f"[RAG] sentence_transformers unavailable: {e}")
+        return (None, None)
     model_name = SETTINGS.get("rag_embedding_model")
     if not model_name:
-        print("[RAG] no rag_embedding_model configured")
-        return None, None
-
+        log.info("[RAG] no rag_embedding_model configured")
+        return (None, None)
     if _EMBEDDER is None or _EMBEDDER_NAME != model_name:
         try:
             _EMBEDDER = SentenceTransformer(model_name)
             _EMBEDDER_NAME = model_name
         except Exception as e:
-            print(f"[RAG] failed to load embedding model {model_name}: {e}")
+            log.error(f"[RAG] failed to load embedding model {model_name}: {e}")
             _EMBEDDER = None
             _EMBEDDER_NAME = None
-    return _EMBEDDER, _EMBEDDER_NAME
+    return (_EMBEDDER, _EMBEDDER_NAME)
 
 
-def _embed_query(q: str) -> List[float]:
+def _embed_query(q: str) -> list[float]:
     q = (q or "").strip()
     if not q:
         return []
@@ -713,10 +2449,11 @@ def _embed_query(q: str) -> List[float]:
         arr = model.encode([q], normalize_embeddings=True, convert_to_numpy=True)
         return arr[0].tolist()
     except Exception as e:
-        print(f"[RAG] embedding encode failed: {e}")
+        log.error(f"[RAG] embedding encode failed: {e}")
         return []
 
-def _primary_score(h: Dict[str, Any]) -> float:
+
+def _primary_score(h: dict[str, Any]) -> float:
     s = h.get("rerankScore")
     if s is not None:
         try:
@@ -728,10 +2465,11 @@ def _primary_score(h: Dict[str, Any]) -> float:
     except Exception:
         return 0.0
 
-def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
+
+def _dedupe_and_sort(hits: list[dict], *, k: int) -> list[dict]:
     hits_sorted = sorted(hits, key=_primary_score, reverse=True)
-    seen: set[Tuple[str, str]] = set()
-    out: List[dict] = []
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
     for h in hits_sorted:
         kid = str(h.get("id") or "")
         key = (kid, "") if kid else (str(h.get("source") or ""), str(h.get("chunkIndex") or ""))
@@ -743,34 +2481,31 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
             break
     return out
 
-def _default_header(h: Dict[str, Any]) -> str:
+
+def _default_header(h: dict[str, Any]) -> str:
     src = str(h.get("source") or "")
     idx = h.get("chunkIndex")
     return f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
 
 
-def _render_header(h: Dict[str, Any]) -> str:
+def _render_header(h: dict[str, Any]) -> str:
     return _default_header(h)
 
 
-def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
+def make_rag_block_generic(hits: list[dict], *, max_chars: int) -> str:
     preamble = str(SETTINGS.get("rag_block_preamble") or "")
     preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
     total_budget = int(SETTINGS.get("rag_total_char_budget"))
-
     lines = [preamble]
     used = len(lines[0]) + 1
-
     for h in hits:
         head = _render_header(h)
         body = (h.get("text") or "").strip()
-
         head_cost = len(head) + 1
         if used + head_cost >= total_budget:
             break
         lines.append(head)
         used += head_cost
-
         if body:
             snippet = body[:max_chars]
             snippet_line = "  " + snippet
@@ -783,20 +2518,21 @@ def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
                 break
             lines.append(snippet_line)
             used += snippet_cost
-
     return "\n".join(lines)
 
 
-def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[str]] = None) -> str:
+def build_block_for_hits(hits_top: list[dict], preferred_sources: list[str] | None = None) -> str:
     block = make_rag_block_tabular(hits_top, preferred_sources=preferred_sources)
     if block is None:
         block = make_rag_block_generic(
-            hits_top,
-            max_chars=int(SETTINGS.get("rag_max_chars_per_chunk")),
+            hits_top, max_chars=int(SETTINGS.get("rag_max_chars_per_chunk"))
         )
     return block or ""
 
-def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
+
+def _rescore_for_preferred_sources(
+    hits: list[dict], preferred_sources: list[str] | None = None
+) -> list[dict]:
     if not preferred_sources:
         return hits
     boost = float(SETTINGS.get("rag_new_upload_score_boost"))
@@ -806,36 +2542,36 @@ def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional
         sc = float(h.get("score") or 0.0)
         src = str(h.get("source") or "").strip().lower()
         if src in pref:
-            sc *= (1.0 + boost)
+            sc *= 1.0 + boost
         hh = dict(h)
         hh["score"] = sc
         out.append(hh)
     return out
 
 
-def _fmt_hit(h: Dict[str, Any]) -> str:
-    return (
-        f"id={h.get('id')!s} src={h.get('source')!s} "
-        f"chunk={h.get('chunkIndex')!s} row={h.get('row')!s} "
-        f"score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
-    )
+def _fmt_hit(h: dict[str, Any]) -> str:
+    return f"id={h.get('id')!s} src={h.get('source')!s} chunk={h.get('chunkIndex')!s} row={h.get('row')!s} score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
 
 
-def _print_hits(label: str, hits: List[Dict[str, Any]], limit: int = PRINT_MAX) -> None:
-    print(f"[RAG DEBUG] {label}: count={len(hits)}")
+def _print_hits(label: str, hits: list[dict[str, Any]], limit: int = PRINT_MAX) -> None:
+    log.debug(f"[RAG DEBUG] {label}: count={len(hits)}")
     for i, h in enumerate(hits[:limit]):
-        print(f"[RAG DEBUG]   {i+1:02d}: {_fmt_hit(h)}")
+        log.debug(f"[RAG DEBUG]   {i + 1:02d}: {_fmt_hit(h)}")
     if len(hits) > limit:
-        print(f"[RAG DEBUG]   … (+{len(hits)-limit} more)")
+        log.debug(f"[RAG DEBUG]   … (+{len(hits) - limit} more)")
 
 
 def _nohit_block(q: str) -> str:
     preamble = str(SETTINGS.get("rag_block_preamble") or "Local knowledge")
     preamble = preamble if preamble.endswith(":") else preamble + ":"
-    msg = str(SETTINGS.get("rag_nohit_message") or "⛔ No relevant local entries found for this query. Do not guess.")
+    msg = str(
+        SETTINGS.get("rag_nohit_message")
+        or "⛔ No relevant local entries found for this query. Do not guess."
+    )
     if q:
         return f"{preamble}\n- {msg}\n- query={q!r}"
     return f"{preamble}\n- {msg}"
+
 
 @dataclass
 class RagTelemetry:
@@ -860,19 +2596,26 @@ class RagTelemetry:
 
 # ===== aimodel/file_read/rag/retrieve_core.py =====
 
-# aimodel/file_read/rag/retrieve_core.py
 from __future__ import annotations
-from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict, Any, Optional
+
+import logging
+
+log = logging.getLogger(__name__)
 import time
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from ..core.logging import get_logger
 from ..core.settings import SETTINGS
-from .store import search_vectors
+from .rerank import cap_per_source, min_score_fraction, rerank_hits
 from .retrieve_tabular import make_rag_block_tabular
-from .rerank import rerank_hits, cap_per_source, min_score_fraction
+from .store import search_vectors
+
+log = get_logger(__name__)
 
 _EMBEDDER = None
 _EMBEDDER_NAME = None
-PRINT_MAX = 10  
+PRINT_MAX = 10
 
 
 def _get_embedder():
@@ -880,26 +2623,24 @@ def _get_embedder():
     try:
         from sentence_transformers import SentenceTransformer
     except Exception as e:
-        print(f"[RAG] sentence_transformers unavailable: {e}")
-        return None, None
-
+        log.info(f"[RAG] sentence_transformers unavailable: {e}")
+        return (None, None)
     model_name = SETTINGS.get("rag_embedding_model")
     if not model_name:
-        print("[RAG] no rag_embedding_model configured")
-        return None, None
-
+        log.info("[RAG] no rag_embedding_model configured")
+        return (None, None)
     if _EMBEDDER is None or _EMBEDDER_NAME != model_name:
         try:
             _EMBEDDER = SentenceTransformer(model_name)
             _EMBEDDER_NAME = model_name
         except Exception as e:
-            print(f"[RAG] failed to load embedding model {model_name}: {e}")
+            log.error(f"[RAG] failed to load embedding model {model_name}: {e}")
             _EMBEDDER = None
             _EMBEDDER_NAME = None
-    return _EMBEDDER, _EMBEDDER_NAME
+    return (_EMBEDDER, _EMBEDDER_NAME)
 
 
-def _embed_query(q: str) -> List[float]:
+def _embed_query(q: str) -> list[float]:
     q = (q or "").strip()
     if not q:
         return []
@@ -910,11 +2651,11 @@ def _embed_query(q: str) -> List[float]:
         arr = model.encode([q], normalize_embeddings=True, convert_to_numpy=True)
         return arr[0].tolist()
     except Exception as e:
-        print(f"[RAG] embedding encode failed: {e}")
+        log.error(f"[RAG] embedding encode failed: {e}")
         return []
 
 
-def _primary_score(h: Dict[str, Any]) -> float:
+def _primary_score(h: dict[str, Any]) -> float:
     s = h.get("rerankScore")
     if s is not None:
         try:
@@ -927,10 +2668,10 @@ def _primary_score(h: Dict[str, Any]) -> float:
         return 0.0
 
 
-def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
+def _dedupe_and_sort(hits: list[dict], *, k: int) -> list[dict]:
     hits_sorted = sorted(hits, key=_primary_score, reverse=True)
-    seen: set[Tuple[str, str]] = set()
-    out: List[dict] = []
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
     for h in hits_sorted:
         kid = str(h.get("id") or "")
         key = (kid, "") if kid else (str(h.get("source") or ""), str(h.get("chunkIndex") or ""))
@@ -943,34 +2684,30 @@ def _dedupe_and_sort(hits: List[dict], *, k: int) -> List[dict]:
     return out
 
 
-def _default_header(h: Dict[str, Any]) -> str:
+def _default_header(h: dict[str, Any]) -> str:
     src = str(h.get("source") or "")
     idx = h.get("chunkIndex")
     return f"- {src} — chunk {idx}" if idx is not None else f"- {src}"
 
 
-def _render_header(h: Dict[str, Any]) -> str:
+def _render_header(h: dict[str, Any]) -> str:
     return _default_header(h)
 
 
-def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
+def make_rag_block_generic(hits: list[dict], *, max_chars: int) -> str:
     preamble = str(SETTINGS.get("rag_block_preamble") or "")
     preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
     total_budget = int(SETTINGS.get("rag_total_char_budget"))
-
     lines = [preamble]
     used = len(lines[0]) + 1
-
     for h in hits:
         head = _render_header(h)
         body = (h.get("text") or "").strip()
-
         head_cost = len(head) + 1
         if used + head_cost >= total_budget:
             break
         lines.append(head)
         used += head_cost
-
         if body:
             snippet = body[:max_chars]
             snippet_line = "  " + snippet
@@ -983,7 +2720,6 @@ def make_rag_block_generic(hits: List[dict], *, max_chars: int) -> str:
                 break
             lines.append(snippet_line)
             used += snippet_cost
-
     return "\n".join(lines)
 
 
@@ -1009,7 +2745,9 @@ class RagTelemetry:
     mode: str = "global"
 
 
-def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> List[dict]:
+def _rescore_for_preferred_sources(
+    hits: list[dict], preferred_sources: list[str] | None = None
+) -> list[dict]:
     if not preferred_sources:
         return hits
     boost = float(SETTINGS.get("rag_new_upload_score_boost"))
@@ -1019,37 +2757,32 @@ def _rescore_for_preferred_sources(hits: List[dict], preferred_sources: Optional
         sc = float(h.get("score") or 0.0)
         src = str(h.get("source") or "").strip().lower()
         if src in pref:
-            sc *= (1.0 + boost)
+            sc *= 1.0 + boost
         hh = dict(h)
         hh["score"] = sc
         out.append(hh)
     return out
 
 
-def build_block_for_hits(hits_top: List[dict], preferred_sources: Optional[List[str]] = None) -> str:
+def build_block_for_hits(hits_top: list[dict], preferred_sources: list[str] | None = None) -> str:
     block = make_rag_block_tabular(hits_top, preferred_sources=preferred_sources)
     if block is None:
         block = make_rag_block_generic(
-            hits_top,
-            max_chars=int(SETTINGS.get("rag_max_chars_per_chunk")),
+            hits_top, max_chars=int(SETTINGS.get("rag_max_chars_per_chunk"))
         )
     return block or ""
 
 
-def _fmt_hit(h: Dict[str, Any]) -> str:
-    return (
-        f"id={h.get('id')!s} src={h.get('source')!s} "
-        f"chunk={h.get('chunkIndex')!s} row={h.get('row')!s} "
-        f"score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
-    )
+def _fmt_hit(h: dict[str, Any]) -> str:
+    return f"id={h.get('id')!s} src={h.get('source')!s} chunk={h.get('chunkIndex')!s} row={h.get('row')!s} score={h.get('score')!s} rerank={h.get('rerankScore')!s}"
 
 
-def _print_hits(label: str, hits: List[Dict[str, Any]], limit: int = PRINT_MAX) -> None:
-    print(f"[RAG DEBUG] {label}: count={len(hits)}")
+def _print_hits(label: str, hits: list[dict[str, Any]], limit: int = PRINT_MAX) -> None:
+    log.debug(f"[RAG DEBUG] {label}: count={len(hits)}")
     for i, h in enumerate(hits[:limit]):
-        print(f"[RAG DEBUG]   {i+1:02d}: {_fmt_hit(h)}")
+        log.debug(f"[RAG DEBUG]   {i + 1:02d}: {_fmt_hit(h)}")
     if len(hits) > limit:
-        print(f"[RAG DEBUG]   … (+{len(hits)-limit} more)")
+        log.debug(f"[RAG DEBUG]   … (+{len(hits) - limit} more)")
 
 
 def _build_rag_block_core(
@@ -1058,49 +2791,38 @@ def _build_rag_block_core(
     session_id: str | None,
     k: int,
     session_only: bool,
-    preferred_sources: Optional[List[str]] = None,
-) -> Tuple[Optional[str], RagTelemetry]:
-    tel = RagTelemetry(topKRequested=k, mode=("session-only" if session_only else "global"))
+    preferred_sources: list[str] | None = None,
+) -> tuple[str | None, RagTelemetry]:
+    tel = RagTelemetry(topKRequested=k, mode="session-only" if session_only else "global")
     q = (query or "").strip()
-    print(f"[RAG SEARCH] q={q!r} session={session_id} k={k} session_only={session_only}")
-
+    log.debug(f"[RAG SEARCH] q={q!r} session={session_id} k={k} session_only={session_only}")
     t0 = time.perf_counter()
     qvec = _embed_query(q)
     tel.embedSec = round(time.perf_counter() - t0, 6)
-
     if not qvec:
-        print("[RAG SEARCH] no qvec")
-        return None, tel
-
+        log.debug("[RAG SEARCH] no qvec")
+        return (None, tel)
     d = len(qvec)
-
     t1 = time.perf_counter()
     hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
     tel.searchChatSec = round(time.perf_counter() - t1, 6)
-
-    hits_glob: List[dict] = []
+    hits_glob: list[dict] = []
     if not session_only:
         t2 = time.perf_counter()
         hits_glob = search_vectors(None, qvec, k, dim=d) or []
         tel.searchGlobalSec = round(time.perf_counter() - t2, 6)
-
     tel.hitsChat = len(hits_chat)
     tel.hitsGlobal = len(hits_glob)
-
     _print_hits("ANN hits (chat)", hits_chat)
     if not session_only:
         _print_hits("ANN hits (global)", hits_glob)
-
     all_hits = hits_chat + ([] if session_only else hits_glob)
     if not all_hits:
-        print("[RAG SEARCH] no hits")
-        return None, tel
-
+        log.debug("[RAG SEARCH] no hits")
+        return (None, tel)
     all_hits = _rescore_for_preferred_sources(all_hits, preferred_sources=preferred_sources)
     _print_hits("After preference boost", all_hits)
-
     pre_prune_hits = list(all_hits)
-
     t_rr = time.perf_counter()
     top_m_cfg = SETTINGS.get("rag_rerank_top_m")
     try:
@@ -1109,24 +2831,20 @@ def _build_rag_block_core(
         top_m = None
     if isinstance(top_m, int):
         top_m = max(1, min(top_m, len(all_hits)))
-
     try:
         all_hits = rerank_hits(q, all_hits, top_m=top_m)
     except Exception as e:
-        print(f"[RAG] rerank error: {e}; skipping rerank")
+        log.error(f"[RAG] rerank error: {e}; skipping rerank")
         pass
-
     tel.rerankSec = round(time.perf_counter() - t_rr, 6)
     tel.usedReranker = any("rerankScore" in h for h in all_hits)
     tel.keptAfterRerank = len(all_hits)
     _print_hits(f"After rerank (top_m={top_m})", all_hits)
-
     frac_cfg = SETTINGS.get("rag_min_score_frac")
     try:
         frac = float(frac_cfg) if frac_cfg not in (None, "", False) else None
     except Exception:
         frac = None
-
     tel.minScoreFrac = float(frac) if isinstance(frac, (int, float)) else 0.0
     if isinstance(frac, (int, float)):
         key = "rerankScore" if any("rerankScore" in h for h in all_hits) else "score"
@@ -1137,7 +2855,6 @@ def _build_rag_block_core(
         if dropped:
             _print_hits("Dropped by minScoreFrac", dropped)
     tel.keptAfterMinFrac = len(all_hits)
-
     cap_cfg = SETTINGS.get("rag_per_source_cap")
     try:
         cap_val = int(cap_cfg) if cap_cfg not in (None, "", False) else 0
@@ -1152,87 +2869,120 @@ def _build_rag_block_core(
         if dropped:
             _print_hits("Dropped by per-source cap", dropped)
     tel.keptAfterCap = len(all_hits)
-
     if not all_hits:
         best = sorted(pre_prune_hits, key=_primary_score, reverse=True)[:1]
         all_hits = best
         tel.fallbackUsed = True
-        print("[RAG] pruning yielded 0 hits; falling back to best pre-prune hit")
+        log.info("[RAG] pruning yielded 0 hits; falling back to best pre-prune hit")
         _print_hits("Fallback best pre-prune", all_hits)
-
     t3 = time.perf_counter()
     hits_top = _dedupe_and_sort(all_hits, k=k)
     tel.dedupeSec = round(time.perf_counter() - t3, 6)
     _print_hits(f"Final top-k (k={k})", hits_top)
-
     t4 = time.perf_counter()
     block = build_block_for_hits(hits_top, preferred_sources=preferred_sources)
     tel.blockBuildSec = round(time.perf_counter() - t4, 6)
     tel.blockChars = len(block or "")
     preview = (block or "")[:400].replace("\n", "\\n")
-    print(f"[RAG BLOCK] chars={tel.blockChars} preview=\"{preview}\"")
-    print(f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}")
+    log.debug(f'[RAG BLOCK] chars={tel.blockChars} preview="{preview}"')
+    log.debug(
+        f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}"
+    )
+    return (block, tel)
 
-    return block, tel
 
-
-def build_rag_block(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> str | None:
+def build_rag_block(
+    query: str, session_id: str | None = None, *, preferred_sources: list[str] | None = None
+) -> str | None:
     if not bool(SETTINGS.get("rag_enabled")):
         return None
     k = int(SETTINGS.get("rag_top_k"))
-    block, _ = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
+    block, _ = _build_rag_block_core(
+        query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources
+    )
     return block
 
 
-def build_rag_block_with_telemetry(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+def build_rag_block_with_telemetry(
+    query: str, session_id: str | None = None, *, preferred_sources: list[str] | None = None
+) -> tuple[str | None, dict[str, Any]]:
     if not bool(SETTINGS.get("rag_enabled")):
-        return None, {}
+        return (None, {})
     k = int(SETTINGS.get("rag_top_k"))
-    block, tel = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
-    return block, asdict(tel)
+    block, tel = _build_rag_block_core(
+        query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources
+    )
+    return (block, asdict(tel))
 
 
-def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Optional[str]:
+def build_rag_block_session_only(
+    query: str,
+    session_id: str | None,
+    *,
+    k: int | None = None,
+    preferred_sources: list[str] | None = None,
+) -> str | None:
     if not bool(SETTINGS.get("rag_enabled")):
         return None
     if k is None:
         k = int(SETTINGS.get("attachments_retrieve_top_k"))
-    block, _ = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
+    block, _ = _build_rag_block_core(
+        query,
+        session_id=session_id,
+        k=int(k),
+        session_only=True,
+        preferred_sources=preferred_sources,
+    )
     return block
 
 
-def build_rag_block_session_only_with_telemetry(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+def build_rag_block_session_only_with_telemetry(
+    query: str,
+    session_id: str | None,
+    *,
+    k: int | None = None,
+    preferred_sources: list[str] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
     if not bool(SETTINGS.get("rag_enabled")):
-        return None, {}
+        return (None, {})
     if k is None:
         k = int(SETTINGS.get("attachments_retrieve_top_k"))
-    block, tel = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
-    return block, asdict(tel)
+    block, tel = _build_rag_block_core(
+        query,
+        session_id=session_id,
+        k=int(k),
+        session_only=True,
+        preferred_sources=preferred_sources,
+    )
+    return (block, asdict(tel))
 
 # ===== aimodel/file_read/rag/retrieve_pipeline.py =====
 
-# ===== aimodel/file_read/rag/retrieve_pipeline.py =====
 from __future__ import annotations
-from dataclasses import asdict
-from typing import List, Tuple, Dict, Any, Optional
-import time
-from ..core.settings import SETTINGS
-from .store import search_vectors
-from .rerank import rerank_hits, cap_per_source, min_score_fraction
-from .retrieve_common import (
-    RagTelemetry,
-    _embed_query,
-    _primary_score,
-    _dedupe_and_sort,
-    _rescore_for_preferred_sources,
-    _print_hits,
-    build_block_for_hits,
-    _nohit_block,
-)
 
-def _mk_preview(text: Optional[str], limit: int = 400) -> str:
+import logging
+
+log = logging.getLogger(__name__)
+import time
+from dataclasses import asdict
+from typing import Any
+
+from ..core.logging import get_logger
+from ..core.settings import SETTINGS
+from .rerank import cap_per_source, min_score_fraction, rerank_hits
+from .retrieve_common import (RagTelemetry, _dedupe_and_sort, _embed_query,
+                              _nohit_block, _primary_score, _print_hits,
+                              _rescore_for_preferred_sources,
+                              build_block_for_hits)
+from .store import search_vectors
+
+log = get_logger(__name__)
+
+
+def _mk_preview(text: str | None, limit: int = 400) -> str:
     t = (text or "")[:limit]
     return t.replace("\n", "\\n")
+
 
 def _build_rag_block_core(
     query: str,
@@ -1240,48 +2990,38 @@ def _build_rag_block_core(
     session_id: str | None,
     k: int,
     session_only: bool,
-    preferred_sources: Optional[List[str]] = None,
-) -> Tuple[Optional[str], RagTelemetry]:
-    tel = RagTelemetry(topKRequested=k, mode=("session-only" if session_only else "global"))
+    preferred_sources: list[str] | None = None,
+) -> tuple[str | None, RagTelemetry]:
+    tel = RagTelemetry(topKRequested=k, mode="session-only" if session_only else "global")
     q = (query or "").strip()
-    print(f"[RAG SEARCH] q={q!r} session={session_id} k={k} session_only={session_only}")
-
+    log.debug(f"[RAG SEARCH] q={q!r} session={session_id} k={k} session_only={session_only}")
     t0 = time.perf_counter()
     qvec = _embed_query(q)
     tel.embedSec = round(time.perf_counter() - t0, 6)
     if not qvec:
-        print("[RAG SEARCH] no qvec")
-        return None, tel
-
+        log.debug("[RAG SEARCH] no qvec")
+        return (None, tel)
     d = len(qvec)
-
     t1 = time.perf_counter()
     hits_chat = search_vectors(session_id, qvec, k, dim=d) or []
     tel.searchChatSec = round(time.perf_counter() - t1, 6)
-
-    hits_glob: List[dict] = []
+    hits_glob: list[dict] = []
     if not session_only:
         t2 = time.perf_counter()
         hits_glob = search_vectors(None, qvec, k, dim=d) or []
         tel.searchGlobalSec = round(time.perf_counter() - t2, 6)
-
     tel.hitsChat = len(hits_chat)
     tel.hitsGlobal = len(hits_glob)
-
     _print_hits("ANN hits (chat)", hits_chat)
     if not session_only:
         _print_hits("ANN hits (global)", hits_glob)
-
     all_hits = hits_chat + ([] if session_only else hits_glob)
     if not all_hits:
-        print("[RAG SEARCH] no hits")
-        return None, tel
-
+        log.debug("[RAG SEARCH] no hits")
+        return (None, tel)
     all_hits = _rescore_for_preferred_sources(all_hits, preferred_sources=preferred_sources)
     _print_hits("After preference boost", all_hits)
-
     pre_prune_hits = list(all_hits)
-
     t_rr = time.perf_counter()
     top_m_cfg = SETTINGS.get("rag_rerank_top_m")
     try:
@@ -1290,18 +3030,15 @@ def _build_rag_block_core(
         top_m = None
     if isinstance(top_m, int):
         top_m = max(1, min(top_m, len(all_hits)))
-
     try:
         all_hits = rerank_hits(q, all_hits, top_m=top_m)
     except Exception as e:
-        print(f"[RAG] rerank error: {e}; skipping rerank")
+        log.error(f"[RAG] rerank error: {e}; skipping rerank")
         pass
-
     tel.rerankSec = round(time.perf_counter() - t_rr, 6)
     tel.usedReranker = any("rerankScore" in h for h in all_hits)
     tel.keptAfterRerank = len(all_hits)
     _print_hits(f"After rerank (top_m={top_m})", all_hits)
-
     min_abs = SETTINGS.get("rag_min_abs_rerank")
     try:
         min_abs = float(min_abs) if min_abs not in (None, "", False) else None
@@ -1309,10 +3046,11 @@ def _build_rag_block_core(
         min_abs = None
     if isinstance(min_abs, float):
         before = list(all_hits)
-        all_hits = [h for h in all_hits if float(h.get("rerankScore") or -1e12) >= min_abs]
+        all_hits = [
+            h for h in all_hits if float(h.get("rerankScore") or -1000000000000.0) >= min_abs
+        ]
         if len(all_hits) != len(before):
             _print_hits(f"After abs rerank cutoff >= {min_abs}", all_hits)
-
     frac_cfg = SETTINGS.get("rag_min_score_frac")
     try:
         frac = float(frac_cfg) if frac_cfg not in (None, "", False) else None
@@ -1328,7 +3066,6 @@ def _build_rag_block_core(
         if dropped:
             _print_hits("Dropped by minScoreFrac", dropped)
     tel.keptAfterMinFrac = len(all_hits)
-
     cap_cfg = SETTINGS.get("rag_per_source_cap")
     try:
         cap_val = int(cap_cfg) if cap_cfg not in (None, "", False) else 0
@@ -1343,1529 +3080,16 @@ def _build_rag_block_core(
         if dropped:
             _print_hits("Dropped by per-source cap", dropped)
     tel.keptAfterCap = len(all_hits)
-
     if not all_hits:
         if pre_prune_hits:
             all_hits = sorted(pre_prune_hits, key=_primary_score, reverse=True)[:1]
             tel.fallbackUsed = True
-            print("[RAG] pruning yielded 0; keeping best pre-prune (low-confidence fallback)")
+            log.info("[RAG] pruning yielded 0; keeping best pre-prune (low-confidence fallback)")
             _print_hits("Fallback best pre-prune", all_hits)
         else:
             tel.fallbackUsed = False
-            print("[RAG] no ANN hits; returning no-hit block")
+            log.info("[RAG] no ANN hits; returning no-hit block")
             block = _nohit_block(q)
             tel.blockChars = len(block or "")
             preview = _mk_preview(block)
-            print(f'[RAG BLOCK] chars={tel.blockChars} preview="{preview}"')
-            print(f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}")
-            return block, tel
-
-    t3 = time.perf_counter()
-    hits_top = _dedupe_and_sort(all_hits, k=k)
-    tel.dedupeSec = round(time.perf_counter() - t3, 6)
-    _print_hits(f"Final top-k (k={k})", hits_top)
-
-    t4 = time.perf_counter()
-    block = build_block_for_hits(hits_top, preferred_sources=preferred_sources)
-    tel.blockBuildSec = round(time.perf_counter() - t4, 6)
-    tel.blockChars = len(block or "")
-    preview = _mk_preview(block)
-    print(f'[RAG BLOCK] chars={tel.blockChars} preview="{preview}"')
-    print(f"[RAG BLOCK] kept: rerank={tel.keptAfterRerank} cap={tel.keptAfterCap} minFrac={tel.keptAfterMinFrac} fallback={tel.fallbackUsed}")
-
-    return block, tel
-
-def build_rag_block(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> str | None:
-    if not bool(SETTINGS.get("rag_enabled")):
-        return None
-    k = int(SETTINGS.get("rag_top_k"))
-    block, _ = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
-    return block
-
-def build_rag_block_with_telemetry(query: str, session_id: str | None = None, *, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
-    if not bool(SETTINGS.get("rag_enabled")):
-        return None, {}
-    k = int(SETTINGS.get("rag_top_k"))
-    block, tel = _build_rag_block_core(query, session_id=session_id, k=k, session_only=False, preferred_sources=preferred_sources)
-    return block, asdict(tel)
-
-def build_rag_block_session_only(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Optional[str]:
-    if not bool(SETTINGS.get("rag_enabled")):
-        return None
-    if k is None:
-        k = int(SETTINGS.get("attachments_retrieve_top_k"))
-    block, _ = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
-    return block
-
-def build_rag_block_session_only_with_telemetry(query: str, session_id: Optional[str], *, k: Optional[int] = None, preferred_sources: Optional[List[str]] = None) -> Tuple[Optional[str], Dict[str, Any]]:
-    if not bool(SETTINGS.get("rag_enabled")):
-        return None, {}
-    if k is None:
-        k = int(SETTINGS.get("attachments_retrieve_top_k"))
-    block, tel = _build_rag_block_core(query, session_id=session_id, k=int(k), session_only=True, preferred_sources=preferred_sources)
-    return block, asdict(tel)
-
-# ===== aimodel/file_read/rag/retrieve_tabular.py =====
-
-from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple
-import re, os
-from ..core.settings import SETTINGS
-
-_TABLE_RE = re.compile(r"^##\s*Table:\s*(?P<sheet>[^!]+)!\s*R(?P<r1>\d+)-(?P<r2>\d+),C(?P<c1>\d+)-(?P<c2>\d+)", re.MULTILINE)
-_ROW_RE = re.compile(r"^#{0,3}\s*Row\s+(?P<row>\d+)\s+—\s+(?P<sheet>[^\r\n]+)", re.MULTILINE)
-
-
-def is_csv_source(src: str) -> bool:
-    try:
-        _, ext = os.path.splitext(src.lower())
-        return ext in {".csv", ".tsv"}
-    except Exception:
-        return False
-
-
-def is_xlsx_source(src: str) -> bool:
-    try:
-        _, ext = os.path.splitext(src.lower())
-        return ext in {".xlsx", ".xlsm", ".xls"}
-    except Exception:
-        return False
-
-
-def _capture_table_block(text: str) -> Optional[str]:
-    m = _TABLE_RE.search(text or "")
-    if not m:
-        return None
-    start = m.start()
-    end = len(text)
-    nxt = re.search(r"^\s*$", text[m.end():], re.MULTILINE)
-    if nxt:
-        end = m.end() + nxt.start()
-    return text[start:end].strip()
-
-
-def _capture_row_block(text: str, row_num: int, sheet: str) -> Optional[str]:
-    if not text:
-        return None
-    pat = re.compile(rf"^#{0,3}\s*Row\s+{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)", re.MULTILINE | re.DOTALL)
-    m = pat.search(text)
-    if not m:
-        pat2 = re.compile(rf"^\s*{row_num}\s+—\s+{re.escape(sheet)}[^\n]*\n(?P<body>.*?)(?:\n\s*\n|$)", re.MULTILINE | re.DOTALL)
-        m = pat2.search(text)
-        if not m:
-            return None
-    head = f"### Row {row_num} — {sheet}"
-    body = (m.group("body") or "").strip()
-    if not body:
-        return head
-    return f"{head}\n{body}"
-
-
-def _collect_tabular_hits(hits: List[dict]) -> Dict[str, Any]:
-    headers: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]] = {}
-    rows: List[Dict[str, Any]] = []
-    for h in hits:
-        src = str(h.get("source") or "")
-        body = (h.get("text") or "").strip()
-
-        for mt in _TABLE_RE.finditer(body):
-            sheet = mt.group("sheet").strip()
-            r1 = int(mt.group("r1")); r2 = int(mt.group("r2"))
-            c1 = int(mt.group("c1")); c2 = int(mt.group("c2"))
-            key = (src, sheet, r1, r2, c1, c2)
-            if key not in headers:
-                tb = _capture_table_block(body)
-                headers[key] = {
-                    "source": src, "sheet": sheet,
-                    "r1": r1, "r2": r2, "c1": c1, "c2": c2,
-                    "text": tb or "", "score": float(h.get("score") or 0.0)
-                }
-            else:
-                headers[key]["score"] = max(headers[key]["score"], float(h.get("score") or 0.0))
-
-        for mr in _ROW_RE.finditer(body):
-            rn = int(mr.group("row"))
-            sheet = mr.group("sheet").strip()
-            rows.append({"source": src, "sheet": sheet, "row": rn, "hit": h, "score": float(h.get("score") or 0.0)})
-    return {"headers": headers, "rows": rows}
-
-
-def _pair_rows_with_headers(collected: Dict[str, Any]) -> Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]]:
-    headers = collected["headers"]
-    rows = collected["rows"]
-    groups: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]] = {}
-    for r in rows:
-        src = r["source"]; sheet = r["sheet"]; rown = r["row"]
-        match_key = None
-        for key in headers.keys():
-            s, sh, r1, r2, c1, c2 = key
-            if s == src and sh == sheet and r1 <= rown <= r2:
-                match_key = key
-                break
-        if not match_key:
-            continue
-        g = groups.setdefault(match_key, {"header": headers[match_key], "rows": []})
-        g["rows"].append(r)
-    return groups
-
-
-def _render_tabular_groups(
-    groups: Dict[Tuple[str, str, int, int, int, int], Dict[str, Any]],
-    preferred_sources: Optional[List[str]] = None
-) -> List[str]:
-    total_budget = int(SETTINGS.get("rag_total_char_budget"))
-    max_row_snippets = int(SETTINGS.get("rag_tabular_rows_per_table"))
-    per_row_max = int(SETTINGS.get("rag_max_chars_per_chunk"))
-    preamble = str(SETTINGS.get("rag_block_preamble") or "")
-    preamble = preamble if not preamble or preamble.endswith(":") else preamble + ":"
-
-    pref = set(s.strip().lower() for s in (preferred_sources or []) if s)
-    boost = float(SETTINGS.get("rag_new_upload_score_boost"))
-
-    lines: List[str] = [preamble]
-    used = len(lines[0]) + 1
-
-    def _group_score(key):
-        base = groups[key]["header"]["score"]
-        src = str(groups[key]["header"]["source"] or "").strip().lower()
-        return base * (1.0 + boost) if src in pref else base
-
-    keys_sorted = sorted(groups.keys(), key=_group_score, reverse=True)
-
-    for key in keys_sorted:
-        hdr = groups[key]["header"]
-        hdr_text = (hdr.get("text") or "").strip()
-        if not hdr_text:
-            hdr_text = f"## Table: {hdr['sheet']}!R{hdr['r1']}-{hdr['r2']},C{hdr['c1']}-{hdr['c2']}"
-        hdr_cost = len(hdr_text) + 1
-        if used + hdr_cost > total_budget:
-            break
-        lines.append(hdr_text)
-        used += hdr_cost
-
-        row_list = sorted(groups[key]["rows"], key=lambda r: r["score"], reverse=True)[:max_row_snippets]
-        for r in row_list:
-            body = (r["hit"].get("text") or "")
-            row_block = _capture_row_block(body, r["row"], r["sheet"]) or ""
-            if not row_block:
-                continue
-            row_snip = row_block[:per_row_max].strip()
-            row_cost = len(row_snip) + 1
-            if used + row_cost > total_budget:
-                break
-            lines.append(row_snip)
-            used += row_cost
-
-        if used >= total_budget:
-            break
-
-    return lines
-
-
-def make_rag_block_tabular(hits: List[dict], preferred_sources: Optional[List[str]] = None) -> Optional[str]:
-    if not hits:
-        return None
-    # Only keep sources that look like CSV/Excel to avoid mixing generic text
-    tabular_hits = [
-        h for h in hits
-        if is_xlsx_source(str(h.get("source") or "")) or is_csv_source(str(h.get("source") or ""))
-    ]
-    if not tabular_hits:
-        return None
-    collected = _collect_tabular_hits(tabular_hits)
-    groups = _pair_rows_with_headers(collected)
-    if not groups:
-        return None
-    lines = _render_tabular_groups(groups, preferred_sources=preferred_sources)
-    return "\n".join(lines)
-
-# ===== aimodel/file_read/rag/router_ai.py =====
-
-# ===== aimodel/file_read/rag/router_ai.py =====
-from __future__ import annotations
-from typing import Tuple, Optional, Any
-import json, re, traceback
-from ..core.settings import SETTINGS
-
-def _dbg(msg: str):
-    print(f"[RAG ROUTER] {msg}")
-
-def _force_json_strict(s: str) -> dict:
-    if not s:
-        return {}
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, dict) else {}
-    except Exception:
-        pass
-    rgx = SETTINGS.get("router_rag_json_extract_regex")
-    if isinstance(rgx, str) and rgx:
-        try:
-            m = re.search(rgx, s, re.DOTALL)
-            if m:
-                cand = m.group(0)
-                v = json.loads(cand)
-                return v if isinstance(v, dict) else {}
-        except Exception:
-            pass
-    return {}
-
-def _strip_wrappers(text: str) -> str:
-    t = text or ""
-    if SETTINGS.get("router_rag_trim_whitespace") is True:
-        t = t.strip()
-    if SETTINGS.get("router_rag_strip_wrappers_enabled") is not True:
-        return t
-    head = t
-    if SETTINGS.get("router_rag_strip_split_on_blank") is True:
-        head = t.split("\n\n", 1)[0]
-    pat = SETTINGS.get("router_rag_strip_header_regex")
-    if isinstance(pat, str) and pat:
-        try:
-            rx = re.compile(pat)
-            out = []
-            for ln in head.splitlines():
-                if rx.match(ln):
-                    break
-                out.append(ln)
-            core = " ".join(" ".join(out).split())
-            return core if core else t
-        except Exception:
-            return head
-    return head
-
-def _normalize_keys(d: dict) -> dict:
-    return {str(k).strip().strip('"').strip("'").strip().lower(): v for k, v in d.items()}
-
-def _as_bool(v) -> Optional[bool]:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        s = v.strip().strip('"').strip("'").lower()
-        if s in ("true", "yes", "y", "1"):  return True
-        if s in ("false", "no", "n", "0"):  return False
-    return None
-
-def decide_rag(llm: Any, user_text: str) -> Tuple[bool, Optional[str]]:
-    try:
-        if not user_text or not user_text.strip():
-            return (False, None)
-
-        core_text = _strip_wrappers(user_text.strip())
-
-        prompt_tpl = SETTINGS.get("router_rag_decide_prompt")
-        if not isinstance(prompt_tpl, str) or ("$text" not in prompt_tpl and "{text}" not in prompt_tpl):
-            _dbg("router_rag_decide_prompt missing/invalid")
-            return (False, None)
-
-        from string import Template
-        if "$text" in prompt_tpl:
-            the_prompt = Template(prompt_tpl).safe_substitute(text=core_text)
-        else:
-            the_prompt = prompt_tpl.format(text=core_text)
-
-        params = {
-            "max_tokens": SETTINGS.get("router_rag_decide_max_tokens"),
-            "temperature": SETTINGS.get("router_rag_decide_temperature"),
-            "top_p": SETTINGS.get("router_rag_decide_top_p"),
-            "stream": False,
-        }
-        stop_list = SETTINGS.get("router_rag_decide_stop")
-        if isinstance(stop_list, list) and stop_list:
-            params["stop"] = stop_list
-        params = {k: v for k, v in params.items() if v is not None}
-
-        raw = llm.create_chat_completion(
-            messages=[{"role": "user", "content": the_prompt}],
-            **params,
-        )
-        text_out = (raw.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-
-        data = _force_json_strict(text_out)
-        if not isinstance(data, dict):
-            need_default = SETTINGS.get("router_rag_default_need_when_invalid")
-            return (bool(need_default) if isinstance(need_default, bool) else False, None)
-        data = _normalize_keys(data)
-
-        need_raw = data.get("need")
-        need_bool = _as_bool(need_raw) if not isinstance(need_raw, bool) else need_raw
-        if need_bool is None:
-            need_default = SETTINGS.get("router_rag_default_need_when_invalid")
-            return (bool(need_default) if isinstance(need_default, bool) else False, None)
-
-        need = bool(need_bool)
-        if not need:
-            return (False, None)
-
-        query_field = data.get("query", "")
-        query_clean = _strip_wrappers(str(query_field or "").strip())
-        if not query_clean:
-            query_clean = core_text[:512]
-
-        return (True, query_clean)
-
-    except Exception as e:
-        _dbg(f"FATAL {type(e).__name__}: {e}")
-        traceback.print_exc()
-        need_default = SETTINGS.get("router_rag_default_need_when_invalid")
-        return (bool(need_default) if isinstance(need_default, bool) else False, None)
-
-# ===== aimodel/file_read/rag/schemas.py =====
-
-from pydantic import BaseModel, Field
-from typing import Optional, Dict
-
-class SearchReq(BaseModel):
-    query: str
-    sessionId: Optional[str] = None
-    kChat: int = 6
-    kGlobal: int = 4
-    hybrid_alpha: float = 0.5  
-
-class ItemRow(BaseModel):
-    id: str
-    sessionId: Optional[str]
-    source: str
-    title: Optional[str]
-    mime: Optional[str]
-    size: Optional[int]
-    createdAt: str
-    meta: Dict[str, str] = Field(default_factory=dict)
-
-class SearchHit(BaseModel):
-    id: str
-    text: str
-    score: float
-    source: Optional[str] = None   
-    title: Optional[str] = None
-    sessionId: Optional[str] = None
-    url: Optional[str] = None
-
-# ===== aimodel/file_read/rag/search.py =====
-
-from __future__ import annotations
-from typing import List, Dict
-
-def reciprocal_rank_fusion(results: List[List[Dict]], k: int = 60) -> List[Dict]:
-    scores: Dict[str, float] = {}
-    lookup: Dict[str, Dict] = {}
-    for lst in results:
-        for rank, r in enumerate(lst, start=1):
-            rid = r["id"]
-            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank)
-            lookup[rid] = r
-    fused = [{"score": s, **lookup[rid]} for rid, s in scores.items()]
-    fused.sort(key=lambda x: x["score"], reverse=True)
-    return fused
-
-# ===== aimodel/file_read/rag/store.py =====
-
-from __future__ import annotations
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-import faiss, json
-import numpy as np
-from ..store.base import APP_DIR   
-import shutil
-
-BASE = APP_DIR / "rag"
-
-def _ns_dir(session_id: Optional[str]) -> Path:
-    if session_id:
-        return BASE / "by_session" / session_id
-    return BASE / "global"
-
-def _paths(session_id: Optional[str]) -> Tuple[Path, Path]:
-    d = _ns_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "index.faiss", d / "meta.jsonl"
-
-def _norm(x: np.ndarray) -> np.ndarray:
-    x = x.astype("float32")
-    faiss.normalize_L2(x)
-    return x
-
-def _load_index(dim: int, p: Path) -> faiss.Index:
-    if p.exists():
-        return faiss.read_index(str(p))
-    return faiss.IndexFlatIP(dim)
-
-def _save_index(idx: faiss.Index, p: Path) -> None:
-    faiss.write_index(idx, str(p))
-
-def add_vectors(session_id: Optional[str], embeds: np.ndarray, metas: List[Dict], dim: int):
-    idx_path, meta_path = _paths(session_id)
-    idx = _load_index(dim, idx_path)
-
-    if not isinstance(idx, faiss.IndexFlatIP):
-        idx = faiss.IndexFlatIP(dim) if idx.ntotal == 0 else idx
-
-    embeds = _norm(embeds)
-
-    existing_ids = set()
-    if meta_path.exists():
-        with meta_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    j = json.loads(line)
-                    existing_ids.add(j["id"])
-                except:
-                    pass
-
-    start = idx.ntotal
-    new_embeds = []
-    new_metas = []
-
-    for i, m in enumerate(metas):
-        if m["id"] in existing_ids:
-            continue
-        m["row"] = start + len(new_embeds)
-        new_embeds.append(embeds[i])
-        new_metas.append(m)
-
-    if new_embeds:
-        idx.add(np.vstack(new_embeds))
-        _save_index(idx, idx_path)
-        with meta_path.open("a", encoding="utf-8") as f:
-            for m in new_metas:
-                f.write(json.dumps(m, ensure_ascii=False) + "\n")
-
-def search_vectors(session_id: Optional[str], query_vec: np.ndarray, topk: int, dim: int) -> List[Dict]:
-    idx_path, meta_path = _paths(session_id)
-    if not idx_path.exists() or not meta_path.exists():
-        return []
-
-    idx = _load_index(dim, idx_path)
-
-    query_vec = np.asarray(query_vec, dtype="float32")
-    q = _norm(query_vec.reshape(1, -1))
-
-    D, I = idx.search(q, topk)
-    out: List[Dict] = []
-    rows: Dict[int, Dict] = {}
-    with meta_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                j = json.loads(line)
-                rows[int(j["row"])] = j
-            except:
-                pass
-    for score, row in zip(D[0].tolist(), I[0].tolist()):
-        if row < 0:
-            continue
-        m = rows.get(row)
-        if not m:
-            continue
-        m = dict(m)
-        m["score"] = float(score)
-        out.append(m)
-    return out
-
-def search_similar(qvec: List[float] | np.ndarray, *, k: int = 5, session_id: Optional[str] = None) -> List[Dict]:
-    """
-    Compatibility wrapper used by retrieve.py.
-    qvec: a single embedding vector (list or np.ndarray)
-    """
-    arr = np.asarray(qvec, dtype="float32")
-    dim = int(arr.shape[-1])
-    return search_vectors(session_id, arr, k, dim)
-
-def add_texts(
-    texts: List[str],
-    metas: List[Dict],
-    *,
-    session_id: Optional[str],
-    embed_fn,  
-) -> int:
-    if not texts:
-        return 0
-    vecs = embed_fn(texts) 
-    if not isinstance(vecs, np.ndarray):
-        vecs = np.asarray(vecs, dtype="float32")
-    dim = int(vecs.shape[-1])
-    add_vectors(session_id, vecs, metas, dim)
-    return len(texts)
-
-def delete_namespace(session_id: str) -> bool:
-    d = _ns_dir(session_id)
-    try:
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-            return True
-        return False
-    except Exception:
-        return False
-
-def session_has_any_vectors(session_id: Optional[str]) -> bool:
-    if not session_id:
-        return False
-
-    idx_path, meta_path = _paths(session_id)
-    if not idx_path.exists() or not meta_path.exists():
-        return False
-
-    try:
-        idx = _load_index(dim=1, p=idx_path)  
-        if getattr(idx, "ntotal", 0) <= 0:
-            return False
-    except Exception as e:
-        print(f"[RAG STORE] failed to read index for {session_id}: {e}")
-        return False
-
-    try:
-        with meta_path.open("r", encoding="utf-8") as f:
-            for _ in f:
-                return True
-        return False
-    except Exception as e:
-        print(f"[RAG STORE] failed to read meta for {session_id}: {e}")
-        return False
-
-# ===== aimodel/file_read/rag/uploads.py =====
-
-from __future__ import annotations
-from typing import Dict, List, Optional, Tuple
-from pathlib import Path
-import json
-import numpy as np
-import faiss
-
-from .store import _ns_dir  
-
-_META_FN = "meta.jsonl"
-_INDEX_FN = "index.faiss"
-
-def _meta_path_ro(session_id: Optional[str]) -> Path:
-    return _ns_dir(session_id) / _META_FN
-
-def _index_path_ro(session_id: Optional[str]) -> Path:
-    return _ns_dir(session_id) / _INDEX_FN
-
-def _paths_mut(session_id: Optional[str]) -> Tuple[Path, Path]:
-    d = _ns_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d / _INDEX_FN, d / _META_FN
-
-def _read_meta(meta_path: Path) -> List[dict]:
-    if not meta_path.exists():
-        return []
-    out: List[dict] = []
-    with meta_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                j = json.loads(line)
-                if isinstance(j, dict):
-                    out.append(j)
-            except:
-                pass
-    return out
-
-def _write_meta(meta_path: Path, rows: List[dict]) -> None:
-    tmp = meta_path.with_suffix(".jsonl.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for j in rows:
-            f.write(json.dumps(j, ensure_ascii=False) + "\n")
-    tmp.replace(meta_path)
-
-def _norm(x: np.ndarray) -> np.ndarray:
-    x = x.astype("float32")
-    faiss.normalize_L2(x)
-    return x
-
-def list_sources(session_id: Optional[str], include_global: bool = True) -> List[dict]:
-    def _agg(ns: Optional[str]) -> Dict[str, int]:
-        mp = _meta_path_ro(ns)  
-        agg: Dict[str, int] = {}
-        for j in _read_meta(mp):
-            src = (j.get("source") or "").strip()
-            if not src:
-                continue
-            agg[src] = agg.get(src, 0) + 1
-        return agg
-
-    rows: List[dict] = []
-    # session first
-    if session_id is not None:
-        for src, n in _agg(session_id).items():
-            rows.append({"source": src, "sessionId": session_id, "chunks": n})
-    if include_global:
-        for src, n in _agg(None).items():
-            rows.append({"source": src, "sessionId": None, "chunks": n})
-    return rows
-
-def hard_delete_source(source: str, *, session_id: Optional[str], embedder) -> dict:
-    idx_path, meta_path = _paths_mut(session_id) 
-    rows = _read_meta(meta_path)
-    if not rows:
-        return {"ok": True, "removed": 0, "remaining": 0}
-
-    keep: List[dict] = []
-    removed = 0
-    for j in rows:
-        if str(j.get("source") or "").strip() == source:
-            removed += 1
-        else:
-            keep.append(j)
-
-    if removed == 0:
-        return {"ok": True, "removed": 0, "remaining": len(keep)}
-
-    for i, j in enumerate(keep):
-        j["row"] = i
-
-    if len(keep) == 0:
-        if idx_path.exists():
-            try:
-                idx_path.unlink()
-            except:
-                pass
-        _write_meta(meta_path, [])
-        return {"ok": True, "removed": removed, "remaining": 0}
-
-    texts = [str(j.get("text") or "") for j in keep]
-    B = 128  # batch size
-    parts: List[np.ndarray] = []
-    for i in range(0, len(texts), B):
-        vec = embedder(texts[i:i + B])
-        if not isinstance(vec, np.ndarray):
-            vec = np.asarray(vec, dtype="float32")
-        parts.append(vec.astype("float32"))
-    embeds = np.vstack(parts)
-    embeds = _norm(embeds)
-
-    dim = int(embeds.shape[-1])
-    new_index = faiss.IndexFlatIP(dim)
-    new_index.add(embeds)
-
-    faiss.write_index(new_index, str(idx_path))
-    _write_meta(meta_path, keep)
-
-    return {"ok": True, "removed": removed, "remaining": len(keep)}
-
-# ===== aimodel/file_read/requirements.txt =====
-
-fastapi==0.116.1
-uvicorn==0.30.6
-pydantic==2.11.7
-starlette==0.47.2
-llama-cpp-python==0.3.4
-ddgs==9.5.4
-httpx==0.27.0
-# HTML parsing / readability (permissive)
-lxml==6.0.1
-readability-lxml==0.8.1
-selectolax==0.3.21
-beautifulsoup4==4.12.3
-
-# RAG
-faiss-cpu==1.8.0.post1
-numpy==1.26.4
-sentence-transformers==3.0.1
-tzlocal==5.2
-openpyxl==3.1.5 
-python-multipart==0.0.20
-
-python-docx==1.1.2
-PyYAML==6.0.2
-toml==0.10.2
-pdfminer.six==20240706
-
-PyPDF2==3.0.1
-pandas==2.2.2
-
-striprtf==0.0.26
-
-python-pptx==0.6.23
-
-pytesseract==0.3.13
-pypdfium2==4.30.0
-Pillow==10.4.
-
-pydantic[email]==2.11.7
-python-jose==3.3.0
-passlib[bcrypt]==1.7.4
-
-
-pynacl==1.5.0
-
-PyJWT>=2.8.0
-cryptography>=41.0.0
-python-jose[cryptography]
-
-# ===== aimodel/file_read/runtime/__init__.py =====
-
-
-
-# ===== aimodel/file_read/runtime/model_runtime.py =====
-
-# aimodel/file_read/model_runtime.py
-from __future__ import annotations
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from threading import RLock
-from typing import Any, Dict, Optional, List
-from ..adaptive.config.paths import read_settings, write_settings
-
-try:
-    from llama_cpp import Llama
-except Exception as e:
-    raise RuntimeError("llama-cpp-python not installed or GPU libs missing") from e
-
-@dataclass
-class ModelConfig:
-    modelPath: str
-    nCtx: int = 4096
-    nThreads: int = 8
-    nGpuLayers: int = 40
-    nBatch: int = 256
-    ropeFreqBase: Optional[float] = None
-    ropeFreqScale: Optional[float] = None
-
-    @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "ModelConfig":
-        return ModelConfig(
-            modelPath=str(d.get("modelPath","")).strip(),
-            nCtx=int(d.get("nCtx", 4096)),
-            nThreads=int(d.get("nThreads", 8)),
-            nGpuLayers=int(d.get("nGpuLayers", 40)),
-            nBatch=int(d.get("nBatch", 256)),
-            ropeFreqBase=(float(d["ropeFreqBase"]) if d.get("ropeFreqBase") not in (None,"") else None),
-            ropeFreqScale=(float(d["ropeFreqScale"]) if d.get("ropeFreqScale") not in (None,"") else None),
-        )
-
-_runtime_lock = RLock()
-_llm: Optional[Llama] = None
-_cfg: Optional[ModelConfig] = None
-
-def _build_kwargs(cfg: ModelConfig) -> Dict[str, Any]:
-    kw = dict(
-        model_path=cfg.modelPath,
-        n_ctx=cfg.nCtx,
-        n_threads=cfg.nThreads,
-        n_gpu_layers=cfg.nGpuLayers,
-        n_batch=cfg.nBatch,
-    )
-    if cfg.ropeFreqBase is not None:
-        kw["rope_freq_base"] = cfg.ropeFreqBase
-    if cfg.ropeFreqScale is not None:
-        kw["rope_freq_scale"] = cfg.ropeFreqScale
-    return kw
-
-def _attach_introspection(llm: Llama) -> None:
-    def get_last_timings():
-        try:
-            t = getattr(llm, "get_timings", None)
-            if callable(t):
-                v = t()
-                if isinstance(v, dict):
-                    return v
-        except Exception:
-            pass
-        try:
-            v = getattr(llm, "timings", None)
-            if isinstance(v, dict):
-                return v
-        except Exception:
-            pass
-        try:
-            v = getattr(llm, "perf", None)
-            if isinstance(v, dict):
-                return v
-        except Exception:
-            pass
-        return None
-    try:
-        setattr(llm, "get_last_timings", get_last_timings)
-    except Exception:
-        pass
-
-def _close_llm():
-    global _llm
-    try:
-        if _llm is not None:
-            _llm = None
-    except Exception:
-        _llm = None
-
-def current_model_info() -> Dict[str, Any]:
-    with _runtime_lock:
-        return {
-            "loaded": _llm is not None,
-            "config": asdict(_cfg) if _cfg else None,
-        }
-
-def ensure_ready() -> None:
-    global _llm, _cfg
-    with _runtime_lock:
-        if _llm is not None:
-            return
-        s = read_settings()
-        cfg = ModelConfig.from_dict(s)
-        if not cfg.modelPath:
-            raise RuntimeError("No model selected. Load one via /models/load or set LOCALAI_MODEL_PATH.")
-        p = Path(cfg.modelPath)
-        if not p.exists():
-            raise FileNotFoundError(f"Model path not found: {p}")
-        _llm = Llama(**_build_kwargs(cfg))
-        _attach_introspection(_llm)
-        _cfg = cfg
-
-def get_llm() -> Llama:
-    ensure_ready()
-    assert _llm is not None
-    return _llm
-
-def load_model(config_patch: Dict[str, Any]) -> Dict[str, Any]:
-    global _llm, _cfg
-    with _runtime_lock:
-        s = read_settings()
-        s.update({k:v for k,v in config_patch.items() if v is not None})
-        cfg = ModelConfig.from_dict(s)
-        if not cfg.modelPath:
-            raise ValueError("modelPath is required")
-        if not Path(cfg.modelPath).exists():
-            raise FileNotFoundError(f"Model not found: {cfg.modelPath}")
-        _close_llm()
-        _llm = Llama(**_build_kwargs(cfg))
-        _attach_introspection(_llm)
-        _cfg = cfg
-        write_settings(asdict(cfg))
-        return current_model_info()
-
-def unload_model() -> None:
-    global _llm
-    with _runtime_lock:
-        _close_llm()
-
-def list_local_models() -> List[Dict[str, Any]]:
-    s = read_settings()
-    root = Path(s.get("modelsDir") or "")
-    root.mkdir(parents=True, exist_ok=True)
-    out: List[Dict[str, Any]] = []
-    for p in root.rglob("*.gguf"):
-        try:
-            out.append({
-                "path": str(p.resolve()),
-                "sizeBytes": p.stat().st_size,
-                "name": p.name,
-                "rel": str(p.relative_to(root)),
-            })
-        except Exception:
-            pass
-    out.sort(key=lambda x: x["sizeBytes"], reverse=True)
-    return out
-
-# ===== aimodel/file_read/services/__init__.py =====
-
-
-
-# ===== aimodel/file_read/services/attachments.py =====
-
-# aimodel/file_read/services/attachments.py
-from __future__ import annotations
-from typing import Any, Iterable, Optional, List
-
-
-def att_get(att: Any, key: str, default=None):
-    try:
-        return att.get(key, default)          
-    except AttributeError:
-        return getattr(att, key, default)    
-
-
-def join_attachment_names(attachments: Optional[Iterable[Any]]) -> str:
-    if not attachments:
-        return ""
-    names: List[str] = [att_get(a, "name") for a in attachments]  
-    names = [n for n in names if n]
-    return ", ".join(names)
-
-# ===== aimodel/file_read/services/auth_service.py =====
-
-from __future__ import annotations
-import os, time
-from typing import Dict, Any
-import httpx
-from jose import jwt as jose_jwt
-from jose.exceptions import ExpiredSignatureError, JWTError
-from fastapi import HTTPException
-
-FIREBASE_API_KEY = (os.getenv("FIREBASE_WEB_API_KEY") or "").strip()
-FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "").strip()
-
-_CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
-_CERTS_TTL = 60 * 60  # 1 hour
-_CERTS_CACHE: Dict[str, Any] = {"k2pem": {}, "fetched_at": 0}
-
-def need_project_check() -> bool:
-    if not FIREBASE_PROJECT_ID:
-        print("[auth] ERROR: FIREBASE_PROJECT_ID is not set")
-        return True
-    return False
-
-def fetch_google_certs_sync() -> Dict[str, str]:
-    now = int(time.time())
-    if now - int(_CERTS_CACHE.get("fetched_at") or 0) < _CERTS_TTL:
-        return _CERTS_CACHE["k2pem"]  # type: ignore[return-value]
-    try:
-        r = httpx.get(_CERTS_URL, timeout=10.0)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict):
-            _CERTS_CACHE["k2pem"] = data
-            _CERTS_CACHE["fetched_at"] = now
-            print(f"[auth] fetched Google certs; kids={list(data.keys())[:3]}...")
-            return data
-    except Exception as e:
-        print(f"[auth] ERROR fetching Google certs: {e!r}")
-    return _CERTS_CACHE.get("k2pem", {})  # type: ignore[return-value]
-
-def verify_jwt_with_google(token: str) -> Dict[str, Any]:
-    if need_project_check():
-        raise HTTPException(500, "Auth not configured")
-    try:
-        header = jose_jwt.get_unverified_header(token)
-        kid = header.get("kid")
-        if not kid:
-            print("[auth] token header missing 'kid'")
-            raise HTTPException(401, "Invalid token header")
-
-        payload_preview = jose_jwt.get_unverified_claims(token)
-        print("[auth] id_token preview:", {
-            "header": {"alg": header.get("alg"), "kid": kid, "typ": header.get("typ")},
-            "payload": {
-                "iss": payload_preview.get("iss"),
-                "aud": payload_preview.get("aud"),
-                "email": payload_preview.get("email"),
-                "email_verified": payload_preview.get("email_verified"),
-                "uid": payload_preview.get("uid"),
-                "iat": payload_preview.get("iat"),
-                "exp": payload_preview.get("exp"),
-            }
-        })
-
-        certs = fetch_google_certs_sync()
-        pem = certs.get(kid)
-        if not pem:
-            print(f"[auth] kid {kid} not found in certs; refreshing once")
-            _CERTS_CACHE["fetched_at"] = 0
-            certs = fetch_google_certs_sync()
-            pem = certs.get(kid)
-            if not pem:
-                raise HTTPException(401, "Key not found for token")
-
-        issuer = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
-        claims = jose_jwt.decode(
-            token,
-            pem,
-            algorithms=["RS256"],
-            audience=FIREBASE_PROJECT_ID,
-            issuer=issuer,
-            options={"verify_signature": True, "verify_aud": True, "verify_iat": True, "verify_exp": True},
-        )
-        return claims
-    except ExpiredSignatureError:
-        print("[auth] token expired")
-        raise HTTPException(401, "Token expired")
-    except JWTError as e:
-        print(f"[auth] JWTError while verifying: {e}")
-        raise HTTPException(401, "Invalid token")
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[auth] unexpected verify error: {e!r}")
-        raise HTTPException(401, "Invalid token")
-
-async def firebase_sign_in_with_password(email: str, password: str) -> Dict[str, Any]:
-    if not FIREBASE_API_KEY:
-        print("[auth] ERROR: FIREBASE_WEB_API_KEY not set")
-        raise HTTPException(500, "Server auth not configured")
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-    if r.status_code >= 400:
-        print(f"[auth] REST login failed status={r.status_code} body={r.text[:200]!r}")
-        raise HTTPException(401, "Invalid credentials")
-    data = r.json()
-    print(f"[auth] REST login ok email={email}")
-    return data
-
-async def firebase_sign_up_with_password(email: str, password: str) -> Dict[str, Any]:
-    if not FIREBASE_API_KEY:
-        print("[auth] ERROR: FIREBASE_WEB_API_KEY not set")
-        raise HTTPException(500, "Server auth not configured")
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-    if r.status_code >= 400:
-        # Typical errors: EMAIL_EXISTS, OPERATION_NOT_ALLOWED, WEAK_PASSWORD
-        try:
-            j = r.json()
-            msg = (j.get("error", {}).get("message") or "").replace("_", " ").title()
-        except Exception:
-            msg = r.text[:200]
-        raise HTTPException(400, msg or "Could not register")
-    data = r.json()
-    print(f"[auth] REST register ok email={email}")
-    return data
-
-# ===== aimodel/file_read/services/budget.py =====
-
-# aimodel/file_read/services/budget.py
-from __future__ import annotations
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Any
-from .context_window import current_n_ctx, estimate_tokens
-
-@dataclass
-class TurnBudget:
-    n_ctx: int
-    input_tokens_est: Optional[int]
-    requested_out_tokens: int
-    clamped_out_tokens: int
-    clamp_margin: int
-    reserved_system_tokens: Optional[int] = None
-    available_for_out_tokens: Optional[int] = None
-    headroom_tokens: Optional[int] = None
-    overage_tokens: Optional[int] = None
-    reason: str = "ok"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-def analyze_budget(
-    llm: Any,
-    messages: List[Dict[str, str]],
-    *,
-    requested_out_tokens: int,
-    clamp_margin: int,
-    reserved_system_tokens: Optional[int] = None,
-) -> TurnBudget:
-    n_ctx = current_n_ctx()
-    try:
-        inp = estimate_tokens(llm, messages)
-    except Exception:
-        inp = None
-
-    rst = int(reserved_system_tokens or 0)
-    min_out = 16
-
-    if inp is None:
-        available = None
-        clamped = requested_out_tokens
-        headroom = None
-        overage = None
-        reason = "input_tokens_unknown"
-    else:
-        available_raw = n_ctx - inp - clamp_margin - rst
-        available = max(min_out, available_raw)
-        clamped = max(min_out, min(requested_out_tokens, available))
-        headroom = max(0, available - clamped)
-        overage = max(0, requested_out_tokens - available)
-        reason = "ok" if overage == 0 else "requested_exceeds_available"
-
-    return TurnBudget(
-        n_ctx=n_ctx,
-        input_tokens_est=inp,
-        requested_out_tokens=requested_out_tokens,
-        clamped_out_tokens=clamped,
-        clamp_margin=clamp_margin,
-        reserved_system_tokens=reserved_system_tokens,
-        available_for_out_tokens=available,
-        headroom_tokens=headroom,
-        overage_tokens=overage,
-        reason=reason,
-    )
-
-# ===== aimodel/file_read/services/cancel.py =====
-
-from __future__ import annotations
-import asyncio
-from threading import Event
-from typing import Dict
-from ..core.settings import SETTINGS
-
-eff = SETTINGS.effective()
-GEN_SEMAPHORE = asyncio.Semaphore(int(eff["gen_semaphore_permits"]))
-_ACTIVE: Dict[str, int] = {}
-_CANCELS: Dict[str, Event] = {}
-
-def is_active(session_id: str) -> bool:
-    return bool(_ACTIVE.get(session_id))
-
-def mark_active(session_id: str, delta: int):
-    _ACTIVE[session_id] = max(0, int(_ACTIVE.get(session_id, 0)) + delta)
-    if _ACTIVE[session_id] == 0:
-        _ACTIVE.pop(session_id, None)
-
-def cancel_event(session_id: str) -> Event:
-    ev = _CANCELS.get(session_id)
-    if ev is None:
-        ev = Event()
-        _CANCELS[session_id] = ev
-    return ev
-
-# ===== aimodel/file_read/services/context_window.py =====
-
-# aimodel/file_read/services/context_window.py
-from __future__ import annotations
-from typing import List, Dict, Optional, Tuple, Any
-from ..utils.streaming import safe_token_count_messages
-from ..runtime.model_runtime import current_model_info
-from ..core.settings import SETTINGS
-
-def estimate_tokens(llm, messages: List[Dict[str, str]]) -> Optional[int]:
-    try:
-        return safe_token_count_messages(llm, messages)
-    except Exception:
-        return None
-
-def current_n_ctx() -> int:
-    eff = SETTINGS.effective()
-    try:
-        info = current_model_info() or {}
-        cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
-        return int(cfg.get("nCtx") or eff["nctx_fallback"])
-    except Exception:
-        return int(eff["nctx_fallback"])
-
-def clamp_out_budget(
-    *, llm, messages: List[Dict[str, str]], requested_out: int, margin: int = 32, reserved_system_tokens: Optional[int] = None
-) -> Tuple[int, Optional[int]]:
-    eff = SETTINGS.effective()
-    inp_est = estimate_tokens(llm, messages)
-    try:
-        prompt_est = inp_est if inp_est is not None else safe_token_count_messages(llm, messages)
-    except Exception:
-        prompt_est = int(eff["token_estimate_fallback"])
-    n_ctx = current_n_ctx()
-    rst = int(reserved_system_tokens or 0)
-    min_out = int(eff.get("min_out_tokens", 16))
-    available = max(min_out, n_ctx - prompt_est - margin - rst)
-    safe_out = max(min_out, min(requested_out, available))
-    return safe_out, (inp_est if inp_est is not None else None)
-
-def compute_budget_view(
-    llm,
-    messages: List[Dict[str, str]],
-    requested_out: Optional[int] = None,
-    clamp_margin: Optional[int] = None,
-    reserved_system_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    eff = SETTINGS.effective()
-    n_ctx = current_n_ctx()
-    margin = int(clamp_margin if clamp_margin is not None else eff.get("clamp_margin", 32))
-    rst = int(reserved_system_tokens if reserved_system_tokens is not None else eff.get("reserved_system_tokens", 0))
-    min_out = int(eff.get("min_out_tokens", 16))
-    default_out = int(eff.get("out_budget", 512))
-    req_out = int(requested_out if requested_out is not None else default_out)
-
-    inp_opt = estimate_tokens(llm, messages)
-    if inp_opt is None:
-        try:
-            prompt_est = safe_token_count_messages(llm, messages)
-        except Exception:
-            prompt_est = int(eff["token_estimate_fallback"])
-    else:
-        prompt_est = int(inp_opt)
-
-    available = max(min_out, n_ctx - prompt_est - margin - rst)
-    out_budget_chosen = max(min_out, min(req_out, available))
-    over_by_tokens = max(0, (prompt_est + req_out + margin + rst) - n_ctx)
-    usable_ctx = max(0, n_ctx - margin - rst)
-
-    return {
-        "modelCtx": n_ctx,
-        "clampMargin": margin,
-        "usableCtx": usable_ctx,
-        "reservedSystemTokens": rst,
-        "inputTokensEst": prompt_est,
-        "outBudgetChosen": out_budget_chosen,
-        "outBudgetDefault": default_out,
-        "outBudgetRequested": req_out,
-        "outBudgetMaxAllowed": available,
-        "overByTokens": over_by_tokens,
-        "minOutTokens": min_out,
-        "queueWaitSec": None,
-    }
-
-# ===== aimodel/file_read/services/generate_flow.py =====
-
-# aimodel/file_read/services/generate_flow.py
-from __future__ import annotations
-from typing import AsyncGenerator, AsyncIterator, Dict
-from dataclasses import asdict
-from fastapi.responses import StreamingResponse
-import time
-from ..core.settings import SETTINGS
-from ..utils.streaming import RUNJSON_START, RUNJSON_END
-from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
-from .streaming_worker import run_stream as _run_stream
-run_stream: (callable[..., AsyncIterator[bytes]]) = _run_stream
-
-from .generate_pipeline import prepare_generation_with_telemetry
-
-async def generate_stream_flow(data, request) -> StreamingResponse:
-    prep = await prepare_generation_with_telemetry(data)
-    eff = SETTINGS.effective(session_id=prep.session_id)
-    stop_ev = cancel_event(prep.session_id)
-    stop_ev.clear()
-
-    async def streamer() -> AsyncGenerator[bytes, None]:
-        q_start = time.perf_counter()
-        async with GEN_SEMAPHORE:
-            try:
-                q_wait = time.perf_counter() - q_start
-                if isinstance(prep.budget_view, dict):
-                    prep.budget_view["queueWaitSec"] = round(q_wait, 3)
-            except Exception:
-                pass
-
-            mark_active(prep.session_id, +1)
-            out_buf = bytearray()
-
-            def _accum_visible(chunk_bytes: bytes):
-                if not chunk_bytes:
-                    return
-                s = chunk_bytes.decode("utf-8", errors="ignore")
-                if RUNJSON_START in s and RUNJSON_END in s:
-                    return
-                if s.strip() == eff["stopped_line_marker"]:
-                    return
-                out_buf.extend(chunk_bytes)
-
-            try:
-                async for chunk in run_stream(
-                    llm=prep.llm,
-                    messages=prep.packed,
-                    out_budget=prep.out_budget,
-                    stop_ev=stop_ev,
-                    request=request,
-                    temperature=prep.temperature,
-                    top_p=prep.top_p,
-                    input_tokens_est=prep.input_tokens_est,
-                    t0_request=prep.t_request_start,
-                    budget_view=prep.budget_view,
-                ):
-                    if isinstance(chunk, (bytes, bytearray)):
-                        _accum_visible(chunk)
-                    else:
-                        _accum_visible(chunk.encode("utf-8"))
-                    yield chunk
-            finally:
-                try:
-                    full_text = out_buf.decode("utf-8", errors="ignore").strip()
-                    start = full_text.find(RUNJSON_START)
-                    if start != -1:
-                        end = full_text.find(RUNJSON_END, start)
-                        if end != -1:
-                            full_text = (full_text[:start] + full_text[end + len(RUNJSON_END):]).strip()
-                    if full_text:
-                        prep.st["recent"].append({"role": "assistant", "content": full_text})
-                except Exception:
-                    pass
-
-                try:
-                    from ..store import apply_pending_for
-                    apply_pending_for(prep.session_id)
-                except Exception:
-                    pass
-
-                try:
-                    from ..store import list_messages as store_list_messages
-                    from ..workers.retitle_worker import enqueue as enqueue_retitle
-                    msgs = store_list_messages(prep.session_id)
-                    last_seq = max((int(m.id) for m in msgs), default=0)
-                    enqueue_retitle(prep.session_id, [asdict(m) for m in msgs], job_seq=last_seq)
-                except Exception:
-                    pass
-
-                mark_active(prep.session_id, -1)
-
-    return StreamingResponse(
-        streamer(),
-        media_type="text/plain",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
-
-async def cancel_session(session_id: str) -> Dict[str, bool]:
-    from .cancel import cancel_event
-    cancel_event(session_id).set()
-    return {"ok": True}
-
-async def cancel_session_alias(session_id: str) -> Dict[str, bool]:
-    return await cancel_session(session_id)
-
-# ===== aimodel/file_read/services/generate_pipeline.py =====
-
-# aimodel/file_read/services/generate_pipeline.py
-from __future__ import annotations
-import time
-from typing import Any, Dict, List, Optional
-from ..core.settings import SETTINGS
-from ..runtime.model_runtime import ensure_ready, get_llm
-from ..core.schemas import ChatBody
-from .session_io import handle_incoming
-from .packing import build_system_text, pack_with_rollup
-from .prompt_utils import chars_len
-from .router_text import compose_router_text
-from .attachments import att_get
-from ..web.router_ai import decide_web_and_fetch
-from ..rag.retrieve_pipeline import build_rag_block_session_only_with_telemetry
-from .generate_pipeline_support import (
-    Prep,
-    _bool,
-    _approx_block_tokens,
-)
-from ..core.packing_memory_core import PACK_TELEMETRY
-from .generate_pipeline_part2 import _finish_prepare_generation_with_telemetry
-
-async def prepare_generation_with_telemetry(data: ChatBody) -> Prep:
-    ensure_ready()
-    llm = get_llm()
-    t_request_start = time.perf_counter()
-    eff0 = SETTINGS.effective()
-    session_id = data.sessionId or eff0["default_session_id"]
-    eff = SETTINGS.effective(session_id=session_id)
-
-    rag_global_enabled = bool(eff.get("rag_global_enabled", True))
-    rag_session_enabled = bool(eff.get("rag_session_enabled", True))
-    force_session_only = bool(eff.get("rag_force_session_only")) or (not rag_global_enabled)
-
-    temperature = float(eff["default_temperature"] if getattr(data, "temperature") is None else data.temperature)
-    top_p = float(eff["default_top_p"] if getattr(data, "top_p") is None else data.top_p)
-    out_budget_req = int(eff["default_max_tokens"] if getattr(data, "max_tokens") is None else data.max_tokens)
-    auto_web = _bool(eff["default_auto_web"])
-    if getattr(data, "autoWeb") is not None:
-        auto_web = _bool(data.autoWeb)
-    web_k = int(eff["default_web_k"] if getattr(data, "webK") is None else data.webK)
-    web_k = max(int(eff["web_k_min"]), min(web_k, int(eff["web_k_max"])))
-    auto_rag = _bool(eff["default_auto_rag"])
-    if getattr(data, "autoRag") is not None:
-        auto_rag = _bool(data.autoRag)
-    model_ctx = int(eff["model_ctx"])
-
-    incoming = [
-        {
-            "role": m.role,
-            "content": m.content,
-            "attachments": getattr(m, "attachments", None),
-        }
-        for m in (data.messages or [])
-    ]
-    print(f"[PIPE] incoming_msgs={len(incoming)}")
-    latest_user = next((m for m in reversed(incoming) if m["role"] == "user"), {})
-    latest_user_text = (latest_user.get("content") or "").strip()
-    atts = (latest_user.get("attachments") or [])
-    has_atts = bool(atts)
-    print(f"[PIPE] latest_user_text_len={len(latest_user_text)} has_atts={has_atts} att_count={len(atts)}")
-
-    if not latest_user_text and has_atts:
-        names = [att_get(a, "name") for a in atts]
-        names = [n for n in names if n]
-        latest_user_text = "User uploaded: " + (", ".join(names) if names else "files")
-
-    st = handle_incoming(session_id, incoming)
-
-    base_user_text = next((m["content"] for m in reversed(incoming) if m["role"] == "user"), "")
-    router_text = compose_router_text(
-        st.get("recent", []),
-        str(base_user_text or ""),
-        st.get("summary", "") or "",
-        tail_turns=int(eff["router_tail_turns"]),
-        summary_chars=int(eff["router_summary_chars"]),
-        max_chars=int(eff["router_max_chars"]),
-    )
-
-    telemetry: Dict[str, Any] = {"web": {}, "rag": {}, "pack": {}, "prepSec": round(time.perf_counter() - t_request_start, 6)}
-    ephemeral_once: List[Dict[str, str]] = []
-    telemetry["web"]["injectElapsedSec"] = 0.0
-    telemetry["web"]["ephemeralBlocks"] = 0
-
-    try:
-        web_block: Optional[str] = None
-        web_tel: Dict[str, Any] = {}
-        if auto_web and not (has_atts and bool(eff.get("disable_global_rag_on_attachments"))):
-            res = await decide_web_and_fetch(llm, router_text, k=web_k)
-            if isinstance(res, tuple):
-                web_block = res[0] if len(res) > 0 else None
-                tel_candidate = res[1] if len(res) > 1 else None
-                if isinstance(tel_candidate, dict):
-                    web_tel = tel_candidate
-            elif isinstance(res, str):
-                web_block = res
-            else:
-                web_block = None
-        telemetry["web"].update(web_tel or {})
-        need_flag = (web_tel or {}).get("needed")
-        injected_candidate = isinstance(web_block, str) and bool(web_block.strip())
-        if (need_flag is True) and (not injected_candidate):
-            try:
-                from ..web.orchestrator import build_web_block
-                fb, fb_tel = await build_web_block(router_text, k=web_k)
-                print(f"[PIPE][WEB] orchestrator block preview: {fb[:200]!r}" if fb else "[PIPE][WEB] orchestrator returned no block")
-                print(f"[PIPE][WEB] orchestrator telemetry: {fb_tel}")
-                if fb and fb.strip():
-                    web_block = fb
-                    injected_candidate = True
-            except Exception as e:
-                print(f"[PIPE][WEB] orchestrator fallback error: {e}")
-        if injected_candidate:
-            t0_inject = time.perf_counter()
-            web_text = str(eff["web_block_preamble"]) + "\n\n" + web_block.strip()
-
-            max_chars = int(eff.get("web_inject_max_chars") or 0)
-            if max_chars > 0 and len(web_text) > max_chars:
-                web_text = web_text[:max_chars]
-
-            telemetry["web"]["blockChars"] = len(web_text)
-            tok = _approx_block_tokens(llm, "assistant", web_text)
-            if tok is not None:
-                telemetry["web"]["blockTokensApprox"] = tok
-            telemetry["web"]["injected"] = True
-
-            ephemeral_only = bool(eff.get("web_ephemeral_only", True))
-            telemetry["web"]["ephemeral"] = ephemeral_only
-            telemetry["web"]["droppedFromSummary"] = ephemeral_only
-
-            PACK_TELEMETRY["ignore_ephemeral_in_summary"] = ephemeral_only
-
-            ephemeral_once.append({
-                "role": "assistant",
-                "content": web_text,
-                "_ephemeral": True if ephemeral_only else False,
-                "_source": "web"
-            })
-
-            telemetry["web"]["injectElapsedSec"] = round(time.perf_counter() - t0_inject, 6)
-        else:
-            telemetry["web"]["injected"] = False
-            telemetry["web"]["injectElapsedSec"] = 0.0
-    except Exception as e:
-        print(f"[PIPE][WEB] error: {e}")
-        telemetry["web"].setdefault("injected", False)
-        telemetry["web"].setdefault("injectElapsedSec", 0.0)
-
-    telemetry["web"]["ephemeralBlocks"] = len(ephemeral_once)
-    print(f"[PIPE] has_atts={has_atts} disable_global_rag_on_attachments={bool(eff.get('disable_global_rag_on_attachments'))}")
-
-    if has_atts and bool(eff.get("disable_global_rag_on_attachments")):
-        att_names = [att_get(a, "name") for a in atts if att_get(a, "name")]
-        query_for_atts = (base_user_text or "").strip() or " ".join(att_names) or "document"
-        print(f"[PIPE] session-only RAG path query_for_atts={query_for_atts!r} att_names={att_names}")
-        t0_att = time.perf_counter()
-        try:
-            att_block, att_tel = build_rag_block_session_only_with_telemetry(query_for_atts, session_id)
-            print(f"[PIPE][RAG] session-only query: {query_for_atts!r}")
-            print(f"[PIPE][RAG] session-only block preview: {att_block[:200]!r}" if att_block else "[PIPE][RAG] no session-only block")
-        except Exception:
-            att_block, att_tel = (None, {})
-        if att_tel:
-            telemetry["rag"].update(att_tel)
-        print(f"[PIPE] session-only RAG built={bool(att_block)} block_chars={len(att_block or '')}")
-        if att_block:
-            rag_text = str(eff["rag_block_preamble"]) + "\n\n" + att_block
-            t
+            log.debug(f

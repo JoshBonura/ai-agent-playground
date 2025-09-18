@@ -9,10 +9,13 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from starlette.staticfiles import StaticFiles
+from starlette.routing import Mount
 
+from .api.system import router as system_router
+from .api.proxy_generate import router as worker_proxy_router
 from .api import admins as admins_api
-# 1) Configure logging first, then get a module logger
 from .core.logging import get_logger, setup_logging
+from .services.system_snapshot import poll_system_snapshot
 
 setup_logging()
 log = get_logger(__name__)
@@ -38,6 +41,9 @@ from .api.licensing_router import router as licensing_router
 from .api.metrics import router as metrics_router
 from .api.models import router as models_router
 from .api.rag import router as rag_router
+from .api.model_workers import router as model_workers_router  # ✅ single import
+from .workers.model_worker import supervisor  # ✅ single supervisor import
+
 from .core import request_ctx
 from .workers.retitle_worker import start_worker
 
@@ -53,7 +59,9 @@ for k in KEYS:
     v = os.getenv(k)
     log.info(f"[env] {k}: set={bool(v)} len={len(v or '')} head={(v or '')[:6]}")
 bootstrap()
+
 app = FastAPI()
+app.state.bg_tasks = []  # keep handles to background tasks so we can cancel/await on shutdown
 
 origins = [
     o.strip() for o in os.getenv("APP_CORS_ORIGIN", "http://localhost:5173").split(",") if o.strip()
@@ -68,6 +76,7 @@ app.add_middleware(
 
 deps = [Depends(require_auth)]
 
+# Core APIs
 app.include_router(models_router)
 app.include_router(chats_router, dependencies=deps)
 app.include_router(generate_router, dependencies=deps)
@@ -79,12 +88,13 @@ app.include_router(licensing_router, dependencies=deps)
 app.include_router(admins_api.router, dependencies=deps)
 app.include_router(auth_router)
 app.include_router(admin_chats_router, dependencies=deps)
-app.include_router(cancel_router, dependencies=deps)  
+app.include_router(cancel_router, dependencies=deps)
+app.include_router(worker_proxy_router, dependencies=deps)
+app.include_router(system_router, dependencies=deps)
+app.include_router(model_workers_router, dependencies=deps)
 
 # --- Route dump (after all includes/mounts) ---
 try:
-    from starlette.routing import Mount
-
     def _dump_routes():
         log.info("==== ROUTES (app) ====")
         for r in app.routes:
@@ -100,13 +110,11 @@ try:
             else:
                 log.info("[APP] %-12s %s type=%s", ",".join(methods), path, typ)
         log.info("==== ROUTES END ====")
-
     _dump_routes()
 except Exception as e:
     log.error("Failed to dump routes: %r", e)
 
 # ---------- Serve built frontend (Vite 'dist') ----------
-# Adjust the path if your dist lives elsewhere.
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 ASSETS_DIR = FRONTEND_DIR / "assets"
 INDEX_FILE = FRONTEND_DIR / "index.html"
@@ -114,13 +122,11 @@ INDEX_FILE = FRONTEND_DIR / "index.html"
 if ASSETS_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR), html=False), name="assets")
 
-
 @app.get("/", response_class=HTMLResponse)
 async def _index():
     if INDEX_FILE.exists():
         return FileResponse(str(INDEX_FILE))
     return HTMLResponse("<h1>Frontend not built</h1>", status_code=500)
-
 
 # SPA catch-all that WON'T swallow /api/* or /assets/*
 @app.get("/{full_path:path}", response_class=HTMLResponse)
@@ -138,8 +144,34 @@ async def _spa(full_path: str):
 async def _startup():
     # Do NOT auto-load a model at startup; load on demand via /api/models/load
     asyncio.create_task(start_worker(), name="retitle_worker")
+
+    # Start non-blocking system poller and keep a handle so we can cancel/await it
+    t = asyncio.create_task(poll_system_snapshot(1.0), name="system_snapshot_poller")
+    app.state.bg_tasks.append(t)
+
     log.info("🟡 Model will be loaded on-demand (via /api/models/load)")
 
+@app.on_event("shutdown")
+async def _shutdown():
+    # 1) Cancel and await background tasks so they don't touch a torn-down executor
+    tasks = getattr(app.state, "bg_tasks", [])
+    for t in tasks:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    if tasks:
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            pass
+
+    # 2) Ensure any spawned model workers are terminated to free VRAM/ports
+    try:
+        n = await supervisor.stop_all()
+        log.info("[workers] shutdown: stopped %s worker(s)", n)
+    except Exception as e:
+        log.warning("[workers] shutdown stop_all error: %r", e)
 
 @app.middleware("http")
 async def _capture_auth_headers(request: Request, call_next):

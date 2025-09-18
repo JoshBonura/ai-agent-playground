@@ -34,7 +34,7 @@ if os.name == "nt":
 # Folders (relative to this script's directory) to search completely.
 # Add/remove as you like.
 # ──────────────────────────────────────────────────────────────────────────────
-SEARCH_FOLDERS = ["aimodel/file_read", "cloudflare"]
+SEARCH_FOLDERS = ["aimodel/file_read", "frontend/src"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional: filename/path substring matches (case-insensitive).

@@ -8,7 +8,7 @@ from typing import Any
 
 from ..core.logging import get_logger
 from ..core.settings import SETTINGS
-from ..runtime.model_runtime import get_llm
+from ..runtime import model_runtime as MR
 from ..services.cancel import GEN_SEMAPHORE, is_active
 from ..store.base import now_iso
 from ..store.chats import _load_chat
@@ -177,7 +177,7 @@ async def _process_session(key: str):
         return
 
     async with GEN_SEMAPHORE:
-        llm = get_llm()
+        llm = MR.get_llm()
         try:
             title_raw = await asyncio.to_thread(_make_title, llm, src)
         except Exception as e:

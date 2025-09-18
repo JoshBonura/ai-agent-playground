@@ -46,3 +46,6 @@ PyJWT>=2.8.0
 cryptography>=41.0.0
 python-jose[cryptography]
 keyring
+
+psutil
+nvidia-ml-py3
