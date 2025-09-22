@@ -124,8 +124,7 @@ async def models_health():
     }
 
 @router.post("/models/load")
-async def api_load_model(req: LoadReq, request: Request):
-    tid = request.headers.get("X-Trace-Id") or "no-trace"
+async def api_load_model(req: LoadReq):
     try:
         flat_fields = {
             k: getattr(req, k)
@@ -147,28 +146,16 @@ async def api_load_model(req: LoadReq, request: Request):
         }
         nested = req.llama.model_dump(exclude_none=True) if req.llama else {}
         log.info(
-            "[models.load] trace=%s incoming req: model=%r flat=%s nested=%s",
-            tid,
+            "[models.load] incoming req: model=%r flat=%s nested=%s",
             req.modelPath,
             flat_fields,
             {k: v for k, v in nested.items() if k != "extra"},
         )
     except Exception as e:
-        log.warning("[models.load] trace=%s provenance log failed: %r", tid, e)
-
+        log.warning("[models.load] provenance log failed: %r", e)
     llama_kwargs = _fold_llama_kwargs(req)
-    log.info("[models.load] trace=%s folded llama kwargs: %s", tid, llama_kwargs)
-
+    log.info("[models.load] folded llama kwargs: %s", llama_kwargs)
     info = await supervisor.spawn_worker(req.modelPath, llama_kwargs=llama_kwargs)
-    log.info(
-        "[models.load] trace=%s spawned id=%s path=%s status=%s kwargs=%s",
-        tid,
-        info.id,
-        info.model_path,
-        info.status,
-        (info.kwargs or {}),
-    )
-
     return {
         "ok": True,
         "worker": {
@@ -179,7 +166,6 @@ async def api_load_model(req: LoadReq, request: Request):
             "kwargs": info.kwargs or {},
         },
     }
-
 
 @router.post("/models/unload")
 async def api_unload_model():

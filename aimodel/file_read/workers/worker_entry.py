@@ -20,6 +20,12 @@ from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import StreamingResponse
 
 try:
+    # gives you GGML_TYPE_* integer constants
+    from llama_cpp import llama_cpp as C  # type: ignore
+except Exception:
+    C = None
+
+try:
     from llama_cpp import Llama  # type: ignore
 except Exception as e:
     raise RuntimeError("llama-cpp-python not installed in worker") from e
@@ -242,22 +248,51 @@ def _filter_llama_kwargs(extra: Dict[str, Any]) -> Dict[str, Any]:
             "flash_attn",
             "type_k","type_v",
             "main_gpu","device",
-            "kv_offload",
-            "offload_kqv",
+            "kv_offload","offload_kqv",
         }
         wlog.info("[worker.filter] using fallback allowed set")
 
     out, dropped = {}, {}
     for k, v in (extra or {}).items():
-        if k in allowed:
-            out[k] = v
-        else:
-            dropped[k] = v
+        (out if k in allowed else dropped)[k] = v
 
     if dropped:
         wlog.info("[worker.filter] dropped_keys=%s", sorted(list(dropped.keys())))
-    return out
+    return out   # <-- return the filtered dict
 
+
+# add these helpers somewhere above _startup()
+_STR_TO_GGML = {
+    "f16":  "GGML_TYPE_F16",
+    "q8_0": "GGML_TYPE_Q8_0",
+    "q6_K": "GGML_TYPE_Q6_K",
+    "q5_K": "GGML_TYPE_Q5_K",
+    "q4_K": "GGML_TYPE_Q4_K",
+    "q4_0": "GGML_TYPE_Q4_0",
+    "q3_K": "GGML_TYPE_Q3_K",
+}
+
+def _coerce_cache_type(x):
+    """Map UI string like 'q4_K' to ggml enum int; return None for 'auto'/unknown."""
+    if x is None:
+        return None
+    if isinstance(x, int):
+        return x
+    s = str(x).strip()
+    if not s or s.lower() == "auto":
+        return None
+    if C is None:
+        wlog.warning("[worker.start] llama_cpp constants unavailable; ignoring type_k/type_v")
+        return None
+    cname = _STR_TO_GGML.get(s)
+    if not cname:
+        wlog.warning("[worker.start] unknown cache type %r (type_k/type_v); ignoring", s)
+        return None
+    val = getattr(C, cname, None)
+    if not isinstance(val, int):
+        wlog.warning("[worker.start] constant %s missing; ignoring", cname)
+        return None
+    return val
 
 def _normalize_kv_offload(extra: Dict[str, Any]) -> Dict[str, Any]:
     # If supervisor sent kv_offload, but this wheel wants offload_kqv, translate it.
@@ -332,6 +367,19 @@ def _startup():
 
     # translate accel -> llama kwargs
     _ACCEL, base_kw = _apply_accel_translation(_ACCEL, base_kw)
+
+    tk = base_kw.get("type_k", None)
+    tv = base_kw.get("type_v", None)
+    c_tk = _coerce_cache_type(tk)
+    c_tv = _coerce_cache_type(tv)
+    if c_tk is not None:
+        base_kw["type_k"] = c_tk
+    else:
+        base_kw.pop("type_k", None)
+    if c_tv is not None:
+        base_kw["type_v"] = c_tv
+    else:
+        base_kw.pop("type_v", None)
 
     # Show the translation result + env that might affect it
     wlog.info("[worker.start] kv_offload=%r (post-translate)", base_kw.get("kv_offload"))
