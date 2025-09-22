@@ -7,7 +7,5 @@
   "hw_guardrails_autofit": true,
   "hw_guardrails_custom_gb": 2,
   "ui_locale": "auto",
-  "hw_backend": "auto",
-  "gpu_offload_kv": false,
-  "gpu_limit_offload_dedicated": true
+  "hw_backend": "auto"
 }

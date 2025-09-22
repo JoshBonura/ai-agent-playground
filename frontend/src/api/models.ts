@@ -34,6 +34,11 @@ type CacheShape = {
 const CACHE_KEY = "lm/models-cache-v1";
 let _mem: CacheShape = { etag: null, data: null, ts: 0 };
 
+function traceId() {
+  return `trc_${Math.random().toString(36).slice(2)}_${Date.now()}`;
+}
+
+
 function readStore(): CacheShape {
   try {
     const raw = sessionStorage.getItem(CACHE_KEY);
@@ -145,10 +150,12 @@ function sanitizeLoadBody(body: LoadBody): LoadBody {
 
 export async function loadModel(body: LoadBody) {
   const clean = sanitizeLoadBody(body);
+  const tid = traceId();
+  console.debug("[loadModel] X-Trace-Id=%s payload=", tid, clean);
   const res = await fetch(`${BASE}/load`, {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Trace-Id": tid },
     body: JSON.stringify(clean),
   });
   if (!res.ok) {
@@ -158,6 +165,7 @@ export async function loadModel(body: LoadBody) {
   }
   return res.json();
 }
+
 
 
 export async function unloadModel() {

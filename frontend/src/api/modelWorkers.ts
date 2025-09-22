@@ -46,8 +46,14 @@ export async function listWorkers(): Promise<InspectResp> {
 }
 
 export async function spawnWorker(modelPath: string, llamaKwargs?: LlamaKwargs) {
-  return postJSON("/api/model-workers/spawn", { modelPath, llamaKwargs });
+  const tid = `trc_${Math.random().toString(36).slice(2)}_${Date.now()}`;
+  const body = { modelPath, llamaKwargs: llamaKwargs || {} };
+  console.debug("[spawnWorker] X-Trace-Id=%s payload=", tid, body);
+  return postJSON("/api/model-workers/spawn", body, {
+    headers: { "X-Trace-Id": tid },
+  });
 }
+
 
 export async function activateWorker(id: string) {
   return postJSON(`/api/model-workers/activate/${encodeURIComponent(id)}`, {});

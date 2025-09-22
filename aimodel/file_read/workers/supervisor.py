@@ -49,11 +49,13 @@ class ModelWorkerSupervisor:
         self._kill_on_spawn_paths: set[str] = set()
         # diagnostics (read by API on conflict)
         self._last_guardrail_diag: dict = {}
+        self._pending_vram_gb: Dict[str, float] = {}
+        
 
     # --------------------------
     # Lookup / snapshot helpers
     # --------------------------
-
+    
     def _find_free_port(self, host: str) -> int:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((host, 0))
@@ -115,6 +117,30 @@ class ModelWorkerSupervisor:
     def get_port(self, wid: str) -> Optional[int]:
         info = self._workers.get(wid)
         return info.port if info else None
+    
+    def _pending_sum_excluding(self, wid: str | None = None) -> float:
+        total = 0.0
+        for k, v in self._pending_vram_gb.items():
+            if wid and k == wid:
+                continue
+            info = self._workers.get(k)
+            if not info:
+                continue
+            # Count only workers that are still loading and whose process hasn't exited.
+            proc = getattr(info, "process", None)
+            alive = False
+            try:
+                alive = (proc is not None and proc.poll() is None)
+            except Exception:
+                # If proc is not a Popen or poll() fails, be conservative and consider it alive while status==LOADING
+                alive = True
+            if getattr(info, "status", None) == "loading" and alive:
+                try:
+                    total += float(v or 0.0)
+                except Exception:
+                    pass
+        return total
+
 
     # --------------------------
     # Kill APIs
@@ -215,6 +241,11 @@ class ModelWorkerSupervisor:
 
 
     async def spawn_worker(self, model_path: str, llama_kwargs: dict | None = None) -> WorkerInfo:
+
+        existing_loading = [w for w in self._find_workers_by_path(model_path) if getattr(w, "status", None) == "loading"]
+        if existing_loading:
+            log.info("[workers.spawn] dedupe: model already loading wid=%s", existing_loading[0].id)
+            return existing_loading[0]
         host_bind = os.getenv("LM_WORKER_BIND_HOST", DEFAULT_BIND_HOST)
         host_client = os.getenv("LM_WORKER_CLIENT_HOST", DEFAULT_CLIENT_HOST)
         pref = read_pref()
@@ -238,10 +269,68 @@ class ModelWorkerSupervisor:
         env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
 
         # Compute final llama settings (kwargs + env) with guardrails
-        cleaned, env_patch, diag = await compute_llama_settings(model_path, llama_kwargs or {})
-        self._last_guardrail_diag = (diag or {})
+        user_kwargs = dict(llama_kwargs or {})
+        user_kwargs["_pending_gb"] = self._pending_sum_excluding(None)
 
+        cleaned, env_patch, diag = await compute_llama_settings(model_path, user_kwargs)
+
+        # <-- record diagnostics right away (so the API can log the current attempt)
+        try:
+            self._last_guardrail_diag = {
+                "incoming": dict(user_kwargs or {}),
+                "resolved": dict(cleaned or {}),
+                "env": dict(env_patch or {}),
+                "vram_proj": {
+                    "per_layer_gb": (diag or {}).get("perLayerGB"),
+                    "overhead_gb": (diag or {}).get("overheadGB"),
+                    "budget_gb": (diag or {}).get("budgetGB"),
+                    "proj_gb": (diag or {}).get("projGB"),
+                    "decision": (diag or {}).get("decision", "unknown"),
+                },
+                "raw": diag or {},  # optional: helpful when debugging
+            }
+        except Exception:
+            self._last_guardrail_diag = {
+                "incoming": dict(user_kwargs or {}),
+                "resolved": dict(cleaned or {}),
+                "env": dict(env_patch or {}),
+                "raw": diag or {},
+            }
+
+        # Abort early if guardrail says we’re over budget with hard pins
+        if isinstance(diag, dict) and str(diag.get("decision", "")).startswith("abort_over_budget"):
+            raise RuntimeError(
+                f"VRAM_BUDGET_EXCEEDED: requested_layers={user_kwargs.get('n_gpu_layers')} "
+                f"projGB={diag.get('projGB')} budgetGB={diag.get('budgetGB')}"
+            )
+
+        # ---------- record guardrail decisions + final resolved kwargs ----------
+        try:
+            self._last_guardrail_diag = {
+                "incoming": dict(user_kwargs or {}),
+                "resolved": dict(cleaned or {}),
+                "env": dict(env_patch or {}),
+                "vram_proj": {
+                    "per_layer_gb": (diag or {}).get("perLayerGB"),
+                    "overhead_gb": (diag or {}).get("overheadGB"),
+                    "budget_gb": (diag or {}).get("budgetGB"),
+                    "proj_gb": (diag or {}).get("projGB"),
+                    "decision": (diag or {}).get("decision", "unknown"),
+                },
+            }
+        except Exception:
+            # never let diagnostics break spawn; fall back to minimal info
+            self._last_guardrail_diag = {
+                "incoming": dict(user_kwargs or {}),
+                "resolved": dict(cleaned or {}),
+                "env": dict(env_patch or {}),
+            }
+
+        log.info("[supervisor.spawn] guardrail diag=%s", self._last_guardrail_diag)
+
+        # Apply env patch from guardrail
         env.update(env_patch)
+
         if isinstance(cleaned.get("main_gpu"), int) and (env.get("LLAMA_ACCEL") in {"cuda", "hip"}):
             env["LLAMA_DEVICE"] = str(int(cleaned["main_gpu"]))
 
@@ -279,6 +368,14 @@ class ModelWorkerSupervisor:
             kwargs=cleaned or {},
         )
         self._workers[wid] = info
+        # Record the projected GPU use while the worker is still loading
+        try:
+            proj = float((diag or {}).get("projGB") or 0.0)
+            kv_on = bool((diag or {}).get("kvOn", False))
+            kv_gb = float((diag or {}).get("kvGB") or 0.0) if kv_on else 0.0
+            self._pending_vram_gb[wid] = max(proj - kv_gb, 0.0)
+        except Exception:
+            self._pending_vram_gb[wid] = float((diag or {}).get("projGB") or 0.0) if diag else 0.0
 
         # Kill-on-spawn handling
         if model_path in self._kill_on_spawn_paths:
@@ -289,11 +386,15 @@ class ModelWorkerSupervisor:
             )
             await self._kill_worker_info(info)
             self._kill_on_spawn_paths.discard(model_path)
+            self._pending_vram_gb.pop(wid, None)
             return info  # stopped info
 
         ready = await self._wait_ready(wid, host_client, port)
         info.status = STATUS_READY if ready else STATUS_LOADING
+        # no longer pending (either became ready or failed)
+        self._pending_vram_gb.pop(wid, None)
         return info
+
 
 
 # Singleton

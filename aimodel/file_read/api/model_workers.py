@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 import httpx
 import asyncio
@@ -149,17 +149,17 @@ async def inspect_workers():
 
 
 @router.post("/spawn")
-async def spawn_worker(req: SpawnReq):
+async def spawn_worker(req: SpawnReq, request: Request):
     global _ACTIVE_WORKER_ID
     t0 = time.perf_counter()
+    tid = request.headers.get("X-Trace-Id") or "no-trace"
     try:
-        log.info("[api.spawn] req.modelPath=%s", req.modelPath)
+        log.info("[api.spawn] trace=%s req.modelPath=%s llamaKwargs=%s", tid, req.modelPath, (req.llamaKwargs or {}))
         info = await supervisor.spawn_worker(req.modelPath, llama_kwargs=req.llamaKwargs or {})
-        # Re-read the info from supervisor to catch race flips (e.g., kill happened)
         cur = supervisor.get_worker(info.id) or info
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        log.info("[api.spawn] created id=%s path=%s status=%s dt=%.1fms",
-                 cur.id, cur.model_path, cur.status, dt_ms)
+        log.info("[api.spawn] trace=%s created id=%s path=%s status=%s dt=%.1fms kwargs=%s",
+                 tid, cur.id, cur.model_path, cur.status, dt_ms, (cur.kwargs or {}))
 
         if _ACTIVE_WORKER_ID is None:
             _ACTIVE_WORKER_ID = cur.id
@@ -170,17 +170,19 @@ async def spawn_worker(req: SpawnReq):
                 "id": cur.id,
                 "port": cur.port,
                 "modelPath": cur.model_path,
-                "status": cur.status,  # <- refreshed
+                "status": cur.status,
                 "kwargs": cur.kwargs or {},
             },
             "active": _ACTIVE_WORKER_ID,
         }
     except RuntimeError as e:
         diag = getattr(supervisor, "_last_guardrail_diag", {}) or {}
+        log.warning("[api.spawn] trace=%s guardrail_abort diag=%s", tid, diag)
         raise HTTPException(
             status_code=409,
             detail={"error": "guardrail_abort", "message": str(e), **diag}
         )
+
 
 
 
