@@ -50,3 +50,22 @@ async def get_system_snapshot() -> Dict[str, Any]:
         return dict(_SNAPSHOT or {
             "cpu": {}, "ram": {}, "gpus": [], "gpuSource": "none", "platform": "", "ts": 0.0
         })
+
+
+# --- helper: VRAM projection for guardrails ---
+async def get_vram_projection(model_gb: float, kv_gb: float, overhead_gb: float = 0.2):
+    """
+    Returns a tuple (proj_gb, free_gb, total_gb).
+    proj_gb = model + kv + overhead.
+    Reads GPU0 stats from the latest system snapshot.
+    """
+    snap = await get_system_snapshot()
+    gpus = snap.get("gpus") or []
+    if not gpus:
+        return (model_gb + kv_gb + overhead_gb, 0.0, 0.0)
+
+    gpu0 = gpus[0]
+    total = float(gpu0.get("total") or 0) / (1024**3)  # bytes→GiB
+    free  = float(gpu0.get("free") or 0) / (1024**3)
+    proj  = model_gb + kv_gb + overhead_gb
+    return (proj, free, total)

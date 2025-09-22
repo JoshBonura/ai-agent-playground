@@ -1,0 +1,61 @@
+{
+  "workerAdvanced": {
+    "n_ctx": {
+      "label": "Longitud de contexto (n_ctx)",
+      "tip": "Máximo de tokens totales (prompt + salida) que el modelo puede atender. Valores altos usan más RAM/VRAM."
+    },
+    "n_gpu_layers": {
+      "label": "Capas en GPU (n_gpu_layers)",
+      "tip": "Número de capas del transformador que se cargan en la GPU. 0 = solo CPU. Más capas consumen más VRAM pero pueden ser más rápidas."
+    },
+    "n_threads": {
+      "label": "Hilos de CPU (n_threads)",
+      "tip": "Tamaño del pool de hilos en CPU. Normalmente igual al número de núcleos de alto rendimiento."
+    },
+    "n_batch": {
+      "label": "Tamaño de lote (n_batch)",
+      "tip": "Tokens procesados por paso. Un valor mayor aumenta el rendimiento pero requiere más RAM/VRAM."
+    },
+    "rope_freq_base": {
+      "label": "Frecuencia base RoPE",
+      "tip": "Frecuencia base de las Rotary Positional Embeddings. Cambiar solo para ajustes experimentales de contexto largo."
+    },
+    "rope_freq_scale": {
+      "label": "Escala de frecuencia RoPE",
+      "tip": "Factor de escala para RoPE. Ajustarlo cambia el equilibrio entre calidad y longitud de contexto efectiva (avanzado)."
+    },
+    "flash_attn": {
+      "label": "Flash attention",
+      "tip": "Usa kernels de atención optimizados para GPU cuando estén disponibles para mayor velocidad."
+    },
+    "use_mmap": {
+      "label": "Usar mmap()",
+      "tip": "Mapea el archivo del modelo en memoria para reducir copias en RAM y acelerar el arranque en algunos sistemas."
+    },
+    "use_mlock": {
+      "label": "Usar mlock()",
+      "tip": "Bloquea páginas del modelo en RAM para evitar swapping. Puede requerir privilegios y fallar en silencio."
+    },
+    "kv_offload": {
+      "label": "Descargar caché KV a GPU",
+      "tip": "Guarda la caché de claves/valores de la atención en la GPU para más velocidad; aumenta el uso de VRAM."
+    },
+    "seed": {
+      "label": "Semilla",
+      "tip": "Semilla fija del generador aleatorio para reproducibilidad. Déjalo vacío para aleatoria."
+    },
+    "type_k": {
+      "label": "Cuantización de caché K",
+      "tip": "Formato de cuantización para la caché de claves. 'auto' deja que el runtime elija."
+    },
+    "type_v": {
+      "label": "Cuantización de caché V",
+      "tip": "Formato de cuantización para la caché de valores. 'auto' deja que el runtime elija."
+    },
+    "remember": "Recordar ajustes para este modelo",
+    "reset": {
+      "label": "Restablecer",
+      "tip": "Borrar todos los overrides avanzados de este modelo."
+    }
+  }
+}

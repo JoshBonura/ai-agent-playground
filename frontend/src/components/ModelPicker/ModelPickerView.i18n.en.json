@@ -1,0 +1,22 @@
+{
+  "modelPicker": {
+    "header": "Select a model to load",
+    "active_ready": "Active worker ready",
+    "ready_name_sep": ": ",
+    "use_active": "Use active worker",
+    "workers_title": "Workers",
+    "worker_active": "active",
+    "worker_activate": "Activate",
+    "worker_eject": "Eject",
+    "worker_eject_title": "Stop worker (frees VRAM)",
+    "nothing_loaded": "Nothing loaded.",
+    "footer_hint": "Press Esc to close · Enter loads the first filtered"
+  },
+  "common": {
+    "close": "Close",
+    "cpu": "CPU",
+    "ram": "RAM",
+    "vram": "VRAM",
+    "none": "—"
+  }
+}

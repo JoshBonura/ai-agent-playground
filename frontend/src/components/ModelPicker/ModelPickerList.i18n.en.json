@@ -1,0 +1,23 @@
+{
+  "common": {
+    "loading": "Loading…",
+    "advanced_show": "Advanced…",
+    "advanced_hide": "Hide advanced",
+    "cancel": "Cancel"
+  },
+  "modelPicker": {
+    "search_placeholder": "Type to filter models…",
+    "sort_title": "Toggle sort key (Recency → Size → Name)",
+    "sort_recency": "Recency",
+    "sort_size": "Size",
+    "sort_name": "Name",
+    "sort_dir_asc": "ascending",
+    "sort_dir_desc": "descending",
+    "list_none": "No models match your filter.",
+    "list_size": "{{size}} GB",
+    "load": "Load",
+    "loading": "Loading…",
+    "quick_load_title": "Quick load with defaults (spawns worker)",
+    "load_with_settings": "Load with advanced settings"
+  }
+}

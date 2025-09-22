@@ -12,7 +12,7 @@ from ..deps.license_deps import is_request_pro_activated
 from ..core.settings import SETTINGS
 from ..utils.streaming import RUNJSON_END, RUNJSON_START
 from ..core.logging import get_logger
-
+from ..runtime import model_runtime as MR
 from .cancel import GEN_SEMAPHORE, cancel_event, mark_active
 from .streaming_worker import run_stream as _run_stream
 from .generate_pipeline import prepare_generation_with_telemetry
@@ -198,6 +198,14 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
             except Exception:
                 emit_stats_flag = bool(SETTINGS.runjson_emit)
 
+            # INSERT THIS BLOCK ↓↓↓
+            from ..runtime import model_runtime as MR
+            try:
+                _mi = MR.current_model_info() or {}
+                _worker_meta = _mi.get("worker") or None
+            except Exception:
+                _worker_meta = None
+
             try:
                 async for chunk in run_stream(
                     llm=prep.llm,                       # type: ignore[attr-defined]
@@ -210,7 +218,8 @@ async def generate_stream_flow(data, request) -> StreamingResponse:
                     input_tokens_est=prep.input_tokens_est,   # type: ignore[attr-defined]
                     t0_request=prep.t_request_start,    # type: ignore[attr-defined]
                     budget_view=prep.budget_view,       # type: ignore[attr-defined]
-                    emit_stats=emit_stats_flag,         # <- what ultimately governs RUNJSON emission
+                    emit_stats=emit_stats_flag,
+                    worker_meta=_worker_meta,           # <- what ultimately governs RUNJSON emission
                 ):
                     # Optional: very lightweight peek for markers (helps prove whether upstream appended)
                     if isinstance(chunk, (bytes, bytearray)):

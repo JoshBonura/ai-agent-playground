@@ -1,9 +1,10 @@
-// frontend/src/file_read/hooks/useRetitle.ts
 import { API_BASE } from "../services/http";
 import { listMessages, updateChatLast } from "../data/chatApi";
 import { stripRunJson } from "../shared/lib/runjson";
 
 const TITLE_MAX_WORDS = 6;
+// ⏹ stopped (server emits as a final line sometimes)
+const STOP_SENTINEL_RE = /(?:\r?\n)?(?:\u23F9|\\u23F9)\s+stopped(?:\r?\n)?$/u;
 
 function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
   let t = raw.split(/\r?\n/)[0] ?? "";
@@ -15,7 +16,6 @@ function sanitizeTitle(raw: string, maxWords = TITLE_MAX_WORDS) {
 
 export function useRetitle(enabled = true) {
   async function retitleNow(sessionId: string, latestAssistant: string) {
-    console.log("1");
     if (!enabled) return;
 
     try {
@@ -25,18 +25,13 @@ export function useRetitle(enabled = true) {
         .map((r) => `${r.role === "user" ? "User" : "Assistant"}: ${r.content}`)
         .join("\n");
 
-      // Ask the local model for a very short title
       const res = await fetch(`${API_BASE}/api/ai/generate/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sessionId: `${sessionId}::titlebot`,
           messages: [
-            {
-              role: "system",
-              content:
-                "You output ultra-concise, neutral chat titles and nothing else.",
-            },
+            { role: "system", content: "You output ultra-concise, neutral chat titles and nothing else." },
             {
               role: "user",
               content:
@@ -54,23 +49,50 @@ export function useRetitle(enabled = true) {
 
       if (!res.ok || !res.body) return;
 
-      // Gather the streamed text + strip runjson
+      // ✅ Parse SSE properly: ignore 'event: ...' and keep only 'data:' payloads
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let raw = "";
+      let buf = "";
+      const lines: string[] = [];
+
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        if (value) raw += decoder.decode(value, { stream: true });
+        if (value) {
+          buf += decoder.decode(value, { stream: true });
+
+          // Process complete lines
+          let idx: number;
+          while ((idx = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, idx).replace(/\r$/, "");
+            buf = buf.slice(idx + 1);
+
+            if (!line) continue;
+            if (line.startsWith("event:")) {
+              // ignore 'event: open' / 'event: hb' etc.
+              continue;
+            }
+            if (line.startsWith("data:")) {
+              const payload = line.slice(5).trimStart();
+              if (payload.includes("⏹ stopped")) {
+                // stop immediately on sentinel
+                buf = "";
+                break;
+              }
+              lines.push(payload);
+            }
+          }
+        }
       }
 
+      // Combine, strip runjson blocks & final sentinel
+      const raw = lines.join("\n");
       const { text } = stripRunJson(raw);
-      const title = sanitizeTitle(text);
+      const cleaned = text.replace(STOP_SENTINEL_RE, "").trim();
+      const title = sanitizeTitle(cleaned);
       if (!title) return;
 
-      // Save title + lastMessage (lastMessage stays the full assistant text)
       await updateChatLast(sessionId, latestAssistant, title).catch(() => {});
-      // Nudge sidebar so it shows new title immediately
       try {
         window.dispatchEvent(new CustomEvent("chats:refresh"));
       } catch {}

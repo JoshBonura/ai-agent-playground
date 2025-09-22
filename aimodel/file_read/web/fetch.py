@@ -51,8 +51,7 @@ def _max_parallel() -> int:
     return max(1, int(_req("web_fetch_max_parallel")))
 
 
-# -------------------- Adaptive cooldown (generic, no host hardcoding) --------------------
-# host -> (fail_count, cooldown_until_ts)
+
 _BAD_HOSTS: dict[str, tuple[int, float]] = {}
 
 

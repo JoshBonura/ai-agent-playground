@@ -41,6 +41,7 @@ async def run_stream(
     t0_request: float | None = None,
     budget_view: dict | None = None,
     emit_stats: bool = True,
+    worker_meta: dict | None = None, 
 ) -> AsyncGenerator[bytes, None]:
     """
     Thread-safe async streamer:
@@ -218,6 +219,7 @@ async def run_stream(
                     budget_view=budget_view,
                     extra_timings=stage,
                     error_text=err_text,
+                    worker_meta=worker_meta,
                 )
 
                 # gate + append diagnostics

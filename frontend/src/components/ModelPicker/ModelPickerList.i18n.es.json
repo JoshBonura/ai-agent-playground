@@ -1,0 +1,23 @@
+{
+  "common": {
+    "loading": "Cargando…",
+    "advanced_show": "Avanzado…",
+    "advanced_hide": "Ocultar avanzado",
+    "cancel": "Cancelar"
+  },
+  "modelPicker": {
+    "search_placeholder": "Escribe para filtrar modelos…",
+    "sort_title": "Cambiar orden (Reciente → Tamaño → Nombre)",
+    "sort_recency": "Reciente",
+    "sort_size": "Tamaño",
+    "sort_name": "Nombre",
+    "sort_dir_asc": "ascendente",
+    "sort_dir_desc": "descendente",
+    "list_none": "Ningún modelo coincide con tu filtro.",
+    "list_size": "{{size}} GB",
+    "load": "Cargar",
+    "loading": "Cargando…",
+    "quick_load_title": "Carga rápida con valores por defecto (inicia proceso)",
+    "load_with_settings": "Cargar con ajustes avanzados"
+  }
+}

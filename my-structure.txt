@@ -2,16 +2,7 @@ ai-agent-playground/
   .gitattributes
   .gitignore
   body.json
-  clean-structure-1.txt
-  clean-structure-2.txt
-  clean-structure-3.txt
-  clean-structure-4.txt
-  clean-structure-5.txt
-  clean-structure-6.txt
-  clean-structure-7.txt
-  clean-structure-8.txt
   fs.py
-  llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl
   my-structure.txt
   package-lock.json
   package.json
@@ -54,9 +45,6 @@ ai-agent-playground/
       requirements.txt
       adaptive/
         config/
-          adaptive_config.py
-          paths.py
-          settings.json
       api/
         __init__.py
         admin_chats.py
@@ -73,6 +61,7 @@ ai-agent-playground/
         models.py
         proxy_generate.py
         rag.py
+        runtime_accel.py
         settings.py
         system.py
       backend/
@@ -126,6 +115,7 @@ ai-agent-playground/
         model_runtime.py
       services/
         __init__.py
+        accel_prefs.py
         attachments.py
         auth_service.py
         budget.py
@@ -152,6 +142,7 @@ ai-agent-playground/
         index.py
         migrate.py
         override_settings.json
+        paths.py
         rag/
           by_session/
             19982f0e-9058-4c4e-b2e9-fe6f178fbdd0/
@@ -181,9 +172,11 @@ ai-agent-playground/
         query_summarizer.py
         router_ai.py
       workers/
-        model_worker.py
         retitle_worker.py
+        supervisor.py
         worker_entry.py
+        worker_guardrail.py
+        worker_types.py
   cloudflare/
     .gitignore
     license-do.ts
@@ -252,7 +245,6 @@ ai-agent-playground/
         MetricsHoverCardPanel.tsx
         MobileDrawer.tsx
         SearchTester.tsx
-        SettingsPanel.tsx
         Budget/
           BudgetBar.tsx
           BudgetBarPanelsCore.tsx
@@ -272,9 +264,17 @@ ai-agent-playground/
         Markdown/
           MarkdownMessage.tsx
         ModelPicker/
+          ModelPicker.i18n.en.json
+          ModelPicker.i18n.es.json
           ModelPicker.tsx
+          ModelPickerList.i18n.en.json
+          ModelPickerList.i18n.es.json
           ModelPickerList.tsx
+          ModelPickerView.i18n.en.json
+          ModelPickerView.i18n.es.json
           ModelPickerView.tsx
+          WorkerAdvancedPanel.i18n.en.json
+          WorkerAdvancedPanel.i18n.es.json
           WorkerAdvancedPanel.tsx
           useModelPicker.ts
         Settings/
@@ -282,8 +282,21 @@ ai-agent-playground/
           AdminGuestToggle.tsx
           AdminScopeToggle.tsx
           BraveSearchCard.tsx
+          SettingsContent.AdminDev.tsx
+          SettingsContent.Core.tsx
+          SettingsContent.tsx
+          SettingsPanel.tsx
+          SettingsSidebar.tsx
           UpgradeSection.tsx
           WebSearchSection.tsx
+          tabs.ts
+          hardware/
+            Hardware.i18n.en.json
+            Hardware.i18n.es.json
+            HardwareSection.tsx
+            HardwareSections.tsx
+            HardwareUI.tsx
+            hardwareHooks.ts
       data/
         chatApi.ts
         ragApi.ts
@@ -314,7 +327,6 @@ ai-agent-playground/
             cancel.ts
             constants.ts
             controller.ts
-            debug.ts
             network.ts
             queue.ts
             runner.ts
@@ -323,11 +335,19 @@ ai-agent-playground/
             runner_stream.ts
             types.ts
             updater.ts
+      i18n/
+        i18n.tsx
+        loaders.ts
+        locales/
+          en.json
+          es.json
       pages/
         AgentRunner.tsx
         AgentRunnerView.tsx
       services/
         http.ts
+      settings/
+        ServerSettingsSync.tsx
       shared/
         lib/
           runjson.helpers.ts
@@ -340,3 +360,5 @@ ai-agent-playground/
           TypingIndicator.tsx
       types/
         chat.ts
+  wheels/
+    llama_cpp_python-0.3.4-cp311-cp311-win_amd64.whl

@@ -5,11 +5,6 @@ export function getDefaults() {
   return request<Record<string, any>>("/api/settings/defaults");
 }
 
-export function getAdaptive(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<Record<string, any>>(`/api/settings/adaptive${qs}`);
-}
-
 export function getOverrides() {
   return request<Record<string, any>>("/api/settings/overrides");
 }
@@ -35,10 +30,4 @@ export function patchOverrides(patch: Record<string, any>) {
   });
 }
 
-export function recomputeAdaptive(sessionId?: string) {
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-  return request<{ ok: boolean; adaptive: any }>(
-    `/api/settings/adaptive/recompute${qs}`,
-    { method: "POST" },
-  );
-}
+

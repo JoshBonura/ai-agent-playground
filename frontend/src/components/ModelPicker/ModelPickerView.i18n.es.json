@@ -1,0 +1,22 @@
+{
+  "modelPicker": {
+    "header": "Selecciona un modelo para cargar",
+    "active_ready": "Trabajador activo listo",
+    "ready_name_sep": ": ",
+    "use_active": "Usar trabajador activo",
+    "workers_title": "Trabajadores",
+    "worker_active": "activo",
+    "worker_activate": "Activar",
+    "worker_eject": "Expulsar",
+    "worker_eject_title": "Detener trabajador (libera VRAM)",
+    "nothing_loaded": "Nada cargado.",
+    "footer_hint": "Pulsa Esc para cerrar · Enter carga el primero filtrado"
+  },
+  "common": {
+    "close": "Cerrar",
+    "cpu": "CPU",
+    "ram": "RAM",
+    "vram": "VRAM",
+    "none": "—"
+  }
+}

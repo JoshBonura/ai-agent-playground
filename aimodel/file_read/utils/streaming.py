@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.logging import get_logger
-from ..runtime.model_runtime import current_model_info  # ← keep only this import
+from ..runtime.model_runtime import current_model_info  # keep only this import
 
 log = get_logger(__name__)
 
@@ -48,11 +48,38 @@ def safe_token_count_messages(llm: Any, msgs: list[dict[str, str]]) -> int:
     return sum(safe_token_count_text(llm, (m.get("content") or "")) for m in msgs)
 
 
+# REMOVE the top-level:
+# from ..runtime.model_runtime import current_model_info
+
 def model_ident_and_cfg() -> tuple[str, dict[str, object]]:
-    info = current_model_info() or {}
+    # dynamically import so worker patches are visible here
+    try:
+        from ..runtime import model_runtime as MR
+        info = MR.current_model_info() or {}
+    except Exception:
+        info = {}
+
+    try:
+        log.info(
+            "[streaming.model_info] type=%s keys=%s raw=%s",
+            type(info).__name__,
+            list(info.keys()) if isinstance(info, dict) else None,
+            {
+                k: (v if k in {"nGpuLayers","nCtx","nThreads","nBatch"} else "...")
+                for k, v in (info.get("config") or {}).items()
+            } if isinstance(info, dict) else info,
+        )
+    except Exception as e:
+        log.warning("[streaming.model_info] log failed: %r", e)
+
     cfg = (info.get("config") or {}) if isinstance(info, dict) else {}
     model_path = cfg.get("modelPath") or ""
     ident = Path(model_path).name or "local-gguf"
+
+    log.info(
+        "[streaming.model_ident] ident=%s path=%s nCtx=%s nGpuLayers=%s nBatch=%s",
+        ident, model_path, cfg.get("nCtx"), cfg.get("nGpuLayers"), cfg.get("nBatch"),
+    )
     return ident, cfg
 
 
@@ -142,7 +169,8 @@ def build_run_json(
     budget_view: dict | None = None,
     extra_timings: dict | None = None,
     error_text: str | None = None,
-    llm: Any | None = None,  # ← accept llm optionally
+    llm: Any | None = None,          # optional, resolved lazily if None
+    worker_meta: dict | None = None, # optional, allows caller to stamp worker identity
 ) -> dict[str, object]:
     # Resolve llm at call time if not provided to avoid stale imports when running in a worker
     if llm is None:
@@ -216,9 +244,19 @@ def build_run_json(
         else None
     )
 
-    return {
+    log.info(
+        "[streaming.build_run_json] ident=%s offloadRatio=%s numGpuLayers=%s cfg=%s",
+        ident,
+        (1 if int(cfg.get("nGpuLayers") or 0) > 0 else 0),
+        int(cfg.get("nGpuLayers") or 0),
+        {k: cfg.get(k) for k in ("nCtx", "nGpuLayers", "nThreads", "nBatch")},
+    )
+
+    payload = {
         "indexedModelIdentifier": ident,
         "identifier": ident,
+        # who produced this runjson (optional; helps when multiple workers/models exist)
+        "worker": worker_meta or None,
         "loadModelConfig": {
             "fields": [
                 {"key": "llm.load.llama.cpuThreadPoolSize", "value": int(cfg.get("nThreads") or 0)},
@@ -296,6 +334,7 @@ def build_run_json(
             },
         },
     }
+    return payload
 
 
 async def watch_disconnect(request, stop_ev):

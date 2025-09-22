@@ -319,5 +319,21 @@
     "from_now": "\\bfrom\\s+now\\s+on[, ]+\\s*(?P<style>[^.;\\n]+)"
   },
   "style_template": "You must talk like {style}. Stay in character but remain helpful and accurate. Follow the user's latest style instructions.",
-  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:"
+  "router_decide_prompt": "You are a router deciding whether answering the text requires the public web.\nRespond with JSON only in exactly this schema:\n{\"need\": true|false, \"query\": \"<text or empty>\"}\n\nDecision principle:\n- The answer requires the web if any part of it depends on information that is not contained in the user text and is not static/stable over time.\n- Capability boundary: Assume you have no access to real-time state (including the current system date/time, clocks, live data feeds) or hidden tools beyond this routing step.\n- If the correct answer depends on real-time state (e.g., ‘current’ values, now/today/tomorrow semantics, live figures, roles that may change, schedules, prices, weather, scores, news), set need=true.\n- If the answer can be derived entirely from the user text plus stable knowledge, set need=false.\n- When uncertain whether real-time state is required, prefer need=true.\n\nText:\n{text}\nJSON:",
+  "ui_locale": "auto",    
+  "ui_theme": "system",   
+  "ui_accent": "default", 
+  "feature_flags": {},
+"worker_default": {
+  "accel": "auto",                       
+  "device": 0,                           
+  "offload_kv_to_gpu": true,             
+  "guardrail": { "mode": "balanced", "custom_gb": 6 },
+  "n_ctx": 4096,
+  "n_threads": 8,
+  "n_gpu_layers": 0,                     
+  "n_batch": 256,
+  "rope_freq_base": null,
+  "rope_freq_scale": null
+}
 }

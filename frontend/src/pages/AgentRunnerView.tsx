@@ -4,7 +4,7 @@ import MobileDrawer from "../components/MobileDrawer";
 import Toast from "../shared/ui/Toast";
 import ChatSidebar from "../components/ChatSidebar/ChatSidebar";
 import ChatContainer from "../components/ChatContainer";
-import SettingsPanel from "../components/SettingsPanel";
+import SettingsPanel from "../components/Settings/SettingsPanel";
 import KnowledgePanel from "../components/KnowledgePanel";
 import ModelPicker from "../components/ModelPicker/ModelPicker";
 import type { Attachment } from "../types/chat";

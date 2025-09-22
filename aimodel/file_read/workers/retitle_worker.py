@@ -1,21 +1,27 @@
+# aimodel/file_read/workers/retitle_worker.py
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from ..core.logging import get_logger
 from ..core.settings import SETTINGS
-from ..runtime import model_runtime as MR
 from ..services.cancel import GEN_SEMAPHORE, is_active
 from ..store.base import now_iso
 from ..store.chats import _load_chat
 from ..store.index import load_index, save_index
+from .supervisor import supervisor, DEFAULT_CLIENT_HOST  # use worker, not in-proc runtime
 
 log = get_logger(__name__)
 
+RUNJSON_BLOCK_RE = re.compile(r"(?:^|\n)⬛ runjson:start[\s\S]*?⬛ runjson:end\s*", re.U)
+STOP_SENTINEL_RE = re.compile(r"(?:\r?\n)?\u23F9\s+stopped(?:\r?\n)?$", re.U)
 
 def S(key: str):
     return SETTINGS[key]
@@ -32,6 +38,7 @@ _ENQUEUED: set[str] = set()
 _queue: asyncio.Queue[str] = asyncio.Queue(maxsize=int(S("retitle_queue_maxsize")))
 _lock = asyncio.Lock()
 
+# --- helpers for content selection / cleanup -------------------------------
 
 def _preview(s: str) -> str:
     n = int(S("retitle_preview_chars"))
@@ -90,31 +97,110 @@ def _sanitize_title(s: str) -> str:
     return s
 
 
-def _make_title(llm, src: str) -> str:
+# --- build messages for the worker ----------------------------------------
+
+def _build_retitle_messages(src: str) -> list[dict]:
     hard = SETTINGS.get("retitle_llm_hard_prefix") or ""
     sys_extra = SETTINGS.get("retitle_llm_sys_inst") or ""
     sys = f"{hard}\n\n{sys_extra}".strip()
     user_text = f"{S('retitle_user_prefix')}{src}{S('retitle_user_suffix')}"
-    messages = [
+    return [
         {"role": "system", "content": sys},
         {"role": "user", "content": user_text},
     ]
-    out = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=int(S("retitle_llm_max_tokens")),
-        temperature=float(S("retitle_llm_temperature")),
-        top_p=float(S("retitle_llm_top_p")),
-        stream=False,
-        stop=S("retitle_llm_stop"),
-    )
-    raw = (out["choices"][0]["message"]["content"] or "").strip().strip('"').strip("'")
+
+
+# --- stream cleanup regexes (mirror FE behavior) --------------------------
+
+STOP_SENTINEL_RE = re.compile(r'(?:\r?\n)?\u23F9\s+stopped(?:\r?\n)?$', re.U)
+
+# If runjson is included inline, strip it defensively.
+RUNJSON_BLOCK_RE = re.compile(
+    r"(?:\r?\n)?(?:<<<RUNJSON_START>>>|<!--RUNJSON_START-->).*?"
+    r"(?:<<<RUNJSON_END>>>|<!--RUNJSON_END-->)(?:\r?\n)?",
+    re.S,
+)
+
+
+async def _call_worker_generate(messages: list[dict]) -> str:
+    """
+    Call the READY llama worker's /api/worker/generate/stream and collect *only*
+    text payloads. Ignore SSE control frames (event:, id:, comments) so "open"/"hb"
+    never leak into the title. Strip runjson blocks & stop sentinel, then tidy.
+    """
+    # Pick a ready worker
+    workers = supervisor.list()
+    w = next((w for w in workers if (w.get("status") == "ready")), None)
+    if not w:
+        log.warning("retitle: no READY worker; skipping")
+        return ""
+
+    host = w.get("host_client") or DEFAULT_CLIENT_HOST or "127.0.0.1"
+    port = int(w.get("port") or 0)
+    if not port:
+        log.warning("retitle: worker has no port; skipping")
+        return ""
+    url = f"http://{host}:{port}/api/worker/generate/stream"
+
+    body = {
+        "sessionId": f"retitle-{os.urandom(4).hex()}",
+        "messages": messages,
+        # keep it tiny/cheap; worker defaults are fine if you omit these
+        "max_tokens": 24,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "stop": None,
+    }
+
+    # Easiest httpx timeout form (applies to connect/read/write/pool)
+    timeout = httpx.Timeout(35.0)
+
+    acc: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers={"Accept": "text/event-stream"}) as client:
+            async with client.stream("POST", url, json=body) as resp:
+                resp.raise_for_status()
+
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    # 🔇 Ignore SSE control frames & comments (prevents "event: open", "event: hb", etc)
+                    if line.startswith(":") or line.startswith("event:") or line.startswith("id:"):
+                        continue
+
+                    # Keep only payloads. If server omits "data:" prefix, still accept the line.
+                    if line.startswith("data:"):
+                        line = line[5:].lstrip()
+
+                    # Stop if the sentinel arrives mid-stream
+                    if "⏹ stopped" in line:
+                        break
+
+                    acc.append(line)
+
+    except Exception as e:
+        log.exception("retitle: worker call error: %s", e)
+        return ""
+
+    # Join & clean
+    text = "\n".join(acc)
+    text = RUNJSON_BLOCK_RE.sub("", text).strip()      # drop runjson block (emoji markers)
+    text = STOP_SENTINEL_RE.sub("", text).strip()      # drop trailing sentinel line
+    if "⏹ stopped" in text:
+        text = text.split("⏹ stopped", 1)[0].rstrip()  # paranoia
+
+    # Final trim similar to old path
     strip_regex = SETTINGS.get("retitle_strip_regex")
     if strip_regex:
-        raw = re.sub(strip_regex, "", raw).strip()
-    raw = re.sub(r"^`{1,3}|`{1,3}$", "", raw).strip()
-    raw = re.sub(r"[.:;,\-\s]+$", "", raw)
-    return raw
+        text = re.sub(strip_regex, "", text).strip()
+    text = re.sub(r"^`{1,3}|`{1,3}$", "", text).strip()
+    text = re.sub(r"[.:;,\-\s]+$", "", text)
 
+    log.info("[retitle.worker] received %d chars from worker", len(text))
+    return text
+
+
+# --- worker loop -----------------------------------------------------------
 
 async def start_worker():
     while True:
@@ -176,18 +262,13 @@ async def _process_session(key: str):
     if not src.strip():
         return
 
-    async with GEN_SEMAPHORE:
-        llm = MR.get_llm()
-        try:
-            title_raw = await asyncio.to_thread(_make_title, llm, src)
-        except Exception as e:
-            logging.exception("retitle: LLM error: %s", e)
-            return
-        finally:
-            try:
-                llm.reset()
-            except Exception:
-                pass
+    # Use the worker for generation (no in-proc model runtime)
+    try:
+        async with GEN_SEMAPHORE:
+            title_raw = await _call_worker_generate(_build_retitle_messages(src))
+    except Exception as e:
+        logging.exception("retitle: worker call error: %s", e)
+        return
 
     title = _sanitize_title(title_raw) if bool(S("retitle_enable_sanitize")) else title_raw
     if not title:
@@ -206,7 +287,10 @@ async def _process_session(key: str):
     row["title"] = title
     row["updatedAt"] = now_iso()
     save_index(root, uid, idx)
+    log.info("[retitle] %s → %s", _preview(src), title)
 
+
+# --- public enqueue API ----------------------------------------------------
 
 def enqueue(
     root: Path, uid: str, session_id: str, messages: list[dict], *, job_seq: int | None = None

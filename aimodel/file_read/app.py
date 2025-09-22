@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-
+from .api.runtime_accel import router as runtime_accel_router
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -29,7 +29,7 @@ try:
 except Exception as _e:
     log.info(f"[env] NOTE: could not load .env: {_e}")
 
-from .adaptive.config.paths import bootstrap
+from .store.paths import bootstrap
 from .api import settings as settings_router
 from .api.admin_chats import router as admin_chats_router
 from .api.auth_router import require_auth
@@ -43,7 +43,7 @@ from .api.metrics import router as metrics_router
 from .api.models import router as models_router
 from .api.rag import router as rag_router
 from .api.model_workers import router as model_workers_router  # ✅ single import
-from .workers.model_worker import supervisor  # ✅ single supervisor import
+from .workers.supervisor import supervisor  # ✅ single supervisor import
 
 from .core import request_ctx
 from .workers.retitle_worker import start_worker
@@ -94,7 +94,7 @@ app.include_router(worker_proxy_router, dependencies=deps)
 app.include_router(system_router, dependencies=deps)
 app.include_router(model_workers_router, dependencies=deps)
 app.include_router(cancel_router, dependencies=deps)
-
+app.include_router(runtime_accel_router, dependencies=deps)
 # --- Route dump (after all includes/mounts) ---
 try:
     def _dump_routes():

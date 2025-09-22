@@ -1,0 +1,61 @@
+{
+  "workerAdvanced": {
+    "n_ctx": {
+      "label": "Context length (n_ctx)",
+      "tip": "Maximum total tokens (prompt + output) the model can attend to. Higher uses more RAM/VRAM."
+    },
+    "n_gpu_layers": {
+      "label": "GPU offload layers (n_gpu_layers)",
+      "tip": "Number of transformer layers to place on the GPU. 0 = CPU-only. More uses more VRAM but can be faster."
+    },
+    "n_threads": {
+      "label": "CPU threads (n_threads)",
+      "tip": "Size of the CPU thread pool. Typically set to the number of performance cores."
+    },
+    "n_batch": {
+      "label": "Eval batch size (n_batch)",
+      "tip": "Tokens processed per step. Higher can increase throughput but requires more RAM/VRAM."
+    },
+    "rope_freq_base": {
+      "label": "RoPE freq base",
+      "tip": "Base frequency for Rotary Positional Embeddings. Change only for experimental long-context tuning."
+    },
+    "rope_freq_scale": {
+      "label": "RoPE freq scale",
+      "tip": "Scale factor for RoPE. Adjusting can trade off quality vs. effective context length (advanced)."
+    },
+    "flash_attn": {
+      "label": "Flash attention",
+      "tip": "Use GPU-optimized attention kernels when available for better speed."
+    },
+    "use_mmap": {
+      "label": "Try mmap()",
+      "tip": "Memory-map the model file to reduce RAM copies and speed startup on some systems."
+    },
+    "use_mlock": {
+      "label": "Use mlock()",
+      "tip": "Lock model pages in RAM to avoid swapping. May require privileges and can fail silently."
+    },
+    "kv_offload": {
+      "label": "Offload KV cache to GPU",
+      "tip": "Store the attention key/value cache in GPU memory for speed; increases VRAM usage."
+    },
+    "seed": {
+      "label": "Seed",
+      "tip": "Fixed RNG seed for reproducible sampling. Leave blank for random."
+    },
+    "type_k": {
+      "label": "K cache quantization",
+      "tip": "Quantization format for the key cache. Use 'auto' to let the runtime choose."
+    },
+    "type_v": {
+      "label": "V cache quantization",
+      "tip": "Quantization format for the value cache. Use 'auto' to let the runtime choose."
+    },
+    "remember": "Remember settings for this model",
+    "reset": {
+      "label": "Reset",
+      "tip": "Clear all advanced overrides for this model."
+    }
+  }
+}

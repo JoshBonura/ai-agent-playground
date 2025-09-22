@@ -12,7 +12,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from ..adaptive.config.paths import app_data_dir
+from .paths import app_data_dir
 from ..core.crypto_keys import get_user_dek
 from ..core.logging import get_logger
 
