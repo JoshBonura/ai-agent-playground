@@ -1,159 +1,273 @@
-name: Build llama-cpp-python wheels
-
+name: build-wheels
 on:
-  push:
-    branches: [ main ]
-  pull_request:
   workflow_dispatch:
-  # Tag a release like v0.3.16 to trigger "release" upload below
-  release:
-    types: [created]
+    inputs:
+      llama_tag:
+        description: "llama-cpp-python tag (e.g., v0.3.16)"
+        required: true
+      build_win_cuda:
+        description: "Build Windows CUDA (installs CUDA via choco; slower)"
+        required: false
+        default: "false"
+
+env:
+  PY_VER: "3.11"
 
 jobs:
-  build:
+  ############################
+  # WINDOWS (cpu, vulkan, cuda?)
+  ############################
+  windows:
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # ---------- Windows ----------
-          - os: windows-latest
-            backend: cpu
-            cmake_args: ""
-          - os: windows-latest
-            backend: cuda
-            cmake_args: "-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=75"
-            setup: cuda
-          - os: windows-latest
-            backend: vulkan
-            cmake_args: "-DGGML_VULKAN=ON"
-            setup: vulkan
-
-          # ---------- Linux ----------
-          - os: ubuntu-22.04
-            backend: cpu
-            cmake_args: ""
-          - os: ubuntu-22.04
-            backend: cuda
-            cmake_args: "-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=75"
-            setup: cuda
-          - os: ubuntu-22.04
-            backend: vulkan
-            cmake_args: "-DGGML_VULKAN=ON"
-            setup: vulkan
-          - os: ubuntu-22.04
-            backend: rocm
-            cmake_args: "-DGGML_HIP=ON"
-            setup: rocm
-
-          # ---------- macOS (Apple Silicon) ----------
-          - os: macos-14
-            backend: cpu
-            cmake_args: ""
-          - os: macos-14
-            backend: metal
-            cmake_args: "-DGGML_METAL=ON"
-
-    runs-on: ${{ matrix.os }}
-    env:
-      # Build from source always
-      LLAMA_CPP_PYTHON_BUILD_FROM_SOURCE: "1"
-      FORCE_CMAKE: "1"
-      CMAKE_ARGS: ${{ matrix.cmake_args }}
-
+        backend: [cpu, vulkan, cuda]
     steps:
-      - name: Checkout your repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # If llama-cpp-python lives in a separate repo, clone it here.
-      # Otherwise, adjust the path to where it lives in your repo.
-      - name: Checkout llama-cpp-python
-        uses: actions/checkout@v4
+      - name: Clone llama-cpp-python @ tag
+        run: git clone --depth=1 --branch ${{ inputs.llama_tag }} https://github.com/abetlen/llama-cpp-python ext/_llama
+
+      - uses: actions/setup-python@v5
         with:
-          repository: abetlen/llama-cpp-python
-          path: ext/llama-cpp-python
+          python-version: ${{ env.PY_VER }}
 
-      - name: Update llama.cpp submodule
-        working-directory: ext/llama-cpp-python
+      - name: Build tools
+        run: python -m pip install --upgrade pip build wheel
+
+      - name: Vulkan SDK (Windows)
+        if: matrix.backend == 'vulkan'
         run: |
-          git submodule update --init --recursive
-          # optionally pin exact llama.cpp commit:
-          # pushd vendor/llama.cpp
-          # git checkout <commit-or-tag>
-          # popd
+          choco install vulkansdk --no-progress -y
+          refreshenv
 
-      # ---------- Backend setup ----------
-      - name: Setup CUDA (Windows/Linux)
-        if: matrix.setup == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.19
+      - name: CUDA Toolkit (Windows)
+        if: matrix.backend == 'cuda' && inputs.build_win_cuda == 'true'
+        run: |
+          choco install cuda --version=12.6 -y --no-progress
+          refreshenv
+
+      - name: Set CMAKE_ARGS
+        shell: bash
+        run: |
+          if [[ "${{ matrix.backend }}" == "cuda" ]]; then
+            echo "CMAKE_ARGS=-DGGML_CUDA=ON" >> $GITHUB_ENV
+          elif [[ "${{ matrix.backend }}" == "vulkan" ]]; then
+            echo "CMAKE_ARGS=-DGGML_VULKAN=ON" >> $GITHUB_ENV
+          else
+            echo "CMAKE_ARGS=" >> $GITHUB_ENV
+          fi
+
+      - name: Build llama wheel (Windows)
+        run: |
+          cd ext/_llama
+          python -m pip wheel . -w dist
+
+      - name: Write base reqs
+        shell: pwsh
+        run: |
+          @"
+          fastapi==0.116.1
+          uvicorn[standard]==0.30.6
+          numpy==1.26.4
+          jinja2==3.1.6
+          MarkupSafe==3.0.2
+          typing_extensions==4.15.0
+          diskcache==5.6.3
+          "@ | Out-File -FilePath ext/req_base.txt -Encoding ASCII
+
+      - name: Collect wheels + base deps (Windows)
+        shell: pwsh
+        run: |
+          $out = "ext/wheels_out/win/${{ matrix.backend }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item ext/_llama/dist/*.whl $out/
+          python -m pip download --only-binary=:all: --dest $out -r ext/req_base.txt
+
+      - uses: actions/upload-artifact@v4
         with:
-          cuda: "12.6.0"
+          name: wheels-win-${{ matrix.backend }}
+          path: ext/wheels_out/win/${{ matrix.backend }}/*.whl
 
-      - name: Setup Vulkan SDK (Windows)
-        if: matrix.setup == 'vulkan' && startsWith(matrix.os, 'windows')
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
-        with:
-          version: "1.3.290.0"
-          cache: true
+  ############################
+  # LINUX (cpu, cuda, rocm, vulkan)
+  ############################
+  linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda, rocm, vulkan]
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Setup Vulkan SDK (Linux)
-        if: matrix.setup == 'vulkan' && startsWith(matrix.os, 'ubuntu')
+      - name: Clone llama-cpp-python @ tag
+        run: git clone --depth=1 --branch ${{ inputs.llama_tag }} https://github.com/abetlen/llama-cpp-python ext/_llama
+
+      - name: Write base reqs
+        run: |
+          cat > ext/req_base.txt <<'REQ'
+          fastapi==0.116.1
+          uvicorn[standard]==0.30.6
+          numpy==1.26.4
+          jinja2==3.1.6
+          MarkupSafe==3.0.2
+          typing_extensions==4.15.0
+          diskcache==5.6.3
+          REQ
+
+      # CPU & Vulkan native
+      - name: Build CPU/Vulkan natively
+        if: matrix.backend == 'cpu' || matrix.backend == 'vulkan'
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget tar
-          VSDK=1.3.290.0
-          wget -q https://sdk.lunarg.com/sdk/download/$VSDK/linux/vulkansdk-linux-x86_64-$VSDK.tar.xz -O vsdk.txz
-          mkdir -p $GITHUB_WORKSPACE/vsdk && tar -xJf vsdk.txz -C $GITHUB_WORKSPACE/vsdk
-          echo "VULKAN_SDK=$GITHUB_WORKSPACE/vsdk/$VSDK/x86_64" >> $GITHUB_ENV
-          echo "$GITHUB_WORKSPACE/vsdk/$VSDK/x86_64/bin" >> $GITHUB_PATH
-          echo "$GITHUB_WORKSPACE/vsdk/$VSDK/x86_64/lib" | sudo tee /etc/ld.so.conf.d/vsdk.conf
-          sudo ldconfig
+          sudo apt-get install -y python3-pip python3-venv cmake ninja-build libvulkan-dev
+          python3 -m venv .venv && . .venv/bin/activate
+          python -m pip install --upgrade pip build wheel
+          if [ "${{ matrix.backend }}" = "vulkan" ]; then export CMAKE_ARGS="-DGGML_VULKAN=ON"; fi
+          cd ext/_llama
+          python -m pip wheel . -w dist
+          mkdir -p ../../wheels_out/linux/${{ matrix.backend }}
+          cp dist/*.whl ../../wheels_out/linux/${{ matrix.backend }}/
+          cd ../../
+          python -m pip download --only-binary=:all: --dest ext/wheels_out/linux/${{ matrix.backend }} -r ext/req_base.txt
 
-      - name: Setup ROCm (Linux)
-        if: matrix.setup == 'rocm'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg2
-          # Minimal ROCm/HIP userspace for building
-          sudo apt-get install -y hip-runtime-amd rocm-hip-sdk || true
-          echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
-          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
-          echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
-          sudo ldconfig
-
-      # ---------- Python toolchain ----------
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # CUDA in NVIDIA Docker
+      - name: Build CUDA in CUDA container
+        if: matrix.backend == 'cuda'
+        uses: addnab/docker-run-action@v3
         with:
-          python-version: "3.11"
+          image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+          options: -v ${{ github.workspace }}:/ws -w /ws/ext/_llama
+          run: |
+            apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build
+            python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
+            python -m pip install --upgrade pip build wheel
+            export CMAKE_ARGS="-DGGML_CUDA=ON"
+            python -m pip wheel . -w dist
+            mkdir -p /ws/ext/wheels_out/linux/cuda
+            cp dist/*.whl /ws/ext/wheels_out/linux/cuda/
+            python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/cuda -r /ws/ext/req_base.txt
 
-      - name: Install build deps
-        run: |
-          python -m pip install -U pip wheel build setuptools
-          python -m pip install scikit-build-core
-
-      - name: Build wheel
-        working-directory: ext/llama-cpp-python
-        run: |
-          mkdir -p dist
-          python -m pip wheel -w dist .
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+      # ROCm in ROCm Docker
+      - name: Build ROCm in ROCm container
+        if: matrix.backend == 'rocm'
+        uses: addnab/docker-run-action@v3
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.backend }}
-          path: ext/llama-cpp-python/dist/*.whl
+          image: rocm/dev-ubuntu-22.04:5.7.1
+          options: -v ${{ github.workspace }}:/ws -w /ws/ext/_llama
+          run: |
+            apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
+            python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
+            python -m pip install --upgrade pip build wheel
+            export CMAKE_ARGS="-DGGML_HIP=ON -DLLAMA_HIPBLAS=ON -DAMDGPU_TARGETS=gfx1030;gfx1100"
+            python -m pip wheel . -w dist
+            mkdir -p /ws/ext/wheels_out/linux/rocm
+            cp dist/*.whl /ws/ext/wheels_out/linux/rocm/
+            python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/rocm -r /ws/ext/req_base.txt
 
-  # (Optional) attach wheels to a Release when a tag is created
-  release-upload:
-    needs: build
-    if: github.event_name == 'release'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.backend }}
+          path: ext/wheels_out/linux/${{ matrix.backend }}/*.whl
+
+  ############################
+  # macOS (cpu, metal / arm64)
+  ############################
+  mac:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, metal]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone llama-cpp-python @ tag
+        run: git clone --depth=1 --branch ${{ inputs.llama_tag }} https://github.com/abetlen/llama-cpp-python ext/_llama
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VER }}
+
+      - name: Build tools
+        run: python -m pip install --upgrade pip build wheel
+
+      - name: Set Metal flags
+        if: matrix.backend == 'metal'
+        run: |
+          echo "CMAKE_ARGS=-DGGML_METAL=ON -DLLAMA_METAL=ON" >> $GITHUB_ENV
+          echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> $GITHUB_ENV
+
+      - name: Build llama wheel (mac)
+        run: |
+          cd ext/_llama
+          python -m pip wheel . -w dist
+          mkdir -p ../../wheels_out/mac/${{ matrix.backend }}
+          cp dist/*.whl ../../wheels_out/mac/${{ matrix.backend }}/
+          cd ../../
+          cat > ext/req_base.txt <<'REQ'
+          fastapi==0.116.1
+          uvicorn[standard]==0.30.6
+          numpy==1.26.4
+          jinja2==3.1.6
+          MarkupSafe==3.0.2
+          typing_extensions==4.15.0
+          diskcache==5.6.3
+          REQ
+          python -m pip download --only-binary=:all: --dest ext/wheels_out/mac/${{ matrix.backend }} -r ext/req_base.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-mac-${{ matrix.backend }}
+          path: ext/wheels_out/mac/${{ matrix.backend }}/*.whl
+
+  ############################
+  # PACKAGE & RELEASE
+  ############################
+  release:
+    needs: [windows, linux, mac]
     runs-on: ubuntu-22.04
     steps:
-      - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: wheels
-      - name: Upload assets to Release
+      - uses: actions/download-artifact@v4
+        with: { path: ./artifacts }
+
+      - name: Assemble per-OS zips + manifest
+        run: |
+          set -e
+          mkdir -p out/win out/linux out/mac
+
+          find artifacts -type f -name "*.whl" -path "*/wheels-win-*"   -exec cp {} out/win/ \;
+          find artifacts -type f -name "*.whl" -path "*/wheels-linux-*" -exec cp {} out/linux/ \;
+          find artifacts -type f -name "*.whl" -path "*/wheels-mac-*"   -exec cp {} out/mac/ \;
+
+          (cd out/win   && zip -r ../wheels-win-${{ inputs.llama_tag }}.zip .)
+          (cd out/linux && zip -r ../wheels-linux-${{ inputs.llama_tag }}.zip .)
+          (cd out/mac   && zip -r ../wheels-mac-${{ inputs.llama_tag }}.zip .)
+
+          sha256sum out/*.zip > out/sha256s.txt
+
+          cat > out/manifest.json <<EOF
+          {
+            "bundle": "rb-${{ inputs.llama_tag }}",
+            "created": "$(date -u +%FT%TZ)",
+            "assets": {
+              "win":   { "file": "wheels-win-${{ inputs.llama_tag }}.zip" },
+              "linux": { "file": "wheels-linux-${{ inputs.llama_tag }}.zip" },
+              "mac":   { "file": "wheels-mac-${{ inputs.llama_tag }}.zip" }
+            }
+          }
+          EOF
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: wheels/**/*
+          tag_name: wheels-${{ inputs.llama_tag }}
+          name: Wheels ${{ inputs.llama_tag }}
+          files: |
+            out/wheels-*.zip
+            out/manifest.json
+            out/sha256s.txt
