@@ -1,0 +1,159 @@
+name: Build llama-cpp-python wheels
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  # Tag a release like v0.3.16 to trigger "release" upload below
+  release:
+    types: [created]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---------- Windows ----------
+          - os: windows-latest
+            backend: cpu
+            cmake_args: ""
+          - os: windows-latest
+            backend: cuda
+            cmake_args: "-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=75"
+            setup: cuda
+          - os: windows-latest
+            backend: vulkan
+            cmake_args: "-DGGML_VULKAN=ON"
+            setup: vulkan
+
+          # ---------- Linux ----------
+          - os: ubuntu-22.04
+            backend: cpu
+            cmake_args: ""
+          - os: ubuntu-22.04
+            backend: cuda
+            cmake_args: "-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=75"
+            setup: cuda
+          - os: ubuntu-22.04
+            backend: vulkan
+            cmake_args: "-DGGML_VULKAN=ON"
+            setup: vulkan
+          - os: ubuntu-22.04
+            backend: rocm
+            cmake_args: "-DGGML_HIP=ON"
+            setup: rocm
+
+          # ---------- macOS (Apple Silicon) ----------
+          - os: macos-14
+            backend: cpu
+            cmake_args: ""
+          - os: macos-14
+            backend: metal
+            cmake_args: "-DGGML_METAL=ON"
+
+    runs-on: ${{ matrix.os }}
+    env:
+      # Build from source always
+      LLAMA_CPP_PYTHON_BUILD_FROM_SOURCE: "1"
+      FORCE_CMAKE: "1"
+      CMAKE_ARGS: ${{ matrix.cmake_args }}
+
+    steps:
+      - name: Checkout your repo
+        uses: actions/checkout@v4
+
+      # If llama-cpp-python lives in a separate repo, clone it here.
+      # Otherwise, adjust the path to where it lives in your repo.
+      - name: Checkout llama-cpp-python
+        uses: actions/checkout@v4
+        with:
+          repository: abetlen/llama-cpp-python
+          path: ext/llama-cpp-python
+
+      - name: Update llama.cpp submodule
+        working-directory: ext/llama-cpp-python
+        run: |
+          git submodule update --init --recursive
+          # optionally pin exact llama.cpp commit:
+          # pushd vendor/llama.cpp
+          # git checkout <commit-or-tag>
+          # popd
+
+      # ---------- Backend setup ----------
+      - name: Setup CUDA (Windows/Linux)
+        if: matrix.setup == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.0"
+
+      - name: Setup Vulkan SDK (Windows)
+        if: matrix.setup == 'vulkan' && startsWith(matrix.os, 'windows')
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          version: "1.3.290.0"
+          cache: true
+
+      - name: Setup Vulkan SDK (Linux)
+        if: matrix.setup == 'vulkan' && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget tar
+          VSDK=1.3.290.0
+          wget -q https://sdk.lunarg.com/sdk/download/$VSDK/linux/vulkansdk-linux-x86_64-$VSDK.tar.xz -O vsdk.txz
+          mkdir -p $GITHUB_WORKSPACE/vsdk && tar -xJf vsdk.txz -C $GITHUB_WORKSPACE/vsdk
+          echo "VULKAN_SDK=$GITHUB_WORKSPACE/vsdk/$VSDK/x86_64" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/vsdk/$VSDK/x86_64/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/vsdk/$VSDK/x86_64/lib" | sudo tee /etc/ld.so.conf.d/vsdk.conf
+          sudo ldconfig
+
+      - name: Setup ROCm (Linux)
+        if: matrix.setup == 'rocm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg2
+          # Minimal ROCm/HIP userspace for building
+          sudo apt-get install -y hip-runtime-amd rocm-hip-sdk || true
+          echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
+          sudo ldconfig
+
+      # ---------- Python toolchain ----------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps
+        run: |
+          python -m pip install -U pip wheel build setuptools
+          python -m pip install scikit-build-core
+
+      - name: Build wheel
+        working-directory: ext/llama-cpp-python
+        run: |
+          mkdir -p dist
+          python -m pip wheel -w dist .
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.backend }}
+          path: ext/llama-cpp-python/dist/*.whl
+
+  # (Optional) attach wheels to a Release when a tag is created
+  release-upload:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
+      - name: Upload assets to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wheels/**/*

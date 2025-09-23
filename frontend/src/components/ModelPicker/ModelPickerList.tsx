@@ -3,6 +3,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type Dispatch,
   type SetStateAction,
 } from "react";
@@ -14,7 +15,12 @@ import {
   Loader2,
   Search,
 } from "lucide-react";
+
 import WorkerAdvancedPanel from "./WorkerAdvancedPanel";
+import {
+  getModelCapabilitiesForPath,
+  type ModelsCapabilities,
+} from "../../api/models";
 import type { ModelFile } from "../../api/models";
 import type { LlamaKwargs } from "../../api/modelWorkers";
 import { useI18n } from "../../i18n/i18n";
@@ -62,8 +68,13 @@ export default function ModelPickerList({
   onLoadAdvanced,
   onClose,
 }: Props) {
-  const inputRef = useRef<HTMLInputElement | null>(null);
   const { t } = useI18n();
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // Per-row capabilities cache: modelPath -> caps|null
+  const [perRowCaps, setPerRowCaps] = useState<
+    Record<string, ModelsCapabilities | null>
+  >({});
 
   const filteredSorted = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -88,6 +99,7 @@ export default function ModelPickerList({
             : b.name.localeCompare(a.name);
         case "recency":
         default:
+          // (no mtime provided here; keep name fallback)
           return sortDir === "asc"
             ? a.name.localeCompare(b.name)
             : b.name.localeCompare(a.name);
@@ -114,6 +126,28 @@ export default function ModelPickerList({
     const tmr = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(tmr);
   }, []);
+
+  // When a row opens, fetch its capabilities once (safely handle Windows paths)
+  useEffect(() => {
+    const path = expandedPath;
+    if (!path) return;
+    if (perRowCaps[path] !== undefined) return; // already fetched for this row
+
+    let alive = true;
+    getModelCapabilitiesForPath(path)
+      .then((caps) => {
+        if (!alive) return;
+        setPerRowCaps((m) => ({ ...m, [path]: caps }));
+      })
+      .catch(() => {
+        if (!alive) return;
+        setPerRowCaps((m) => ({ ...m, [path]: null }));
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [expandedPath, perRowCaps]);
 
   return (
     <>
@@ -178,6 +212,8 @@ export default function ModelPickerList({
         <div className="space-y-2">
           {filteredSorted.map((m) => {
             const isOpen = expandedPath === m.path;
+            const caps = perRowCaps[m.path] ?? null;
+
             return (
               <div key={m.path} className="rounded-lg border">
                 <div className="p-3 flex items-center justify-between">
@@ -186,7 +222,11 @@ export default function ModelPickerList({
                       className="p-1 rounded hover:bg-gray-100"
                       onClick={() => setExpandedPath(isOpen ? null : m.path)}
                     >
-                      {isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                      {isOpen ? (
+                        <ChevronDown className="w-4 h-4" />
+                      ) : (
+                        <ChevronRight className="w-4 h-4" />
+                      )}
                     </button>
                     <HardDrive className="w-4 h-4 text-gray-500" />
                     <div className="truncate ml-1">
@@ -219,6 +259,7 @@ export default function ModelPickerList({
                       onChange={setAdvDraft}
                       remember={rememberAdv}
                       setRemember={setRememberAdv}
+                      caps={caps}
                     />
                     <div className="px-3 py-2 flex items-center justify-end gap-2">
                       <button
@@ -247,5 +288,7 @@ export default function ModelPickerList({
 
 function formatGBNumber(bytes: number): string {
   const gb = bytes / 1024 ** 3;
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(gb);
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2,
+  }).format(gb);
 }

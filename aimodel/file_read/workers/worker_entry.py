@@ -263,13 +263,14 @@ def _filter_llama_kwargs(extra: Dict[str, Any]) -> Dict[str, Any]:
 
 # add these helpers somewhere above _startup()
 _STR_TO_GGML = {
-    "f16":  "GGML_TYPE_F16",
-    "q8_0": "GGML_TYPE_Q8_0",
-    "q6_K": "GGML_TYPE_Q6_K",
-    "q5_K": "GGML_TYPE_Q5_K",
-    "q4_K": "GGML_TYPE_Q4_K",
-    "q4_0": "GGML_TYPE_Q4_0",
-    "q3_K": "GGML_TYPE_Q3_K",
+    "f32":    "GGML_TYPE_F32",
+    "f16":    "GGML_TYPE_F16",
+    "q8_0":   "GGML_TYPE_Q8_0",
+    "q4_0":   "GGML_TYPE_Q4_0",
+    "q4_1":   "GGML_TYPE_Q4_1",
+    "iq4_nl": "GGML_TYPE_IQ4_NL",
+    "q5_0":   "GGML_TYPE_Q5_0",
+    "q5_1":   "GGML_TYPE_Q5_1",
 }
 
 def _coerce_cache_type(x):

@@ -124,6 +124,8 @@ export type LoadBody = {
   resetDefaults?: boolean;
 };
 
+
+
 // Add this helper near the top or above loadModel:
 function sanitizeLoadBody(body: LoadBody): LoadBody {
   // start clean copy
@@ -193,5 +195,21 @@ export async function cancelModelLoad() {
     credentials: "include",
   });
   if (!res.ok) throw new Error(`cancelModelLoad ${res.status}`);
+  return res.json();
+}
+
+// --- Capabilities API ---
+export type ModelsCapabilities = {
+  ok: boolean;
+  maxTokens: { header: number | null; effective: number | null };
+  cpu: { threads: number | null };
+  gpu: { offloadLayers: number | null; kvOffload: boolean | null; accel?: string | null };
+  model: { path?: string | null; arch?: string | null; nLayersHeader?: number | null };
+};
+
+export async function getModelCapabilitiesForPath(modelPath: string): Promise<ModelsCapabilities> {
+  const qs = new URLSearchParams({ modelPath }); // encodes backslashes on Windows
+  const res = await fetch(`/api/models/capabilities?` + qs.toString(), { credentials: "include" });
+  if (!res.ok) throw new Error(`capabilities ${res.status}`);
   return res.json();
 }

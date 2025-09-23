@@ -75,6 +75,109 @@ def _guess_quant(name: str) -> str | None:
     m = re.search(r"Q\d[A-Z0-9_]*", name)
     return m.group(0) if m else None
 
+# --- GGUF header helpers (optional dependency) ---
+try:
+    from gguf import GGUFReader  # pip install gguf
+except Exception:
+    GGUFReader = None
+
+def _gguf_fields(path: str) -> dict[str, Any] | None:
+    if GGUFReader is None:
+        return None
+    try:
+        r = GGUFReader(path)
+        # r.fields is a list of (name, value) pairs in older gguf; newer exposes .get k/v
+        # Normalize to dict defensively:
+        try:
+            # Newer versions expose .kv_data or .fields as dict-like
+            kv = dict(r.fields)  # may work if fields is iterable of pairs
+        except Exception:
+            kv = {}
+            for k in dir(r):
+                if k.startswith("get_"):
+                    # skip methods; stay minimal
+                    pass
+        # Fallback: try known accessors
+        if not kv:
+            try:
+                for item in r.fields:
+                    try:
+                        kv[item.key] = item.value
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return kv or {}
+    except Exception:
+        return None
+
+def read_model_meta_from_gguf(path: str) -> dict[str, Any] | None:
+    """
+    Returns:
+      {
+        'ctxTrain': int|None,
+        'nLayers': int|None,
+        'nHeads': int|None,
+        'arch': str|None,
+        'quant': str|None
+      }
+    """
+    fields = _gguf_fields(path)
+    if fields is None:
+        return None
+
+    # Common keys across families; try a few, in order:
+    def pick_int(*names: str, default: int | None = None) -> int | None:
+        for n in names:
+            if n in fields:
+                try:
+                    return int(fields[n])
+                except Exception:
+                    pass
+        return default
+
+    def pick_str(*names: str, default: str | None = None) -> str | None:
+        for n in names:
+            if n in fields:
+                try:
+                    v = fields[n]
+                    return str(v) if v is not None else default
+                except Exception:
+                    pass
+        return default
+
+    ctx_train = pick_int(
+        "llama.context_length",
+        "general.context_length",
+        "gpt.model.context_length",
+        "context_length",
+        default=None,
+    )
+    n_layers = pick_int(
+        "llama.block_count",
+        "general.block_count",
+        "block_count",
+        default=None,
+    )
+    n_heads = pick_int(
+        "llama.attention.head_count",
+        "attention.head_count",
+        default=None,
+    )
+    arch = pick_str("general.architecture", "llama.architecture", default=None)
+
+    # You already parse a filename quant; keep that, but header often has this:
+    quant = pick_str("general.file_type", "quantization", default=None)
+
+    return {
+        "ctxTrain": ctx_train,
+        "nLayers": n_layers,
+        "nHeads": n_heads,
+        "arch": arch,
+        "quant": quant,
+    }
+
+
 
 def list_models_cached(*, with_ctx: bool = False) -> tuple[list[dict[str, Any]], str]:
     """

@@ -46,12 +46,14 @@
     },
     "type_k": {
       "label": "K cache quantization",
-      "tip": "Quantization format for the key cache. Use 'auto' to let the runtime choose."
+      "tip": "Quantization format for the key cache. 'auto' lets the runtime decide."
     },
     "type_v": {
       "label": "V cache quantization",
-      "tip": "Quantization format for the value cache. Use 'auto' to let the runtime choose."
+      "tip": "Quantization format for the value cache. 'auto' lets the runtime decide.",
+      "flashRequired": "V cache quantization requires Flash Attention"
     },
+    "enableFlashHint": "enable the Flash Attention option above",
     "remember": "Remember settings for this model",
     "reset": {
       "label": "Reset",

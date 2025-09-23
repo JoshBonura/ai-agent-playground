@@ -1,16 +1,15 @@
 // frontend/src/components/ModelPicker/ModelPickerView.tsx
 import { CheckCircle2, X } from "lucide-react";
-import ModelPickerList from "./ModelPickerList";
 import type { ModelFile } from "../../api/models";
 import type { SortDir, SortKey, WorkerRow } from "./useModelPicker";
 import type { Dispatch, SetStateAction } from "react";
 import type { LlamaKwargs } from "../../api/modelWorkers";
 import { useI18n } from "../../i18n/i18n";
+import ModelPickerList from "./ModelPickerList";
 
 type Props = {
   open: boolean;
   onClose: () => void;
-
   // list + data
   loading: boolean;
   err: string | null;

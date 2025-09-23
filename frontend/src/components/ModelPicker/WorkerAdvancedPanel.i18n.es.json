@@ -50,8 +50,10 @@
     },
     "type_v": {
       "label": "Cuantización de caché V",
-      "tip": "Formato de cuantización para la caché de valores. 'auto' deja que el runtime elija."
+      "tip": "Formato de cuantización para la caché de valores. 'auto' deja que el runtime elija.",
+      "flashRequired": "La cuantización de la caché V requiere Flash Attention"
     },
+    "enableFlashHint": "activa la opción de Flash Attention de arriba",
     "remember": "Recordar ajustes para este modelo",
     "reset": {
       "label": "Restablecer",

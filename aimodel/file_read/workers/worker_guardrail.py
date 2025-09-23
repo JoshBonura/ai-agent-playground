@@ -277,17 +277,6 @@ def _guardrail_decide(*, mode: str, custom_gb: float | None, proj_gb: float,
 # ----------------------------------------------------------------------
 
 async def compute_llama_settings(model_path: str, user_kwargs: dict | None = None) -> tuple[dict, dict, dict]:
-    """
-    Returns (cleaned_kwargs, env_patch, diag).
-
-    Behavior:
-      * Honors your existing guardrail mode (strict/balanced/relaxed/custom).
-      * If a budget is exceeded, performs a bounded-spillover loop:
-          1) prefer KV on CPU (unless explicitly requested on GPU),
-          2) reduce n_gpu_layers just enough to fit,
-          3) if KV is still on-GPU and we're over, shrink n_ctx (down to 2048 floor).
-      * Stops once the projection fits the budget (or abort ladder would have been used before).
-    """
     base_kwargs, env_patch = _llama_kwargs_from_settings(model_path)
     cleaned: Dict = dict(base_kwargs)
     if isinstance(user_kwargs, dict):
@@ -319,6 +308,70 @@ async def compute_llama_settings(model_path: str, user_kwargs: dict | None = Non
     if user_set_ctx_hard:
         log.info("[guardrail.hard] honoring user n_ctx=%s (no shrink)", user_kwargs["n_ctx"])
 
+    # ----- normal CPU short-circuit -----
+    accel = (env_patch.get("LLAMA_ACCEL") or "auto").lower()
+    accel_is_cpu = (accel == "cpu") or (env_patch.get("CUDA_VISIBLE_DEVICES") == "-1")
+    if accel_is_cpu:
+        cleaned["n_gpu_layers"] = 0
+        cleaned["offload_kqv"] = False
+        log.info("[guardrail.cpu] accel=cpu → skipping VRAM guardrail (model & KV on CPU)")
+        diag = {
+            "mode": (str((SETTINGS.effective() or {}).get("worker_default", {}).get("guardrail", {}).get("mode") or "balanced").lower()),
+            "projGB": 0.0, "freeGB": 0.0, "totalGB": 0.0, "budgetGB": None,
+            "kvOn": False, "nGpuLayers": 0, "nCtx": int(cleaned.get("n_ctx", 4096)),
+            "autoFit": True, "strictPreferCpuKV": True,
+            "suggested": {"tryBalanced": True, "reduceLayersTo": 0, "shrinkCtxTo": 2048, "disableKV": "alreadyOff"},
+        }
+        return cleaned, env_patch, diag
+
+    # ----- pull guardrail config (mode/auto_fit etc) BEFORE using them -----
+    eff = SETTINGS.effective() or {}
+    wd = (eff.get("worker_default") or {})
+    gr = (wd.get("guardrail") or {}).copy()
+    flat_mode = (eff.get("hw_guardrails_mode") or "").strip().lower()
+    if flat_mode:
+        gr["mode"] = flat_mode
+    flat_custom = eff.get("hw_guardrails_custom_gb")
+    if isinstance(flat_custom, (int, float)):
+        gr["custom_gb"] = float(flat_custom)
+
+    mode = str(gr.get("mode") or "balanced").lower()
+    custom_gb = gr.get("custom_gb") or gr.get("custom_gb_limit") or gr.get("custom_gb_budget")
+
+    auto_fit = gr.get("auto_fit")
+    if auto_fit is None:
+        auto_fit = eff.get("hw_guardrails_autofit")
+    if auto_fit is None:
+        auto_fit = True
+
+    strict_prefer_cpu_kv = gr.get("strict_prefer_cpu_kv")
+    if strict_prefer_cpu_kv is None:
+        strict_prefer_cpu_kv = eff.get("hw_guardrails_strict_prefer_cpu_kv")
+    if strict_prefer_cpu_kv is None:
+        strict_prefer_cpu_kv = True
+
+    log.info("[guardrail.config] worker_default.guardrail=%r (mode=%s, custom_gb=%r)", gr, mode, custom_gb)
+    log.info("[guardrail.feature] auto_fit=%s strict_prefer_cpu_kv=%s", auto_fit, strict_prefer_cpu_kv)
+
+    # ----- NEW: seed max layers when allowed (maximize first) -----
+    no_pins = (not user_set_layers_hard and not user_set_kv_hard and not user_set_ctx_hard)
+    seeded_max = False
+    if (auto_fit is not False) and no_pins:
+        ngl_in_pre = cleaned.get("n_gpu_layers")
+        if not isinstance(ngl_in_pre, int) or ngl_in_pre <= 0:
+            cleaned["n_gpu_layers"] = 999  # llama.cpp will clamp to model depth
+            seeded_max = True
+
+    # If guardrail is OFF and nothing is pinned → keep max and return (no shrinking)
+    if mode == "off" and no_pins:
+        diag = {
+            "mode": "off", "decision": "maximize_layers",
+            "nGpuLayers": cleaned.get("n_gpu_layers"),
+            "kvOn": bool(cleaned.get("kv_offload") or cleaned.get("offload_kqv")),
+            "nCtx": int(cleaned.get("n_ctx", 4096)),
+            "pins": {"layers": False, "kvOffload": False, "ctx": False},
+        }
+        return cleaned, env_patch, diag
 
     accel = (env_patch.get("LLAMA_ACCEL") or "auto").lower()
     accel_is_cpu = (accel == "cpu") or (env_patch.get("CUDA_VISIBLE_DEVICES") == "-1")
@@ -370,6 +423,7 @@ async def compute_llama_settings(model_path: str, user_kwargs: dict | None = Non
 
     log.info("[guardrail.feature] auto_fit=%s strict_prefer_cpu_kv=%s", auto_fit, strict_prefer_cpu_kv)
 
+
     try:
         model_sz_bytes = os.path.getsize(model_path)
     except Exception:
@@ -388,7 +442,6 @@ async def compute_llama_settings(model_path: str, user_kwargs: dict | None = Non
     )
     ngl_eff = max(1, min(total_layers, ngl_eff)) if ngl_eff else 0
 
-
     n_ctx = int(cleaned.get("n_ctx", 4096))
     kv_on = bool(cleaned.get("kv_offload") or cleaned.get("offload_kqv"))
 
@@ -400,8 +453,6 @@ async def compute_llama_settings(model_path: str, user_kwargs: dict | None = Non
         return (_estimate_kv_bytes(_nctx) / (1024**3)) if _kv_on else 0.0
 
     per_layer_gb = _per_layer_gb()
-
-    # first projection (may be coarse)
     model_gb = per_layer_gb * (ngl_eff or 0)
     kv_gb = _kv_gb(n_ctx, kv_on)
     proj_gb, free_gb, total_gb = await get_vram_projection(model_gb, kv_gb, overhead_gb=0.2)
@@ -445,46 +496,24 @@ async def compute_llama_settings(model_path: str, user_kwargs: dict | None = Non
 
     def _budget_for(_mode: str) -> float:
         vmm_headroom = 0.10 if (env_patch.get("GGML_CUDA_NO_VMM") == "1") else 0.00
-
         if _mode == "off":
             return float("+inf")
-
         if _mode == "strict":
-            return min(
-                max(live_free_gb - (0.25 + vmm_headroom), 0.0),
-                (0.85 - vmm_headroom) * total_gb,
-            )
-
+            return min(max(live_free_gb - (0.25 + vmm_headroom), 0.0), (0.85 - vmm_headroom) * total_gb)
         if _mode == "balanced":
-            return min(
-                max(live_free_gb - (0.15 + vmm_headroom), 0.0),
-                (0.93 - vmm_headroom) * total_gb,
-            )
-
+            return min(max(live_free_gb - (0.15 + vmm_headroom), 0.0), (0.93 - vmm_headroom) * total_gb)
         if _mode == "relaxed":
-            return min(
-                max(live_free_gb - (0.05 + vmm_headroom), 0.0),
-                (0.99 - vmm_headroom) * total_gb,
-            )
-
+            return min(max(live_free_gb - (0.05 + vmm_headroom), 0.0), (0.99 - vmm_headroom) * total_gb)
         if _mode == "custom" and isinstance(custom_gb, (int, float)):
-            # Treat custom GB as an upper bound, but never exceed live headroom
-            cap = min(
-                max(live_free_gb - (0.15 + vmm_headroom), 0.0),
-                (0.93 - vmm_headroom) * total_gb,
-            )
+            cap = min(max(live_free_gb - (0.15 + vmm_headroom), 0.0), (0.93 - vmm_headroom) * total_gb)
             return max(min(float(custom_gb), cap), 0.0)
-
         # default similar to balanced
-        return min(
-            max(live_free_gb - (0.15 + vmm_headroom), 0.0),
-            (0.93 - vmm_headroom) * total_gb,
-    )
+        return min(max(live_free_gb - (0.15 + vmm_headroom), 0.0), (0.93 - vmm_headroom) * total_gb)
 
     budget_gb = _budget_for(mode)
 
-    # optional auto-fit of n_gpu_layers when user didn't pin it
-    if auto_fit and (not isinstance(ngl_in, int) or ngl_in <= 0):
+    # IMPORTANT tweak: only run this classic auto-fit when we didn't seed 999
+    if auto_fit and (not seeded_max) and (not isinstance(ngl_in, int) or ngl_in <= 0):
         target_model_gb = max(0.0, budget_gb - (kv_gb + 0.2))
         ngl_auto = int(max(1, min(total_layers, (target_model_gb / per_layer_gb) if per_layer_gb > 0 else 1)))
         cleaned["n_gpu_layers"] = ngl_auto
