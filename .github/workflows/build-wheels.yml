@@ -10,6 +10,9 @@ on:
         required: false
         default: "false"
 
+permissions:
+  contents: write
+
 env:
   PY_VER: "3.11"
 
@@ -26,15 +29,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone llama-cpp-python @ tag
-        run: git clone --depth=1 --branch ${{ inputs.llama_tag }} https://github.com/abetlen/llama-cpp-python ext/_llama
+      - name: Clone llama-cpp-python @ tag (with submodules)
+        run: >
+          git clone --branch ${{ inputs.llama_tag }} --recurse-submodules
+          https://github.com/abetlen/llama-cpp-python ext/_llama
+
+      - name: Init submodules (llama.cpp)
+        working-directory: ext/_llama
+        shell: bash
+        run: |
+          set -e
+          git submodule deinit -f .
+          git submodule update --init --recursive
+          git submodule status
+          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; exit 1; }
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PY_VER }}
 
       - name: Build tools
-        run: python -m pip install --upgrade pip build wheel
+        run: python -m pip install --upgrade pip build wheel cmake ninja
 
       - name: Vulkan SDK (Windows)
         if: matrix.backend == 'vulkan'
@@ -49,6 +64,7 @@ jobs:
           refreshenv
 
       - name: Set CMAKE_ARGS
+        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
         shell: bash
         run: |
           if [[ "${{ matrix.backend }}" == "cuda" ]]; then
@@ -59,7 +75,12 @@ jobs:
             echo "CMAKE_ARGS=" >> $GITHUB_ENV
           fi
 
+      - name: Skip Windows CUDA (not requested)
+        if: matrix.backend == 'cuda' && inputs.build_win_cuda != 'true'
+        run: echo "Skipping Windows CUDA build because build_win_cuda=false"
+
       - name: Build llama wheel (Windows)
+        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
         run: |
           cd ext/_llama
           python -m pip wheel . -w dist
@@ -78,6 +99,7 @@ jobs:
           "@ | Out-File -FilePath ext/req_base.txt -Encoding ASCII
 
       - name: Collect wheels + base deps (Windows)
+        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
         shell: pwsh
         run: |
           $out = "ext/wheels_out/win/${{ matrix.backend }}"
@@ -86,6 +108,7 @@ jobs:
           python -m pip download --only-binary=:all: --dest $out -r ext/req_base.txt
 
       - uses: actions/upload-artifact@v4
+        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
         with:
           name: wheels-win-${{ matrix.backend }}
           path: ext/wheels_out/win/${{ matrix.backend }}/*.whl
@@ -102,8 +125,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone llama-cpp-python @ tag
-        run: git clone --depth=1 --branch ${{ inputs.llama_tag }} https://github.com/abetlen/llama-cpp-python ext/_llama
+      - name: Clone llama-cpp-python @ tag (with submodules)
+        run: >
+          git clone --branch ${{ inputs.llama_tag }} --recurse-submodules
+          https://github.com/abetlen/llama-cpp-python ext/_llama
+
+      - name: Init submodules (llama.cpp)
+        working-directory: ext/_llama
+        shell: bash
+        run: |
+          set -e
+          git submodule deinit -f .
+          git submodule update --init --recursive
+          git submodule status
+          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; exit 1; }
 
       - name: Write base reqs
         run: |
@@ -124,7 +159,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip python3-venv cmake ninja-build libvulkan-dev
+          sudo apt-get install -y python3-pip python3-venv cmake ninja-build libvulkan-dev glslang-dev
           python3 -m venv .venv && . .venv/bin/activate
           python -m pip install --upgrade pip build wheel
           if [ "${{ matrix.backend }}" = "vulkan" ]; then export CMAKE_ARGS="-DGGML_VULKAN=ON"; fi
@@ -186,21 +221,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone llama-cpp-python @ tag
-        run: git clone --depth=1 --branch ${{ inputs.llama_tag }} https://github.com/abetlen/llama-cpp-python ext/_llama
+      - name: Clone llama-cpp-python @ tag (with submodules)
+        run: >
+          git clone --branch ${{ inputs.llama_tag }} --recurse-submodules
+          https://github.com/abetlen/llama-cpp-python ext/_llama
+
+      - name: Init submodules (llama.cpp)
+        working-directory: ext/_llama
+        shell: bash
+        run: |
+          set -e
+          git submodule deinit -f .
+          git submodule update --init --recursive
+          git submodule status
+          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; exit 1; }
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PY_VER }}
 
       - name: Build tools
-        run: python -m pip install --upgrade pip build wheel
+        run: python -m pip install --upgrade pip build wheel cmake ninja
 
-      - name: Set Metal flags
+      - name: Set mac flags (arch/deployment)
+        shell: bash
+        run: |
+          echo "CMAKE_OSX_ARCHITECTURES=arm64" >> $GITHUB_ENV
+          echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> $GITHUB_ENV
+
+      - name: Enable Metal
         if: matrix.backend == 'metal'
+        shell: bash
         run: |
           echo "CMAKE_ARGS=-DGGML_METAL=ON -DLLAMA_METAL=ON" >> $GITHUB_ENV
-          echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> $GITHUB_ENV
 
       - name: Build llama wheel (mac)
         run: |
@@ -232,6 +285,9 @@ jobs:
     needs: [windows, linux, mac]
     runs-on: ubuntu-22.04
     steps:
+      - name: Ensure zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
       - uses: actions/download-artifact@v4
         with: { path: ./artifacts }
 
