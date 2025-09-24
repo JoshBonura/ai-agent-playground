@@ -1,4 +1,5 @@
 name: build-wheels
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,6 +13,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-wheels-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   PY_VER: "3.11"
@@ -29,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build env (Windows)
+        shell: pwsh
+        run: |
+          echo "FORCE_CMAKE=1" >> $env:GITHUB_ENV
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$env:NUMBER_OF_PROCESSORS" >> $env:GITHUB_ENV
+
       - name: Clone llama-cpp-python @ tag (with submodules)
         run: >
           git clone --branch ${{ inputs.llama_tag }} --recurse-submodules
@@ -39,10 +50,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          git submodule deinit -f .
-          git submodule update --init --recursive
+          git submodule sync --recursive
+          git submodule update --init --recursive --jobs 8 --depth 1
           git submodule status
-          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; exit 1; }
+          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; ls -la vendor/llama.cpp || true; exit 1; }
 
       - uses: actions/setup-python@v5
         with:
@@ -53,22 +64,27 @@ jobs:
 
       - name: Vulkan SDK (Windows)
         if: matrix.backend == 'vulkan'
+        shell: pwsh
         run: |
           choco install vulkansdk --no-progress -y
           refreshenv
+          $vks = (Get-ChildItem 'C:\VulkanSDK' | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          echo "VULKAN_SDK=$vks" >> $env:GITHUB_ENV
+          echo "$vks\Bin" >> $env:GITHUB_PATH
 
       - name: CUDA Toolkit (Windows)
         if: matrix.backend == 'cuda' && inputs.build_win_cuda == 'true'
+        shell: pwsh
         run: |
           choco install cuda --version=12.6 -y --no-progress
           refreshenv
 
-      - name: Set CMAKE_ARGS
+      - name: Set CMAKE_ARGS (Windows)
         if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
         shell: bash
         run: |
           if [[ "${{ matrix.backend }}" == "cuda" ]]; then
-            echo "CMAKE_ARGS=-DGGML_CUDA=ON" >> $GITHUB_ENV
+            echo 'CMAKE_ARGS=-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75\;80\;86\;89\;90' >> $GITHUB_ENV
           elif [[ "${{ matrix.backend }}" == "vulkan" ]]; then
             echo "CMAKE_ARGS=-DGGML_VULKAN=ON" >> $GITHUB_ENV
           else
@@ -79,13 +95,27 @@ jobs:
         if: matrix.backend == 'cuda' && inputs.build_win_cuda != 'true'
         run: echo "Skipping Windows CUDA build because build_win_cuda=false"
 
+      - name: "Sanity: vendored llama.cpp present (Windows)"
+        working-directory: ext/_llama
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f vendor/llama.cpp/CMakeLists.txt ]; then
+            echo "Re-initting submodules..."
+            git submodule sync --recursive
+            git submodule update --init --recursive --jobs 8 --depth 1
+          fi
+          test -f vendor/llama.cpp/CMakeLists.txt
+          git -C vendor/llama.cpp log -1 --oneline || true
+
+
       - name: Build llama wheel (Windows)
         if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
         run: |
           cd ext/_llama
           python -m pip wheel . -w dist
 
-      - name: Write base reqs
+      - name: Write base reqs (Windows)
         shell: pwsh
         run: |
           @"
@@ -112,6 +142,7 @@ jobs:
         with:
           name: wheels-win-${{ matrix.backend }}
           path: ext/wheels_out/win/${{ matrix.backend }}/*.whl
+          if-no-files-found: error
 
   ############################
   # LINUX (cpu, cuda, rocm, vulkan)
@@ -125,6 +156,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build env (Linux)
+        run: |
+          echo "FORCE_CMAKE=1" >> $GITHUB_ENV
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)" >> $GITHUB_ENV
+
       - name: Clone llama-cpp-python @ tag (with submodules)
         run: >
           git clone --branch ${{ inputs.llama_tag }} --recurse-submodules
@@ -135,12 +171,12 @@ jobs:
         shell: bash
         run: |
           set -e
-          git submodule deinit -f .
-          git submodule update --init --recursive
+          git submodule sync --recursive
+          git submodule update --init --recursive --jobs 8 --depth 1
           git submodule status
-          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; exit 1; }
+          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; ls -la vendor/llama.cpp || true; exit 1; }
 
-      - name: Write base reqs
+      - name: Write base reqs (Linux)
         run: |
           cat > ext/req_base.txt <<'REQ'
           fastapi==0.116.1
@@ -160,10 +196,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip python3-venv cmake ninja-build libvulkan-dev glslang-dev
+          # Optional for faster CPU wheels:
+          # sudo apt-get install -y libopenblas-dev
           python3 -m venv .venv && . .venv/bin/activate
           python -m pip install --upgrade pip build wheel
           if [ "${{ matrix.backend }}" = "vulkan" ]; then export CMAKE_ARGS="-DGGML_VULKAN=ON"; fi
+          # Optional BLAS flags:
+          # export CMAKE_ARGS="$CMAKE_ARGS -DGGML_BLAS=ON -DGGML_OPENBLAS=ON"
           cd ext/_llama
+          # Sanity before build
+          test -f vendor/llama.cpp/CMakeLists.txt
           python -m pip wheel . -w dist
           mkdir -p ../../wheels_out/linux/${{ matrix.backend }}
           cp dist/*.whl ../../wheels_out/linux/${{ matrix.backend }}/
@@ -178,10 +220,15 @@ jobs:
           image: nvidia/cuda:12.4.1-devel-ubuntu22.04
           options: -v ${{ github.workspace }}:/ws -w /ws/ext/_llama
           run: |
-            apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build
+            set -e
+            apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
             python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
             python -m pip install --upgrade pip build wheel
-            export CMAKE_ARGS="-DGGML_CUDA=ON"
+            # Ensure submodules are present inside the container (bind mount brings .git)
+            git submodule sync --recursive
+            git submodule update --init --recursive --jobs 8 --depth 1
+            test -f vendor/llama.cpp/CMakeLists.txt
+            export CMAKE_ARGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75\;80\;86\;89\;90"
             python -m pip wheel . -w dist
             mkdir -p /ws/ext/wheels_out/linux/cuda
             cp dist/*.whl /ws/ext/wheels_out/linux/cuda/
@@ -195,10 +242,14 @@ jobs:
           image: rocm/dev-ubuntu-22.04:5.7.1
           options: -v ${{ github.workspace }}:/ws -w /ws/ext/_llama
           run: |
+            set -e
             apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
             python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
             python -m pip install --upgrade pip build wheel
-            export CMAKE_ARGS="-DGGML_HIP=ON -DLLAMA_HIPBLAS=ON -DAMDGPU_TARGETS=gfx1030;gfx1100"
+            git submodule sync --recursive
+            git submodule update --init --recursive --jobs 8 --depth 1
+            test -f vendor/llama.cpp/CMakeLists.txt
+            export CMAKE_ARGS="-DGGML_HIP=ON -DLLAMA_HIPBLAS=ON -DAMDGPU_TARGETS=gfx1030\;gfx1100"
             python -m pip wheel . -w dist
             mkdir -p /ws/ext/wheels_out/linux/rocm
             cp dist/*.whl /ws/ext/wheels_out/linux/rocm/
@@ -208,6 +259,7 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.backend }}
           path: ext/wheels_out/linux/${{ matrix.backend }}/*.whl
+          if-no-files-found: error
 
   ############################
   # macOS (cpu, metal / arm64)
@@ -221,6 +273,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build env (macOS)
+        run: |
+          echo "FORCE_CMAKE=1" >> $GITHUB_ENV
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$(sysctl -n hw.ncpu)" >> $GITHUB_ENV
+
       - name: Clone llama-cpp-python @ tag (with submodules)
         run: >
           git clone --branch ${{ inputs.llama_tag }} --recurse-submodules
@@ -231,10 +288,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          git submodule deinit -f .
-          git submodule update --init --recursive
+          git submodule sync --recursive
+          git submodule update --init --recursive --jobs 8 --depth 1
           git submodule status
-          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; exit 1; }
+          test -f vendor/llama.cpp/CMakeLists.txt || { echo "FATAL: Missing vendor/llama.cpp/CMakeLists.txt"; ls -la vendor/llama.cpp || true; exit 1; }
 
       - uses: actions/setup-python@v5
         with:
@@ -255,13 +312,8 @@ jobs:
         run: |
           echo "CMAKE_ARGS=-DGGML_METAL=ON -DLLAMA_METAL=ON" >> $GITHUB_ENV
 
-      - name: Build llama wheel (mac)
+      - name: Write base reqs (macOS)
         run: |
-          cd ext/_llama
-          python -m pip wheel . -w dist
-          mkdir -p ../../wheels_out/mac/${{ matrix.backend }}
-          cp dist/*.whl ../../wheels_out/mac/${{ matrix.backend }}/
-          cd ../../
           cat > ext/req_base.txt <<'REQ'
           fastapi==0.116.1
           uvicorn[standard]==0.30.6
@@ -271,12 +323,35 @@ jobs:
           typing_extensions==4.15.0
           diskcache==5.6.3
           REQ
+
+      - name: "Sanity: vendored llama.cpp present (mac)"
+        working-directory: ext/_llama
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f vendor/llama.cpp/CMakeLists.txt ]; then
+            echo "Re-initting submodules..."
+            git submodule sync --recursive
+            git submodule update --init --recursive --jobs 8 --depth 1
+          fi
+          test -f vendor/llama.cpp/CMakeLists.txt
+          git -C vendor/llama.cpp log -1 --oneline || true
+
+          
+      - name: Build llama wheel (mac)
+        run: |
+          cd ext/_llama
+          python -m pip wheel . -w dist
+          mkdir -p ../../wheels_out/mac/${{ matrix.backend }}
+          cp dist/*.whl ../../wheels_out/mac/${{ matrix.backend }}/
+          cd ../../
           python -m pip download --only-binary=:all: --dest ext/wheels_out/mac/${{ matrix.backend }} -r ext/req_base.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-mac-${{ matrix.backend }}
           path: ext/wheels_out/mac/${{ matrix.backend }}/*.whl
+          if-no-files-found: error
 
   ############################
   # PACKAGE & RELEASE
@@ -289,7 +364,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zip
 
       - uses: actions/download-artifact@v4
-        with: { path: ./artifacts }
+        with:
+          path: ./artifacts
 
       - name: Assemble per-OS zips + manifest
         run: |
