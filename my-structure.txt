@@ -1,7 +1,9 @@
 ai-agent-playground/
   .gitattributes
   .gitignore
+  LICENSES-THIRD-PARTY.txt
   fs.py
+  localmind-backend.spec
   my-structure.txt
   package-lock.json
   package.json
@@ -37,168 +39,202 @@ ai-agent-playground/
     auth.sqlite
     ports.json
   aimodel/
+    .env
+    __init__.py
+    app.py
+    requirements.txt
     .runtime/
-      ports.json
-    file_read/
-      .env
       __init__.py
-      app.py
-      requirements.txt
-      adaptive/
-        config/
-      api/
+      ports.json
+    api/
+      __init__.py
+      admin_chats.py
+      admins.py
+      auth_router.py
+      billing.py
+      cancel_router.py
+      chats.py
+      devices_router.py
+      generate_router.py
+      licensing_router.py
+      metrics.py
+      model_workers.py
+      models.py
+      proxy_generate.py
+      rag.py
+      runtime_accel.py
+      settings.py
+      system.py
+    backend/
+      __init__.py
+      .runtime/
         __init__.py
-        admin_chats.py
-        admins.py
-        auth_router.py
-        billing.py
-        cancel_router.py
-        chats.py
-        devices_router.py
-        generate_router.py
-        licensing_router.py
-        metrics.py
-        model_workers.py
-        models.py
-        proxy_generate.py
-        rag.py
-        runtime_accel.py
-        settings.py
-        system.py
-      backend/
-        .runtime/
-          ports.json
-      core/
+        ports.json
+    core/
+      __init__.py
+      admins.py
+      crypto_keys.py
+      files.py
+      http.py
+      logging.py
+      packing_memory_core.py
+      packing_ops.py
+      request_ctx.py
+      schemas.py
+      settings.py
+      style.py
+    deps/
+      __init__.py
+      admin_deps.py
+      auth_deps.py
+      license_deps.py
+      model_deps.py
+    rag/
+      __init__.py
+      rerank.py
+      retrieve_common.py
+      retrieve_core.py
+      retrieve_pipeline.py
+      retrieve_tabular.py
+      router_ai.py
+      schemas.py
+      search.py
+      store.py
+      uploads.py
+      ingest/
         __init__.py
-        admins.py
-        crypto_keys.py
-        files.py
-        http.py
-        logging.py
-        packing_memory_core.py
-        packing_ops.py
-        request_ctx.py
-        schemas.py
-        settings.py
-        style.py
-      deps/
-        admin_deps.py
-        auth_deps.py
-        license_deps.py
-        model_deps.py
-      rag/
-        __init__.py
-        rerank.py
-        retrieve_common.py
-        retrieve_core.py
-        retrieve_pipeline.py
-        retrieve_tabular.py
-        router_ai.py
-        schemas.py
-        search.py
-        store.py
-        uploads.py
-        ingest/
-          __init__.py
-          common.py
-          csv_ingest.py
-          doc_binary_ingest.py
-          docx_ingest.py
-          excel_ingest.py
-          excel_ingest_core.py
-          main.py
-          ocr.py
-          pdf_ingest.py
-          ppt_ingest.py
-          xls_ingest.py
-      runtime/
-        __init__.py
-        model_runtime.py
-      services/
-        __init__.py
-        accel_prefs.py
-        attachments.py
-        auth_service.py
-        budget.py
-        cancel.py
-        context_window.py
-        generate_flow.py
-        generate_pipeline.py
-        generate_pipeline_part2.py
-        generate_pipeline_support.py
-        licensing_core.py
-        licensing_service.py
-        packing.py
-        prompt_utils.py
-        router_text.py
-        session_io.py
-        streaming_worker.py
-        system_collectors.py
-        system_snapshot.py
-      store/
-        __init__.py
-        base.py
-        chats.py
-        default_settings.json
-        index.py
-        migrate.py
-        override_settings.json
-        paths.py
-        rag/
-          by_session/
-            19982f0e-9058-4c4e-b2e9-fe6f178fbdd0/
-              index.faiss
-              meta.jsonl
-            5142ff3d-c26e-4d7a-b53e-a90190f3a12b/
-              index.faiss
-              meta.jsonl
-            9e3d10ea-1484-435a-83dc-6408f4f1f6ff/
-              meta.jsonl
-            dcea3a93-3260-4a46-9028-a04f04accb49/
-              meta.jsonl
-          global/
-            meta.jsonl
-      telemetry/
-        models.py
-      utils/
-        streaming.py
-        text.py
-      web/
-        __init__.py
-        brave.py
-        fetch.py
-        orchestrator.py
-        orchestrator_common.py
-        provider.py
-        query_summarizer.py
-        router_ai.py
-      workers/
-        retitle_worker.py
-        supervisor.py
-        worker_entry.py
-        worker_guardrail.py
-        worker_types.py
+        common.py
+        csv_ingest.py
+        doc_binary_ingest.py
+        docx_ingest.py
+        excel_ingest.py
+        excel_ingest_core.py
+        main.py
+        ocr.py
+        pdf_ingest.py
+        ppt_ingest.py
+        xls_ingest.py
+    runtime/
+      __init__.py
+      model_runtime.py
+    services/
+      __init__.py
+      accel_prefs.py
+      attachments.py
+      auth_service.py
+      budget.py
+      cancel.py
+      context_window.py
+      generate_flow.py
+      generate_pipeline.py
+      generate_pipeline_part2.py
+      generate_pipeline_support.py
+      licensing_core.py
+      licensing_service.py
+      packing.py
+      prompt_utils.py
+      router_text.py
+      session_io.py
+      streaming_worker.py
+      system_collectors.py
+      system_snapshot.py
+    store/
+      __init__.py
+      base.py
+      chats.py
+      default_settings.json
+      index.py
+      migrate.py
+      override_settings.json
+      paths.cpython-311.pyc
+      paths.py
+    telemetry/
+      __init__.py
+      models.py
+    utils/
+      __init__.py
+      streaming.py
+      text.py
+    web/
+      __init__.py
+      brave.py
+      fetch.py
+      orchestrator.py
+      orchestrator_common.py
+      provider.py
+      query_summarizer.py
+      router_ai.py
+    workers/
+      retitle_worker.py
+      supervisor.py
+      worker_entry.py
+      worker_guardrail.py
+      worker_types.py
   cloudflare/
     .gitignore
-    license-do.ts
+    catalog.json
+    common.ts
+    licensing.ts
     package-lock.json
     package.json
     tsconfig.json
-    worker-licensing.ts
+    win-cpu-v1.50.2.json
+    worker.ts
     wrangler.toml
     .wrangler/
+      state/
+        v3/
+          cache/
+            miniflare-CacheObject/
+          r2/
+            miniflare-R2BucketObject/
+              55640f7c7b363ff306f436f24b10df88c0edae4fe5cde8febd100ad548ca07b4.sqlite
+              55640f7c7b363ff306f436f24b10df88c0edae4fe5cde8febd100ad548ca07b4.sqlite-shm
+              55640f7c7b363ff306f436f24b10df88c0edae4fe5cde8febd100ad548ca07b4.sqlite-wal
+            runtimes/
+              blobs/
+                befb967eaf31f6ab47c30aae7dc29eda164a6144c0255d434b1188885c6333c5000001997c35b78b
+          workflows/
       tmp/
   desktop/
     .gitignore
+    LICENSES-NPM.json
+    installer.nsh
+    localmind-backend.spec
+    localmind-provisioner.spec
     main.ts
     package-lock.json
     package.json
+    pyi_rth_aimodel_path.py
     tsconfig.json
+    .pyi_build/
+      localmind-backend/
+      localmind-provisioner/
+        Analysis-00.toc
+        EXE-00.toc
+        PKG-00.toc
+        PYZ-00.pyz
+        PYZ-00.toc
+        base_library.zip
+        localmind-provisioner.pkg
+        warn-localmind-provisioner.txt
+        xref-localmind-provisioner.html
+        localpycs/
+          pyimod01_archive.pyc
+          pyimod02_importers.pyc
+          pyimod03_ctypes.pyc
+          pyimod04_pywin32.pyc
+          struct.pyc
   ext/
+    __init__.py
     ai_service.py
+    common.py
+    provision.py
+    provision_cli.py
     runtime_api.py
-    runtime_manager.py
-    requirements.txt/
+    worker.py
+    base/
+    requirements/
       base.txt
       linux.cpu.txt
       linux.cuda.txt
@@ -211,20 +247,110 @@ ai-agent-playground/
       windows.vulkan.txt
     wheels/
       win/
-        cpu/
+        base/
           MarkupSafe-3.0.2-cp311-cp311-win_amd64.whl
+          PyJWT-2.10.1-py3-none-any.whl
+          PyNaCl-1.5.0-cp36-abi3-win_amd64.whl
+          PyYAML-6.0.2-cp311-cp311-win_amd64.whl
+          annotated_types-0.7.0-py3-none-any.whl
+          anyio-4.11.0-py3-none-any.whl
+          backports.tarfile-1.2.0-py3-none-any.whl
+          bcrypt-4.3.0-cp39-abi3-win_amd64.whl
+          beautifulsoup4-4.12.3-py3-none-any.whl
+          certifi-2025.8.3-py3-none-any.whl
+          cffi-2.0.0-cp311-cp311-win_amd64.whl
+          chardet-5.2.0-py3-none-any.whl
+          charset_normalizer-3.4.3-cp311-cp311-win_amd64.whl
+          click-8.3.0-py3-none-any.whl
+          colorama-0.4.6-py2.py3-none-any.whl
+          cryptography-45.0.6-cp311-abi3-win_amd64.whl
+          cssselect-1.3.0-py3-none-any.whl
+          ddgs-9.5.4-py3-none-any.whl
           diskcache-5.6.3-py3-none-any.whl
+          ecdsa-0.19.1-py2.py3-none-any.whl
+          et_xmlfile-2.0.0-py3-none-any.whl
+          faiss_cpu-1.8.0.post1-cp311-cp311-win_amd64.whl
+          fastapi-0.116.1-py3-none-any.whl
+          filelock-3.19.1-py3-none-any.whl
+          fsspec-2025.9.0-py3-none-any.whl
+          gguf-0.17.1-py3-none-any.whl
+          h11-0.16.0-py3-none-any.whl
+          httpcore-1.0.9-py3-none-any.whl
+          httptools-0.6.4-cp311-cp311-win_amd64.whl
+          httpx-0.27.0-py3-none-any.whl
+          huggingface_hub-0.35.1-py3-none-any.whl
+          idna-3.10-py3-none-any.whl
+          importlib_metadata-8.7.0-py3-none-any.whl
+          jaraco.classes-3.4.0-py3-none-any.whl
+          jaraco.context-6.0.1-py3-none-any.whl
+          jaraco_functools-4.3.0-py3-none-any.whl
           jinja2-3.1.6-py3-none-any.whl
-          llama_cpp_python-latest-win_amd64.cpu.whl
+          joblib-1.5.2-py3-none-any.whl
+          keyring-25.6.0-py3-none-any.whl
+          lxml-6.0.1-cp311-cp311-win_amd64.whl
+          more_itertools-10.8.0-py3-none-any.whl
+          mpmath-1.3.0-py3-none-any.whl
+          networkx-3.5-py3-none-any.whl
           numpy-1.26.4-cp311-cp311-win_amd64.whl
+          nvidia_ml_py3-7.352.0-py3-none-any.whl
+          openpyxl-3.1.5-py2.py3-none-any.whl
+          packaging-25.0-py3-none-any.whl
+          pandas-2.2.2-cp311-cp311-win_amd64.whl
+          passlib-1.7.4-py2.py3-none-any.whl
+          pdfminer.six-20240706-py3-none-any.whl
+          pillow-10.4.0-cp311-cp311-win_amd64.whl
+          primp-0.15.0-cp38-abi3-win_amd64.whl
+          psutil-7.0.0-cp37-abi3-win_amd64.whl
+          pyasn1-0.6.1-py3-none-any.whl
+          pycparser-2.23-py3-none-any.whl
+          pydantic-2.11.9-py3-none-any.whl
+          pydantic_core-2.33.2-cp311-cp311-win_amd64.whl
+          pypdf2-3.0.1-py3-none-any.whl
+          pypdfium2-4.30.0-py3-none-win_amd64.whl
+          pytesseract-0.3.13-py3-none-any.whl
+          python_dateutil-2.9.0.post0-py2.py3-none-any.whl
+          python_docx-1.1.2-py3-none-any.whl
+          python_dotenv-1.1.1-py3-none-any.whl
+          python_jose-3.5.0-py2.py3-none-any.whl
+          python_pptx-0.6.23-py3-none-any.whl
+          pytz-2025.2-py2.py3-none-any.whl
+          pywin32_ctypes-0.2.3-py3-none-any.whl
+          readability_lxml-0.8.1-py3-none-any.whl
+          regex-2025.7.34-cp311-cp311-win_amd64.whl
+          requests-2.32.5-py3-none-any.whl
+          rsa-4.9.1-py3-none-any.whl
+          safetensors-0.6.2-cp38-abi3-win_amd64.whl
+          scikit_learn-1.7.1-cp311-cp311-win_amd64.whl
+          scipy-1.16.1-cp311-cp311-win_amd64.whl
+          selectolax-0.3.21-cp311-cp311-win_amd64.whl
+          sentence_transformers-3.0.1-py3-none-any.whl
+          six-1.17.0-py2.py3-none-any.whl
+          sniffio-1.3.1-py3-none-any.whl
+          soupsieve-2.8-py3-none-any.whl
+          starlette-0.47.3-py3-none-any.whl
+          striprtf-0.0.26-py3-none-any.whl
+          sympy-1.14.0-py3-none-any.whl
+          threadpoolctl-3.6.0-py3-none-any.whl
+          tokenizers-0.21.4-cp39-abi3-win_amd64.whl
+          torch-2.8.0-cp311-cp311-win_amd64.whl
+          tqdm-4.67.1-py3-none-any.whl
+          transformers-4.55.4-py3-none-any.whl
           typing_extensions-4.15.0-py3-none-any.whl
+          typing_inspection-0.4.1-py3-none-any.whl
+          tzdata-2025.2-py2.py3-none-any.whl
+          tzlocal-5.2-py3-none-any.whl
+          urllib3-2.5.0-py3-none-any.whl
+          uvicorn-0.30.6-py3-none-any.whl
+          watchfiles-1.1.0-cp311-cp311-win_amd64.whl
+          websockets-15.0.1-cp311-cp311-win_amd64.whl
+          xlsxwriter-3.2.9-py3-none-any.whl
+          zipp-3.23.0-py3-none-any.whl
+        cpu/
+          llama_cpp_python-0.3.16-cp311-cp311-win_amd64.whl
+          v1.50.2/
+            llama_cpp_python-0.3.16-cp311-cp311-win_amd64.whl
         cuda/
-          MarkupSafe-3.0.2-cp311-cp311-win_amd64.whl
-          jinja2-3.1.6-py3-none-any.whl
-          llama_cpp_python-0.3.16+cuda-cp311-cp311-win_amd64.whl
-          llama_cpp_python-latest-win_amd64.cpu.whl
-          numpy-1.26.4-cp311-cp311-win_amd64.whl
-          typing_extensions-4.15.0-py3-none-any.whl
+          llama_cpp_python-0.3.16-cp311-cp311-win_amd64.whl
   frontend/
     .env.development
     .gitignore
@@ -255,6 +381,7 @@ ai-agent-playground/
         license.ts
         modelWorkers.ts
         models.ts
+        runtime.ts
         system.ts
       auth/
         AuthContext.tsx
@@ -329,12 +456,12 @@ ai-agent-playground/
             HardwareSections.tsx
             HardwareUI.tsx
             hardwareHooks.ts
+          runtime/
+            RuntimeSection.tsx
       data/
         chatApi.ts
         ragApi.ts
         settingsApi.ts
-      features/
-        chat/
       hooks/
         adminChatsApi.ts
         useAttachmentUploads.ts
@@ -392,3 +519,11 @@ ai-agent-playground/
           TypingIndicator.tsx
       types/
         chat.ts
+  protected/
+    run_backend.py
+    pyarmor_runtime_000000/
+      __init__.py
+      pyarmor_runtime.pyd
+  tools/
+    make_manifest.py
+    update_catalog.py

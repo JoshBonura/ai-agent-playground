@@ -4,6 +4,7 @@ import type { Dispatch, SetStateAction } from "react";
 export type Tab =
   | "general"
   | "hardware"
+  | "runtime"
   | "notifications"
   | "personalization"
   | "connectors"

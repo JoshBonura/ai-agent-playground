@@ -26,6 +26,10 @@ ignore_full = {
     ".pytest_cache",
     ".idea",
     ".DS_Store",
+    "bin",
+    ".pyi_build"
+    ".ruff_cache"
+    "bind"
 }
 collapse = {".git"}  # show marker only
 expand_two_levels = {".venv"}  # expand .venv two levels (but collapse site-packages)

@@ -10,6 +10,7 @@ import SettingsContent from "./SettingsContent";
 const BASE_NAV: { key: Tab; label: string }[] = [
   { key: "general", label: "General" },
   { key: "hardware", label: "Hardware" },
+  { key: "runtime", label: "Runtime" },
   { key: "notifications", label: "Notifications" },
   { key: "personalization", label: "Personalization" },
   { key: "connectors", label: "Connectors" },

@@ -1,42 +1,22 @@
 import SettingsContentCore from "./SettingsContent.Core";
 import SettingsContentAdminDev from "./SettingsContent.AdminDev";
 import HardwareSection from "./hardware/HardwareSection";
+import RuntimeSection from "./runtime/RuntimeSection";
 import type { AdminState } from "../../api/admins";
-
-// duplicate union here to avoid another file
-type Tab =
-  | "general"
-  | "hardware"
-  | "notifications"
-  | "personalization"
-  | "connectors"
-  | "schedules"
-  | "datacontrols"
-  | "security"
-  | "account"
-  | "developer"
-  | "admin";
+import type { Tab } from "./SettingsSidebar"; // ← reuse the shared Tab type
 
 type Props = {
   tab: Tab;
   userEmail: string;
-
   loading: boolean;
-  loadingSoft?: boolean; // ← NEW
-
+  loadingSoft?: boolean;
   error: string | null;
   adminErr: string | null;
-
   effective: Record<string, any> | null;
   overrides: Record<string, any> | null;
   defaults: Record<string, any> | null;
-
   adminState: AdminState | null;
-
-  saveOverrides: (
-    payload: Record<string, any>,
-    method?: "patch" | "put",
-  ) => Promise<void>;
+  saveOverrides: (payload: Record<string, any>, method?: "patch" | "put") => Promise<void>;
 };
 
 export default function SettingsContent(p: Props) {
@@ -46,26 +26,17 @@ export default function SettingsContent(p: Props) {
         <div className="text-base font-semibold capitalize">
           {p.tab.replace(/([a-z])([A-Z])/g, "$1 $2")}
         </div>
-
-        {/* Only show Loading… for hard loads (not soft refresh) */}
-        {p.loading && !p.loadingSoft && (
-          <div className="text-xs text-gray-500 mt-1">Loading…</div>
-        )}
-
+        {p.loading && !p.loadingSoft && <div className="text-xs text-gray-500 mt-1">Loading…</div>}
         {p.error && <div className="text-xs text-red-600 mt-1">{p.error}</div>}
-        {p.adminErr && p.tab === "admin" && (
-          <div className="text-xs text-red-600 mt-1">{p.adminErr}</div>
-        )}
+        {p.adminErr && p.tab === "admin" && <div className="text-xs text-red-600 mt-1">{p.adminErr}</div>}
       </header>
 
       <div className="flex-1 overflow-auto p-5">
         {p.tab === "hardware" && (
-          <HardwareSection
-            effective={p.effective}
-            overrides={p.overrides}
-            saveOverrides={p.saveOverrides}
-          />
+          <HardwareSection effective={p.effective} overrides={p.overrides} saveOverrides={p.saveOverrides} />
         )}
+
+        {p.tab === "runtime" && <RuntimeSection />}
 
         {(p.tab === "general" || p.tab === "account") && (
           <SettingsContentCore
@@ -88,8 +59,9 @@ export default function SettingsContent(p: Props) {
           />
         )}
 
-        {/* Stubs for other tabs */}
+        {/* Stub for any other tabs (exclude runtime) */}
         {p.tab !== "hardware" &&
+          p.tab !== "runtime" &&
           p.tab !== "general" &&
           p.tab !== "account" &&
           p.tab !== "admin" &&

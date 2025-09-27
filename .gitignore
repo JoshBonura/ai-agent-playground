@@ -21,6 +21,7 @@ __pycache__/
 *.parquet
 *.csv
 *.tsv
+*.whl
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
@@ -37,3 +38,6 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+bin/
+.pyi_build
+ext/wheels/win/base

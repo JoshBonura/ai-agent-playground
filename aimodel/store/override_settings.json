@@ -1,0 +1,16 @@
+{
+  "hw_guardrails_mode": "off",
+  "worker_default": {
+    "accel": "auto"
+  },
+  "hw_guardrails_strict_prefer_cpu_kv": false,
+  "hw_guardrails_autofit": false,
+  "hw_guardrails_custom_gb": 2,
+  "ui_locale": "auto",
+  "hw_backend": "auto",
+  "runtime": {
+    "preferred_backend": "cuda",
+    "allow_fallback": false
+  },
+  "gpu_limit_offload_dedicated": false
+}

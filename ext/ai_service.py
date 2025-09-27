@@ -1,7 +1,8 @@
 # ext/ai_service.py
+from __future__ import annotations
 
 from fastapi import FastAPI
-from ext.runtime_api import router as runtime_router  # absolute import = reliable
+from ext.runtime_api import router as runtime_router  # same-origin runtime control
 
 app = FastAPI(title="AI Agent Playground Runtime Service")
 
@@ -12,7 +13,6 @@ app.include_router(runtime_router)
 def healthz():
     return {"ok": True}
 
-# Optional: simple root for quick sanity checks
 @app.get("/")
 def root():
     return {"service": "runtime", "ok": True}

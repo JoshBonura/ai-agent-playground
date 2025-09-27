@@ -1,0 +1,32 @@
+﻿{
+  "schema": 1,
+  "os": "win",
+  "backend": "cpu",
+  "version": "v1.50.2",
+  "wheels": [
+    {
+      "path": "wheels/win/cpu/v1.50.2/diskcache-5.6.3-py3-none-any.whl",
+      "sha256": "5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19"
+    },
+    {
+      "path": "wheels/win/cpu/v1.50.2/jinja2-3.1.6-py3-none-any.whl",
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+    },
+    {
+      "path": "wheels/win/cpu/v1.50.2/llama_cpp_python-0.3.16-cp311-cp311-win_amd64.whl",
+      "sha256": "e031f66db4809d8187c5f9b57f01e44e05bcdf35238bc7b11a686d693674a3a2"
+    },
+    {
+      "path": "wheels/win/cpu/v1.50.2/MarkupSafe-3.0.2-cp311-cp311-win_amd64.whl",
+      "sha256": "70a87b411535ccad5ef2f1df5136506a10775d267e197e4cf531ced10537bd6b"
+    },
+    {
+      "path": "wheels/win/cpu/v1.50.2/numpy-1.26.4-cp311-cp311-win_amd64.whl",
+      "sha256": "cd25bcecc4974d09257ffcd1f098ee778f7834c3ad767fe5db785be9a4aa9cb2"
+    },
+    {
+      "path": "wheels/win/cpu/v1.50.2/typing_extensions-4.15.0-py3-none-any.whl",
+      "sha256": "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"
+    }
+  ]
+}

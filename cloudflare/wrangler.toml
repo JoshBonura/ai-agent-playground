@@ -1,5 +1,5 @@
 name = "lic-server"
-main = "worker-licensing.ts"
+main = "worker.ts"
 compatibility_date = "2024-09-01"
 
 [durable_objects]
@@ -10,6 +10,10 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["LicenseStore"]
+
+[[r2_buckets]]
+binding = "R2"                 # env.R2 in code
+bucket_name = "runtimes"       # create this in CF dashboard
 
 [vars]
 APP_BASE_URL = "https://lic-server.localmind.workers.dev"
@@ -26,5 +30,4 @@ ASSET_MAC_UNIVERSAL_SHA256 = "<hex>"
 ASSET_LINUX_X64_URL = "https://cdn.example.com/app-1.4.2-linux-x64.AppImage"
 ASSET_LINUX_X64_SHA256 = "<hex>"
 UPDATE_CHANNEL = "stable"
-UPDATE_ROLLOUT_PCT = "100"
-
+UPDATE_ROLLOUT_PCT = "100"     # string envs; parseInt in code

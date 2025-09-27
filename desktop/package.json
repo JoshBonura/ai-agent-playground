@@ -1,42 +1,96 @@
 {
   "name": "localmind-desktop",
   "version": "0.1.0",
+  "description": "LocalMind desktop app (Electron + FastAPI backend + bundled wheels)",
+  "author": "Your Name",
+  "private": true,
   "main": "dist/main.js",
-  "scripts": {
-    "dev": "tsc && electron .",
-    "build:frontend": "cd ../frontend && npm ci && npm run build",
-    "build:backend": "pyinstaller --onefile --name localmind-backend ../run_backend.py",
-    "prepack": "npm run build:frontend && npm run build:backend && tsc",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder"
-  },
+"scripts": {
+  "dev": "tsc && electron .",
+
+  "build:frontend": "cd ../frontend && npm ci && npm run build",
+  "build:backend": "set PYTHONPATH=..&& pyinstaller --clean --noconfirm --onedir --name localmind-backend --distpath bin --workpath .pyi_build --paths .. --collect-submodules aimodel --collect-data aimodel --collect-all fastapi --collect-all starlette ..\\run_backend.py",
+
+    "build:backend:fast": "set PYTHONPATH=..&& pyinstaller --noconfirm --onedir --name localmind-backend --distpath bin --workpath .pyi_build --paths .. --collect-submodules aimodel --collect-data aimodel --collect-all fastapi --collect-all starlette ..\\run_backend.py",
+    
+    "build:backend:lean": "set PYTHONPATH=..&& pyinstaller --noconfirm --onedir --name localmind-backend --distpath bin --workpath .pyi_build --paths .. --collect-submodules aimodel --collect-data aimodel --collect-all fastapi --collect-all starlette --exclude-module torch --exclude-module transformers --exclude-module faiss --exclude-module scipy --exclude-module PIL ..\\run_backend.py",
+
+
+
+  
+  "build:provisioner": "pyinstaller --onefile --distpath bin --workpath .pyi_build --name localmind-provisioner ../ext/provision_cli.py",
+
+  "secure:backend": "pyarmor gen -O ../protected ../run_backend.py",
+  "build:backend:secure": "npm run secure:backend && pyinstaller --onefile --distpath bin --workpath .pyi_build --name localmind-backend --paths .. --collect-submodules aimodel --collect-data aimodel --collect-all ext --runtime-hook pyi_rth_aimodel_path.py ../protected/run_backend.py",
+
+
+  "prep:all": "npm run build:frontend && npm run build:backend && npm run build:provisioner && tsc",
+  "prep:backend": "npm run build:backend && tsc",
+  "prep:frontend": "npm run build:frontend && tsc",
+  "prep:provisioner": "npm run build:provisioner && tsc",
+
+  "prepack": "echo Skipping heavy prepack (use `npm run prep:all` when needed)",
+
+
+  "pack:fast": "electron-builder --dir",
+  "dist:fast": "electron-builder",
+
+
+  "pack:full": "npm run prep:all && electron-builder --dir",
+  "dist:full": "npm run prep:all && electron-builder",
+
+  "pack": "npm run pack:fast",
+  "dist": "npm run dist:fast"
+},
   "build": {
     "appId": "com.localmind.app",
+    "asar": true,
+    "forceCodeSigning": false,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
     "files": [
       "dist/**/*",
       "../frontend/dist/**/*"
     ],
-    "extraResources": [
-      {
-        "from": "../dist/localmind-backend*",
-        "to": "."
-      }
-    ],
+"extraResources": [
+  { "from": "bin/localmind-backend", "to": "." },
+
+  { "from": "bin/localmind-provisioner.exe", "to": "." },
+
+  { "from": "../ext/requirements", "to": "runtime/requirements" },
+  { "from": "../ext/wheels/win",   "to": "runtime/wheels/win" },
+  { "from": "../ext", "to": "_internal/ext" },
+  { "from": "../aimodel",          "to": "_internal/aimodel" },
+
+  { "from": "../frontend/dist", "to": "frontend/dist" },
+  { "from": "../LICENSES-THIRD-PARTY.txt", "to": "licenses/LICENSES-THIRD-PARTY.txt" },
+  { "from": "LICENSES-NPM.json", "to": "licenses/LICENSES-NPM.json" }
+],
+
+
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "build/icon.ico",
+      "forceCodeSigning": false,
+      "signAndEditExecutable": false,
+      "signingHashAlgorithms": [],
+      "signDlls": false
     },
-    "mac": {
-      "target": "dmg"
-    },
-    "linux": {
-      "target": "AppImage"
+
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false
     }
-  },
-  "dependencies": {
-    "electron": "^31.0.0"
+
   },
   "devDependencies": {
+    "electron": "^31.7.7",
     "electron-builder": "^24.13.3",
     "typescript": "^5.4.0"
-  }
+  },
+  "dependencies": {}
 }
