@@ -65,47 +65,42 @@ jobs:
       - name: Build tools
         run: python -m pip install --upgrade pip build wheel cmake ninja
 
-      - name: Vulkan SDK (Windows) — winget or zip fallback
+# ---- Windows Vulkan setup + diagnostics ----
+# ---- Windows Vulkan setup + diagnostics ----
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0   # pin a known-good; you can try "latest" later
+          cache: true
+
+      - name: Configure CMAKE_ARGS for Vulkan (Windows)
+        if: matrix.backend == 'vulkan'
+        shell: bash
+        run: |
+          echo "CMAKE_ARGS=-DGGML_VULKAN=ON" >> $GITHUB_ENV
+          echo "CMAKE_VERBOSE_MAKEFILE=ON"   >> $GITHUB_ENV
+          echo "SKBUILD_CMAKE_ARGS=--log-level=VERBOSE" >> $GITHUB_ENV
+
+      - name: Vulkan diagnostics (Windows)
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $installed = $false
-
-          # Try winget first (present on Windows Server 2022 runners)
-          try {
-            winget --version
-            winget install --id LunarG.VulkanSDK --exact `
-              --accept-package-agreements --accept-source-agreements -s winget -e
-            $installed = $true
-          } catch {
-            Write-Host "winget install failed or winget missing: $($_.Exception.Message)"
+          Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
+          if (Test-Path $env:VULKAN_SDK) {
+            Get-ChildItem $env:VULKAN_SDK | Select Name,FullName
+            Get-ChildItem "$env:VULKAN_SDK\Lib" -Filter "vulkan-1.lib" -Recurse -ErrorAction SilentlyContinue `
+              | Select-Object -First 5 FullName
+          } else {
+            Write-Error "VULKAN_SDK not set by install-vulkan-sdk action."
           }
-
-          if (-not $installed) {
-            $ver = "${{ env.VULKAN_VER }}"
-            $zipUrl = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver.zip?Human=true"
-            $zip    = "$env:TEMP\VulkanSDK-$ver.zip"
-            $dest   = "C:\VulkanSDK\$ver"
-
-            Write-Host "Falling back to portable ZIP: $zipUrl"
-            Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zip
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            tar -xf $zip -C $dest
-            $installed = Test-Path $dest
-          }
-
-          # Discover the newest installed SDK and export env
-          $vks = (Get-ChildItem 'C:\VulkanSDK' -Directory `
-                  | Sort-Object Name -Descending | Select-Object -First 1).FullName
-          if (-not $vks) { throw "Vulkan SDK not found under C:\VulkanSDK" }
-
-          echo "VULKAN_SDK=$vks" >> $env:GITHUB_ENV
-          echo "$vks\Bin"        >> $env:GITHUB_PATH
-
-          Write-Host "Using Vulkan SDK at: $vks"
-          & "$vks\Bin\glslc.exe" --version
-
+          where.exe glslc
+          glslc --version
+          where.exe glslangValidator
+          glslangValidator --version
+          cmake --version
+          ninja --version
 
       - name: Install CUDA Toolkit (Windows) — winget with fallback
         if: matrix.backend == 'cuda' && inputs.build_win_cuda == 'true'
