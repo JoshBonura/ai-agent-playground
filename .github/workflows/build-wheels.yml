@@ -20,7 +20,9 @@ concurrency:
 
 env:
   PY_VER: "3.11"
-  WF_VERSION: "build-wheels.yml v2025-09-27.1"  
+  WF_VERSION: "build-wheels.yml v2025-09-27.1"
+  VULKAN_VER: "1.3.296.0"
+  CUDA_VER: "12.4.1" 
 
 jobs:
   ############################
@@ -63,31 +65,92 @@ jobs:
       - name: Build tools
         run: python -m pip install --upgrade pip build wheel cmake ninja
 
-      - name: Vulkan SDK (Windows)
+      - name: Vulkan SDK (Windows) — winget or zip fallback
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
-          # Correct package name is 'vulkan-sdk' (NOT 'vulkansdk')
-          choco install vulkan-sdk --no-progress -y
-          refreshenv
+          $ErrorActionPreference = 'Stop'
+          $installed = $false
 
-          # Pick the newest SDK installed under C:\VulkanSDK\<version>
-          $vks = (Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
-          if (-not $vks) { Write-Error "Vulkan SDK not found under C:\VulkanSDK after install"; exit 1 }
+          # Try winget first (present on Windows Server 2022 runners)
+          try {
+            winget --version
+            winget install --id LunarG.VulkanSDK --exact `
+              --accept-package-agreements --accept-source-agreements -s winget -e
+            $installed = $true
+          } catch {
+            Write-Host "winget install failed or winget missing: $($_.Exception.Message)"
+          }
+
+          if (-not $installed) {
+            $ver = "${{ env.VULKAN_VER }}"
+            $zipUrl = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver.zip?Human=true"
+            $zip    = "$env:TEMP\VulkanSDK-$ver.zip"
+            $dest   = "C:\VulkanSDK\$ver"
+
+            Write-Host "Falling back to portable ZIP: $zipUrl"
+            Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zip
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            tar -xf $zip -C $dest
+            $installed = Test-Path $dest
+          }
+
+          # Discover the newest installed SDK and export env
+          $vks = (Get-ChildItem 'C:\VulkanSDK' -Directory `
+                  | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          if (-not $vks) { throw "Vulkan SDK not found under C:\VulkanSDK" }
 
           echo "VULKAN_SDK=$vks" >> $env:GITHUB_ENV
           echo "$vks\Bin"        >> $env:GITHUB_PATH
 
           Write-Host "Using Vulkan SDK at: $vks"
-          Get-ChildItem "$vks\Lib" | Select-Object -First 5 | Format-Table
+          & "$vks\Bin\glslc.exe" --version
 
 
-      - name: CUDA Toolkit (Windows)
+      - name: Install CUDA Toolkit (Windows) — winget with fallback
         if: matrix.backend == 'cuda' && inputs.build_win_cuda == 'true'
         shell: pwsh
         run: |
-          choco install cuda --version=12.6 -y --no-progress
-          refreshenv
+          $ErrorActionPreference = 'Stop'
+          $installed = $false
+          try {
+            winget --version
+            # Try exact version first; if it fails, try latest
+            try {
+              winget install --id NVIDIA.CUDA --exact `
+                --version "${{ env.CUDA_VER }}" `
+                --accept-package-agreements --accept-source-agreements -e
+              $installed = $true
+            } catch {
+              Write-Host "winget exact version failed; trying latest NVIDIA.CUDA"
+              winget install --id NVIDIA.CUDA --accept-package-agreements --accept-source-agreements -e
+              $installed = $true
+            }
+          } catch {
+            Write-Host "winget not available; falling back to NVIDIA web installer"
+            # Fallback: download a pinned network installer (update if needed)
+            $url = "https://developer.download.nvidia.com/compute/cuda/${{ env.CUDA_VER }}/network_installers/cuda_${{ env.CUDA_VER }}_windows_network.exe"
+            $exe = "$env:TEMP\cuda_${{ env.CUDA_VER }}_windows_network.exe"
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $exe
+            Start-Process -FilePath $exe -ArgumentList "-s" -Wait
+            $installed = $true
+          }
+
+          if (-not $installed) { throw "CUDA install failed" }
+
+          # Locate the newest CUDA folder and export env vars
+          $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+          if (-not (Test-Path $root)) { throw "CUDA root not found at $root" }
+          $verDir = (Get-ChildItem $root -Directory | Sort-Object Name -Descending | Select-Object -First 1)
+          if (-not $verDir) { throw "No CUDA version directories under $root" }
+
+          $cudaPath = $verDir.FullName
+          echo "CUDAToolkit_ROOT=$cudaPath" >> $env:GITHUB_ENV
+          echo "$cudaPath\bin"              >> $env:GITHUB_PATH
+          echo "$cudaPath\libnvvp"          >> $env:GITHUB_PATH
+
+          & "$cudaPath\bin\nvcc.exe" --version
+          Write-Host "CUDA installed at: $cudaPath"
 
       - name: Set CMAKE_ARGS (Windows)
         if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
@@ -100,6 +163,7 @@ jobs:
           else
             echo "CMAKE_ARGS=" >> $GITHUB_ENV
           fi
+
 
       - name: Skip Windows CUDA (not requested)
         if: matrix.backend == 'cuda' && inputs.build_win_cuda != 'true'
@@ -198,27 +262,48 @@ jobs:
           diskcache==5.6.3
           REQ
 
-      # CPU & Vulkan native
-# CPU & Vulkan native
-      - name: Build CPU/Vulkan natively
-        if: matrix.backend == 'cpu' || matrix.backend == 'vulkan'
+      # CPU only
+      - name: Build CPU natively
+        if: matrix.backend == 'cpu'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y \
-            python3-pip python3-venv cmake ninja-build \
-            libvulkan-dev glslang-dev glslc
+          sudo apt-get install -y python3-venv cmake ninja-build
           python3 -m venv .venv && . .venv/bin/activate
           python -m pip install --upgrade pip build wheel
-          if [ "${{ matrix.backend }}" = "vulkan" ]; then export CMAKE_ARGS="-DGGML_VULKAN=ON"; fi
           cd ext/_llama
-          test -f vendor/llama.cpp/CMakeLists.txt
           python -m pip wheel . -w dist
-          mkdir -p ../../wheels_out/linux/${{ matrix.backend }}
-          cp dist/*.whl ../../wheels_out/linux/${{ matrix.backend }}/
+          mkdir -p ../../wheels_out/linux/cpu
+          cp dist/*.whl ../../wheels_out/linux/cpu/
           cd ../../
-          python -m pip download --only-binary=:all: --dest ext/wheels_out/linux/${{ matrix.backend }} -r ext/req_base.txt
+          python -m pip download --only-binary=:all: --dest ext/wheels_out/linux/cpu -r ext/req_base.txt
+
+
+      # Vulkan only
+      - name: Build Vulkan natively
+        if: matrix.backend == 'vulkan'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-venv cmake ninja-build \
+            libvulkan-dev glslang-dev spirv-tools
+          python3 -m venv .venv && . .venv/bin/activate
+          python -m pip install --upgrade pip build wheel
+          export CMAKE_ARGS="-DGGML_VULKAN=ON"
+          cd ext/_llama
+          python -m pip wheel . -w dist
+          mkdir -p ../../wheels_out/linux/vulkan
+          cp dist/*.whl ../../wheels_out/linux/vulkan/
+          cd ../../
+          python -m pip download --only-binary=:all: --dest ext/wheels_out/linux/vulkan -r ext/req_base.txt
+
+
+
 
       # CUDA in NVIDIA Docker
       - name: Build CUDA in CUDA container
@@ -230,17 +315,25 @@ jobs:
           run: |
             set -e
             apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
+            # Allow git to operate on the bind mount paths
+            git config --global --add safe.directory /ws/ext/_llama
+            git config --global --add safe.directory /ws/ext/_llama/vendor/llama.cpp
+
             python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
             python -m pip install --upgrade pip build wheel
-            # Ensure submodules are present inside the container (bind mount brings .git)
+
+            # Ensure submodules are present (needed for ggml backends)
             git submodule sync --recursive
             git submodule update --init --recursive --jobs 8 --depth 1
             test -f vendor/llama.cpp/CMakeLists.txt
+
             export CMAKE_ARGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75\;80\;86\;89\;90"
             python -m pip wheel . -w dist
+
             mkdir -p /ws/ext/wheels_out/linux/cuda
             cp dist/*.whl /ws/ext/wheels_out/linux/cuda/
             python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/cuda -r /ws/ext/req_base.txt
+
 
       # ROCm in ROCm Docker
       - name: Build ROCm in ROCm container
@@ -251,20 +344,31 @@ jobs:
           options: -v ${{ github.workspace }}:/ws -w /ws/ext/_llama
           run: |
             set -e
-            apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
-            # allow git to operate on the bind mount
+            apt-get update
+            apt-get install -y python3-pip python3-venv cmake ninja-build git \
+                              hipblas hipblas-dev rocblas-dev   # <— add these
+
+            # allow git to operate on the bind mount (avoids “dubious ownership”)
             git config --global --add safe.directory /ws/ext/_llama
             git config --global --add safe.directory /ws/ext/_llama/vendor/llama.cpp
+
             python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
             python -m pip install --upgrade pip build wheel
+
+            # make sure submodules are present
             git submodule sync --recursive
             git submodule update --init --recursive --jobs 8 --depth 1
             test -f vendor/llama.cpp/CMakeLists.txt
+
             export CMAKE_ARGS="-DGGML_HIP=ON -DLLAMA_HIPBLAS=ON -DAMDGPU_TARGETS=gfx1030\;gfx1100"
+            # (optional) help CMake find ROCm packages explicitly:
+            export CMAKE_PREFIX_PATH="/opt/rocm:${CMAKE_PREFIX_PATH:-}"
+
             python -m pip wheel . -w dist
             mkdir -p /ws/ext/wheels_out/linux/rocm
             cp dist/*.whl /ws/ext/wheels_out/linux/rocm/
             python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/rocm -r /ws/ext/req_base.txt
+
 
 
       - uses: actions/upload-artifact@v4
