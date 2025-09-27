@@ -7,7 +7,27 @@ on:
         description: "llama-cpp-python tag (e.g., v0.3.16)"
         required: true
       build_win_cuda:
-        description: "Build Windows CUDA (installs CUDA via choco; slower)"
+        description: "Build Windows CUDA (installs CUDA; slow)"
+        required: false
+        default: "false"
+      build_win_vulkan:
+        description: "Build Windows Vulkan"
+        required: false
+        default: "false"
+      build_linux_cuda:
+        description: "Build Linux CUDA (Docker)"
+        required: false
+        default: "false"
+      build_linux_vulkan:
+        description: "Build Linux Vulkan (native)"
+        required: false
+        default: "false"
+      build_linux_rocm:
+        description: "Build Linux ROCm (Docker)"
+        required: false
+        default: "false"
+      build_mac_metal:
+        description: "Build macOS Metal (arm64)"
         required: false
         default: "false"
 
@@ -20,13 +40,13 @@ concurrency:
 
 env:
   PY_VER: "3.11"
-  WF_VERSION: "build-wheels.yml v2025-09-27.1"
+  WF_VERSION: "build-wheels.yml v2025-09-27.2"
   VULKAN_VER: "1.3.296.0"
-  CUDA_VER: "12.4.1" 
+  CUDA_VER: "12.4.1"
 
 jobs:
   ############################
-  # WINDOWS (cpu, vulkan, cuda?)
+  # WINDOWS (cpu, vulkan, cuda)
   ############################
   windows:
     runs-on: windows-latest
@@ -65,17 +85,16 @@ jobs:
       - name: Build tools
         run: python -m pip install --upgrade pip build wheel cmake ninja
 
-# ---- Windows Vulkan setup + diagnostics ----
-# ---- Windows Vulkan setup + diagnostics ----
+      # ---- Windows Vulkan setup + diagnostics ----
       - name: Install Vulkan SDK (Windows)
-        if: matrix.backend == 'vulkan'
+        if: matrix.backend == 'vulkan' && inputs.build_win_vulkan == 'true'
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          version: 1.4.309.0   # pin a known-good; you can try "latest" later
+          version: 1.4.309.0
           cache: true
 
       - name: Configure CMAKE_ARGS for Vulkan (Windows)
-        if: matrix.backend == 'vulkan'
+        if: matrix.backend == 'vulkan' && inputs.build_win_vulkan == 'true'
         shell: bash
         run: |
           echo "CMAKE_ARGS=-DGGML_VULKAN=ON" >> $GITHUB_ENV
@@ -83,15 +102,15 @@ jobs:
           echo "SKBUILD_CMAKE_ARGS=--log-level=VERBOSE" >> $GITHUB_ENV
 
       - name: Vulkan diagnostics (Windows)
-        if: matrix.backend == 'vulkan'
+        if: matrix.backend == 'vulkan' && inputs.build_win_vulkan == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           if (Test-Path $env:VULKAN_SDK) {
             Get-ChildItem $env:VULKAN_SDK | Select Name,FullName
-            Get-ChildItem "$env:VULKAN_SDK\Lib" -Filter "vulkan-1.lib" -Recurse -ErrorAction SilentlyContinue `
-              | Select-Object -First 5 FullName
+            Get-ChildItem "$env:VULKAN_SDK\Lib" -Filter "vulkan-1.lib" -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 5 FullName
           } else {
             Write-Error "VULKAN_SDK not set by install-vulkan-sdk action."
           }
@@ -102,6 +121,7 @@ jobs:
           cmake --version
           ninja --version
 
+      # ---- Windows CUDA install (optional) ----
       - name: Install CUDA Toolkit (Windows) — winget with fallback
         if: matrix.backend == 'cuda' && inputs.build_win_cuda == 'true'
         shell: pwsh
@@ -110,7 +130,6 @@ jobs:
           $installed = $false
           try {
             winget --version
-            # Try exact version first; if it fails, try latest
             try {
               winget install --id NVIDIA.CUDA --exact `
                 --version "${{ env.CUDA_VER }}" `
@@ -123,7 +142,6 @@ jobs:
             }
           } catch {
             Write-Host "winget not available; falling back to NVIDIA web installer"
-            # Fallback: download a pinned network installer (update if needed)
             $url = "https://developer.download.nvidia.com/compute/cuda/${{ env.CUDA_VER }}/network_installers/cuda_${{ env.CUDA_VER }}_windows_network.exe"
             $exe = "$env:TEMP\cuda_${{ env.CUDA_VER }}_windows_network.exe"
             Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $exe
@@ -133,7 +151,6 @@ jobs:
 
           if (-not $installed) { throw "CUDA install failed" }
 
-          # Locate the newest CUDA folder and export env vars
           $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
           if (-not (Test-Path $root)) { throw "CUDA root not found at $root" }
           $verDir = (Get-ChildItem $root -Directory | Sort-Object Name -Descending | Select-Object -First 1)
@@ -148,7 +165,9 @@ jobs:
           Write-Host "CUDA installed at: $cudaPath"
 
       - name: Set CMAKE_ARGS (Windows)
-        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
+        if: (matrix.backend == 'cuda'  && inputs.build_win_cuda   == 'true') ||
+            (matrix.backend == 'vulkan'&& inputs.build_win_vulkan == 'true') ||
+            (matrix.backend == 'cpu')
         shell: bash
         run: |
           if [[ "${{ matrix.backend }}" == "cuda" ]]; then
@@ -159,10 +178,13 @@ jobs:
             echo "CMAKE_ARGS=" >> $GITHUB_ENV
           fi
 
-
       - name: Skip Windows CUDA (not requested)
         if: matrix.backend == 'cuda' && inputs.build_win_cuda != 'true'
         run: echo "Skipping Windows CUDA build because build_win_cuda=false"
+
+      - name: Skip Windows Vulkan (not requested)
+        if: matrix.backend == 'vulkan' && inputs.build_win_vulkan != 'true'
+        run: echo "Skipping Windows Vulkan build because build_win_vulkan=false"
 
       - name: "Sanity: vendored llama.cpp present (Windows)"
         working-directory: ext/_llama
@@ -177,9 +199,10 @@ jobs:
           test -f vendor/llama.cpp/CMakeLists.txt
           git -C vendor/llama.cpp log -1 --oneline || true
 
-
       - name: Build llama wheel (Windows)
-        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
+        if: (matrix.backend == 'cpu') ||
+            (matrix.backend == 'cuda'   && inputs.build_win_cuda   == 'true') ||
+            (matrix.backend == 'vulkan' && inputs.build_win_vulkan == 'true')
         run: |
           cd ext/_llama
           python -m pip wheel . -w dist
@@ -198,7 +221,9 @@ jobs:
           "@ | Out-File -FilePath ext/req_base.txt -Encoding ASCII
 
       - name: Collect wheels + base deps (Windows)
-        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
+        if: (matrix.backend == 'cpu') ||
+            (matrix.backend == 'cuda'   && inputs.build_win_cuda   == 'true') ||
+            (matrix.backend == 'vulkan' && inputs.build_win_vulkan == 'true')
         shell: pwsh
         run: |
           $out = "ext/wheels_out/win/${{ matrix.backend }}"
@@ -207,7 +232,9 @@ jobs:
           python -m pip download --only-binary=:all: --dest $out -r ext/req_base.txt
 
       - uses: actions/upload-artifact@v4
-        if: matrix.backend != 'cuda' || inputs.build_win_cuda == 'true'
+        if: (matrix.backend == 'cpu') ||
+            (matrix.backend == 'cuda'   && inputs.build_win_cuda   == 'true') ||
+            (matrix.backend == 'vulkan' && inputs.build_win_vulkan == 'true')
         with:
           name: wheels-win-${{ matrix.backend }}
           path: ext/wheels_out/win/${{ matrix.backend }}/*.whl
@@ -275,34 +302,65 @@ jobs:
           cd ../../
           python -m pip download --only-binary=:all: --dest ext/wheels_out/linux/cpu -r ext/req_base.txt
 
-
       # Vulkan only
       - name: Build Vulkan natively
-        if: matrix.backend == 'vulkan'
+        if: matrix.backend == 'vulkan' && inputs.build_linux_vulkan == 'true'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          set -e
+          set -euo pipefail
+
+          echo "== apt-get =="
           sudo apt-get update
           sudo apt-get install -y \
-            python3-venv cmake ninja-build \
-            libvulkan-dev glslang-dev spirv-tools
-          python3 -m venv .venv && . .venv/bin/activate
+            python3-venv cmake ninja-build pkg-config \
+            libvulkan-dev glslang-dev spirv-tools shaderc glslang-tools
+
+          echo "== tool versions =="
+          cmake --version
+          ninja --version
+          gcc --version | head -n1 || true
+          pkg-config --modversion vulkan || true
+
+          echo "== vulkan tool sanity =="
+          which glslc || { echo "ERROR: glslc not on PATH"; exit 1; }
+          glslc --version
+          whereis glslc || true
+          ls -1 /usr/lib/x86_64-linux-gnu | grep -E 'libvulkan|libshaderc' || true
+
+          echo "== python venv =="
+          python3 -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip build wheel
-          export CMAKE_ARGS="-DGGML_VULKAN=ON"
+
+          export CMAKE_ARGS="-DGGML_VULKAN=ON -DCMAKE_VERBOSE_MAKEFILE=ON"
+          export SKBUILD_CMAKE_ARGS="--log-level=VERBOSE"
+
+          echo "== build llama-cpp-python wheel (Vulkan) =="
           cd ext/_llama
-          python -m pip wheel . -w dist
+          if ! python -m pip wheel . -w dist 2>&1 | tee ../build_vulkan.log; then
+            echo "::group::CMake logs"
+            find . -type f \( -name CMakeOutput.log -o -name CMakeError.log \) -print \
+              -exec sh -c 'echo "--- {} ---"; sed -n "1,200p" "{}"' \;
+            echo "::endgroup::"
+            exit 1
+          fi
+
           mkdir -p ../../wheels_out/linux/vulkan
           cp dist/*.whl ../../wheels_out/linux/vulkan/
           cd ../../
-          python -m pip download --only-binary=:all: --dest ext/wheels_out/linux/vulkan -r ext/req_base.txt
 
+          echo "== lock supporting wheels =="
+          python -m pip download --only-binary=:all: \
+            --dest ext/wheels_out/linux/vulkan -r ext/req_base.txt
 
-
+      - name: Skip Linux Vulkan (not requested)
+        if: matrix.backend == 'vulkan' && inputs.build_linux_vulkan != 'true'
+        run: echo "Skipping Linux Vulkan build (build_linux_vulkan=false)"
 
       # CUDA in NVIDIA Docker
       - name: Build CUDA in CUDA container
-        if: matrix.backend == 'cuda'
+        if: matrix.backend == 'cuda' && inputs.build_linux_cuda == 'true'
         uses: addnab/docker-run-action@v3
         with:
           image: nvidia/cuda:12.4.1-devel-ubuntu22.04
@@ -310,14 +368,12 @@ jobs:
           run: |
             set -e
             apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
-            # Allow git to operate on the bind mount paths
             git config --global --add safe.directory /ws/ext/_llama
             git config --global --add safe.directory /ws/ext/_llama/vendor/llama.cpp
 
             python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
             python -m pip install --upgrade pip build wheel
 
-            # Ensure submodules are present (needed for ggml backends)
             git submodule sync --recursive
             git submodule update --init --recursive --jobs 8 --depth 1
             test -f vendor/llama.cpp/CMakeLists.txt
@@ -329,44 +385,87 @@ jobs:
             cp dist/*.whl /ws/ext/wheels_out/linux/cuda/
             python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/cuda -r /ws/ext/req_base.txt
 
+      - name: Skip Linux CUDA (not requested)
+        if: matrix.backend == 'cuda' && inputs.build_linux_cuda != 'true'
+        run: echo "Skipping Linux CUDA build (build_linux_cuda=false)"
 
-      # ROCm in ROCm Docker
+      # ROCm in ROCm Docker (>= 6.1 required by llama.cpp)
       - name: Build ROCm in ROCm container
-        if: matrix.backend == 'rocm'
+        if: matrix.backend == 'rocm' && inputs.build_linux_rocm == 'true'
         uses: addnab/docker-run-action@v3
         with:
-          image: rocm/dev-ubuntu-22.04:5.7.1
+          image: rocm/dev-ubuntu-22.04:6.1.3   # <-- bump from 5.7.1
           options: -v ${{ github.workspace }}:/ws -w /ws/ext/_llama
           run: |
-            set -e
-            apt-get update
-            apt-get install -y python3-pip python3-venv cmake ninja-build git \
-                              hipblas hipblas-dev rocblas-dev   # <— add these
+            set -euo pipefail
 
-            # allow git to operate on the bind mount (avoids “dubious ownership”)
+            echo "== apt-get =="
+            apt-get update
+            # keep hip runtime + BLAS dev bits around for link-time detection
+            DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends \
+              python3-pip python3-venv cmake ninja-build git \
+              hip-runtime-amd hipblas hipblas-dev rocblas-dev
+
+            echo "== ROCm toolchain diagnostics =="
+            if command -v /opt/rocm/bin/hipcc >/dev/null 2>&1; then
+              /opt/rocm/bin/hipcc --version || true
+            fi
+            if command -v /opt/rocm/llvm/bin/clang++ >/dev/null 2>&1; then
+              /opt/rocm/llvm/bin/clang++ --version || true
+            fi
+            command -v rocminfo >/dev/null 2>&1 && rocminfo | head -n 50 || echo "rocminfo unavailable"
+            ldconfig -p | grep -E 'lib(hipblas|rocblas)' || true
+
+            echo "== Python env =="
+            python3 -m venv /ws/.venv
+            . /ws/.venv/bin/activate
+            python -m pip install --upgrade pip build wheel
+
+            echo "== Git safe.directory for bind mount =="
             git config --global --add safe.directory /ws/ext/_llama
             git config --global --add safe.directory /ws/ext/_llama/vendor/llama.cpp
 
-            python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
-            python -m pip install --upgrade pip build wheel
-
-            # make sure submodules are present
+            echo "== Ensure submodules =="
             git submodule sync --recursive
             git submodule update --init --recursive --jobs 8 --depth 1
             test -f vendor/llama.cpp/CMakeLists.txt
 
-            export CMAKE_ARGS="-DGGML_HIP=ON -DLLAMA_HIPBLAS=ON -DAMDGPU_TARGETS=gfx1030\;gfx1100"
-            # (optional) help CMake find ROCm packages explicitly:
+            echo "== Configure CMake for HIP =="
+            export HIPCXX=/opt/rocm/bin/hipcc
             export CMAKE_PREFIX_PATH="/opt/rocm:${CMAKE_PREFIX_PATH:-}"
+            # Pick a reasonable default target set; adjust to what you want to support
+            export AMDGPU_TARGETS="gfx1030;gfx1100;gfx1101;gfx1102"
+            export CMAKE_ARGS="-DGGML_HIP=ON -DLLAMA_HIPBLAS=ON -DAMDGPU_TARGETS=${AMDGPU_TARGETS} -DCMAKE_VERBOSE_MAKEFILE=ON"
+            export SKBUILD_CMAKE_ARGS="--log-level=VERBOSE"
 
-            python -m pip wheel . -w dist
+            echo "== Build wheel (ROCm) =="
+            # capture full output for debugging
+            if ! python -m pip wheel . -w dist 2>&1 | tee /ws/ext/build_rocm.log; then
+              echo "::group::CMake logs"
+              find . -type f \( -name CMakeError.log -o -name CMakeOutput.log \) -print \
+                -exec sh -c 'echo \"--- {} ---\"; sed -n \"1,200p\" \"{}\"' \;
+              echo "::endgroup::"
+              exit 1
+            fi
+
+            echo "== Collect wheels =="
             mkdir -p /ws/ext/wheels_out/linux/rocm
             cp dist/*.whl /ws/ext/wheels_out/linux/rocm/
-            python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/rocm -r /ws/ext/req_base.txt
 
+            echo "== Lock supporting wheels =="
+            python -m pip download --only-binary=:all: \
+              --dest /ws/ext/wheels_out/linux/rocm /ws/ext/req_base.txt
 
+      - name: Skip Linux ROCm (not requested)
+        if: matrix.backend == 'rocm' && inputs.build_linux_rocm != 'true'
+        run: echo "Skipping Linux ROCm build (build_linux_rocm=false)"
 
       - uses: actions/upload-artifact@v4
+        if: (matrix.backend == 'cpu') ||
+            (matrix.backend == 'cuda'   && inputs.build_linux_cuda   == 'true') ||
+            (matrix.backend == 'vulkan' && inputs.build_linux_vulkan == 'true') ||
+            (matrix.backend == 'rocm'   && inputs.build_linux_rocm   == 'true')
         with:
           name: wheels-linux-${{ matrix.backend }}
           path: ext/wheels_out/linux/${{ matrix.backend }}/*.whl
@@ -418,10 +517,14 @@ jobs:
           echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> $GITHUB_ENV
 
       - name: Enable Metal
-        if: matrix.backend == 'metal'
+        if: matrix.backend == 'metal' && inputs.build_mac_metal == 'true'
         shell: bash
         run: |
           echo "CMAKE_ARGS=-DGGML_METAL=ON -DLLAMA_METAL=ON" >> $GITHUB_ENV
+
+      - name: Skip macOS Metal (not requested)
+        if: matrix.backend == 'metal' && inputs.build_mac_metal != 'true'
+        run: echo "Skipping macOS Metal build (build_mac_metal=false)"
 
       - name: Write base reqs (macOS)
         run: |
@@ -448,8 +551,9 @@ jobs:
           test -f vendor/llama.cpp/CMakeLists.txt
           git -C vendor/llama.cpp log -1 --oneline || true
 
-          
       - name: Build llama wheel (mac)
+        if: (matrix.backend == 'cpu') ||
+            (matrix.backend == 'metal' && inputs.build_mac_metal == 'true')
         run: |
           cd ext/_llama
           python -m pip wheel . -w dist
@@ -459,6 +563,8 @@ jobs:
           python -m pip download --only-binary=:all: --dest ext/wheels_out/mac/${{ matrix.backend }} -r ext/req_base.txt
 
       - uses: actions/upload-artifact@v4
+        if: (matrix.backend == 'cpu') ||
+            (matrix.backend == 'metal' && inputs.build_mac_metal == 'true')
         with:
           name: wheels-mac-${{ matrix.backend }}
           path: ext/wheels_out/mac/${{ matrix.backend }}/*.whl
