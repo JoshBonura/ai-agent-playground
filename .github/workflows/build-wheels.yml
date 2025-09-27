@@ -67,11 +67,20 @@ jobs:
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
-          choco install vulkansdk --no-progress -y
+          # Correct package name is 'vulkan-sdk' (NOT 'vulkansdk')
+          choco install vulkan-sdk --no-progress -y
           refreshenv
-          $vks = (Get-ChildItem 'C:\VulkanSDK' | Sort-Object Name -Descending | Select-Object -First 1).FullName
+
+          # Pick the newest SDK installed under C:\VulkanSDK\<version>
+          $vks = (Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          if (-not $vks) { Write-Error "Vulkan SDK not found under C:\VulkanSDK after install"; exit 1 }
+
           echo "VULKAN_SDK=$vks" >> $env:GITHUB_ENV
-          echo "$vks\Bin" >> $env:GITHUB_PATH
+          echo "$vks\Bin"        >> $env:GITHUB_PATH
+
+          Write-Host "Using Vulkan SDK at: $vks"
+          Get-ChildItem "$vks\Lib" | Select-Object -First 5 | Format-Table
+
 
       - name: CUDA Toolkit (Windows)
         if: matrix.backend == 'cuda' && inputs.build_win_cuda == 'true'
@@ -190,22 +199,20 @@ jobs:
           REQ
 
       # CPU & Vulkan native
+# CPU & Vulkan native
       - name: Build CPU/Vulkan natively
         if: matrix.backend == 'cpu' || matrix.backend == 'vulkan'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip python3-venv cmake ninja-build libvulkan-dev glslang-dev
-          # Optional for faster CPU wheels:
-          # sudo apt-get install -y libopenblas-dev
+          sudo apt-get install -y \
+            python3-pip python3-venv cmake ninja-build \
+            libvulkan-dev glslang-dev glslc
           python3 -m venv .venv && . .venv/bin/activate
           python -m pip install --upgrade pip build wheel
           if [ "${{ matrix.backend }}" = "vulkan" ]; then export CMAKE_ARGS="-DGGML_VULKAN=ON"; fi
-          # Optional BLAS flags:
-          # export CMAKE_ARGS="$CMAKE_ARGS -DGGML_BLAS=ON -DGGML_OPENBLAS=ON"
           cd ext/_llama
-          # Sanity before build
           test -f vendor/llama.cpp/CMakeLists.txt
           python -m pip wheel . -w dist
           mkdir -p ../../wheels_out/linux/${{ matrix.backend }}
@@ -245,6 +252,9 @@ jobs:
           run: |
             set -e
             apt-get update && apt-get install -y python3-pip python3-venv cmake ninja-build git
+            # allow git to operate on the bind mount
+            git config --global --add safe.directory /ws/ext/_llama
+            git config --global --add safe.directory /ws/ext/_llama/vendor/llama.cpp
             python3 -m venv /ws/.venv && . /ws/.venv/bin/activate
             python -m pip install --upgrade pip build wheel
             git submodule sync --recursive
@@ -255,6 +265,7 @@ jobs:
             mkdir -p /ws/ext/wheels_out/linux/rocm
             cp dist/*.whl /ws/ext/wheels_out/linux/rocm/
             python -m pip download --only-binary=:all: --dest /ws/ext/wheels_out/linux/rocm -r /ws/ext/req_base.txt
+
 
       - uses: actions/upload-artifact@v4
         with:
